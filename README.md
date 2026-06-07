@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./assets/logo.svg" alt="Mosoo" width="92" height="92" />
+<img src="./assets/logo.svg" alt="Mosoo" width="138" height="138" />
 
 <h1>agent-driver</h1>
 
@@ -24,8 +24,6 @@ The runtime that drives a sandbox-hosted agent session inside <a href="https://g
 
 [![Built by langgenius](https://img.shields.io/badge/built%20by-langgenius-6fd305)](https://github.com/langgenius)
 [![X / Twitter](https://img.shields.io/badge/X-%40mosooagent-000000?logo=x&logoColor=white)](https://x.com/mosooagent)
-
-<strong><a href="https://github.com/langgenius/mosoo">Docs</a> · <a href="#quick-start">Install</a> · <a href="https://x.com/mosooagent">Community</a></strong>
 
 </div>
 
