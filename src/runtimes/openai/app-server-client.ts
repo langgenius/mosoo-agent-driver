@@ -174,6 +174,7 @@ export class OpenAiAppServerClient {
       materializeOpenAiModelProviderConfig({
         env,
         provider: this.#payload.execution.provider,
+        providerOptions: this.#payload.execution.providerOptions,
         runtimeHome,
       }),
     );

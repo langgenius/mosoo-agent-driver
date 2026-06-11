@@ -9,9 +9,11 @@ import type {
 
 import { isTruthy } from "../../core/truthiness";
 import type { DriverBootMcpServer } from "../../protocol/boot";
+import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
 import type { AgentDriverContext } from "../agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
+import { mergeProviderOptions } from "../provider-options";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
 export const CLAUDE_CODE_EXECUTABLE_ENV = "MOSOO_CLAUDE_CODE_EXECUTABLE";
@@ -100,6 +102,13 @@ export function resolveClaudeConfigDir(payload: DriverStartInput): string {
   return payload.execution.session.homePath;
 }
 
+export function mergeClaudeQueryOptions<T extends object>(
+  options: T,
+  providerOptions: JsonObject,
+): T {
+  return mergeProviderOptions(options, providerOptions);
+}
+
 export async function createClaudeQueryOptions(input: {
   abortController: AbortController;
   context: AgentDriverContext;
@@ -150,5 +159,5 @@ export async function createClaudeQueryOptions(input: {
     options.resume = input.nativeSessionId;
   }
 
-  return options;
+  return mergeClaudeQueryOptions(options, input.payload.execution.providerOptions);
 }

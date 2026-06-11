@@ -40,6 +40,7 @@ export const driverBootPayload = {
     model: "model-1",
     profilePrompt: "",
     provider: "provider-1",
+    providerOptions: {},
     session: {
       additionalDirectories: [],
       context: {

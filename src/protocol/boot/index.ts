@@ -1,4 +1,6 @@
 import type { DriverInstanceId } from "../id";
+import type { JsonObject } from "../json";
+import { readJsonObject } from "../json";
 import type { DriverNativeRuntimeRef, DriverRuntime, DriverRuntimeTransport } from "../runtime";
 import {
   isSupportedDriverRuntime,
@@ -136,6 +138,7 @@ export interface DriverExecutionSpec {
   readonly model: string;
   readonly profilePrompt: string;
   readonly provider: string;
+  readonly providerOptions: JsonObject;
   readonly session: DriverExecutionSessionSpec;
   readonly skillCatalog: DriverSkillCatalogEntry[];
   readonly skills: DriverResolvedSkill[];
@@ -338,6 +341,10 @@ function readExecution(value: unknown): DriverExecutionSpec {
     model: readNonEmptyString(record, "model", "execution"),
     profilePrompt: readString(record, "profilePrompt", "execution"),
     provider: readNonEmptyString(record, "provider", "execution"),
+    providerOptions:
+      record["providerOptions"] === undefined
+        ? {}
+        : readJsonObject(record["providerOptions"], "execution.providerOptions"),
     session: readExecutionSession(record["session"]),
     skillCatalog: readArray(record["skillCatalog"], "execution.skillCatalog").map(
       readSkillCatalogEntry,

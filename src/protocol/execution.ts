@@ -33,6 +33,7 @@ export interface DriverExecutionInput {
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
   readonly provider: string;
+  readonly providerOptions: DriverExecutionSpec["providerOptions"];
   readonly run: DriverExecutionRunInput;
   readonly session: DriverExecutionSessionInput;
   readonly skillCatalog: DriverSkillCatalogEntry[];
@@ -47,6 +48,7 @@ export function createDriverExecutionInputFromBootExecution(
     environment: execution.environment,
     model: execution.model,
     provider: execution.provider,
+    providerOptions: execution.providerOptions,
     run: {
       runId: execution.configRevision.runId,
       sessionId: execution.configRevision.sessionId,

@@ -72,6 +72,17 @@ describe("OpenAI app-server auth state", () => {
         OPENAI_COMPATIBLE_BASE_URL: "https://compat.example/v1",
       },
       provider: "openai-compatible",
+      providerOptions: {
+        features: {
+          tool_suggest: true,
+        },
+        model_providers: {
+          "openai-compatible": {
+            wire_api: "chat",
+          },
+        },
+        sandbox_workspace_write: true,
+      },
       runtimeHome,
     });
 
@@ -84,9 +95,14 @@ describe("OpenAI app-server auth state", () => {
       base_url: "https://compat.example/v1",
       env_key: "OPENAI_COMPATIBLE_API_KEY",
       name: "Mosoo OpenAI-Compatible",
-      wire_api: "responses",
+      wire_api: "chat",
     });
-    expectDisabledRuntimeFeatures(config);
+    expect(requireRecord(config["features"], "runtime features")).toMatchObject({
+      plugins: false,
+      remote_plugin: false,
+      tool_suggest: true,
+    });
+    expect(config["sandbox_workspace_write"]).toBe(true);
   });
 
   test("writes generated config for built-in OpenAI auth", async () => {
