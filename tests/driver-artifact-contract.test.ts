@@ -42,7 +42,7 @@ describe("driver artifact contract", () => {
     expect(packageJson.private).toBe(false);
     expect(packageJson.version).toBe("0.1.0");
     expect(packageJson.description).toContain("Agent Driver");
-    expect(packageJson.license).toBe("UNLICENSED");
+    expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.packageManager).toBe("bun@1.3.14");
     expect(packageJson.bin).toEqual({
       "agent-driver": "./dist/driver.mjs",
@@ -200,8 +200,8 @@ describe("driver artifact contract", () => {
   test("documents the standalone release boundary", () => {
     const readme = readText("../README.md");
 
-    expect(readme).toContain("The core product is the Driver Kernel");
-    expect(readme).toContain("CMA is a compatibility surface");
+    expect(readme).toContain("The core product is the **Driver Kernel**");
+    expect(readme).toContain("CMA (the Anthropic Managed Agents compatibility surface)");
     expect(readme).toContain("Every public entry has a matching declaration file");
     expect(readme).toContain("agent-driver/boot");
     expect(readme).toContain("agent-driver/events");
