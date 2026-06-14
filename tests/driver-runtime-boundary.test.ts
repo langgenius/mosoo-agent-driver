@@ -95,7 +95,7 @@ describe("driver runtime boundary", () => {
           text: "hello",
         },
         kind: "input.start",
-        organizationAccessSnapshot: accessSnapshot,
+        appAccessSnapshot: accessSnapshot,
         requestId: "request-1",
         runId: DRIVER_TEST_IDS.runId,
       },
@@ -231,7 +231,7 @@ describe("driver runtime boundary", () => {
       {
         commandId: "access-1",
         kind: "access.refresh",
-        organizationAccessSnapshot: accessSnapshot,
+        appAccessSnapshot: accessSnapshot,
       },
       {
         argumentsJson: '{"issue":"A-1"}',
@@ -409,7 +409,7 @@ describe("driver runtime boundary", () => {
     const refreshStarted = createPromiseDeferred<void>();
     const refreshCanFinish = createPromiseDeferred<void>();
     const backend = createBackend();
-    backend.refreshOrganizationAccess = async (_context, snapshot) => {
+    backend.refreshAppAccess = async (_context, snapshot) => {
       backend.refreshedSnapshots.push(snapshot);
       refreshStarted.resolve();
       await refreshCanFinish.promise;
@@ -422,7 +422,7 @@ describe("driver runtime boundary", () => {
           text: "hello",
         },
         kind: "input.start",
-        organizationAccessSnapshot: accessSnapshot,
+        appAccessSnapshot: accessSnapshot,
         requestId: "request-1",
         runId: DRIVER_TEST_IDS.runId,
       },

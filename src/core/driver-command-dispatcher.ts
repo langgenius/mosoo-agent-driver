@@ -224,14 +224,11 @@ export class DriverCommandDispatcher {
       }
 
       if (command.kind === "access.refresh") {
-        await runtimeContext.ports.access.refresh(command.organizationAccessSnapshot);
-        await this.#backend.refreshOrganizationAccess(
-          runtimeContext,
-          command.organizationAccessSnapshot,
-        );
+        await runtimeContext.ports.access.refresh(command.appAccessSnapshot);
+        await this.#backend.refreshAppAccess(runtimeContext, command.appAccessSnapshot);
         await sendCommandUpdate(runtimeContext, command, {
           result: {
-            entryCount: command.organizationAccessSnapshot.entries.length,
+            entryCount: command.appAccessSnapshot.entries.length,
           },
           status: "completed",
         });
@@ -355,12 +352,9 @@ export class DriverCommandDispatcher {
     try {
       cancellation.throwIfCancelled();
 
-      if (command.organizationAccessSnapshot) {
-        await runtimeContext.ports.access.refresh(command.organizationAccessSnapshot);
-        await this.#backend.refreshOrganizationAccess(
-          runtimeContext,
-          command.organizationAccessSnapshot,
-        );
+      if (command.appAccessSnapshot) {
+        await runtimeContext.ports.access.refresh(command.appAccessSnapshot);
+        await this.#backend.refreshAppAccess(runtimeContext, command.appAccessSnapshot);
       }
 
       cancellation.throwIfCancelled();

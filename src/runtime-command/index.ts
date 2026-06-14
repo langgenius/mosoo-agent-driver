@@ -22,15 +22,15 @@ export interface RuntimeCommandInput {
   readonly text: string;
 }
 
-export interface DriverOrganizationAccessSnapshotEntry {
+export interface DriverAppAccessSnapshotEntry {
   readonly mountPath: string;
   readonly role: "admin" | "edit" | "read";
   readonly spaceId: string;
   readonly type: "space";
 }
 
-export interface DriverOrganizationAccessSnapshot {
-  readonly entries: DriverOrganizationAccessSnapshotEntry[];
+export interface DriverAppAccessSnapshot {
+  readonly entries: DriverAppAccessSnapshotEntry[];
 }
 
 export interface TurnCancelCommand {
@@ -43,7 +43,7 @@ export interface InputStartCommand {
   readonly commandId: string;
   readonly input: RuntimeCommandInput;
   readonly kind: "input.start";
-  readonly organizationAccessSnapshot?: DriverOrganizationAccessSnapshot | undefined;
+  readonly appAccessSnapshot?: DriverAppAccessSnapshot | undefined;
   readonly requestId: string;
   readonly runId: string;
 }
@@ -73,7 +73,7 @@ export interface PermissionResolveCommand {
 export interface AccessRefreshCommand {
   readonly commandId: string;
   readonly kind: "access.refresh";
-  readonly organizationAccessSnapshot: DriverOrganizationAccessSnapshot;
+  readonly appAccessSnapshot: DriverAppAccessSnapshot;
 }
 
 export type RuntimeCommand =
@@ -197,22 +197,20 @@ function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
   };
 }
 
-function readAccessRole(value: unknown): DriverOrganizationAccessSnapshotEntry["role"] {
+function readAccessRole(value: unknown): DriverAppAccessSnapshotEntry["role"] {
   if (value === "admin" || value === "edit" || value === "read") {
     return value;
   }
 
-  throw new TypeError("organizationAccessSnapshot.entries[].role must be admin, edit, or read.");
+  throw new TypeError("appAccessSnapshot.entries[].role must be admin, edit, or read.");
 }
 
-function readOrganizationAccessSnapshotEntry(
-  value: unknown,
-): DriverOrganizationAccessSnapshotEntry {
-  const record = readRecord(value, "organizationAccessSnapshot.entries[]");
+function readAppAccessSnapshotEntry(value: unknown): DriverAppAccessSnapshotEntry {
+  const record = readRecord(value, "appAccessSnapshot.entries[]");
   const type = readNonEmptyString(record, "type");
 
   if (type !== "space") {
-    throw new TypeError("organizationAccessSnapshot.entries[].type must be space.");
+    throw new TypeError("appAccessSnapshot.entries[].type must be space.");
   }
 
   return {
@@ -223,29 +221,29 @@ function readOrganizationAccessSnapshotEntry(
   };
 }
 
-function readOrganizationAccessSnapshot(value: unknown): DriverOrganizationAccessSnapshot {
-  const record = readRecord(value, "organizationAccessSnapshot");
+function readAppAccessSnapshot(value: unknown): DriverAppAccessSnapshot {
+  const record = readRecord(value, "appAccessSnapshot");
   const entries = record["entries"];
 
   if (!Array.isArray(entries)) {
-    throw new TypeError("organizationAccessSnapshot.entries must be an array.");
+    throw new TypeError("appAccessSnapshot.entries must be an array.");
   }
 
   return {
-    entries: entries.map(readOrganizationAccessSnapshotEntry),
+    entries: entries.map(readAppAccessSnapshotEntry),
   };
 }
 
-function readOptionalOrganizationAccessSnapshot(
+function readOptionalAppAccessSnapshot(
   record: Record<string, unknown>,
-): DriverOrganizationAccessSnapshot | undefined {
-  const value = record["organizationAccessSnapshot"];
+): DriverAppAccessSnapshot | undefined {
+  const value = record["appAccessSnapshot"];
 
   if (value === undefined) {
     return undefined;
   }
 
-  return readOrganizationAccessSnapshot(value);
+  return readAppAccessSnapshot(value);
 }
 
 function readPermissionDecision(value: unknown): PermissionResolveCommand["decision"] {
@@ -265,18 +263,16 @@ export function parseRuntimeCommand(value: unknown): RuntimeCommand {
       return {
         commandId: readNonEmptyString(record, "commandId"),
         kind,
-        organizationAccessSnapshot: readOrganizationAccessSnapshot(
-          record["organizationAccessSnapshot"],
-        ),
+        appAccessSnapshot: readAppAccessSnapshot(record["appAccessSnapshot"]),
       };
     case "input.start": {
-      const organizationAccessSnapshot = readOptionalOrganizationAccessSnapshot(record);
+      const appAccessSnapshot = readOptionalAppAccessSnapshot(record);
 
       return {
         commandId: readNonEmptyString(record, "commandId"),
         input: readRuntimeCommandInput(record["input"]),
         kind,
-        ...(organizationAccessSnapshot === undefined ? {} : { organizationAccessSnapshot }),
+        ...(appAccessSnapshot === undefined ? {} : { appAccessSnapshot }),
         requestId: readNonEmptyString(record, "requestId"),
         runId: readNonEmptyString(record, "runId"),
       };

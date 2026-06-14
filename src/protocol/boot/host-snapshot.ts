@@ -1,4 +1,4 @@
-import type { DriverOrganizationAccessSnapshot } from "../../runtime-command";
+import type { DriverAppAccessSnapshot } from "../../runtime-command";
 import type { DriverId, SessionId, RunId } from "../id";
 import type {
   AccountId,
@@ -19,7 +19,7 @@ import {
   readRecord,
 } from "./readers";
 
-export type DriverOrganizationAccessSnapshotOutput = DriverOrganizationAccessSnapshot;
+export type DriverAppAccessSnapshotOutput = DriverAppAccessSnapshot;
 
 export interface DriverOrigin {
   readonly callerUserId: AccountId;
@@ -37,7 +37,7 @@ export interface DriverSpaceAliasBinding {
 
 export interface DriverExecutionSessionContext {
   readonly homePath: string;
-  readonly organizationAccessSnapshot: DriverOrganizationAccessSnapshotOutput;
+  readonly appAccessSnapshot: DriverAppAccessSnapshotOutput;
   readonly origin: DriverOrigin;
   readonly sandboxId: SandboxId;
   readonly sandboxKind: string;
@@ -94,17 +94,15 @@ function readSpaceAliasBinding(value: unknown, index: number): DriverSpaceAliasB
   };
 }
 
-export function readOrganizationAccessSnapshot(
-  value: unknown,
-): DriverOrganizationAccessSnapshotOutput {
-  const record = readRecord(value, "execution.session.context.organizationAccessSnapshot");
+export function readAppAccessSnapshot(value: unknown): DriverAppAccessSnapshotOutput {
+  const record = readRecord(value, "execution.session.context.appAccessSnapshot");
 
   return {
     entries: readArray(
       record["entries"],
-      "execution.session.context.organizationAccessSnapshot.entries",
+      "execution.session.context.appAccessSnapshot.entries",
     ).map((entry, index) => {
-      const label = `execution.session.context.organizationAccessSnapshot.entries[${index}]`;
+      const label = `execution.session.context.appAccessSnapshot.entries[${index}]`;
       const entryRecord = readRecord(entry, label);
       const role = readNonEmptyString(entryRecord, "role", label);
       const type = readNonEmptyString(entryRecord, "type", label);
@@ -158,9 +156,7 @@ export function readExecutionSessionContext(value: unknown): DriverExecutionSess
 
   return {
     homePath: readNonEmptyString(record, "homePath", "execution.session.context"),
-    organizationAccessSnapshot: readOrganizationAccessSnapshot(
-      record["organizationAccessSnapshot"],
-    ),
+    appAccessSnapshot: readAppAccessSnapshot(record["appAccessSnapshot"]),
     origin: readOrigin(record["origin"]),
     sandboxId: parseId(record["sandboxId"], "Driver execution sandbox ID") as SandboxId,
     sandboxKind: readNonEmptyString(record, "sandboxKind", "execution.session.context"),

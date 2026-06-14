@@ -13,7 +13,7 @@ import type {
   AgentDriverSkillPort,
 } from "../host-ports";
 import type { Logger } from "../observability";
-import type { DriverOrganizationAccessSnapshotOutput } from "../protocol/boot";
+import type { DriverAppAccessSnapshotOutput } from "../protocol/boot";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type { DriverRuntime } from "../protocol/runtime";
@@ -145,9 +145,9 @@ export interface AgentDriverBackend {
     context: AgentDriverContext,
     command: McpExecuteCommand,
   ): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }>;
-  refreshOrganizationAccess(
+  refreshAppAccess(
     context: AgentDriverContext,
-    snapshot: DriverOrganizationAccessSnapshotOutput,
+    snapshot: DriverAppAccessSnapshotOutput,
   ): Promise<void>;
   start(context: AgentDriverContext): Promise<void>;
   stop(context: AgentDriverContext, reason: string): Promise<void>;

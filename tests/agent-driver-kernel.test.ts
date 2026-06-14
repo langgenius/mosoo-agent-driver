@@ -51,7 +51,7 @@ describe("AgentDriverKernelCore", () => {
     const result = await kernel.dispatch({
       commandId: "access-1",
       kind: "access.refresh",
-      organizationAccessSnapshot: accessSnapshot,
+      appAccessSnapshot: accessSnapshot,
     });
     await kernel.stop("test.stop");
 

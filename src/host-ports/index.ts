@@ -1,5 +1,5 @@
 import type { Logger } from "../observability";
-import type { DriverOrganizationAccessSnapshotOutput } from "../protocol/boot";
+import type { DriverAppAccessSnapshotOutput } from "../protocol/boot";
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
@@ -41,7 +41,7 @@ export interface AgentDriverPermissionPort {
 }
 
 export interface AgentDriverAccessPort {
-  refresh(snapshot: DriverOrganizationAccessSnapshotOutput): Promise<void>;
+  refresh(snapshot: DriverAppAccessSnapshotOutput): Promise<void>;
 }
 
 export interface AgentDriverMcpPort {

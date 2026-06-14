@@ -12,12 +12,12 @@ import {
 import { isTruthy } from "../../core/truthiness";
 import type { AgentDriverMaterializedSkill } from "../../host-ports";
 import {
-  summarizeOrganizationAccessSnapshot,
+  summarizeAppAccessSnapshot,
   summarizePath,
   summarizePathCollection,
   summarizeRuntimeCommandInput,
 } from "../../infrastructure/logging/driver-debug";
-import type { DriverOrganizationAccessSnapshotOutput } from "../../protocol/boot";
+import type { DriverAppAccessSnapshotOutput } from "../../protocol/boot";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
@@ -278,13 +278,13 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     });
   }
 
-  async refreshOrganizationAccess(
+  async refreshAppAccess(
     context: AgentDriverContext,
-    snapshot: DriverOrganizationAccessSnapshotOutput,
+    snapshot: DriverAppAccessSnapshotOutput,
   ): Promise<void> {
-    context.logger.debug("driver.claude.organization-access.refreshed", {
+    context.logger.debug("driver.claude.app-access.refreshed", {
       nativeSessionIdPresent: Boolean(this.#nativeSessionId),
-      organizationAccessSnapshot: summarizeOrganizationAccessSnapshot(snapshot),
+      appAccessSnapshot: summarizeAppAccessSnapshot(snapshot),
     });
   }
 

@@ -181,7 +181,7 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
-  test("completed turns project final items before run finish", async () => {
+  test("completed turns app final items before run finish", async () => {
     const { bridge, context, events, logger } = createHarness();
 
     await bridge.handleNotification(context, "turn/completed", {

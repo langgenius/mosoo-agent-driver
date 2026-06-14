@@ -1,7 +1,7 @@
 {
   "commandId": "command-access-1",
   "kind": "access.refresh",
-  "organizationAccessSnapshot": {
+  "appAccessSnapshot": {
     "entries": [
       {
         "mountPath": "/workspace",

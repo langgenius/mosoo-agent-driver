@@ -1,12 +1,12 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { AgentDriverMaterializedSkill } from "../../host-ports";
 import {
-  summarizeOrganizationAccessSnapshot,
+  summarizeAppAccessSnapshot,
   summarizePath,
   summarizePathCollection,
   summarizeRuntimeCommandInput,
 } from "../../infrastructure/logging/driver-debug";
-import type { DriverOrganizationAccessSnapshotOutput } from "../../protocol/boot";
+import type { DriverAppAccessSnapshotOutput } from "../../protocol/boot";
 import type { DriverEventInput } from "../../protocol/events";
 import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
 import { createDriverId } from "../../protocol/id";
@@ -69,7 +69,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   #hostSnapshot: DriverHostIntegrationSnapshot | null = null;
   #materializedSkills: readonly AgentDriverMaterializedSkill[] = [];
   #nativeSessionId: string | null = null;
-  #organizationAccessSnapshot: DriverOrganizationAccessSnapshotOutput | null = null;
+  #appAccessSnapshot: DriverAppAccessSnapshotOutput | null = null;
   readonly #payload: DriverStartInput;
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
@@ -98,7 +98,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     }
 
     this.#hostSnapshot = hostSnapshot;
-    this.#organizationAccessSnapshot = hostSnapshot.sessionContext.organizationAccessSnapshot;
+    this.#appAccessSnapshot = hostSnapshot.sessionContext.appAccessSnapshot;
     this.#materializedSkills = await context.ports.skill.materialize(this.#payload.execution);
     const bootstrapArtifacts = await writeSkillBootstrapArtifacts(this.#payload.execution);
     const env = buildAcpChildProcessEnv(this.#payload);
@@ -188,7 +188,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     };
     this.#turnEvents.begin({ messageId, runId, sessionId });
     const hostSnapshot = this.#requireHostSnapshot();
-    const organizationAccessSnapshot = this.#requireOrganizationAccessSnapshot();
+    const appAccessSnapshot = this.#requireAppAccessSnapshot();
 
     context.logger.info("driver.acp.prompt.sending", {
       sessionId,
@@ -196,7 +196,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     });
     context.logger.debug("driver.acp.prompt.requested", {
       input: summarizeRuntimeCommandInput(input),
-      organizationAccessSnapshot: summarizeOrganizationAccessSnapshot(organizationAccessSnapshot),
+      appAccessSnapshot: summarizeAppAccessSnapshot(appAccessSnapshot),
       sessionId,
     });
 
@@ -210,7 +210,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       const promptResult = parseAcpPromptResult(
         await connection.request("session/prompt", {
           _meta: toAcpRequestMeta({
-            organizationAccessSnapshot,
+            appAccessSnapshot,
             sessionContext: hostSnapshot.sessionContext,
           }),
           messageId,
@@ -323,13 +323,13 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return result;
   }
 
-  async refreshOrganizationAccess(
+  async refreshAppAccess(
     context: AgentDriverContext,
-    snapshot: DriverOrganizationAccessSnapshotOutput,
+    snapshot: DriverAppAccessSnapshotOutput,
   ): Promise<void> {
-    this.#organizationAccessSnapshot = snapshot;
-    context.logger.debug("driver.acp.organization-access.refreshed", {
-      organizationAccessSnapshot: summarizeOrganizationAccessSnapshot(snapshot),
+    this.#appAccessSnapshot = snapshot;
+    context.logger.debug("driver.acp.app-access.refreshed", {
+      appAccessSnapshot: summarizeAppAccessSnapshot(snapshot),
       sessionId: this.#nativeSessionId,
     });
   }
@@ -455,12 +455,12 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return this.#hostSnapshot;
   }
 
-  #requireOrganizationAccessSnapshot(): DriverOrganizationAccessSnapshotOutput {
-    if (this.#organizationAccessSnapshot === null) {
-      throw new Error("ACP driver backend organization access snapshot is not initialized.");
+  #requireAppAccessSnapshot(): DriverAppAccessSnapshotOutput {
+    if (this.#appAccessSnapshot === null) {
+      throw new Error("ACP driver backend App access snapshot is not initialized.");
     }
 
-    return this.#organizationAccessSnapshot;
+    return this.#appAccessSnapshot;
   }
 
   async #setupSession(): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
@@ -469,7 +469,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       agentCapabilities: this.#agentCapabilities,
       connection: this.#requireConnection(),
       currentSessionId: this.#nativeSessionId,
-      organizationAccessSnapshot: this.#requireOrganizationAccessSnapshot(),
+      appAccessSnapshot: this.#requireAppAccessSnapshot(),
       payload: this.#payload,
       sessionContext: hostSnapshot.sessionContext,
       replaySession: async (operation) => this.#clientRequests.withSessionReplay(operation),

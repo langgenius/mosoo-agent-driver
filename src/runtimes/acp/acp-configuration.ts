@@ -1,6 +1,6 @@
 import type {
   DriverExecutionSessionContext,
-  DriverOrganizationAccessSnapshotOutput,
+  DriverAppAccessSnapshotOutput,
 } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
 import type { AcpAuthMethod, AcpInitializeResult, AcpMcpServer, JsonObject } from "./acp-types";
@@ -148,13 +148,13 @@ export function resolveAcpAuthMethodId(
 }
 
 export function toAcpRequestMeta(input: {
-  organizationAccessSnapshot: DriverOrganizationAccessSnapshotOutput;
+  appAccessSnapshot: DriverAppAccessSnapshotOutput;
   sessionContext: DriverExecutionSessionContext;
 }): JsonObject {
   const context = input.sessionContext;
 
   return {
-    "mosoo.ai/organizationAccessSnapshot": input.organizationAccessSnapshot,
+    "mosoo.ai/appAccessSnapshot": input.appAccessSnapshot,
     "mosoo.ai/origin": context.origin,
     "mosoo.ai/sessionContext": context,
   };

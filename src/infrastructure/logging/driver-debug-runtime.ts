@@ -3,11 +3,7 @@ import type {
   RuntimeCommandInput,
   RuntimeCommandResult,
 } from "../../runtime-command";
-import {
-  digestText,
-  summarizeOrganizationAccessSnapshot,
-  summarizeTextDigest,
-} from "./driver-debug-paths";
+import { digestText, summarizeAppAccessSnapshot, summarizeTextDigest } from "./driver-debug-paths";
 
 export function summarizeRuntimeCommandInput(input: RuntimeCommandInput): Record<string, unknown> {
   const attachmentIds = [...(input.attachmentIds ?? [])].toSorted();
@@ -30,8 +26,8 @@ export function summarizeRuntimeCommand(command: RuntimeCommand): Record<string,
       return {
         ...base,
         input: summarizeRuntimeCommandInput(command.input),
-        organizationAccessSnapshot: command.organizationAccessSnapshot
-          ? summarizeOrganizationAccessSnapshot(command.organizationAccessSnapshot)
+        appAccessSnapshot: command.appAccessSnapshot
+          ? summarizeAppAccessSnapshot(command.appAccessSnapshot)
           : null,
         requestId: command.requestId,
         runId: command.runId,
@@ -40,9 +36,7 @@ export function summarizeRuntimeCommand(command: RuntimeCommand): Record<string,
     case "access.refresh": {
       return {
         ...base,
-        organizationAccessSnapshot: summarizeOrganizationAccessSnapshot(
-          command.organizationAccessSnapshot,
-        ),
+        appAccessSnapshot: summarizeAppAccessSnapshot(command.appAccessSnapshot),
       };
     }
     case "mcp.execute": {
@@ -84,7 +78,7 @@ export function summarizeRuntimeCommandResult(
   if ("entryCount" in result) {
     return {
       entryCount: result.entryCount,
-      kind: "organization_access_snapshot",
+      kind: "app_access_snapshot",
     };
   }
 

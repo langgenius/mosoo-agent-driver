@@ -3,7 +3,7 @@ import { DriverPermissionBroker } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeIo } from "../src/core/driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverOrganizationAccessSnapshotOutput } from "../src/protocol/boot";
+import type { DriverAppAccessSnapshotOutput } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
 import type { AgentDriverBackend, AgentDriverContext } from "../src/runtimes/agent-driver-backend";
@@ -80,7 +80,7 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
 export interface RecordingBackend extends AgentDriverBackend {
   readonly cancelledReasons: string[];
   readonly handledInputs: AgentDriverContext["payload"]["execution"]["session"][];
-  readonly refreshedSnapshots: DriverOrganizationAccessSnapshotOutput[];
+  readonly refreshedSnapshots: DriverAppAccessSnapshotOutput[];
   failInput: boolean;
 }
 
@@ -109,7 +109,7 @@ export function createBackend(): RecordingBackend {
         toolName: command.toolName,
       };
     },
-    async refreshOrganizationAccess(_context, snapshot) {
+    async refreshAppAccess(_context, snapshot) {
       this.refreshedSnapshots.push(snapshot);
     },
     async start() {},
@@ -128,7 +128,7 @@ export function createDispatcher(input: {
     service: "driver-runtime-boundary-test",
     sink: async () => {},
   });
-  const accessRefreshes: DriverOrganizationAccessSnapshotOutput[] = [];
+  const accessRefreshes: DriverAppAccessSnapshotOutput[] = [];
   const commandReads = {
     count: 0,
   };

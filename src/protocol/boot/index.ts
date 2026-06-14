@@ -41,7 +41,7 @@ export type {
 export type {
   DriverConfigRevision,
   DriverExecutionSessionContext,
-  DriverOrganizationAccessSnapshotOutput,
+  DriverAppAccessSnapshotOutput,
   DriverOrigin,
   DriverSpaceAliasBinding,
 } from "./host-snapshot";

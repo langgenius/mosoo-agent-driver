@@ -232,7 +232,7 @@ async function assertTrackTurnFixture(
 }
 
 describe("OpenAI app-server provider fixtures", () => {
-  test.each(providerFixtureNames)("projects provider-native fixture %s", async (name) => {
+  test.each(providerFixtureNames)("apps provider-native fixture %s", async (name) => {
     const fixture = readProviderFixtureCase(
       `./fixtures/providers/openai-app-server/cases/${name}.json`,
     );

@@ -186,7 +186,7 @@ function createHarness() {
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
-  test.each(claudeFixtureNames)("projects provider-native fixture %s", async (name) => {
+  test.each(claudeFixtureNames)("apps provider-native fixture %s", async (name) => {
     const fixture = readClaudeProviderFixtureCase(
       `./fixtures/providers/claude-agent-sdk/cases/${name}.json`,
     );

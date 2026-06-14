@@ -1,7 +1,4 @@
-import type {
-  DriverBootPayload,
-  DriverOrganizationAccessSnapshotOutput,
-} from "../src/protocol/boot";
+import type { DriverBootPayload, DriverAppAccessSnapshotOutput } from "../src/protocol/boot";
 import { DRIVER_CONTROL_PORT_MIN } from "../src/protocol/boot";
 
 export const DRIVER_TEST_IDS = {
@@ -45,7 +42,7 @@ export const driverBootPayload = {
       additionalDirectories: [],
       context: {
         homePath: "/tmp/home",
-        organizationAccessSnapshot: {
+        appAccessSnapshot: {
           entries: [],
         },
         origin: {
@@ -86,4 +83,4 @@ export const driverTestAccessSnapshot = {
       type: "space",
     },
   ],
-} satisfies DriverOrganizationAccessSnapshotOutput;
+} satisfies DriverAppAccessSnapshotOutput;

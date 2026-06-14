@@ -1,6 +1,6 @@
 import type {
   DriverExecutionSessionContext,
-  DriverOrganizationAccessSnapshotOutput,
+  DriverAppAccessSnapshotOutput,
 } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
 import {
@@ -26,7 +26,7 @@ interface AcpSessionSetupInput {
   readonly agentCapabilities: JsonObject | null;
   readonly connection: AcpJsonRpcConnection;
   readonly currentSessionId: string | null;
-  readonly organizationAccessSnapshot: DriverOrganizationAccessSnapshotOutput;
+  readonly appAccessSnapshot: DriverAppAccessSnapshotOutput;
   readonly payload: DriverStartInput;
   readonly sessionContext: DriverExecutionSessionContext;
   replaySession<T>(operation: () => Promise<T>): Promise<T>;
@@ -38,7 +38,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   const existingSessionId = input.currentSessionId;
   const baseParams = {
     _meta: toAcpRequestMeta({
-      organizationAccessSnapshot: input.organizationAccessSnapshot,
+      appAccessSnapshot: input.appAccessSnapshot,
       sessionContext: input.sessionContext,
     }),
     additionalDirectories: input.payload.execution.session.additionalDirectories,

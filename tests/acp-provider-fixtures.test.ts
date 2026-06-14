@@ -230,7 +230,7 @@ function normalizeAcpEvent(event: DriverEventInput): Record<string, unknown> {
   return eventRecord;
 }
 
-function projectAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
+function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   const state = new AcpTurnEventState();
   const events: DriverEventInput[] = [];
 
@@ -264,9 +264,9 @@ function projectAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] 
 }
 
 describe("ACP provider fixtures", () => {
-  test.each(acpFixtureNames)("projects provider-native fixture %s", (name) => {
+  test.each(acpFixtureNames)("apps provider-native fixture %s", (name) => {
     const fixture = readAcpProviderFixtureCase(`./fixtures/providers/acp/cases/${name}.json`);
 
-    expect(projectAcpFixture(fixture).map(normalizeAcpEvent)).toEqual(fixture.expectedEvents);
+    expect(appAcpFixture(fixture).map(normalizeAcpEvent)).toEqual(fixture.expectedEvents);
   });
 });

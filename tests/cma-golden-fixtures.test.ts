@@ -30,13 +30,13 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 describe("CMA golden fixtures", () => {
-  test("project inbound user.message fixture to runtime command fixture", () => {
+  test("app inbound user.message fixture to runtime command fixture", () => {
     expect(
       projectCmaInboundToDriverCommand(readJsonFixture("./fixtures/cma/inbound/user-message.json")),
     ).toEqual(readJsonFixture("./fixtures/cma/commands/input-start.json"));
   });
 
-  test("project permission request fixture to requires_action outbound fixture", () => {
+  test("app permission request fixture to requires_action outbound fixture", () => {
     expect(
       projectDriverEventToCma(
         readJsonFixture(

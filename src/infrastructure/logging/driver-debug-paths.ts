@@ -1,9 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type {
-  DriverBootPayload,
-  DriverOrganizationAccessSnapshotOutput,
-} from "../../protocol/boot";
+import type { DriverBootPayload, DriverAppAccessSnapshotOutput } from "../../protocol/boot";
 import {
   isSandboxGlobalSpacePath,
   isSandboxOrganizationPath,
@@ -143,8 +140,8 @@ export function summarizePathCollection(
   };
 }
 
-export function summarizeOrganizationAccessSnapshot(
-  snapshot: DriverOrganizationAccessSnapshotOutput,
+export function summarizeAppAccessSnapshot(
+  snapshot: DriverAppAccessSnapshotOutput,
 ): Record<string, unknown> {
   const roleCounts = {
     admin: 0,
@@ -202,7 +199,7 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
       readySkillCount: payload.execution.skills.filter((skill) => skill.snapshotId).length,
       sessionContext: {
         homePath: summarizePath(context.homePath),
-        organizationAccess: summarizeOrganizationAccessSnapshot(context.organizationAccessSnapshot),
+        appAccess: summarizeAppAccessSnapshot(context.appAccessSnapshot),
         origin: {
           entrypoint: context.origin.entrypoint,
           type: context.origin.type,
