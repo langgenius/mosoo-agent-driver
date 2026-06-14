@@ -143,18 +143,17 @@ export function summarizePathCollection(
 export function summarizeAppAccessSnapshot(
   snapshot: DriverAppAccessSnapshotOutput,
 ): Record<string, unknown> {
-  const roleCounts = {
-    admin: 0,
-    edit: 0,
-    read: 0,
-  };
   const typeCounts = {
     root: 0,
     space: 0,
   };
+  let writableEntryCount = 0;
 
   for (const entry of snapshot.entries) {
-    roleCounts[entry.role] += 1;
+    if (entry.canWrite) {
+      writableEntryCount += 1;
+    }
+
     typeCounts[entry.type] += 1;
   }
 
@@ -166,8 +165,8 @@ export function summarizeAppAccessSnapshot(
             JSON.stringify(
               snapshot.entries
                 .map((entry) => ({
+                  canWrite: entry.canWrite,
                   mountPath: entry.mountPath,
-                  role: entry.role,
                   spaceId: entry.spaceId,
                   type: entry.type,
                 }))
@@ -175,8 +174,8 @@ export function summarizeAppAccessSnapshot(
             ),
           )
         : null,
-    roleCounts,
     typeCounts,
+    writableEntryCount,
   };
 }
 

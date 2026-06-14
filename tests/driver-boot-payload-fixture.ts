@@ -77,8 +77,8 @@ export const driverBootPayload = {
 export const driverTestAccessSnapshot = {
   entries: [
     {
+      canWrite: true,
       mountPath: "/workspace/docs",
-      role: "read",
       spaceId: DRIVER_TEST_IDS.spaceId,
       type: "space",
     },

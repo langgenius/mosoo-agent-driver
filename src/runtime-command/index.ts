@@ -23,8 +23,8 @@ export interface RuntimeCommandInput {
 }
 
 export interface DriverAppAccessSnapshotEntry {
+  readonly canWrite: boolean;
   readonly mountPath: string;
-  readonly role: "admin" | "edit" | "read";
   readonly spaceId: string;
   readonly type: "space";
 }
@@ -173,6 +173,16 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
   return value;
 }
 
+function readBoolean(record: Record<string, unknown>, field: string): boolean {
+  const value = record[field];
+
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${field} must be a boolean.`);
+  }
+
+  return value;
+}
+
 function readStringArray(record: Record<string, unknown>, field: string): string[] | undefined {
   const value = record[field];
 
@@ -197,14 +207,6 @@ function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
   };
 }
 
-function readAccessRole(value: unknown): DriverAppAccessSnapshotEntry["role"] {
-  if (value === "admin" || value === "edit" || value === "read") {
-    return value;
-  }
-
-  throw new TypeError("appAccessSnapshot.entries[].role must be admin, edit, or read.");
-}
-
 function readAppAccessSnapshotEntry(value: unknown): DriverAppAccessSnapshotEntry {
   const record = readRecord(value, "appAccessSnapshot.entries[]");
   const type = readNonEmptyString(record, "type");
@@ -214,8 +216,8 @@ function readAppAccessSnapshotEntry(value: unknown): DriverAppAccessSnapshotEntr
   }
 
   return {
+    canWrite: readBoolean(record, "canWrite"),
     mountPath: readNonEmptyString(record, "mountPath"),
-    role: readAccessRole(record["role"]),
     spaceId: readNonEmptyString(record, "spaceId"),
     type,
   };

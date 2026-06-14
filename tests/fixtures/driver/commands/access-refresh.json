@@ -4,8 +4,8 @@
   "appAccessSnapshot": {
     "entries": [
       {
+        "canWrite": true,
         "mountPath": "/workspace",
-        "role": "read",
         "spaceId": "space-1",
         "type": "space"
       }

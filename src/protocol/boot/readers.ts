@@ -65,6 +65,20 @@ export function readNumber(record: Record<string, unknown>, field: string, label
   return value;
 }
 
+export function readBoolean(
+  record: Record<string, unknown>,
+  field: string,
+  label: string,
+): boolean {
+  const value = record[field];
+
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${label}.${field} must be a boolean.`);
+  }
+
+  return value;
+}
+
 export function readInteger(record: Record<string, unknown>, field: string, label: string): number {
   const value = readNumber(record, field, label);
 

@@ -14,6 +14,7 @@ import {
   parseId,
   parseNullableId,
   readArray,
+  readBoolean,
   readNonEmptyString,
   readNumber,
   readRecord,
@@ -104,20 +105,15 @@ export function readAppAccessSnapshot(value: unknown): DriverAppAccessSnapshotOu
     ).map((entry, index) => {
       const label = `execution.session.context.appAccessSnapshot.entries[${index}]`;
       const entryRecord = readRecord(entry, label);
-      const role = readNonEmptyString(entryRecord, "role", label);
       const type = readNonEmptyString(entryRecord, "type", label);
-
-      if (role !== "admin" && role !== "edit" && role !== "read") {
-        throw new TypeError(`${label}.role must be admin, edit, or read.`);
-      }
 
       if (type !== "space") {
         throw new TypeError(`${label}.type must be space.`);
       }
 
       return {
+        canWrite: readBoolean(entryRecord, "canWrite", label),
         mountPath: readNonEmptyString(entryRecord, "mountPath", label),
-        role,
         spaceId: parseId(entryRecord["spaceId"], `${label}.spaceId`) as SpaceId,
         type,
       };
