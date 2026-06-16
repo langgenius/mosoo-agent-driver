@@ -124,6 +124,50 @@ describe("OpenAI app-server auth state", () => {
     expectDisabledRuntimeFeatures(config);
   });
 
+  test("writes mcp_servers tables into the generated config", async () => {
+    const runtimeHome = await createRuntimeHome();
+
+    const result = await materializeOpenAiModelProviderConfig({
+      env: {
+        OPENAI_API_KEY: "openai-key",
+      },
+      mcpServers: {
+        Linear: {
+          bearer_token_env_var: "MOSOO_MCP_BEARER_TOKEN_0",
+          url: "https://api.example/driver/mcp/proxy/server-1",
+        },
+      },
+      provider: "openai",
+      runtimeHome,
+    });
+
+    expect(result.written).toBe(true);
+    const config = await readGeneratedConfig(result.configTomlPath);
+    const mcpServers = requireRecord(config["mcp_servers"], "mcp servers");
+
+    expect(mcpServers["Linear"]).toEqual({
+      bearer_token_env_var: "MOSOO_MCP_BEARER_TOKEN_0",
+      url: "https://api.example/driver/mcp/proxy/server-1",
+    });
+    expectDisabledRuntimeFeatures(config);
+  });
+
+  test("omits mcp_servers when no servers are wired", async () => {
+    const runtimeHome = await createRuntimeHome();
+
+    const result = await materializeOpenAiModelProviderConfig({
+      env: {
+        OPENAI_API_KEY: "openai-key",
+      },
+      mcpServers: {},
+      provider: "openai",
+      runtimeHome,
+    });
+
+    const config = await readGeneratedConfig(result.configTomlPath);
+    expect(config["mcp_servers"]).toBeUndefined();
+  });
+
   test("skips unchanged generated config writes", async () => {
     const runtimeHome = await createRuntimeHome();
     const input = {

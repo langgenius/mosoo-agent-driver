@@ -23,6 +23,7 @@ import {
   materializeOpenAiApiKeyAuthState,
   materializeOpenAiModelProviderConfig,
 } from "./auth-state";
+import { buildOpenAiMcpServerConfig } from "./mcp-config";
 import type {
   ClientRequestMethod,
   ClientRequestParams,
@@ -159,8 +160,10 @@ export class OpenAiAppServerClient {
     const runtimeHome = homePath;
     await measure("app_server.home.mkdir", () => mkdir(runtimeHome, { recursive: true }));
 
+    const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
     const env = buildRuntimeChildProcessEnv({
       ...this.#payload.execution.environment.variables,
+      ...mcpConfig.env,
       [OPENAI_RUNTIME_HOME_ENV_NAME]: runtimeHome,
       LOG_FORMAT: "json",
     });
@@ -173,6 +176,7 @@ export class OpenAiAppServerClient {
     const modelProviderConfig = await measure("app_server.config", () =>
       materializeOpenAiModelProviderConfig({
         env,
+        mcpServers: mcpConfig.mcpServers,
         provider: this.#payload.execution.provider,
         providerOptions: this.#payload.execution.providerOptions,
         runtimeHome,
@@ -185,6 +189,7 @@ export class OpenAiAppServerClient {
     });
     this.#context.logger.debug("driver.openai.model_provider_config.prepared", {
       configTomlWritten: modelProviderConfig.written,
+      mcpServerCount: Object.keys(mcpConfig.mcpServers).length,
       provider: modelProviderConfig.provider,
     });
     this.#context.logger.debug("driver.openai.env.prepared", {

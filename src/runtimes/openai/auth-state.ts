@@ -18,6 +18,7 @@ interface OpenAiApiKeyAuthStateResult {
 
 interface OpenAiModelProviderConfigInput {
   env: NodeJS.ProcessEnv;
+  mcpServers?: Record<string, JsonValue>;
   provider: string;
   providerOptions?: JsonObject;
   runtimeHome: string;
@@ -209,6 +210,10 @@ export async function materializeOpenAiModelProviderConfig(
         wire_api: "responses",
       },
     };
+  }
+
+  if (input.mcpServers !== undefined && Object.keys(input.mcpServers).length > 0) {
+    generatedConfig["mcp_servers"] = input.mcpServers;
   }
 
   const config = mergeProviderOptions(generatedConfig, input.providerOptions ?? {});
