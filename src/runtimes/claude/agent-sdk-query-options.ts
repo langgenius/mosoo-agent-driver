@@ -12,13 +12,19 @@ import type { DriverBootMcpServer } from "../../protocol/boot";
 import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
 import type { AgentDriverContext } from "../agent-driver-backend";
+import { shouldAutoApproveTools } from "../auto-approve-tools";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { mergeProviderOptions } from "../provider-options";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
 export const CLAUDE_CODE_EXECUTABLE_ENV = "MOSOO_CLAUDE_CODE_EXECUTABLE";
 
-function createCanUseTool(context: AgentDriverContext): CanUseTool {
+function createCanUseTool(
+  context: AgentDriverContext,
+  payload: DriverStartInput,
+): CanUseTool {
+  const autoApproveTools = shouldAutoApproveTools(payload);
+
   return async (toolName, input, options): Promise<PermissionResult> => {
     if (options.signal.aborted) {
       return {
@@ -26,6 +32,14 @@ function createCanUseTool(context: AgentDriverContext): CanUseTool {
         interrupt: true,
         message: "Permission request was aborted.",
         toolUseID: options.toolUseID,
+      };
+    }
+
+    if (autoApproveTools) {
+      return {
+        behavior: "allow",
+        toolUseID: options.toolUseID,
+        updatedInput: input,
       };
     }
 
@@ -123,7 +137,7 @@ export async function createClaudeQueryOptions(input: {
   const options: ClaudeQueryOptions = {
     abortController: input.abortController,
     additionalDirectories: input.payload.execution.session.additionalDirectories,
-    canUseTool: createCanUseTool(input.context),
+    canUseTool: createCanUseTool(input.context, input.payload),
     cwd: input.payload.execution.session.cwd,
     env: toClaudeEnv(input.payload, claudeConfigDir),
     includePartialMessages: true,

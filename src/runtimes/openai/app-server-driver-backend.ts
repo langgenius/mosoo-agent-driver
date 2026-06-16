@@ -16,6 +16,7 @@ import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { McpExecuteCommand, RuntimeCommandInput } from "../../runtime-command";
 import type { AgentDriverBackend, AgentDriverContext } from "../agent-driver-backend";
+import { shouldAutoApproveTools } from "../auto-approve-tools";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildNativeRuntimeSystemPrompt,
@@ -36,7 +37,12 @@ import type {
 
 const OPENAI_RUNTIME_APPROVAL_POLICY = "on-request" satisfies ApprovalPolicy;
 
+function resolveOpenAiApprovalPolicy(payload: DriverStartInput): ApprovalPolicy {
+  return shouldAutoApproveTools(payload) ? "never" : OPENAI_RUNTIME_APPROVAL_POLICY;
+}
+
 interface OpenAiTurnStartInput {
+  readonly approvalPolicy: ApprovalPolicy;
   readonly cwd: string;
   readonly model: string;
   readonly text: string;
@@ -70,7 +76,7 @@ function isTerminalOpenAiTurnStatus(status: TurnStatus | undefined): boolean {
 
 export function createOpenAiTurnStartParams(input: OpenAiTurnStartInput): TurnStartParams {
   return {
-    approvalPolicy: OPENAI_RUNTIME_APPROVAL_POLICY,
+    approvalPolicy: input.approvalPolicy,
     cwd: input.cwd,
     input: [
       {
@@ -177,7 +183,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     const developerInstructions = buildNativeRuntimeSystemPrompt(this.#payload.execution);
     const nativeResumeThreadId = readOpenAiNativeResumeThreadId(this.#payload);
     const baseThreadParams = {
-      approvalPolicy: OPENAI_RUNTIME_APPROVAL_POLICY,
+      approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
       cwd: this.#payload.execution.session.cwd,
       model: this.#payload.execution.model,
       modelProvider: this.#payload.execution.provider,
@@ -274,6 +280,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       turnResult = await client.request(
         "turn/start",
         createOpenAiTurnStartParams({
+          approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
           cwd: this.#payload.execution.session.cwd,
           model: this.#payload.execution.model,
           text: input.text,
