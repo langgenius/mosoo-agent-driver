@@ -8,12 +8,6 @@ import type {
 } from "./boot";
 import type { RunId, SessionId } from "./id";
 
-export interface DriverExecutionMountAlias {
-  readonly aliasPath: string;
-  readonly globalMountPath: string;
-  readonly name: string;
-}
-
 export interface DriverExecutionRunInput {
   readonly runId: RunId | null;
   readonly sessionId: SessionId;
@@ -24,7 +18,6 @@ export interface DriverExecutionSessionInput {
   readonly cwd: string;
   readonly homePath: string;
   readonly mcpServers: DriverBootMcpServer[];
-  readonly mountAliases: DriverExecutionMountAlias[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
   readonly sharedRootPath: string;
 }
@@ -58,11 +51,6 @@ export function createDriverExecutionInputFromBootExecution(
       cwd: execution.session.cwd,
       homePath: execution.session.context.homePath,
       mcpServers: execution.session.mcpServers,
-      mountAliases: execution.session.context.spaceAliases.map((alias) => ({
-        aliasPath: alias.aliasPath,
-        globalMountPath: alias.globalMountPath,
-        name: alias.spaceName,
-      })),
       nativeResumeRef: execution.session.nativeResumeRef,
       sharedRootPath: execution.session.context.sessionOrganizationPath,
     },

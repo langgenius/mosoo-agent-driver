@@ -134,7 +134,7 @@ describe("driver artifact contract", () => {
   });
 
   test("keeps every public testing fixture path packaged", () => {
-    expect(AGENT_DRIVER_TESTING_FIXTURE_PATHS.length).toBe(42);
+    expect(AGENT_DRIVER_TESTING_FIXTURE_PATHS.length).toBe(41);
 
     for (const fixturePath of AGENT_DRIVER_TESTING_FIXTURE_PATHS) {
       expect(existsSync(new URL(`../${fixturePath}`, import.meta.url))).toBe(true);
@@ -276,7 +276,7 @@ describe("driver artifact contract", () => {
   test("keeps sandbox path helpers local to the driver", () => {
     const pathProtocol = readText("../src/protocol/paths/index.ts");
 
-    expect(pathProtocol).toContain("SANDBOX_GLOBAL_SPACE_ROOT");
+    expect(pathProtocol).toContain("SANDBOX_SESSION_ROOT");
     expect(pathProtocol).not.toContain("@mosoo/driver-protocol");
   });
 
@@ -320,7 +320,7 @@ describe("driver artifact contract", () => {
     expect(startInput).not.toContain("traceparent");
     expect(executionInput).toContain("interface DriverExecutionInput");
     expect(executionInput).toContain("sharedRootPath");
-    expect(executionInput).toContain("mountAliases");
+    expect(executionInput).not.toContain("mountAliases");
     expect(executionInput).not.toContain("readonly host");
     expect(hostIntegration).toContain("interface DriverHostIntegrationSnapshot");
     expect(hostIntegration).toContain("createDriverHostIntegrationSnapshotFromBootExecution");
@@ -346,10 +346,8 @@ describe("driver artifact contract", () => {
     expect(idProtocol).toContain("RunId");
     expect(idProtocol).toContain("MessageId");
     expect(idProtocol).not.toContain("AgentId");
-    expect(idProtocol).not.toContain("SpaceId");
     expect(idProtocol).not.toContain("SandboxId");
     expect(bootHostIds).toContain("AgentId");
-    expect(bootHostIds).toContain("SpaceId");
     expect(bootHostIds).toContain("SandboxId");
   });
 });

@@ -6,11 +6,9 @@ import {
 } from "../../core/driver-runtime-timing";
 import type { AgentDriverMaterializedSkill } from "../../host-ports";
 import {
-  summarizeAppAccessSnapshot,
   summarizePath,
   summarizeRuntimeCommandInput,
 } from "../../infrastructure/logging/driver-debug";
-import type { DriverAppAccessSnapshotOutput } from "../../protocol/boot";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
@@ -211,7 +209,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       execution: {
         cwd: summarizePath(this.#payload.execution.session.cwd),
         homePath: summarizePath(this.#payload.execution.session.homePath),
-        mountAliasCount: this.#payload.execution.session.mountAliases.length,
         sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
       },
       nativeResumeRefPresent: Boolean(nativeResumeThreadId),
@@ -383,16 +380,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     });
 
     return result;
-  }
-
-  async refreshAppAccess(
-    context: AgentDriverContext,
-    snapshot: DriverAppAccessSnapshotOutput,
-  ): Promise<void> {
-    context.logger.debug("driver.openai.app-access.refreshed", {
-      appAccessSnapshot: summarizeAppAccessSnapshot(snapshot),
-      threadIdPresent: Boolean(this.#threadId),
-    });
   }
 
   async stop(context: AgentDriverContext, reason: string): Promise<void> {

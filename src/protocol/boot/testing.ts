@@ -8,7 +8,6 @@ import type {
   EnvironmentRevisionId,
   SandboxId,
   SkillId,
-  SpaceId,
 } from "./host-ids";
 
 function fixture(value: string): DriverId {
@@ -28,5 +27,4 @@ export const DRIVER_ID_FIXTURES = {
   sandbox: fixture("01J0000000000000000000000J") as SandboxId,
   session: fixture("01J0000000000000000000000K") as SessionId,
   skill: fixture("01J0000000000000000000000P") as SkillId,
-  space: fixture("01J0000000000000000000000Q") as SpaceId,
 } as const;

@@ -7,7 +7,6 @@ import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 import {
   DRIVER_TEST_IDS,
-  accessSnapshot,
   bootPayload,
   createBackend,
 } from "./driver-runtime-boundary-fixtures";
@@ -35,31 +34,26 @@ describe("AgentDriverKernelCore", () => {
 
   test("starts a backend and dispatches runtime commands without process transport", async () => {
     const backend = createBackend();
-    const accessRefreshes: (typeof accessSnapshot)[] = [];
     const kernel = new AgentDriverKernelCore({
       backendFactory: async () => backend,
-      hostPorts: {
-        access: {
-          refresh: async (snapshot) => {
-            accessRefreshes.push(snapshot);
-          },
-        },
-      },
     });
 
     await kernel.start(bootPayload);
     const result = await kernel.dispatch({
-      commandId: "access-1",
-      kind: "access.refresh",
-      appAccessSnapshot: accessSnapshot,
+      commandId: "input-1",
+      input: {
+        text: "hello",
+      },
+      kind: "input.start",
+      requestId: "request-1",
+      runId: DRIVER_TEST_IDS.runId,
     });
     await kernel.stop("test.stop");
 
     expect(result).toEqual({
-      entryCount: 1,
+      requestId: "request-1",
     });
-    expect(accessRefreshes).toEqual([accessSnapshot]);
-    expect(backend.refreshedSnapshots).toEqual([accessSnapshot]);
+    expect(backend.handledInputs).toHaveLength(1);
   });
 
   test("exposes provider events through the kernel event stream", async () => {

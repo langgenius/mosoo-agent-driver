@@ -75,7 +75,6 @@ export type {
   AgentDriverCommandSource,
   AgentDriverEventSink,
   AgentDriverPermissionPort,
-  AgentDriverAccessPort,
   AgentDriverMaterializedSkill,
   AgentDriverMcpPort,
   AgentDriverSkillPort,
@@ -115,7 +114,6 @@ export { parseDriverEventEnvelope } from "./protocol/events";
 export type { DriverEvent, DriverEventEnvelope, DriverEventInput } from "./protocol/events";
 export type {
   DriverExecutionInput,
-  DriverExecutionMountAlias,
   DriverExecutionRunInput,
   DriverExecutionSessionInput,
 } from "./protocol/execution";
@@ -140,12 +138,8 @@ export type {
 } from "./protocol/id";
 export { parseRuntimeCommand } from "./runtime-command";
 export type {
-  AccessRefreshCommand,
-  AccessRefreshCommandResult,
   DriverCapability,
   DriverCapabilityId,
-  DriverAppAccessSnapshot,
-  DriverAppAccessSnapshotEntry,
   InputStartCommand,
   InputStartCommandResult,
   McpExecuteCommand,

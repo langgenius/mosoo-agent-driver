@@ -1,6 +1,5 @@
 import type { DriverRuntimeEventPort } from "../core/driver-runtime-io";
 import type {
-  AgentDriverAccessPort,
   AgentDriverCommandSource,
   AgentDriverEventSink,
   AgentDriverFilePort,
@@ -13,7 +12,6 @@ import type {
   AgentDriverSkillPort,
 } from "../host-ports";
 import type { Logger } from "../observability";
-import type { DriverAppAccessSnapshotOutput } from "../protocol/boot";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type { DriverRuntime } from "../protocol/runtime";
@@ -27,7 +25,6 @@ export interface AgentDriverContext {
 }
 
 export type AgentDriverContextPortOverrides = Partial<{
-  access: AgentDriverAccessPort;
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
@@ -75,9 +72,6 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
   const eventSink = toAgentDriverEventSink(input.eventSink);
 
   return {
-    access: {
-      refresh: async () => {},
-    },
     commandSource:
       input.commandSource ??
       (hasNextCommand(input.eventSink)
@@ -145,10 +139,6 @@ export interface AgentDriverBackend {
     context: AgentDriverContext,
     command: McpExecuteCommand,
   ): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }>;
-  refreshAppAccess(
-    context: AgentDriverContext,
-    snapshot: DriverAppAccessSnapshotOutput,
-  ): Promise<void>;
   start(context: AgentDriverContext): Promise<void>;
   stop(context: AgentDriverContext, reason: string): Promise<void>;
 }

@@ -1,5 +1,4 @@
 import type { Logger } from "../observability";
-import type { DriverAppAccessSnapshotOutput } from "../protocol/boot";
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
@@ -9,7 +8,6 @@ export type AgentDriverHostPortName =
   | "command_source"
   | "event_sink"
   | "permission"
-  | "access"
   | "mcp"
   | "skill"
   | "file"
@@ -38,10 +36,6 @@ export interface AgentDriverPermissionPort {
     toolCallId: string | null;
     toolKind: string | null;
   }): Promise<"allow_once" | "reject_once">;
-}
-
-export interface AgentDriverAccessPort {
-  refresh(snapshot: DriverAppAccessSnapshotOutput): Promise<void>;
 }
 
 export interface AgentDriverMcpPort {
@@ -86,7 +80,6 @@ export interface AgentDriverPolicyPort {
 }
 
 export interface AgentDriverHostPorts {
-  access: AgentDriverAccessPort;
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;

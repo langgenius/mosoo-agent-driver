@@ -1,7 +1,4 @@
-import type {
-  DriverExecutionSessionContext,
-  DriverAppAccessSnapshotOutput,
-} from "../../protocol/boot";
+import type { DriverExecutionSessionContext } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
 import {
   buildAcpMcpServers,
@@ -26,7 +23,6 @@ interface AcpSessionSetupInput {
   readonly agentCapabilities: JsonObject | null;
   readonly connection: AcpJsonRpcConnection;
   readonly currentSessionId: string | null;
-  readonly appAccessSnapshot: DriverAppAccessSnapshotOutput;
   readonly payload: DriverStartInput;
   readonly sessionContext: DriverExecutionSessionContext;
   replaySession<T>(operation: () => Promise<T>): Promise<T>;
@@ -38,7 +34,6 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   const existingSessionId = input.currentSessionId;
   const baseParams = {
     _meta: toAcpRequestMeta({
-      appAccessSnapshot: input.appAccessSnapshot,
       sessionContext: input.sessionContext,
     }),
     additionalDirectories: input.payload.execution.session.additionalDirectories,

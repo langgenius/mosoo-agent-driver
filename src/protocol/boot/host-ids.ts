@@ -11,4 +11,3 @@ export type SandboxId = SemanticDriverId<"SandboxId">;
 export type SandboxSessionId = SemanticDriverId<"SandboxSessionId">;
 export type SkillId = SemanticDriverId<"SkillId">;
 export type SkillSnapshotId = SemanticDriverId<"SkillSnapshotId">;
-export type SpaceId = SemanticDriverId<"SpaceId">;

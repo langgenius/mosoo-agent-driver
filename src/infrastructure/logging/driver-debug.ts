@@ -2,7 +2,6 @@ export {
   summarizeDriverBootPayload,
   summarizePath,
   summarizePathCollection,
-  summarizeAppAccessSnapshot,
 } from "./driver-debug-paths";
 export {
   summarizeDriverPermissionRequest,

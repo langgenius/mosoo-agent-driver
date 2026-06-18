@@ -7,7 +7,7 @@ import { createPromiseDeferred } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import {
   FakeDriverRuntimeIo,
-  accessSnapshot,
+  bootPayload,
   createBackend,
   createDispatcher,
   waitForUpdate,
@@ -94,12 +94,11 @@ describe("driver runtime boundary", () => {
           text: "hello",
         },
         kind: "input.start",
-        appAccessSnapshot: accessSnapshot,
         requestId: "request-1",
         runId: DRIVER_TEST_IDS.runId,
       },
     ]);
-    const { accessRefreshes, commandReads, dispatcher, logger } = createDispatcher({
+    const { commandReads, dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () => socket.isDrained(),
       runtimeState,
@@ -114,8 +113,6 @@ describe("driver runtime boundary", () => {
 
     expect(runtimeState.status()).toBe("ready");
     expect(commandReads.count).toBe(1);
-    expect(accessRefreshes).toEqual([accessSnapshot]);
-    expect(backend.refreshedSnapshots).toEqual([accessSnapshot]);
     expect(socket.updates).toEqual([
       {
         commandId: "input-1",
@@ -223,15 +220,10 @@ describe("driver runtime boundary", () => {
     );
   });
 
-  test("keeps non-turn commands explicit at the API boundary", async () => {
+  test("keeps MCP commands explicit at the API boundary", async () => {
     const backend = createBackend();
     const runtimeState = new DriverRuntimeStateMachine();
     const socket = new FakeDriverRuntimeIo([
-      {
-        commandId: "access-1",
-        kind: "access.refresh",
-        appAccessSnapshot: accessSnapshot,
-      },
       {
         argumentsJson: '{"issue":"A-1"}',
         commandId: "mcp-1",
@@ -241,7 +233,7 @@ describe("driver runtime boundary", () => {
         toolName: "createIssue",
       },
     ]);
-    const { accessRefreshes, commandReads, dispatcher, logger } = createDispatcher({
+    const { commandReads, dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () => socket.isDrained(),
       runtimeState,
@@ -251,21 +243,8 @@ describe("driver runtime boundary", () => {
     await logger.destroy();
 
     expect(runtimeState.status()).toBe("ready");
-    expect(commandReads.count).toBe(2);
-    expect(accessRefreshes).toEqual([accessSnapshot]);
-    expect(backend.refreshedSnapshots).toEqual([accessSnapshot]);
+    expect(commandReads.count).toBe(1);
     expect(socket.updates).toEqual([
-      {
-        commandId: "access-1",
-        status: "accepted",
-      },
-      {
-        commandId: "access-1",
-        result: {
-          entryCount: 1,
-        },
-        status: "completed",
-      },
       {
         commandId: "mcp-1",
         status: "accepted",
@@ -402,58 +381,6 @@ describe("driver runtime boundary", () => {
       },
     ]);
     expect(shutdownCalls).toHaveLength(1);
-  });
-
-  test("cancels a turn that is still refreshing access", async () => {
-    const refreshStarted = createPromiseDeferred<void>();
-    const refreshCanFinish = createPromiseDeferred<void>();
-    const backend = createBackend();
-    backend.refreshAppAccess = async (_context, snapshot) => {
-      backend.refreshedSnapshots.push(snapshot);
-      refreshStarted.resolve();
-      await refreshCanFinish.promise;
-    };
-    const runtimeState = new DriverRuntimeStateMachine();
-    const socket = new FakeDriverRuntimeIo([
-      {
-        commandId: "input-1",
-        input: {
-          text: "hello",
-        },
-        kind: "input.start",
-        appAccessSnapshot: accessSnapshot,
-        requestId: "request-1",
-        runId: DRIVER_TEST_IDS.runId,
-      },
-      {
-        commandId: "cancel-1",
-        kind: "turn.cancel",
-        reason: "viewer.cancelled",
-      },
-    ]);
-    const { dispatcher, logger } = createDispatcher({
-      backend,
-      isShuttingDown: () => socket.isDrained(),
-      runtimeState,
-    });
-    const runTask = dispatcher.run(socket, logger);
-
-    await refreshStarted.promise;
-    await waitForUpdate(
-      socket,
-      (update) => update.commandId === "cancel-1" && update.status === "completed",
-    );
-    refreshCanFinish.resolve();
-    await waitForUpdate(
-      socket,
-      (update) => update.commandId === "input-1" && update.status === "cancelled",
-    );
-    await runTask;
-    await logger.destroy();
-
-    expect(backend.cancelledReasons).toEqual(["viewer.cancelled"]);
-    expect(backend.handledInputs).toEqual([]);
-    expect(runtimeState.status()).toBe("ready");
   });
 
   test("stops sessions as terminal commands and reports run completion", async () => {

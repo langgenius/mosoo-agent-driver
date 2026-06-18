@@ -22,17 +22,6 @@ export interface RuntimeCommandInput {
   readonly text: string;
 }
 
-export interface DriverAppAccessSnapshotEntry {
-  readonly canWrite: boolean;
-  readonly mountPath: string;
-  readonly spaceId: string;
-  readonly type: "space";
-}
-
-export interface DriverAppAccessSnapshot {
-  readonly entries: DriverAppAccessSnapshotEntry[];
-}
-
 export interface TurnCancelCommand {
   readonly commandId: string;
   readonly kind: "turn.cancel";
@@ -43,7 +32,6 @@ export interface InputStartCommand {
   readonly commandId: string;
   readonly input: RuntimeCommandInput;
   readonly kind: "input.start";
-  readonly appAccessSnapshot?: DriverAppAccessSnapshot | undefined;
   readonly requestId: string;
   readonly runId: string;
 }
@@ -70,14 +58,7 @@ export interface PermissionResolveCommand {
   readonly requestId: string;
 }
 
-export interface AccessRefreshCommand {
-  readonly commandId: string;
-  readonly kind: "access.refresh";
-  readonly appAccessSnapshot: DriverAppAccessSnapshot;
-}
-
 export type RuntimeCommand =
-  | AccessRefreshCommand
   | InputStartCommand
   | McpExecuteCommand
   | PermissionResolveCommand
@@ -95,12 +76,7 @@ export interface McpExecuteCommandResult {
   readonly toolName: string;
 }
 
-export interface AccessRefreshCommandResult {
-  readonly entryCount: number;
-}
-
 export type RuntimeCommandResult =
-  | AccessRefreshCommandResult
   | InputStartCommandResult
   | McpExecuteCommandResult
   | null;
@@ -173,16 +149,6 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
   return value;
 }
 
-function readBoolean(record: Record<string, unknown>, field: string): boolean {
-  const value = record[field];
-
-  if (typeof value !== "boolean") {
-    throw new TypeError(`${field} must be a boolean.`);
-  }
-
-  return value;
-}
-
 function readStringArray(record: Record<string, unknown>, field: string): string[] | undefined {
   const value = record[field];
 
@@ -207,47 +173,6 @@ function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
   };
 }
 
-function readAppAccessSnapshotEntry(value: unknown): DriverAppAccessSnapshotEntry {
-  const record = readRecord(value, "appAccessSnapshot.entries[]");
-  const type = readNonEmptyString(record, "type");
-
-  if (type !== "space") {
-    throw new TypeError("appAccessSnapshot.entries[].type must be space.");
-  }
-
-  return {
-    canWrite: readBoolean(record, "canWrite"),
-    mountPath: readNonEmptyString(record, "mountPath"),
-    spaceId: readNonEmptyString(record, "spaceId"),
-    type,
-  };
-}
-
-function readAppAccessSnapshot(value: unknown): DriverAppAccessSnapshot {
-  const record = readRecord(value, "appAccessSnapshot");
-  const entries = record["entries"];
-
-  if (!Array.isArray(entries)) {
-    throw new TypeError("appAccessSnapshot.entries must be an array.");
-  }
-
-  return {
-    entries: entries.map(readAppAccessSnapshotEntry),
-  };
-}
-
-function readOptionalAppAccessSnapshot(
-  record: Record<string, unknown>,
-): DriverAppAccessSnapshot | undefined {
-  const value = record["appAccessSnapshot"];
-
-  if (value === undefined) {
-    return undefined;
-  }
-
-  return readAppAccessSnapshot(value);
-}
-
 function readPermissionDecision(value: unknown): PermissionResolveCommand["decision"] {
   if (value === "allow_once" || value === "reject_once") {
     return value;
@@ -261,20 +186,11 @@ export function parseRuntimeCommand(value: unknown): RuntimeCommand {
   const kind = readString(record, "kind");
 
   switch (kind) {
-    case "access.refresh":
-      return {
-        commandId: readNonEmptyString(record, "commandId"),
-        kind,
-        appAccessSnapshot: readAppAccessSnapshot(record["appAccessSnapshot"]),
-      };
     case "input.start": {
-      const appAccessSnapshot = readOptionalAppAccessSnapshot(record);
-
       return {
         commandId: readNonEmptyString(record, "commandId"),
         input: readRuntimeCommandInput(record["input"]),
         kind,
-        ...(appAccessSnapshot === undefined ? {} : { appAccessSnapshot }),
         requestId: readNonEmptyString(record, "requestId"),
         runId: readNonEmptyString(record, "runId"),
       };

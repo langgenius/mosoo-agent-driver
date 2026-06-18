@@ -223,18 +223,6 @@ export class DriverCommandDispatcher {
         return;
       }
 
-      if (command.kind === "access.refresh") {
-        await runtimeContext.ports.access.refresh(command.appAccessSnapshot);
-        await this.#backend.refreshAppAccess(runtimeContext, command.appAccessSnapshot);
-        await sendCommandUpdate(runtimeContext, command, {
-          result: {
-            entryCount: command.appAccessSnapshot.entries.length,
-          },
-          status: "completed",
-        });
-        return;
-      }
-
       if (command.kind === "input.start") {
         if (this.#activeRunTask) {
           await waitForActiveInputSettle(this.#activeRunTask);
@@ -351,11 +339,6 @@ export class DriverCommandDispatcher {
   ): Promise<void> {
     try {
       cancellation.throwIfCancelled();
-
-      if (command.appAccessSnapshot) {
-        await runtimeContext.ports.access.refresh(command.appAccessSnapshot);
-        await this.#backend.refreshAppAccess(runtimeContext, command.appAccessSnapshot);
-      }
 
       cancellation.throwIfCancelled();
       await this.#backend.handleInput(runtimeContext, command.input, runId);

@@ -3,7 +3,6 @@ import { DriverPermissionBroker } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeIo } from "../src/core/driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverAppAccessSnapshotOutput } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
 import type { AgentDriverBackend, AgentDriverContext } from "../src/runtimes/agent-driver-backend";
@@ -11,13 +10,11 @@ import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import {
   DRIVER_TEST_IDS,
   driverBootPayload,
-  driverTestAccessSnapshot,
 } from "./driver-boot-payload-fixture";
 
 export { DRIVER_TEST_IDS };
 
 export const bootPayload = createDriverStartInputFromBootPayload(driverBootPayload);
-export const accessSnapshot = driverTestAccessSnapshot;
 
 export class FakeDriverRuntimeIo implements DriverRuntimeIo {
   readonly completedRunReasons: string[] = [];
@@ -80,7 +77,6 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
 export interface RecordingBackend extends AgentDriverBackend {
   readonly cancelledReasons: string[];
   readonly handledInputs: AgentDriverContext["payload"]["execution"]["session"][];
-  readonly refreshedSnapshots: DriverAppAccessSnapshotOutput[];
   failInput: boolean;
 }
 
@@ -89,7 +85,6 @@ export function createBackend(): RecordingBackend {
     cancelledReasons: [],
     failInput: false,
     handledInputs: [],
-    refreshedSnapshots: [],
     runtime: "openai-runtime",
     async cancelActiveTurn(_context, reason) {
       this.cancelledReasons.push(reason);
@@ -109,9 +104,6 @@ export function createBackend(): RecordingBackend {
         toolName: command.toolName,
       };
     },
-    async refreshAppAccess(_context, snapshot) {
-      this.refreshedSnapshots.push(snapshot);
-    },
     async start() {},
     async stop() {},
   };
@@ -128,7 +120,6 @@ export function createDispatcher(input: {
     service: "driver-runtime-boundary-test",
     sink: async () => {},
   });
-  const accessRefreshes: DriverAppAccessSnapshotOutput[] = [];
   const commandReads = {
     count: 0,
   };
@@ -148,11 +139,6 @@ export function createDispatcher(input: {
           request: async () => "reject_once",
         },
         ports: {
-          access: {
-            refresh: async (snapshot) => {
-              accessRefreshes.push(snapshot);
-            },
-          },
           commandSource: {
             nextCommand: async () => {
               commandReads.count += 1;
@@ -179,7 +165,6 @@ export function createDispatcher(input: {
   });
 
   return {
-    accessRefreshes,
     commandReads,
     dispatcher,
     logger,

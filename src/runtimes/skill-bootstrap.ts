@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 
-import { isTruthy } from "../core/truthiness";
 import type { DriverSkillCatalogEntry } from "../protocol/boot";
 import type { DriverExecutionInput } from "../protocol/execution";
-import { SANDBOX_GLOBAL_SPACE_ROOT } from "../protocol/paths";
+
 interface SkillCatalogManifestEntry {
   frontmatter: DriverSkillCatalogEntry["frontmatter"];
   mountPath: string;
@@ -22,48 +21,6 @@ export interface SkillBootstrapArtifacts {
 
 function getSkillCatalogRoot(execution: DriverExecutionInput): string {
   return join(execution.session.sharedRootPath, ".mosoo", "skills");
-}
-
-function toRelativeMountAlias(execution: DriverExecutionInput, aliasPath: string): string {
-  const relativePath = relative(execution.session.cwd, aliasPath);
-
-  if (!relativePath || relativePath.startsWith("..")) {
-    return aliasPath;
-  }
-
-  return relativePath;
-}
-
-function buildMountBootstrapSection(execution: DriverExecutionInput): string | null {
-  const { cwd, mountAliases } = execution.session;
-  const aliasEntries = mountAliases.map((alias) => ({
-    absoluteAliasPath: alias.aliasPath,
-    aliasPath: toRelativeMountAlias(execution, alias.aliasPath),
-    label: `Mount ${alias.name}`,
-    name: alias.name,
-  }));
-  const lines = [
-    "Mounted file layout:",
-    `Current working directory: ${cwd}`,
-    `Visible spaces are explicitly mounted under the session directory at \`${cwd}/space/<space-name>/\`.`,
-    "Persistent user files are exposed through those session-local `space/<space-name>/...` mount points inside the working directory.",
-    "Use those `space/*` directories for user-managed files. Files created elsewhere in the working directory are conversation-local scratch files and are not part of any Space.",
-    `Prefer the relative \`space/*\` aliases instead of internal mount paths such as \`${SANDBOX_GLOBAL_SPACE_ROOT}/*\`.`,
-  ];
-
-  if (aliasEntries.length === 0) {
-    lines.push("No visible file mounts are available for this session.");
-    return lines.join("\n");
-  }
-
-  lines.push(
-    "Visible file mounts:",
-    ...aliasEntries.map(
-      (entry) => `- ${entry.aliasPath} -> ${entry.absoluteAliasPath}: ${entry.label}`,
-    ),
-  );
-
-  return lines.join("\n");
 }
 
 function getSkillCatalogManifestEntries(
@@ -140,7 +97,6 @@ export async function writeSkillBootstrapArtifacts(
 
 export function buildRuntimeBootstrapText(execution: DriverExecutionInput): string {
   const systemPrompt = execution.systemPrompt.trim();
-  const mountBootstrap = buildMountBootstrapSection(execution);
   const manifestPath = join(getSkillCatalogRoot(execution), "manifest.json");
   const readmePath = join(getSkillCatalogRoot(execution), "README.md");
   const availableSkills = execution.skillCatalog.filter(
@@ -150,7 +106,7 @@ export function buildRuntimeBootstrapText(execution: DriverExecutionInput): stri
     (entry) => entry.resolutionMode === "tombstone",
   );
 
-  if (!systemPrompt && execution.skillCatalog.length === 0 && !isTruthy(mountBootstrap)) {
+  if (!systemPrompt && execution.skillCatalog.length === 0) {
     return "";
   }
 
@@ -163,10 +119,6 @@ export function buildRuntimeBootstrapText(execution: DriverExecutionInput): stri
 
   if (systemPrompt) {
     sections.push(`Agent profile prompt:\n${systemPrompt}`);
-  }
-
-  if (isTruthy(mountBootstrap)) {
-    sections.push(mountBootstrap);
   }
 
   if (execution.skillCatalog.length > 0) {

@@ -1,18 +1,14 @@
 import { createHash } from "node:crypto";
 
-import type { DriverBootPayload, DriverAppAccessSnapshotOutput } from "../../protocol/boot";
+import type { DriverBootPayload } from "../../protocol/boot";
 import {
-  isSandboxGlobalSpacePath,
   isSandboxOrganizationPath,
-  isSandboxSessionAliasPath,
   isSandboxSessionPath,
 } from "../../protocol/paths";
 
 type PathKind =
-  | "global_space"
   | "other_absolute"
   | "relative_or_unknown"
-  | "session_alias"
   | "session_organization"
   | "organization_other";
 
@@ -23,50 +19,13 @@ interface PathCollectionSummary {
 }
 
 const PATH_KINDS: PathKind[] = [
-  "global_space",
-  "session_alias",
   "session_organization",
   "organization_other",
   "other_absolute",
   "relative_or_unknown",
 ] as const;
 
-function summarizeSpaceAliases(
-  aliases: DriverBootPayload["execution"]["session"]["context"]["spaceAliases"],
-): { count: number; fingerprint: string | null } {
-  if (aliases.length === 0) {
-    return {
-      count: 0,
-      fingerprint: null,
-    };
-  }
-
-  return {
-    count: aliases.length,
-    fingerprint: digestText(
-      JSON.stringify(
-        aliases
-          .map((alias) => ({
-            aliasPath: alias.aliasPath,
-            globalMountPath: alias.globalMountPath,
-            spaceId: alias.spaceId,
-            spaceName: alias.spaceName,
-          }))
-          .toSorted((left, right) => left.aliasPath.localeCompare(right.aliasPath)),
-      ),
-    ),
-  };
-}
-
 function getPathKind(path: string): PathKind {
-  if (isSandboxGlobalSpacePath(path)) {
-    return "global_space";
-  }
-
-  if (isSandboxSessionAliasPath(path)) {
-    return "session_alias";
-  }
-
   if (isSandboxSessionPath(path)) {
     return "session_organization";
   }
@@ -140,45 +99,6 @@ export function summarizePathCollection(
   };
 }
 
-export function summarizeAppAccessSnapshot(
-  snapshot: DriverAppAccessSnapshotOutput,
-): Record<string, unknown> {
-  const typeCounts = {
-    root: 0,
-    space: 0,
-  };
-  let writableEntryCount = 0;
-
-  for (const entry of snapshot.entries) {
-    if (entry.canWrite) {
-      writableEntryCount += 1;
-    }
-
-    typeCounts[entry.type] += 1;
-  }
-
-  return {
-    entryCount: snapshot.entries.length,
-    fingerprint:
-      snapshot.entries.length > 0
-        ? digestText(
-            JSON.stringify(
-              snapshot.entries
-                .map((entry) => ({
-                  canWrite: entry.canWrite,
-                  mountPath: entry.mountPath,
-                  spaceId: entry.spaceId,
-                  type: entry.type,
-                }))
-                .toSorted((left, right) => left.mountPath.localeCompare(right.mountPath)),
-            ),
-          )
-        : null,
-    typeCounts,
-    writableEntryCount,
-  };
-}
-
 export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<string, unknown> {
   const { session } = payload.execution;
   const { context } = session;
@@ -198,13 +118,11 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
       readySkillCount: payload.execution.skills.filter((skill) => skill.snapshotId).length,
       sessionContext: {
         homePath: summarizePath(context.homePath),
-        appAccess: summarizeAppAccessSnapshot(context.appAccessSnapshot),
         origin: {
           entrypoint: context.origin.entrypoint,
           type: context.origin.type,
         },
         sessionOrganizationPath: summarizePath(context.sessionOrganizationPath),
-        spaceAliases: summarizeSpaceAliases(context.spaceAliases),
       },
       skillCatalogCount: payload.execution.skillCatalog.length,
       skillCount: payload.execution.skills.length,

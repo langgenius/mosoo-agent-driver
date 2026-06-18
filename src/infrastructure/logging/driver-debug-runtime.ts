@@ -3,7 +3,7 @@ import type {
   RuntimeCommandInput,
   RuntimeCommandResult,
 } from "../../runtime-command";
-import { digestText, summarizeAppAccessSnapshot, summarizeTextDigest } from "./driver-debug-paths";
+import { digestText, summarizeTextDigest } from "./driver-debug-paths";
 
 export function summarizeRuntimeCommandInput(input: RuntimeCommandInput): Record<string, unknown> {
   const attachmentIds = [...(input.attachmentIds ?? [])].toSorted();
@@ -26,17 +26,8 @@ export function summarizeRuntimeCommand(command: RuntimeCommand): Record<string,
       return {
         ...base,
         input: summarizeRuntimeCommandInput(command.input),
-        appAccessSnapshot: command.appAccessSnapshot
-          ? summarizeAppAccessSnapshot(command.appAccessSnapshot)
-          : null,
         requestId: command.requestId,
         runId: command.runId,
-      };
-    }
-    case "access.refresh": {
-      return {
-        ...base,
-        appAccessSnapshot: summarizeAppAccessSnapshot(command.appAccessSnapshot),
       };
     }
     case "mcp.execute": {
@@ -73,13 +64,6 @@ export function summarizeRuntimeCommandResult(
 ): Record<string, unknown> | null {
   if (result === undefined || result === null) {
     return null;
-  }
-
-  if ("entryCount" in result) {
-    return {
-      entryCount: result.entryCount,
-      kind: "app_access_snapshot",
-    };
   }
 
   if ("outputText" in result) {

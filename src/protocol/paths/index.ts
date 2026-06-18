@@ -1,7 +1,6 @@
 export const SANDBOX_ORGANIZATION_ROOT = "/organization";
 export const SANDBOX_WORKSPACE_ROOT = "/workspace";
 export const SANDBOX_CACHE_PATH = `${SANDBOX_WORKSPACE_ROOT}/cache`;
-export const SANDBOX_GLOBAL_SPACE_ROOT = "/organization/sp";
 export const SANDBOX_MEMORY_PATH = `${SANDBOX_WORKSPACE_ROOT}/memory`;
 export const SANDBOX_SESSION_STATE_DIR = ".state";
 export const SANDBOX_SESSION_ROOT = `${SANDBOX_WORKSPACE_ROOT}/se`;
@@ -10,22 +9,12 @@ const SESSION_RESOURCE_MOUNT_DIR = "session-files";
 
 export type SandboxFileBrowserPathPurpose = "content" | "tree";
 
-declare const RuntimeSpaceMountPathBrand: unique symbol;
-
-export type RuntimeSpaceMountPath = string & {
-  readonly [RuntimeSpaceMountPathBrand]: true;
-};
-
 export function getSessionWorkspacePath(sessionId: string): string {
   return `${SANDBOX_SESSION_ROOT}/${sessionId}`;
 }
 
 export function getSessionOrganizationPath(sessionId: string): string {
   return getSessionWorkspacePath(sessionId);
-}
-
-export function getSessionSpaceRootPath(sessionId: string): string {
-  return `${getSessionWorkspacePath(sessionId)}/space`;
 }
 
 export function getSessionStateRootPath(sessionId: string): string {
@@ -38,14 +27,6 @@ export function getSessionResourceRootPath(sessionId: string): string {
 
 export function getSessionRuntimeStatePath(sessionId: string, runtimeId: string): string {
   return `${getSessionStateRootPath(sessionId)}/${runtimeId}`;
-}
-
-export function getGlobalSpaceMountPath(spaceId: string): string {
-  return `${SANDBOX_GLOBAL_SPACE_ROOT}/${spaceId}`;
-}
-
-export function getSessionAliasPath(sessionId: string, spaceName: string): string {
-  return `${getSessionSpaceRootPath(sessionId)}/${spaceName}`;
 }
 
 function hasConcreteChildPath(path: string, rootPath: string): boolean {
@@ -64,10 +45,6 @@ export function isSandboxMemoryPath(path: string): boolean {
   return path === SANDBOX_MEMORY_PATH || path.startsWith(`${SANDBOX_MEMORY_PATH}/`);
 }
 
-export function isSandboxGlobalSpacePath(path: string): boolean {
-  return hasConcreteChildPath(path, SANDBOX_GLOBAL_SPACE_ROOT);
-}
-
 export function isSandboxSessionPath(path: string): boolean {
   return hasConcreteChildPath(path, SANDBOX_SESSION_ROOT);
 }
@@ -81,24 +58,6 @@ export function isSandboxSessionStatePath(path: string): boolean {
 
   return (
     sessionId !== undefined && sessionId.length > 0 && stateSegment === SANDBOX_SESSION_STATE_DIR
-  );
-}
-
-export function isSandboxSessionAliasPath(path: string): boolean {
-  if (!isSandboxSessionPath(path)) {
-    return false;
-  }
-
-  const [sessionId, spaceSegment, spaceName] = path
-    .slice(SANDBOX_SESSION_ROOT.length + 1)
-    .split("/");
-
-  return (
-    sessionId !== undefined &&
-    sessionId.length > 0 &&
-    spaceSegment === "space" &&
-    spaceName !== undefined &&
-    spaceName.length > 0
   );
 }
 
@@ -163,19 +122,6 @@ function readSandboxFileBrowserPathOriginal(rawPath: string): string {
   });
 }
 
-export function readRuntimeSpaceMountPathOriginal(rawPath: string): RuntimeSpaceMountPath {
-  const path = readSandboxAbsolutePathOriginal({
-    ownerLabel: "Runtime Space mount path",
-    rawPath,
-  });
-
-  if (path === "/") {
-    throw new Error("Runtime Space mount path must not be the sandbox root.");
-  }
-
-  return path as RuntimeSpaceMountPath;
-}
-
 function isAllowedSandboxFileBrowserPath(path: string): boolean {
   return (
     path === "/" ||
@@ -185,27 +131,13 @@ function isAllowedSandboxFileBrowserPath(path: string): boolean {
     path === SANDBOX_SESSION_ROOT ||
     path.startsWith(`${SANDBOX_SESSION_ROOT}/`) ||
     path === SANDBOX_ORGANIZATION_ROOT ||
-    path === SANDBOX_GLOBAL_SPACE_ROOT ||
-    path.startsWith(`${SANDBOX_GLOBAL_SPACE_ROOT}/`)
+    path.startsWith(`${SANDBOX_ORGANIZATION_ROOT}/`)
   );
-}
-
-function isSandboxSessionSpaceAliasPath(path: string): boolean {
-  if (isSandboxSessionAliasPath(path)) {
-    return true;
-  }
-
-  if (!path.startsWith(`${SANDBOX_SESSION_ROOT}/`)) {
-    return false;
-  }
-
-  const [sessionId, segment] = path.slice(SANDBOX_SESSION_ROOT.length + 1).split("/");
-  return sessionId !== undefined && sessionId.length > 0 && segment === "space";
 }
 
 export function normalizeSandboxFileBrowserPath(
   rawPath: string,
-  purpose: SandboxFileBrowserPathPurpose,
+  _purpose: SandboxFileBrowserPathPurpose,
 ): string {
   const path = readSandboxFileBrowserPathOriginal(rawPath);
 
@@ -215,21 +147,6 @@ export function normalizeSandboxFileBrowserPath(
 
   if (isSandboxSessionStatePath(path)) {
     throw new Error("Session runtime state is not visible in the Agent File Browser.");
-  }
-
-  if (isSandboxSessionSpaceAliasPath(path)) {
-    throw new Error("Space files open in the Space page.");
-  }
-
-  const isSpacePath = path.startsWith(`${SANDBOX_GLOBAL_SPACE_ROOT}/`);
-  const spacePathDepth = isSpacePath ? path.split("/").filter(Boolean).length : 0;
-
-  if (purpose === "content" && isSpacePath) {
-    throw new Error("Space files open in the Space page.");
-  }
-
-  if (purpose === "tree" && spacePathDepth > 3) {
-    throw new Error("Space files open in the Space page.");
   }
 
   if (!isAllowedSandboxFileBrowserPath(path)) {

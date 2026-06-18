@@ -162,7 +162,6 @@ function createLiveStartInput(input: {
         cwd: input.cwd,
         homePath: input.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: input.sharedRootPath,
       },

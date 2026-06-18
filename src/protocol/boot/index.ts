@@ -36,14 +36,11 @@ export type {
   SandboxSessionId,
   SkillId,
   SkillSnapshotId,
-  SpaceId,
 } from "./host-ids";
 export type {
   DriverConfigRevision,
   DriverExecutionSessionContext,
-  DriverAppAccessSnapshotOutput,
   DriverOrigin,
-  DriverSpaceAliasBinding,
 } from "./host-snapshot";
 
 export const DRIVER_PROTOCOL_VERSION = 1 as const;

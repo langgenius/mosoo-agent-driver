@@ -1,4 +1,4 @@
-import type { DriverBootPayload, DriverAppAccessSnapshotOutput } from "../src/protocol/boot";
+import type { DriverBootPayload } from "../src/protocol/boot";
 import { DRIVER_CONTROL_PORT_MIN } from "../src/protocol/boot";
 
 export const DRIVER_TEST_IDS = {
@@ -12,7 +12,6 @@ export const DRIVER_TEST_IDS = {
   sandboxSessionId: "01J0000000000000000000000E",
   secondRunId: "01J00000000000000000000013",
   sessionId: "01J00000000000000000000008",
-  spaceId: "01J00000000000000000000014",
   thirdRunId: "01J00000000000000000000015",
 } as const;
 
@@ -42,9 +41,6 @@ export const driverBootPayload = {
       additionalDirectories: [],
       context: {
         homePath: "/tmp/home",
-        appAccessSnapshot: {
-          entries: [],
-        },
         origin: {
           callerUserId: DRIVER_TEST_IDS.callerAccountId,
           entrypoint: "api",
@@ -57,7 +53,6 @@ export const driverBootPayload = {
         sandboxSubjectId: DRIVER_TEST_IDS.sessionId,
         sandboxSubjectKind: "session",
         sessionOrganizationPath: "/tmp/organization",
-        spaceAliases: [],
       },
       cwd: "/tmp/organization",
       mcpServers: [],
@@ -73,14 +68,3 @@ export const driverBootPayload = {
   sandboxId: DRIVER_TEST_IDS.sandboxId,
   traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
 } satisfies DriverBootPayload;
-
-export const driverTestAccessSnapshot = {
-  entries: [
-    {
-      canWrite: true,
-      mountPath: "/workspace/docs",
-      spaceId: DRIVER_TEST_IDS.spaceId,
-      type: "space",
-    },
-  ],
-} satisfies DriverAppAccessSnapshotOutput;

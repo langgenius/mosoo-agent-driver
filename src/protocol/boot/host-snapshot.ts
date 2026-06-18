@@ -1,4 +1,3 @@
-import type { DriverAppAccessSnapshot } from "../../runtime-command";
 import type { DriverId, SessionId, RunId } from "../id";
 import type {
   AccountId,
@@ -8,19 +7,14 @@ import type {
   EnvironmentRevisionId,
   SandboxId,
   SandboxSessionId,
-  SpaceId,
 } from "./host-ids";
 import {
   parseId,
   parseNullableId,
-  readArray,
-  readBoolean,
   readNonEmptyString,
   readNumber,
   readRecord,
 } from "./readers";
-
-export type DriverAppAccessSnapshotOutput = DriverAppAccessSnapshot;
 
 export interface DriverOrigin {
   readonly callerUserId: AccountId;
@@ -29,16 +23,8 @@ export interface DriverOrigin {
   readonly type: "agent";
 }
 
-export interface DriverSpaceAliasBinding {
-  readonly aliasPath: string;
-  readonly globalMountPath: string;
-  readonly spaceId: SpaceId;
-  readonly spaceName: string;
-}
-
 export interface DriverExecutionSessionContext {
   readonly homePath: string;
-  readonly appAccessSnapshot: DriverAppAccessSnapshotOutput;
   readonly origin: DriverOrigin;
   readonly sandboxId: SandboxId;
   readonly sandboxKind: string;
@@ -46,7 +32,6 @@ export interface DriverExecutionSessionContext {
   readonly sandboxSubjectId: DriverId;
   readonly sandboxSubjectKind: string;
   readonly sessionOrganizationPath: string;
-  readonly spaceAliases: DriverSpaceAliasBinding[];
 }
 
 export interface DriverConfigRevision {
@@ -83,44 +68,6 @@ function readOrigin(value: unknown): DriverOrigin {
   };
 }
 
-function readSpaceAliasBinding(value: unknown, index: number): DriverSpaceAliasBinding {
-  const label = `execution.session.context.spaceAliases[${index}]`;
-  const record = readRecord(value, label);
-
-  return {
-    aliasPath: readNonEmptyString(record, "aliasPath", label),
-    globalMountPath: readNonEmptyString(record, "globalMountPath", label),
-    spaceId: parseId(record["spaceId"], `${label}.spaceId`) as SpaceId,
-    spaceName: readNonEmptyString(record, "spaceName", label),
-  };
-}
-
-export function readAppAccessSnapshot(value: unknown): DriverAppAccessSnapshotOutput {
-  const record = readRecord(value, "execution.session.context.appAccessSnapshot");
-
-  return {
-    entries: readArray(
-      record["entries"],
-      "execution.session.context.appAccessSnapshot.entries",
-    ).map((entry, index) => {
-      const label = `execution.session.context.appAccessSnapshot.entries[${index}]`;
-      const entryRecord = readRecord(entry, label);
-      const type = readNonEmptyString(entryRecord, "type", label);
-
-      if (type !== "space") {
-        throw new TypeError(`${label}.type must be space.`);
-      }
-
-      return {
-        canWrite: readBoolean(entryRecord, "canWrite", label),
-        mountPath: readNonEmptyString(entryRecord, "mountPath", label),
-        spaceId: parseId(entryRecord["spaceId"], `${label}.spaceId`) as SpaceId,
-        type,
-      };
-    }),
-  };
-}
-
 export function readConfigRevision(value: unknown): DriverConfigRevision {
   const record = readRecord(value, "execution.configRevision");
 
@@ -152,7 +99,6 @@ export function readExecutionSessionContext(value: unknown): DriverExecutionSess
 
   return {
     homePath: readNonEmptyString(record, "homePath", "execution.session.context"),
-    appAccessSnapshot: readAppAccessSnapshot(record["appAccessSnapshot"]),
     origin: readOrigin(record["origin"]),
     sandboxId: parseId(record["sandboxId"], "Driver execution sandbox ID") as SandboxId,
     sandboxKind: readNonEmptyString(record, "sandboxKind", "execution.session.context"),
@@ -170,9 +116,6 @@ export function readExecutionSessionContext(value: unknown): DriverExecutionSess
       record,
       "sessionOrganizationPath",
       "execution.session.context",
-    ),
-    spaceAliases: readArray(record["spaceAliases"], "execution.session.context.spaceAliases").map(
-      readSpaceAliasBinding,
     ),
   };
 }

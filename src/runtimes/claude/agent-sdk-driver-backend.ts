@@ -12,12 +12,10 @@ import {
 import { isTruthy } from "../../core/truthiness";
 import type { AgentDriverMaterializedSkill } from "../../host-ports";
 import {
-  summarizeAppAccessSnapshot,
   summarizePath,
   summarizePathCollection,
   summarizeRuntimeCommandInput,
 } from "../../infrastructure/logging/driver-debug";
-import type { DriverAppAccessSnapshotOutput } from "../../protocol/boot";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
@@ -84,7 +82,6 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         model: this.#payload.execution.model,
         provider: this.#payload.execution.provider,
         sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
-        mountAliasCount: this.#payload.execution.session.mountAliases.length,
       },
       nativeResumeRefPresent: Boolean(this.#nativeSessionId),
       skillCount: this.#materializedSkills.length,
@@ -275,16 +272,6 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         reason,
         runId: activeTurn.runId,
       });
-    });
-  }
-
-  async refreshAppAccess(
-    context: AgentDriverContext,
-    snapshot: DriverAppAccessSnapshotOutput,
-  ): Promise<void> {
-    context.logger.debug("driver.claude.app-access.refreshed", {
-      nativeSessionIdPresent: Boolean(this.#nativeSessionId),
-      appAccessSnapshot: summarizeAppAccessSnapshot(snapshot),
     });
   }
 

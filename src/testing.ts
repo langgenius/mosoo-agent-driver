@@ -25,7 +25,6 @@ export const AGENT_DRIVER_TESTING_FIXTURES = {
   },
   driver: {
     commands: {
-      accessRefresh: "tests/fixtures/driver/commands/access-refresh.json",
       inputStart: "tests/fixtures/driver/commands/input-start.json",
       mcpExecute: "tests/fixtures/driver/commands/mcp-execute.json",
       permissionResolve: "tests/fixtures/driver/commands/permission-resolve.json",
@@ -95,7 +94,6 @@ export const AGENT_DRIVER_TESTING_FIXTURE_PATHS = [
   AGENT_DRIVER_TESTING_FIXTURES.cma.http.createEnvironmentSelfHostedRequest,
   AGENT_DRIVER_TESTING_FIXTURES.cma.inbound.userMessage,
   AGENT_DRIVER_TESTING_FIXTURES.cma.outbound.permissionRequiresAction,
-  AGENT_DRIVER_TESTING_FIXTURES.driver.commands.accessRefresh,
   AGENT_DRIVER_TESTING_FIXTURES.driver.commands.inputStart,
   AGENT_DRIVER_TESTING_FIXTURES.driver.commands.mcpExecute,
   AGENT_DRIVER_TESTING_FIXTURES.driver.commands.permissionResolve,

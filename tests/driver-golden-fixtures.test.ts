@@ -9,7 +9,6 @@ import type { RuntimeEventBuildContext } from "../src/runtime-events";
 const occurredAt = "2026-05-26T00:00:00.000Z";
 
 const commandFixtures = [
-  "access-refresh",
   "input-start",
   "mcp-execute",
   "permission-resolve",
