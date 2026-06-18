@@ -58,7 +58,7 @@ function logLiveStatus(
   const suffix =
     Object.keys(details).length === 0
       ? ""
-      : ` ${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted()))}`;
+      : ` ${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted((a, b) => a[0].localeCompare(b[0]))))}`;
   console.info(`[live-opencode] ${message}${suffix}`);
 }
 
@@ -200,7 +200,9 @@ async function withTimeout<T>(input: {
     if (result === "timeout") {
       throw new Error(
         `Timed out waiting for ${input.label}. ${JSON.stringify(
-          Object.fromEntries(Object.entries(input.details).toSorted()),
+          Object.fromEntries(
+            Object.entries(input.details).toSorted((a, b) => a[0].localeCompare(b[0])),
+          ),
         )}`,
       );
     }

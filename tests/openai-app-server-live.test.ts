@@ -24,7 +24,7 @@ function logLiveStatus(
   const suffix =
     Object.keys(details).length === 0
       ? ""
-      : ` ${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted()))}`;
+      : ` ${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted((a, b) => a[0].localeCompare(b[0]))))}`;
   console.info(`[live-openai] ${message}${suffix}`);
 }
 

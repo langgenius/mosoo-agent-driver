@@ -166,13 +166,21 @@ function createOpenCodeAcpClient(input: {
 
       child.kill("SIGTERM");
       await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          resolve();
+        };
         const timeout = setTimeout(() => {
           child.kill("SIGKILL");
-          resolve();
+          finish();
         }, 2_000);
         child.once("exit", () => {
           clearTimeout(timeout);
-          resolve();
+          finish();
         });
       });
     },
