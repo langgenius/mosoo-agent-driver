@@ -5,11 +5,7 @@ import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
-import {
-  DRIVER_TEST_IDS,
-  bootPayload,
-  createBackend,
-} from "./driver-runtime-boundary-fixtures";
+import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
   test("starts from a driver start input without boot transport fields", async () => {

@@ -1,10 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { DriverBootPayload } from "../../protocol/boot";
-import {
-  isSandboxOrganizationPath,
-  isSandboxSessionPath,
-} from "../../protocol/paths";
+import { isSandboxOrganizationPath, isSandboxSessionPath } from "../../protocol/paths";
 
 type PathKind =
   | "other_absolute"

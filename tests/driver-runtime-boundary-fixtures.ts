@@ -7,10 +7,7 @@ import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
 import type { AgentDriverBackend, AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
-import {
-  DRIVER_TEST_IDS,
-  driverBootPayload,
-} from "./driver-boot-payload-fixture";
+import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 export { DRIVER_TEST_IDS };
 

@@ -8,13 +8,7 @@ import type {
   SandboxId,
   SandboxSessionId,
 } from "./host-ids";
-import {
-  parseId,
-  parseNullableId,
-  readNonEmptyString,
-  readNumber,
-  readRecord,
-} from "./readers";
+import { parseId, parseNullableId, readNonEmptyString, readNumber, readRecord } from "./readers";
 
 export interface DriverOrigin {
   readonly callerUserId: AccountId;

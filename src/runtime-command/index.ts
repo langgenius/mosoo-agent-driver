@@ -76,10 +76,7 @@ export interface McpExecuteCommandResult {
   readonly toolName: string;
 }
 
-export type RuntimeCommandResult =
-  | InputStartCommandResult
-  | McpExecuteCommandResult
-  | null;
+export type RuntimeCommandResult = InputStartCommandResult | McpExecuteCommandResult | null;
 
 export type DriverCapabilityId =
   | "custom_tool_execute"
