@@ -160,6 +160,9 @@
     {
       "kind": "tool.call.updated",
       "payload": {
+        "content": "[{\"text\":\"/workspace\",\"type\":\"text\"}]",
+        "messageId": "<driver-id>",
+        "rawOutput": "[{\"text\":\"/workspace\",\"type\":\"text\"}]",
         "status": "completed",
         "toolCallId": "tool-1"
       }
@@ -170,16 +173,6 @@
         "itemId": "tool-1",
         "itemType": "tool_call",
         "status": "completed"
-      }
-    },
-    {
-      "kind": "tool.call.updated",
-      "payload": {
-        "content": "[{\"text\":\"/workspace\",\"type\":\"text\"}]",
-        "messageId": "<driver-id>",
-        "rawOutput": "[{\"text\":\"/workspace\",\"type\":\"text\"}]",
-        "status": "completed",
-        "toolCallId": "tool-1"
       }
     },
     {

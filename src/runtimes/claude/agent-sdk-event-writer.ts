@@ -93,31 +93,6 @@ export class ClaudeAgentSdkEventWriter {
     ]);
   }
 
-  async endTool(context: AgentDriverContext, toolCallId: string): Promise<void> {
-    if (this.#toolEnded.has(toolCallId)) {
-      return;
-    }
-
-    this.#toolEnded.add(toolCallId);
-    await this.#push(context, "driver.claude.tool.ended", [
-      {
-        kind: "tool.call.updated",
-        payload: {
-          status: "completed",
-          toolCallId,
-        },
-      },
-      {
-        kind: "item.completed",
-        payload: {
-          itemId: toolCallId,
-          itemType: "tool_call",
-          status: "completed",
-        },
-      },
-    ]);
-  }
-
   async ensureMessageStarted(context: AgentDriverContext, messageId: string): Promise<void> {
     if (this.#messageStarted.has(messageId)) {
       return;
@@ -316,7 +291,7 @@ export class ClaudeAgentSdkEventWriter {
     messageId,
     toolCallId,
   }: ClaudeToolResultEvent): Promise<void> {
-    await this.#push(context, "driver.claude.tool.result", [
+    const events: DriverEventInput[] = [
       {
         kind: "tool.call.updated",
         payload: {
@@ -327,7 +302,21 @@ export class ClaudeAgentSdkEventWriter {
           toolCallId,
         },
       },
-    ]);
+    ];
+
+    if (!this.#toolEnded.has(toolCallId)) {
+      this.#toolEnded.add(toolCallId);
+      events.push({
+        kind: "item.completed",
+        payload: {
+          itemId: toolCallId,
+          itemType: "tool_call",
+          status: "completed",
+        },
+      });
+    }
+
+    await this.#push(context, "driver.claude.tool.result", events);
   }
 
   async pushUsage(

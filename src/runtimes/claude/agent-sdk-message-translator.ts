@@ -164,7 +164,6 @@ export class ClaudeAgentSdkMessageTranslator {
             toolCallId,
           });
         }
-        await this.#events.endTool(context, toolCallId);
       }
     }
 
@@ -197,10 +196,8 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (eventType === "content_block_stop") {
       const index = readNumber(event, "index");
-      const toolCallId = index === null ? null : this.#blockIndexToToolCallId.get(index);
 
-      if (isTruthy(toolCallId) && index !== null) {
-        await this.#events.endTool(context, toolCallId);
+      if (index !== null) {
         this.#blockIndexToToolCallId.delete(index);
       }
       return;

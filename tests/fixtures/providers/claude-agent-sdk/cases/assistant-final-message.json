@@ -67,21 +67,6 @@
       }
     },
     {
-      "kind": "tool.call.updated",
-      "payload": {
-        "status": "completed",
-        "toolCallId": "tool-2"
-      }
-    },
-    {
-      "kind": "item.completed",
-      "payload": {
-        "itemId": "tool-2",
-        "itemType": "tool_call",
-        "status": "completed"
-      }
-    },
-    {
       "kind": "message.completed",
       "payload": {
         "messageId": "<driver-id>",
