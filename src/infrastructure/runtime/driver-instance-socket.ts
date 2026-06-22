@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
@@ -9,6 +9,7 @@ import { createDriverId, parseDriverId } from "../../protocol/id";
 import type { DriverInstanceId, EventId, SessionId, RunId } from "../../protocol/id";
 import type {
   DriverFailureInput,
+  DriverEventBatchOutput,
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
   DriverHelloInput,
@@ -123,11 +124,12 @@ export class DriverInstanceSocket {
     });
   }
 
-  async pushEvents(input: { events: DriverEventInput[] }): Promise<void> {
-    await this.#requireClient().driver.pushEvents({
+  async pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput> {
+    const sourceEventIdOccurrences = new Map<string, number>();
+    return this.#requireClient().driver.pushEvents({
       driverInstanceId: this.payload.driverInstanceId,
       events: input.events.flatMap((event) =>
-        toDriverEventEnvelopes(this.payload, event, this.#activeRunId),
+        toDriverEventEnvelopes(this.payload, event, this.#activeRunId, sourceEventIdOccurrences),
       ),
     });
   }
@@ -179,7 +181,38 @@ function readSourceEventId(event: DriverEventInput): string {
     return event.sourceEventId ?? event.id;
   }
 
-  return event.sourceEventId ?? randomUUID();
+  return event.sourceEventId ?? createDeterministicSourceEventId(event);
+}
+
+function addSourceEventIdOccurrence(
+  sourceEventId: string,
+  occurrences: Map<string, number>,
+): string {
+  const nextOccurrence = (occurrences.get(sourceEventId) ?? 0) + 1;
+  occurrences.set(sourceEventId, nextOccurrence);
+
+  return nextOccurrence === 1 ? sourceEventId : `${sourceEventId}:${nextOccurrence}`;
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  }
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .toSorted()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function createDeterministicSourceEventId(event: DriverEventInput): string {
+  return `sha256:${createHash("sha256").update(stableJson(event)).digest("hex")}`;
 }
 
 function parseRunId(value: string): RunId {
@@ -200,9 +233,13 @@ export function toDriverEventEnvelopes(
   payload: DriverBootPayload,
   event: DriverEventInput,
   activeRunId: RunId | null,
+  sourceEventIdOccurrences = new Map<string, number>(),
 ): DriverEventEnvelope[] {
   const occurredAtMs = readEventOccurredAt(event);
-  const sourceEventId = readSourceEventId(event);
+  const sourceEventId = addSourceEventIdOccurrence(
+    readSourceEventId(event),
+    sourceEventIdOccurrences,
+  );
   const occurredAt = new Date(occurredAtMs).toISOString();
   const runId = readEventRunId(event, activeRunId);
 

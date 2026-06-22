@@ -83,6 +83,34 @@ describe("driver runtime boundary", () => {
     expect(event?.event.runId).toBe(DRIVER_TEST_IDS.thirdRunId);
   });
 
+  test("driver socket creates deterministic source ids for draft event replay", () => {
+    const draft = {
+      kind: "message.started",
+      payload: {
+        messageId: "message-1",
+        role: "agent",
+      },
+    } as const;
+    const occurrences = new Map<string, number>();
+    const [first] = toDriverEventEnvelopes(
+      driverBootPayload,
+      draft,
+      DRIVER_TEST_IDS.runId,
+      occurrences,
+    );
+    const [second] = toDriverEventEnvelopes(
+      driverBootPayload,
+      draft,
+      DRIVER_TEST_IDS.runId,
+      occurrences,
+    );
+    const [retry] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
+
+    expect(first?.event.sourceEventId).toMatch(/^sha256:/);
+    expect(second?.event.sourceEventId).toBe(`${first?.event.sourceEventId}:2`);
+    expect(retry?.event.sourceEventId).toBe(first?.event.sourceEventId);
+  });
+
   test("runs input commands through the backend and reports completion to API", async () => {
     const backend = createBackend();
     const runtimeState = new DriverRuntimeStateMachine();

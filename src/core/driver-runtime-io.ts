@@ -1,6 +1,7 @@
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type {
+  DriverEventBatchOutput,
   DriverFailureInput,
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
@@ -8,7 +9,7 @@ import type {
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
 
 export interface DriverRuntimeEventPort {
-  pushEvents(input: { events: DriverEventInput[] }): Promise<void>;
+  pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput>;
 }
 
 export interface DriverRuntimeCommandPort {

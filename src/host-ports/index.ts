@@ -2,6 +2,7 @@ import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
+import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type { McpExecuteCommand, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
 
 export type AgentDriverHostPortName =
@@ -25,7 +26,7 @@ export interface AgentDriverEventSink {
     result?: RuntimeCommandResult;
     status: "accepted" | "cancelled" | "completed" | "failed";
   }): Promise<void>;
-  pushEvents(input: { events: DriverEventInput[] }): Promise<void>;
+  pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput>;
 }
 
 export interface AgentDriverPermissionPort {

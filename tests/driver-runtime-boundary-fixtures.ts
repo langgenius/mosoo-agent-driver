@@ -66,8 +66,16 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
     this.failedRuns.push(error);
   }
 
-  async pushEvents(input: Parameters<DriverRuntimeIo["pushEvents"]>[0]): Promise<void> {
+  async pushEvents(
+    input: Parameters<DriverRuntimeIo["pushEvents"]>[0],
+  ): ReturnType<DriverRuntimeIo["pushEvents"]> {
     this.pushedEvents.push(input);
+    return {
+      accepted: input.events.map((event, index) => ({
+        seq: index + 1,
+        type: event.kind,
+      })),
+    };
   }
 }
 

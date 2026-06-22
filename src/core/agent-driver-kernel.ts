@@ -1,6 +1,7 @@
 import { createBufferedSinkLogger } from "../observability";
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
+import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type { DriverStartInput } from "../protocol/start";
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
 import type {
@@ -139,6 +140,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   readonly #runtimeState = new DriverRuntimeStateMachine();
   #backend: AgentDriverBackend | null = null;
   #payload: DriverStartInput | null = null;
+  #pushedEventSeq = 0;
   #runTask: Promise<void> | null = null;
   #shuttingDown = false;
   #started = false;
@@ -245,10 +247,21 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     return result.done ? null : result.value;
   }
 
-  async pushEvents(input: { events: DriverEventInput[] }): Promise<void> {
+  async pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput> {
+    const accepted = input.events.map((event) => {
+      this.#pushedEventSeq += 1;
+
+      return {
+        seq: this.#pushedEventSeq,
+        type: event.kind,
+      };
+    });
+
     for (const event of input.events) {
       this.#events.push(event);
     }
+
+    return { accepted };
   }
 
   async start(input: AgentDriverKernelStartInput): Promise<void> {
