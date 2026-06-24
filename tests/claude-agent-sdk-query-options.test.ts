@@ -98,7 +98,9 @@ describe("Claude Agent SDK query options", () => {
       execution: {
         ...driverBootPayload.execution,
         builtInTools: driverBootPayload.execution.builtInTools.map((tool) =>
-          tool.name === "bash" || tool.name === "web_search" ? { ...tool, enabled: false } : tool,
+          tool.name === "bash" || tool.name === "web_search"
+            ? { enabled: false, name: tool.name }
+            : tool,
         ),
       },
     });
@@ -120,7 +122,9 @@ describe("Claude Agent SDK query options", () => {
       execution: {
         ...driverBootPayload.execution,
         builtInTools: driverBootPayload.execution.builtInTools.map((tool) =>
-          tool.name === "bash" || tool.name === "web_search" ? { ...tool, enabled: false } : tool,
+          tool.name === "bash" || tool.name === "web_search"
+            ? { enabled: false, name: tool.name }
+            : tool,
         ),
         model: "claude-sonnet-4-5",
         provider: "anthropic",
