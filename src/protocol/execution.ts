@@ -23,6 +23,7 @@ export interface DriverExecutionSessionInput {
 }
 
 export interface DriverExecutionInput {
+  readonly builtInTools: DriverExecutionSpec["builtInTools"];
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
   readonly provider: string;
@@ -38,6 +39,7 @@ export function createDriverExecutionInputFromBootExecution(
   execution: DriverExecutionSpec,
 ): DriverExecutionInput {
   return {
+    builtInTools: execution.builtInTools,
     environment: execution.environment,
     model: execution.model,
     provider: execution.provider,

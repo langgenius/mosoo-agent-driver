@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { mergeClaudeQueryOptions } from "../src/runtimes/claude/agent-sdk-query-options";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
+import {
+  mergeClaudeQueryOptions,
+  toClaudeBuiltInTools,
+} from "../src/runtimes/claude/agent-sdk-query-options";
+import { driverBootPayload } from "./driver-boot-payload-fixture";
 
 describe("Claude Agent SDK query options", () => {
   test("deep-merges advanced provider options into generated query options", () => {
@@ -56,5 +61,26 @@ describe("Claude Agent SDK query options", () => {
       persistSession: true,
     });
     expect(base.env).toEqual({ BASE: "1" });
+  });
+
+  test("maps Mosoo built-in tool toggles into Claude SDK tool names", () => {
+    const payload = createDriverStartInputFromBootPayload({
+      ...driverBootPayload,
+      execution: {
+        ...driverBootPayload.execution,
+        builtInTools: driverBootPayload.execution.builtInTools.map((tool) =>
+          tool.name === "bash" || tool.name === "web_search" ? { ...tool, enabled: false } : tool,
+        ),
+      },
+    });
+
+    expect(toClaudeBuiltInTools(payload)).toEqual([
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+    ]);
   });
 });

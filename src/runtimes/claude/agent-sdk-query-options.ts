@@ -9,6 +9,7 @@ import type {
 
 import { isTruthy } from "../../core/truthiness";
 import type { DriverBootMcpServer } from "../../protocol/boot";
+import type { DriverBuiltInToolName } from "../../protocol/boot";
 import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
 import type { AgentDriverContext } from "../agent-driver-backend";
@@ -16,7 +17,19 @@ import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { mergeProviderOptions } from "../provider-options";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
+
 export const CLAUDE_CODE_EXECUTABLE_ENV = "MOSOO_CLAUDE_CODE_EXECUTABLE";
+
+const CLAUDE_BUILT_IN_TOOL_NAMES = {
+  bash: "Bash",
+  edit: "Edit",
+  glob: "Glob",
+  grep: "Grep",
+  read: "Read",
+  web_fetch: "WebFetch",
+  web_search: "WebSearch",
+  write: "Write",
+} as const satisfies Record<DriverBuiltInToolName, string>;
 
 function createCanUseTool(context: AgentDriverContext): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {
@@ -98,6 +111,12 @@ function toClaudeEnv(payload: DriverStartInput, claudeConfigDir: string): NodeJS
   });
 }
 
+export function toClaudeBuiltInTools(payload: DriverStartInput): string[] {
+  return payload.execution.builtInTools.flatMap((tool) =>
+    tool.enabled ? [CLAUDE_BUILT_IN_TOOL_NAMES[tool.name]] : [],
+  );
+}
+
 export function resolveClaudeConfigDir(payload: DriverStartInput): string {
   return payload.execution.session.homePath;
 }
@@ -136,6 +155,7 @@ export async function createClaudeQueryOptions(input: {
       });
     },
   };
+  options.tools = toClaudeBuiltInTools(input.payload);
 
   const claudeCodeExecutable = readProcessEnvString(CLAUDE_CODE_EXECUTABLE_ENV);
   if (isTruthy(claudeCodeExecutable)) {

@@ -21,6 +21,16 @@ export const driverBootPayload = {
   driverGeneration: 0,
   driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
   execution: {
+    builtInTools: [
+      { enabled: true, name: "bash" },
+      { enabled: true, name: "read" },
+      { enabled: true, name: "write" },
+      { enabled: true, name: "edit" },
+      { enabled: true, name: "glob" },
+      { enabled: true, name: "grep" },
+      { enabled: true, name: "web_fetch" },
+      { enabled: true, name: "web_search" },
+    ],
     configRevision: {
       agentId: DRIVER_TEST_IDS.agentId,
       deploymentVersionId: null,

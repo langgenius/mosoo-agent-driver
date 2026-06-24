@@ -107,6 +107,7 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
       additionalDirectories: summarizePathCollection(session.additionalDirectories, {
         includeFingerprint: true,
       }),
+      builtInToolCount: payload.execution.builtInTools.length,
       configRevision: payload.execution.configRevision,
       cwd: summarizePath(session.cwd),
       envVarCount: Object.keys(payload.execution.environment.variables).length,

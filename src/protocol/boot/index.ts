@@ -68,6 +68,29 @@ export interface DriverExecutionEnvironment {
   readonly variables: Record<string, string>;
 }
 
+export type DriverBuiltInToolName =
+  | "bash"
+  | "edit"
+  | "glob"
+  | "grep"
+  | "read"
+  | "web_fetch"
+  | "web_search"
+  | "write";
+
+export interface DriverBuiltInToolConfig {
+  readonly enabled: boolean;
+  readonly name: DriverBuiltInToolName;
+}
+
+function readBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${label} must be a boolean.`);
+  }
+
+  return value;
+}
+
 export interface DriverSkillCatalogFrontmatterSummary {
   readonly author: string | null;
   readonly description: string | null;
@@ -130,6 +153,7 @@ export interface DriverExecutionSessionSpec {
 }
 
 export interface DriverExecutionSpec {
+  readonly builtInTools: DriverBuiltInToolConfig[];
   readonly configRevision: DriverConfigRevision;
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
@@ -273,6 +297,33 @@ function readResolvedSkill(value: unknown, index: number): DriverResolvedSkill {
   };
 }
 
+function readBuiltInToolName(value: unknown, label: string): DriverBuiltInToolName {
+  if (
+    value === "bash" ||
+    value === "edit" ||
+    value === "glob" ||
+    value === "grep" ||
+    value === "read" ||
+    value === "web_fetch" ||
+    value === "web_search" ||
+    value === "write"
+  ) {
+    return value;
+  }
+
+  throw new TypeError(`${label} is unsupported.`);
+}
+
+function readBuiltInTool(value: unknown, index: number): DriverBuiltInToolConfig {
+  const label = `execution.builtInTools[${index}]`;
+  const record = readRecord(value, label);
+
+  return {
+    enabled: readBoolean(record["enabled"], `${label}.enabled`),
+    name: readBuiltInToolName(record["name"], `${label}.name`),
+  };
+}
+
 function readBootMcpServer(value: unknown, index: number): DriverBootMcpServer {
   const label = `execution.session.mcpServers[${index}]`;
   const record = readRecord(value, label);
@@ -331,6 +382,7 @@ function readExecution(value: unknown): DriverExecutionSpec {
   const environment = readRecord(record["environment"], "execution.environment");
 
   return {
+    builtInTools: readArray(record["builtInTools"], "execution.builtInTools").map(readBuiltInTool),
     configRevision: readConfigRevision(record["configRevision"]),
     environment: {
       variables: readVariables(environment["variables"]),
