@@ -124,6 +124,29 @@ describe("OpenAI app-server auth state", () => {
     expectDisabledRuntimeFeatures(config);
   });
 
+  test("passes reasoning effort and verbosity provider options into generated config", async () => {
+    const runtimeHome = await createRuntimeHome();
+
+    const result = await materializeOpenAiModelProviderConfig({
+      env: {
+        OPENAI_API_KEY: "openai-key",
+      },
+      provider: "openai",
+      providerOptions: {
+        model_reasoning_effort: "high",
+        model_verbosity: "low",
+      },
+      runtimeHome,
+    });
+
+    expect(result.written).toBe(true);
+    const config = await readGeneratedConfig(result.configTomlPath);
+
+    expect(config["model_reasoning_effort"]).toBe("high");
+    expect(config["model_verbosity"]).toBe("low");
+    expectDisabledRuntimeFeatures(config);
+  });
+
   test("writes mcp_servers tables into the generated config", async () => {
     const runtimeHome = await createRuntimeHome();
 
