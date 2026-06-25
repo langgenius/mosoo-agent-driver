@@ -2,11 +2,11 @@
 
 <img src="./assets/logo.svg" alt="Mosoo" width="138" height="138" />
 
-<h1>agent-driver</h1>
+<h1>mosoo-agent-driver</h1>
 
 <strong>One Driver Kernel. Every agent backend.</strong>
 <br />
-The runtime that drives a sandbox-hosted agent session inside Mosoo.
+The Mosoo Agent Driver — the runtime that drives a sandbox-hosted agent session inside Mosoo.
 
 <br />
 <br />
@@ -29,7 +29,7 @@ The runtime that drives a sandbox-hosted agent session inside Mosoo.
 
 ---
 
-`agent-driver` is the standalone runtime driver for sandbox-hosted agent sessions. It runs inside the sandbox and drives a single agent session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
+`mosoo-agent-driver` (published to npm as `agent-driver`) is the standalone runtime driver for sandbox-hosted agent sessions. It runs inside the sandbox and drives a single agent session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
 
 CMA (the Anthropic Managed Agents compatibility surface) is layered on top of the Driver Kernel through projections. Provider backends must emit Driver runtime events and consume Driver commands; they must not emit CMA events directly.
 
