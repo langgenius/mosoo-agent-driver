@@ -8,25 +8,21 @@ import { ClaudeAgentSdkDriverBackend } from "./claude/agent-sdk-driver-backend";
 import { OpenAiAppServerDriverBackend } from "./openai/app-server-driver-backend";
 
 export interface AgentDriverProviderDescriptor {
-  readonly aliases: readonly DriverRuntimeTransport[];
   readonly capabilities: readonly DriverCapability[];
   createBackend(input: DriverStartInput): AgentDriverBackend;
   readonly id: DriverRuntimeTransport;
   readonly requiredHostPorts: readonly AgentDriverHostPortName[];
   readonly runtime: DriverRuntime;
-  readonly unsupportedGaps: readonly string[];
 }
 
 export interface AgentDriverProviderRegistry {
   createBackend(input: DriverStartInput): AgentDriverBackend;
   getByStartInput(input: DriverStartInput): AgentDriverProviderDescriptor;
-  getByTransport(transport: DriverRuntimeTransport): AgentDriverProviderDescriptor | null;
   list(): readonly AgentDriverProviderDescriptor[];
 }
 
 const SHARED_REQUIRED_HOST_PORTS = [
   "event_sink",
-  "logger",
   "permission",
   "mcp",
   "skill",
@@ -48,7 +44,6 @@ const TEXT_TOOL_CAPABILITIES = [
 
 const PROVIDERS = [
   {
-    aliases: [],
     capabilities: [
       ...TEXT_TOOL_CAPABILITIES,
       { id: "native_resume", status: "supported", version: 1 },
@@ -58,10 +53,8 @@ const PROVIDERS = [
     id: "openai-app-server",
     requiredHostPorts: SHARED_REQUIRED_HOST_PORTS,
     runtime: "openai-runtime",
-    unsupportedGaps: ["thinking_stream"],
   },
   {
-    aliases: [],
     capabilities: [
       ...TEXT_TOOL_CAPABILITIES,
       { id: "native_resume", status: "supported", version: 1 },
@@ -71,10 +64,8 @@ const PROVIDERS = [
     id: "claude-agent-sdk",
     requiredHostPorts: SHARED_REQUIRED_HOST_PORTS,
     runtime: "claude-agent-sdk",
-    unsupportedGaps: [],
   },
   {
-    aliases: [],
     capabilities: [
       ...TEXT_TOOL_CAPABILITIES,
       { id: "native_resume", status: "supported", version: 1 },
@@ -84,7 +75,6 @@ const PROVIDERS = [
     id: "acp-fallback",
     requiredHostPorts: [...SHARED_REQUIRED_HOST_PORTS, "file", "host_integration"],
     runtime: "acp-fallback",
-    unsupportedGaps: [],
   },
 ] as const satisfies readonly AgentDriverProviderDescriptor[];
 
@@ -96,9 +86,6 @@ export function createAgentDriverProviderRegistry(
   for (const provider of providers) {
     registerProviderTransport(providersByTransport, provider, provider.id);
 
-    for (const alias of provider.aliases) {
-      registerProviderTransport(providersByTransport, provider, alias);
-    }
   }
 
   return {
@@ -107,9 +94,6 @@ export function createAgentDriverProviderRegistry(
     },
     getByStartInput(input) {
       return resolveProviderForStartInput(providersByTransport, input);
-    },
-    getByTransport(transport) {
-      return providersByTransport.get(transport) ?? null;
     },
     list() {
       return providers;

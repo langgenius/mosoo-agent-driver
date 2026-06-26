@@ -131,6 +131,7 @@ describe("Claude Agent SDK query options", () => {
         providerOptions: {
           effort: "max",
           maxTurns: 7,
+          tools: ["Bash", "Read", "WebFetch"],
         },
         session: {
           ...driverBootPayload.execution.session,

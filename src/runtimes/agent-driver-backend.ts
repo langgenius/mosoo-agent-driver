@@ -5,10 +5,8 @@ import type {
   AgentDriverFilePort,
   AgentDriverHostIntegrationPort,
   AgentDriverHostPorts,
-  AgentDriverLoggerPort,
   AgentDriverMcpPort,
   AgentDriverPermissionPort,
-  AgentDriverPolicyPort,
   AgentDriverSkillPort,
 } from "../host-ports";
 import type { Logger } from "../observability";
@@ -29,10 +27,8 @@ export type AgentDriverContextPortOverrides = Partial<{
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
   hostIntegration: AgentDriverHostIntegrationPort;
-  logger: AgentDriverLoggerPort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
-  policy: AgentDriverPolicyPort;
   skill: AgentDriverSkillPort;
 }>;
 
@@ -94,9 +90,6 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
         await eventSink.pushEvents({ events: [event] });
       },
     },
-    logger: {
-      logger: () => input.logger,
-    },
     hostIntegration: {
       snapshot: async () => null,
     },
@@ -106,9 +99,6 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
       },
     },
     permission: input.permission,
-    policy: {
-      assertSupported: async () => {},
-    },
     skill: {
       materialize: async () => {
         throw new Error("Driver skill host port is not configured.");
