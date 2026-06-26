@@ -1,4 +1,3 @@
-import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
@@ -12,9 +11,7 @@ export type AgentDriverHostPortName =
   | "mcp"
   | "skill"
   | "file"
-  | "host_integration"
-  | "logger"
-  | "policy";
+  | "host_integration";
 
 export interface AgentDriverCommandSource {
   nextCommand(): Promise<RuntimeCommand | null>;
@@ -72,22 +69,13 @@ export interface AgentDriverHostIntegrationPort {
   snapshot(): Promise<DriverHostIntegrationSnapshot | null>;
 }
 
-export interface AgentDriverLoggerPort {
-  logger(): Logger;
-}
-
-export interface AgentDriverPolicyPort {
-  assertSupported(input: { capability: string; subject: string }): Promise<void>;
-}
 
 export interface AgentDriverHostPorts {
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
   hostIntegration: AgentDriverHostIntegrationPort;
-  logger: AgentDriverLoggerPort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
-  policy: AgentDriverPolicyPort;
   skill: AgentDriverSkillPort;
 }

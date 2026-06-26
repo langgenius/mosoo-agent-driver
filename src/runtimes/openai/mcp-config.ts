@@ -1,5 +1,6 @@
 import type { AuthorizedDriverBootMcpServer, DriverBootMcpServer } from "../../protocol/boot";
 import type { JsonValue } from "../../protocol/json";
+import { toMcpServerKey } from "../mcp/server-key";
 
 export interface OpenAiMcpServerConfig {
   /**
@@ -19,19 +20,6 @@ function isAuthorized(server: DriverBootMcpServer): server is AuthorizedDriverBo
   return server.authorizationState === "active";
 }
 
-function toMcpServerKey(server: DriverBootMcpServer, usedNames: Set<string>): string {
-  const baseName = server.name.trim() || server.serverId;
-  let candidate = baseName;
-  let suffix = 2;
-
-  while (usedNames.has(candidate)) {
-    candidate = `${baseName}-${suffix}`;
-    suffix += 1;
-  }
-
-  usedNames.add(candidate);
-  return candidate;
-}
 
 function toBearerTokenEnvName(index: number): string {
   return `MOSOO_MCP_BEARER_TOKEN_${index}`;

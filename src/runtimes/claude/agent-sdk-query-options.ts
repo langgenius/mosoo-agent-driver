@@ -14,6 +14,7 @@ import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
 import type { AgentDriverContext } from "../agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
+import { toMcpServerKey } from "../mcp/server-key";
 import { mergeProviderOptions } from "../provider-options";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
@@ -66,19 +67,6 @@ function createCanUseTool(context: AgentDriverContext): CanUseTool {
   };
 }
 
-function toMcpServerKey(server: DriverBootMcpServer, usedNames: Set<string>): string {
-  const baseName = server.name.trim() || server.serverId;
-  let candidate = baseName;
-  let suffix = 2;
-
-  while (usedNames.has(candidate)) {
-    candidate = `${baseName}-${suffix}`;
-    suffix += 1;
-  }
-
-  usedNames.add(candidate);
-  return candidate;
-}
 
 function toClaudeMcpServers(
   servers: DriverBootMcpServer[],
@@ -155,7 +143,8 @@ export async function createClaudeQueryOptions(input: {
       });
     },
   };
-  options.tools = toClaudeBuiltInTools(input.payload);
+  const builtInTools = toClaudeBuiltInTools(input.payload);
+  options.tools = builtInTools;
 
   const claudeCodeExecutable = readProcessEnvString(CLAUDE_CODE_EXECUTABLE_ENV);
   if (isTruthy(claudeCodeExecutable)) {
@@ -179,5 +168,7 @@ export async function createClaudeQueryOptions(input: {
     options.resume = input.nativeSessionId;
   }
 
-  return mergeClaudeQueryOptions(options, input.payload.execution.providerOptions);
+  const mergedOptions = mergeClaudeQueryOptions(options, input.payload.execution.providerOptions);
+  mergedOptions.tools = builtInTools;
+  return mergedOptions;
 }

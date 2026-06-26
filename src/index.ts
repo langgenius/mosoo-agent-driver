@@ -80,8 +80,6 @@ export type {
   AgentDriverSkillPort,
   AgentDriverFilePort,
   AgentDriverHostIntegrationPort,
-  AgentDriverLoggerPort,
-  AgentDriverPolicyPort,
 } from "./host-ports";
 export type {
   AgentDriverBackend,

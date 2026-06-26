@@ -93,17 +93,16 @@ describe("provider registry", () => {
     ).toEqual([
       {
         id: "openai-app-server",
-        requiredHostPorts: ["event_sink", "logger", "permission", "mcp", "skill"],
+        requiredHostPorts: ["event_sink", "permission", "mcp", "skill"],
       },
       {
         id: "claude-agent-sdk",
-        requiredHostPorts: ["event_sink", "logger", "permission", "mcp", "skill"],
+        requiredHostPorts: ["event_sink", "permission", "mcp", "skill"],
       },
       {
         id: "acp-fallback",
         requiredHostPorts: [
           "event_sink",
-          "logger",
           "permission",
           "mcp",
           "skill",
