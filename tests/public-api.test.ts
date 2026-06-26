@@ -30,7 +30,6 @@ import {
 import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "../src/orpc";
 import { SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH } from "../src/paths";
 import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "../src/runtime";
-import { AGENT_DRIVER_TESTING_FIXTURE_PATHS, AGENT_DRIVER_TESTING_FIXTURES } from "../src/testing";
 
 describe("public API", () => {
   test("imports without starting the driver process", () => {
@@ -95,11 +94,5 @@ describe("public API", () => {
     });
     expect(isSupportedDriverRuntimeFromSubpath("openai-runtime")).toBe(true);
     expect(SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH).toBe("/workspace/memory");
-    expect(AGENT_DRIVER_TESTING_FIXTURES.cma.inbound.userMessage).toBe(
-      "tests/fixtures/cma/inbound/user-message.json",
-    );
-    expect(AGENT_DRIVER_TESTING_FIXTURE_PATHS).toContain(
-      AGENT_DRIVER_TESTING_FIXTURES.providers.openaiAppServer.turnPlanUpdated,
-    );
   });
 });

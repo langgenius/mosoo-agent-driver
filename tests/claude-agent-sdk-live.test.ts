@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
+import { textDeltaFrom, waitForTerminalTurnEvent } from "./live-driver-events";
 
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
@@ -34,87 +34,6 @@ function readLiveApiKey(): string | null {
 
 function readLiveModel(): string {
   return readEnvString(LIVE_MODEL_ENV) ?? DEFAULT_LIVE_MODEL;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function eventPayload(event: DriverEventInput): Record<string, unknown> | null {
-  return isRecord(event.payload) ? event.payload : null;
-}
-
-function textDeltaFrom(event: DriverEventInput): string {
-  if (event.kind !== "message.delta") {
-    return "";
-  }
-
-  const contentDelta = eventPayload(event)?.["contentDelta"];
-  return typeof contentDelta === "string" ? contentDelta : "";
-}
-
-function errorMessageFrom(event: DriverEventInput): string {
-  const error = eventPayload(event)?.["error"];
-
-  if (!isRecord(error)) {
-    return "unknown provider error";
-  }
-
-  const code = typeof error["code"] === "string" ? error["code"] : "unknown";
-  const message = typeof error["message"] === "string" ? error["message"] : "unknown";
-  return `${code}: ${message}`;
-}
-
-function describeCollectedKinds(events: readonly DriverEventInput[]): string {
-  return events.map((event) => event.kind).join(", ");
-}
-
-async function waitForTerminalTurnEvent(input: {
-  events: AsyncIterable<DriverEventInput>;
-  timeoutMs: number;
-}): Promise<DriverEventInput[]> {
-  const collected: DriverEventInput[] = [];
-  const iterator = input.events[Symbol.asyncIterator]();
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<"timeout">((resolve) => {
-    timeoutId = setTimeout(() => resolve("timeout"), input.timeoutMs);
-  });
-
-  try {
-    while (true) {
-      const result = await Promise.race([iterator.next(), timeout]);
-
-      if (result === "timeout") {
-        throw new Error(
-          `Timed out waiting for live driver turn. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      if (result.done) {
-        throw new Error(
-          `Driver event stream closed before live turn completed. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      collected.push(result.value);
-
-      if (result.value.kind === "run.failed") {
-        throw new Error(`Live driver turn failed: ${errorMessageFrom(result.value)}`);
-      }
-
-      if (result.value.kind === "run.completed") {
-        return collected;
-      }
-    }
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-  }
 }
 
 async function createLiveDriverPaths(): Promise<{

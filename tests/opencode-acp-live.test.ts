@@ -6,12 +6,12 @@ import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
+import { textDeltaFrom, waitForTerminalTurnEvent, withLiveTimeout } from "./live-driver-events";
 
 const LIVE_ENABLED_ENV = "AGENT_DRIVER_LIVE_OPENCODE";
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_OPENCODE_API_KEY";
@@ -175,50 +175,6 @@ function readOpenCodeVersion(command: string): string {
   return result.stdout.trim() || "unknown";
 }
 
-async function withTimeout<T>(input: {
-  details: Record<string, string | number | boolean>;
-  label: string;
-  task: () => Promise<T>;
-  timeoutMs: number;
-}): Promise<T> {
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  let progressId: ReturnType<typeof setInterval> | null = null;
-  const startedAtMs = Date.now();
-  const timeout = new Promise<"timeout">((resolve) => {
-    timeoutId = setTimeout(() => resolve("timeout"), input.timeoutMs);
-  });
-  progressId = setInterval(() => {
-    logLiveStatus(`waiting for ${input.label}`, {
-      ...input.details,
-      elapsedMs: Date.now() - startedAtMs,
-    });
-  }, 10_000);
-
-  try {
-    const result = await Promise.race([input.task(), timeout]);
-
-    if (result === "timeout") {
-      throw new Error(
-        `Timed out waiting for ${input.label}. ${JSON.stringify(
-          Object.fromEntries(
-            Object.entries(input.details).toSorted((a, b) => a[0].localeCompare(b[0])),
-          ),
-        )}`,
-      );
-    }
-
-    return result;
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-
-    if (progressId) {
-      clearInterval(progressId);
-    }
-  }
-}
-
 function toOpenCodeModelId(model: string): string {
   const providerConfig = liveProviderConfig ?? PROVIDER_CONFIGS.openai;
 
@@ -243,119 +199,6 @@ function createOpenCodeConfig(): string {
     },
     small_model: toOpenCodeModelId(readLiveSmallModel()),
   });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function eventPayload(event: DriverEventInput): Record<string, unknown> | null {
-  return isRecord(event.payload) ? event.payload : null;
-}
-
-function textDeltaFrom(event: DriverEventInput): string {
-  if (event.kind !== "message.delta") {
-    return "";
-  }
-
-  const contentDelta = eventPayload(event)?.["contentDelta"];
-  return typeof contentDelta === "string" ? contentDelta : "";
-}
-
-function errorMessageFrom(event: DriverEventInput): string {
-  const error = eventPayload(event)?.["error"];
-
-  if (!isRecord(error)) {
-    return "unknown provider error";
-  }
-
-  const code = typeof error["code"] === "string" ? error["code"] : "unknown";
-  const message = typeof error["message"] === "string" ? error["message"] : "unknown";
-  return `${code}: ${message}`;
-}
-
-function describeCollectedKinds(events: readonly DriverEventInput[]): string {
-  return events.map((event) => event.kind).join(", ");
-}
-
-async function waitForTerminalTurnEvent(input: {
-  events: AsyncIterable<DriverEventInput>;
-  timeoutMs: number;
-}): Promise<DriverEventInput[]> {
-  const collected: DriverEventInput[] = [];
-  const iterator = input.events[Symbol.asyncIterator]();
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  let progressId: ReturnType<typeof setInterval> | null = null;
-  let messageDeltaChars = 0;
-  let lastEventKind = "none";
-  const startedAtMs = Date.now();
-  const timeout = new Promise<"timeout">((resolve) => {
-    timeoutId = setTimeout(() => resolve("timeout"), input.timeoutMs);
-  });
-  progressId = setInterval(() => {
-    logLiveStatus("waiting for terminal event", {
-      elapsedMs: Date.now() - startedAtMs,
-      events: collected.length,
-      lastEventKind,
-      messageDeltaChars,
-    });
-  }, 10_000);
-
-  try {
-    while (true) {
-      const result = await Promise.race([iterator.next(), timeout]);
-
-      if (result === "timeout") {
-        throw new Error(
-          `Timed out waiting for live driver turn. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      if (result.done) {
-        throw new Error(
-          `Driver event stream closed before live turn completed. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      collected.push(result.value);
-      lastEventKind = result.value.kind;
-
-      if (result.value.kind === "message.delta") {
-        messageDeltaChars += textDeltaFrom(result.value).length;
-      }
-
-      logLiveStatus("received event", {
-        count: collected.length,
-        kind: result.value.kind,
-        messageDeltaChars,
-      });
-
-      if (result.value.kind === "run.failed") {
-        throw new Error(`Live driver turn failed: ${errorMessageFrom(result.value)}`);
-      }
-
-      if (result.value.kind === "run.completed") {
-        logLiveStatus("terminal event received", {
-          elapsedMs: Date.now() - startedAtMs,
-          events: collected.length,
-          messageDeltaChars,
-        });
-        return collected;
-      }
-    }
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-
-    if (progressId) {
-      clearInterval(progressId);
-    }
-  }
 }
 
 async function createLiveDriverPaths(): Promise<{
@@ -557,9 +400,10 @@ describe("OpenCode ACP live provider", () => {
       try {
         await withOpenCodeFallbackEnv(async () => {
           logLiveStatus("starting driver kernel", runtimeDetails);
-          await withTimeout({
+          await withLiveTimeout({
             details: runtimeDetails,
             label: "OpenCode ACP driver kernel start",
+            logStatus: logLiveStatus,
             task: () => kernel.start(startInput),
             timeoutMs: LIVE_START_TIMEOUT_MS,
           });
@@ -578,6 +422,7 @@ describe("OpenCode ACP live provider", () => {
           });
           const turnEvents = await waitForTerminalTurnEvent({
             events,
+            logStatus: logLiveStatus,
             timeoutMs: LIVE_TURN_TIMEOUT_MS,
           });
           const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
@@ -593,9 +438,10 @@ describe("OpenCode ACP live provider", () => {
         });
       } finally {
         logLiveStatus("stopping driver kernel", { kernelStarted });
-        await withTimeout({
+        await withLiveTimeout({
           details: { kernelStarted },
           label: "OpenCode ACP driver kernel stop",
+          logStatus: logLiveStatus,
           task: () => kernel.stop("test.stop"),
           timeoutMs: 5_000,
         }).catch((error: unknown) => {

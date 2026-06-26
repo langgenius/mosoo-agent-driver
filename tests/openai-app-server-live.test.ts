@@ -5,10 +5,10 @@ import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { OPENAI_DEFAULT_MODEL_ID } from "../src/models";
-import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
+import { textDeltaFrom, waitForTerminalTurnEvent } from "./live-driver-events";
 
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_OPENAI_API_KEY";
 const PROVIDER_API_KEY_ENV = "OPENAI_API_KEY";
@@ -45,125 +45,6 @@ function readLiveApiKey(): string | null {
 
 function readLiveModel(): string {
   return readEnvString(LIVE_MODEL_ENV) ?? OPENAI_DEFAULT_MODEL_ID;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function eventPayload(event: DriverEventInput): Record<string, unknown> | null {
-  return isRecord(event.payload) ? event.payload : null;
-}
-
-function textDeltaFrom(event: DriverEventInput): string {
-  if (event.kind !== "message.delta") {
-    return "";
-  }
-
-  const contentDelta = eventPayload(event)?.["contentDelta"];
-  return typeof contentDelta === "string" ? contentDelta : "";
-}
-
-function errorMessageFrom(event: DriverEventInput): string {
-  const error = eventPayload(event)?.["error"];
-
-  if (!isRecord(error)) {
-    return "unknown provider error";
-  }
-
-  const code = typeof error["code"] === "string" ? error["code"] : "unknown";
-  const message = typeof error["message"] === "string" ? error["message"] : "unknown";
-  return `${code}: ${message}`;
-}
-
-function describeCollectedKinds(events: readonly DriverEventInput[]): string {
-  return events.map((event) => event.kind).join(", ");
-}
-
-async function waitForTerminalTurnEvent(input: {
-  events: AsyncIterable<DriverEventInput>;
-  timeoutMs: number;
-}): Promise<DriverEventInput[]> {
-  const collected: DriverEventInput[] = [];
-  const iterator = input.events[Symbol.asyncIterator]();
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  let progressId: ReturnType<typeof setInterval> | null = null;
-  let messageDeltaCount = 0;
-  let messageDeltaChars = 0;
-  const startedAtMs = Date.now();
-  const timeout = new Promise<"timeout">((resolve) => {
-    timeoutId = setTimeout(() => resolve("timeout"), input.timeoutMs);
-  });
-  progressId = setInterval(() => {
-    logLiveStatus("still waiting for terminal event", {
-      elapsedMs: Date.now() - startedAtMs,
-      events: collected.length,
-      messageDeltaChars,
-    });
-  }, 10_000);
-
-  try {
-    while (true) {
-      const result = await Promise.race([iterator.next(), timeout]);
-
-      if (result === "timeout") {
-        throw new Error(
-          `Timed out waiting for live driver turn. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      if (result.done) {
-        throw new Error(
-          `Driver event stream closed before live turn completed. Collected events: ${describeCollectedKinds(
-            collected,
-          )}`,
-        );
-      }
-
-      collected.push(result.value);
-
-      if (result.value.kind === "message.delta") {
-        const deltaLength = textDeltaFrom(result.value).length;
-        messageDeltaCount += 1;
-        messageDeltaChars += deltaLength;
-
-        if (messageDeltaCount === 1 || messageDeltaCount % 20 === 0) {
-          logLiveStatus("received message delta", {
-            chars: messageDeltaChars,
-            count: messageDeltaCount,
-          });
-        }
-      } else {
-        logLiveStatus("received event", {
-          count: collected.length,
-          kind: result.value.kind,
-        });
-      }
-
-      if (result.value.kind === "run.failed") {
-        throw new Error(`Live driver turn failed: ${errorMessageFrom(result.value)}`);
-      }
-
-      if (result.value.kind === "run.completed") {
-        logLiveStatus("terminal event received", {
-          elapsedMs: Date.now() - startedAtMs,
-          events: collected.length,
-          messageDeltaChars,
-        });
-        return collected;
-      }
-    }
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-
-    if (progressId) {
-      clearInterval(progressId);
-    }
-  }
 }
 
 async function createLiveDriverPaths(): Promise<{
@@ -278,6 +159,8 @@ describe("OpenAI app-server live provider", () => {
         logLiveStatus("waiting for terminal event");
         const turnEvents = await waitForTerminalTurnEvent({
           events,
+          logStatus: logLiveStatus,
+          progressMessage: "still waiting for terminal event",
           timeoutMs: LIVE_TURN_TIMEOUT_MS,
         });
         const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();

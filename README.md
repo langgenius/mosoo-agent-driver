@@ -59,7 +59,6 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - `agent-driver/orpc`: sandbox-local driver RPC wire input/output contracts.
 - `agent-driver/cma-http`: CMA-compatible HTTP surface.
 - `agent-driver/cma-sdk`: thin CMA client.
-- `agent-driver/testing`: public golden fixture manifest.
 
 Every public entry has a matching declaration file under `dist/types`.
 
@@ -151,7 +150,6 @@ bun run docker:build
 - `bun run docker:build`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
-- golden fixtures are packaged under `tests/fixtures`
 - live provider smoke tests are gated by environment credentials
 
 ## License
