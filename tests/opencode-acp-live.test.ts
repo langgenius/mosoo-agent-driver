@@ -20,18 +20,25 @@ const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_OPENCODE_MODEL";
 const LIVE_PROVIDER_ENV = "AGENT_DRIVER_LIVE_OPENCODE_PROVIDER";
 const LIVE_SMALL_MODEL_ENV = "AGENT_DRIVER_LIVE_OPENCODE_SMALL_MODEL";
 const ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY";
+const DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY";
+const OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY";
 const OPENAI_API_KEY_ENV = "OPENAI_API_KEY";
 const LIVE_START_TIMEOUT_MS = 120_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 const OPENCODE_ACP_ARGS = ["acp", "--pure", "--print-logs", "--log-level", "DEBUG"] as const;
 
-type OpenCodeLiveProvider = "anthropic" | "openai";
+type OpenCodeLiveProvider = "anthropic" | "deepseek" | "openai" | "opencode";
 
 interface OpenCodeLiveProviderConfig {
   readonly defaultModel: string;
   readonly defaultSmallModel: string;
   readonly id: OpenCodeLiveProvider;
   readonly providerApiKeyEnv: string;
+  readonly openCodeProvider?: {
+    readonly baseURL: string;
+    readonly name: string;
+    readonly npm: string;
+  };
 }
 
 const PROVIDER_CONFIGS = {
@@ -41,11 +48,28 @@ const PROVIDER_CONFIGS = {
     id: "anthropic",
     providerApiKeyEnv: ANTHROPIC_API_KEY_ENV,
   },
+  deepseek: {
+    defaultModel: "deepseek-v4-pro",
+    defaultSmallModel: "deepseek-v4-pro",
+    id: "deepseek",
+    openCodeProvider: {
+      baseURL: "https://api.deepseek.com",
+      name: "DeepSeek",
+      npm: "@ai-sdk/openai-compatible",
+    },
+    providerApiKeyEnv: DEEPSEEK_API_KEY_ENV,
+  },
   openai: {
     defaultModel: "gpt-5.4",
     defaultSmallModel: "gpt-5-nano",
     id: "openai",
     providerApiKeyEnv: OPENAI_API_KEY_ENV,
+  },
+  opencode: {
+    defaultModel: "deepseek-v4-flash-free",
+    defaultSmallModel: "deepseek-v4-flash-free",
+    id: "opencode",
+    providerApiKeyEnv: OPENCODE_API_KEY_ENV,
   },
 } as const satisfies Record<OpenCodeLiveProvider, OpenCodeLiveProviderConfig>;
 
@@ -98,7 +122,12 @@ function isLiveEnabled(): boolean {
 function readLiveProvider(): OpenCodeLiveProvider {
   const provider = readEnvString(LIVE_PROVIDER_ENV) ?? "openai";
 
-  if (provider === "anthropic" || provider === "openai") {
+  if (
+    provider === "anthropic" ||
+    provider === "deepseek" ||
+    provider === "openai" ||
+    provider === "opencode"
+  ) {
     return provider;
   }
 
@@ -229,17 +258,26 @@ function createOpenCodeConfig(): string {
   if (liveProviderConfig === null) {
     throw new Error("OpenCode live provider config is unavailable when live testing is disabled.");
   }
+  const options: Record<string, string> = {
+    apiKey: `{env:${liveProviderConfig.providerApiKeyEnv}}`,
+  };
+  const providerConfig = liveProviderConfig.openCodeProvider
+    ? {
+        name: liveProviderConfig.openCodeProvider.name,
+        npm: liveProviderConfig.openCodeProvider.npm,
+        options: {
+          ...options,
+          baseURL: liveProviderConfig.openCodeProvider.baseURL,
+        },
+      }
+    : { options };
 
   return JSON.stringify({
     $schema: "https://opencode.ai/config.json",
     enabled_providers: [liveProviderConfig.id],
     model: toOpenCodeModelId(readLiveModel()),
     provider: {
-      [liveProviderConfig.id]: {
-        options: {
-          apiKey: `{env:${liveProviderConfig.providerApiKeyEnv}}`,
-        },
-      },
+      [liveProviderConfig.id]: providerConfig,
     },
     small_model: toOpenCodeModelId(readLiveSmallModel()),
   });

@@ -6,6 +6,17 @@ import { isRecord, readRecord } from "./acp-types";
 export const ACP_PROTOCOL_VERSION = 1 as const;
 const ACP_RUNTIME_HOME_DIR = "acp-fallback";
 const ACP_DEFAULT_COMMAND = "acp-agent";
+const ACP_INHERITED_PROCESS_ENV_KEYS = [
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NODE_USE_ENV_PROXY",
+  "NO_PROXY",
+  "all_proxy",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+] as const;
 
 export function readAcpFallbackCommand(): string {
   const command = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
@@ -30,18 +41,36 @@ export function readAcpFallbackArgs(): string[] {
   return parsed;
 }
 
-export function buildAcpChildProcessEnv(payload: DriverStartInput): Record<string, string> {
+function buildAcpInheritedProcessEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const inherited: Record<string, string> = {};
+
+  for (const key of ACP_INHERITED_PROCESS_ENV_KEYS) {
+    const value = env[key];
+
+    if (typeof value === "string" && value.trim().length > 0) {
+      inherited[key] = value;
+    }
+  }
+
+  return inherited;
+}
+
+export function buildAcpChildProcessEnv(
+  payload: DriverStartInput,
+  processEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   const { homePath } = payload.execution.session;
 
   return {
     ...payload.execution.environment.variables,
+    ...buildAcpInheritedProcessEnv(processEnv),
     DISABLE_AUTOUPDATER: "1",
     DISABLE_ERROR_REPORTING: "1",
     DISABLE_TELEMETRY: "1",
     MOSOO_ACP_HOME: `${homePath}/${ACP_RUNTIME_HOME_DIR}`,
     HOME: homePath,
     IS_SANDBOX: "1",
-    PATH: process.env["PATH"] ?? "",
+    PATH: processEnv["PATH"] ?? "",
     PWD: payload.execution.session.cwd,
   };
 }

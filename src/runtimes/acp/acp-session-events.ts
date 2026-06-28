@@ -11,6 +11,8 @@ import {
 } from "./acp-types";
 import type { AcpInitializeResult, JsonObject } from "./acp-types";
 
+const ACP_USAGE_CONTRACT = "openai_total_with_cached_breakdown";
+
 export function toAcpInitializeEvents(result: AcpInitializeResult): DriverEventInput[] {
   const events: DriverEventInput[] = [
     {
@@ -162,8 +164,9 @@ export function normalizePromptUsage(raw: unknown): JsonObject | null {
     inputTokens,
     outputTokens,
     raw,
-    source: "acp.prompt",
+    source: "prompt_response",
     totalTokens,
+    usageContract: ACP_USAGE_CONTRACT,
   };
 }
 
@@ -216,7 +219,7 @@ function normalizeAvailableCommands(raw: unknown): JsonObject[] | null {
 
     return [
       {
-        description: readNullableString(entry, "description") ?? null,
+        description: readNullableString(entry, "description") ?? "",
         input: entry["input"] ?? null,
         name,
       },
@@ -226,12 +229,71 @@ function normalizeAvailableCommands(raw: unknown): JsonObject[] | null {
   return commands;
 }
 
+function normalizeConfigValueOptions(raw: unknown): JsonObject[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw.flatMap((entry): JsonObject[] => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+
+    const value = readNonEmptyString(entry, "value");
+
+    if (value === null) {
+      return [];
+    }
+
+    const description = readNullableString(entry, "description");
+    const group = readNullableString(entry, "group");
+    const groupName = readNullableString(entry, "groupName");
+
+    return [
+      {
+        ...(description === undefined ? {} : { description }),
+        ...(group === undefined ? {} : { group }),
+        ...(groupName === undefined ? {} : { groupName }),
+        name: readNonEmptyString(entry, "name") ?? value,
+        value,
+      },
+    ];
+  });
+}
+
 function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
   if (!Array.isArray(raw)) {
     return null;
   }
 
-  return raw.filter(isRecord);
+  return raw.flatMap((entry): JsonObject[] => {
+    if (!isRecord(entry) || entry["type"] !== "select") {
+      return [];
+    }
+
+    const id = readNonEmptyString(entry, "id");
+    const currentValue = readString(entry, "currentValue");
+
+    if (id === null || currentValue === null) {
+      return [];
+    }
+
+    const category = readNullableString(entry, "category");
+    const description = readNullableString(entry, "description");
+    const rawValues = entry["values"] ?? entry["options"];
+
+    return [
+      {
+        ...(category === undefined ? {} : { category }),
+        currentValue,
+        ...(description === undefined ? {} : { description }),
+        id,
+        name: readNonEmptyString(entry, "name") ?? id,
+        type: "select",
+        values: normalizeConfigValueOptions(rawValues),
+      },
+    ];
+  });
 }
 
 function normalizePlanEntries(raw: unknown): JsonObject[] {
@@ -402,9 +464,11 @@ function toSessionModelsEvents(setup: JsonObject | null): DriverEventInput[] {
 export function toUsageUpdateEvents(update: JsonObject | null): DriverEventInput[] {
   const used = readNumber(update, "used");
   const size = readNumber(update, "size");
-  const cost = update?.["cost"];
+  const cost = readRecord(update, "cost");
+  const costAmount = readNumber(cost, "amount");
+  const costCurrency = readNullableString(cost, "currency");
 
-  if (used === null && size === null && cost === undefined) {
+  if (used === null && size === null && cost === null) {
     return [];
   }
 
@@ -412,9 +476,11 @@ export function toUsageUpdateEvents(update: JsonObject | null): DriverEventInput
     {
       kind: "usage.updated",
       payload: {
-        cost,
+        costAmount,
+        ...(costCurrency === undefined ? {} : { costCurrency }),
         size,
-        source: "acp.session",
+        source: "session_update",
+        usageContract: ACP_USAGE_CONTRACT,
         used,
       },
     },
