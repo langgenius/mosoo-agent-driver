@@ -274,23 +274,25 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
     const id = readNonEmptyString(entry, "id");
     const currentValue = readString(entry, "currentValue");
 
-    if (id === null || currentValue === null) {
+    if (id === null) {
       return [];
     }
 
     const category = readNullableString(entry, "category");
     const description = readNullableString(entry, "description");
+    const name = readNonEmptyString(entry, "name");
     const rawValues = entry["values"] ?? entry["options"];
+    const values = Array.isArray(rawValues) ? normalizeConfigValueOptions(rawValues) : null;
 
     return [
       {
         ...(category === undefined ? {} : { category }),
-        currentValue,
+        ...(currentValue === null ? {} : { currentValue }),
         ...(description === undefined ? {} : { description }),
         id,
-        name: readNonEmptyString(entry, "name") ?? id,
+        ...(name === null ? {} : { name }),
         type: "select",
-        values: normalizeConfigValueOptions(rawValues),
+        ...(values === null ? {} : { values }),
       },
     ];
   });

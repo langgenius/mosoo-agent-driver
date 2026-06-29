@@ -34,11 +34,6 @@ interface OpenCodeLiveProviderConfig {
   readonly defaultSmallModel: string;
   readonly id: OpenCodeLiveProvider;
   readonly providerApiKeyEnv: string;
-  readonly openCodeProvider?: {
-    readonly baseURL: string;
-    readonly name: string;
-    readonly npm: string;
-  };
 }
 
 const PROVIDER_CONFIGS = {
@@ -52,11 +47,6 @@ const PROVIDER_CONFIGS = {
     defaultModel: "deepseek-v4-pro",
     defaultSmallModel: "deepseek-v4-pro",
     id: "deepseek",
-    openCodeProvider: {
-      baseURL: "https://api.deepseek.com",
-      name: "DeepSeek",
-      npm: "@ai-sdk/openai-compatible",
-    },
     providerApiKeyEnv: DEEPSEEK_API_KEY_ENV,
   },
   openai: {
@@ -261,23 +251,13 @@ function createOpenCodeConfig(): string {
   const options: Record<string, string> = {
     apiKey: `{env:${liveProviderConfig.providerApiKeyEnv}}`,
   };
-  const providerConfig = liveProviderConfig.openCodeProvider
-    ? {
-        name: liveProviderConfig.openCodeProvider.name,
-        npm: liveProviderConfig.openCodeProvider.npm,
-        options: {
-          ...options,
-          baseURL: liveProviderConfig.openCodeProvider.baseURL,
-        },
-      }
-    : { options };
 
   return JSON.stringify({
     $schema: "https://opencode.ai/config.json",
     enabled_providers: [liveProviderConfig.id],
     model: toOpenCodeModelId(readLiveModel()),
     provider: {
-      [liveProviderConfig.id]: providerConfig,
+      [liveProviderConfig.id]: { options },
     },
     small_model: toOpenCodeModelId(readLiveSmallModel()),
   });

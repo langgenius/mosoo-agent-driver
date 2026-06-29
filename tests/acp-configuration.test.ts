@@ -68,6 +68,32 @@ describe("ACP runtime configuration", () => {
     expect(env["RANDOM_SECRET"]).toBeUndefined();
   });
 
+  test("keeps explicit ACP execution proxy env above inherited process env", () => {
+    const env = buildAcpChildProcessEnv(
+      {
+        ...bootPayload,
+        execution: {
+          ...bootPayload.execution,
+          environment: {
+            variables: {
+              ...bootPayload.execution.environment.variables,
+              HTTPS_PROXY: "http://explicit-proxy:7897",
+              NO_PROXY: "metadata.google.internal",
+            },
+          },
+        },
+      },
+      {
+        HTTPS_PROXY: "http://ambient-proxy:7897",
+        NO_PROXY: "localhost,127.0.0.1",
+        PATH: "/usr/local/bin:/usr/bin",
+      },
+    );
+
+    expect(env["HTTPS_PROXY"]).toBe("http://explicit-proxy:7897");
+    expect(env["NO_PROXY"]).toBe("metadata.google.internal");
+  });
+
   test("requires host integration snapshot before starting", async () => {
     const logger = createBufferedSinkLogger({
       level: "debug",

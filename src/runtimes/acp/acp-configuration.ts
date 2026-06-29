@@ -62,8 +62,8 @@ export function buildAcpChildProcessEnv(
   const { homePath } = payload.execution.session;
 
   return {
-    ...payload.execution.environment.variables,
     ...buildAcpInheritedProcessEnv(processEnv),
+    ...payload.execution.environment.variables,
     DISABLE_AUTOUPDATER: "1",
     DISABLE_ERROR_REPORTING: "1",
     DISABLE_TELEMETRY: "1",
