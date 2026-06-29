@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { createBufferedSinkLogger } from "../src/observability";
 import {
   ACP_PROTOCOL_VERSION,
+  buildAcpChildProcessEnv,
   enforceAcpProtocolVersion,
   resolveAcpAuthMethodId,
 } from "../src/runtimes/acp/acp-configuration";
@@ -47,6 +48,50 @@ describe("ACP runtime configuration", () => {
         MOSOO_ACP_AUTH_METHOD_ID: "device-login",
       }),
     ).toThrow();
+  });
+
+  test("inherits runtime proxy env for ACP child processes only", () => {
+    const env = buildAcpChildProcessEnv(bootPayload, {
+      HTTPS_PROXY: "http://host.docker.internal:7897",
+      NODE_USE_ENV_PROXY: "1",
+      PATH: "/usr/local/bin:/usr/bin",
+      RANDOM_SECRET: "secret",
+      http_proxy: "http://host.docker.internal:7897",
+    });
+
+    expect(env).toMatchObject({
+      HTTPS_PROXY: "http://host.docker.internal:7897",
+      NODE_USE_ENV_PROXY: "1",
+      PATH: "/usr/local/bin:/usr/bin",
+      http_proxy: "http://host.docker.internal:7897",
+    });
+    expect(env["RANDOM_SECRET"]).toBeUndefined();
+  });
+
+  test("keeps explicit ACP execution proxy env above inherited process env", () => {
+    const env = buildAcpChildProcessEnv(
+      {
+        ...bootPayload,
+        execution: {
+          ...bootPayload.execution,
+          environment: {
+            variables: {
+              ...bootPayload.execution.environment.variables,
+              HTTPS_PROXY: "http://explicit-proxy:7897",
+              NO_PROXY: "metadata.google.internal",
+            },
+          },
+        },
+      },
+      {
+        HTTPS_PROXY: "http://ambient-proxy:7897",
+        NO_PROXY: "localhost,127.0.0.1",
+        PATH: "/usr/local/bin:/usr/bin",
+      },
+    );
+
+    expect(env["HTTPS_PROXY"]).toBe("http://explicit-proxy:7897");
+    expect(env["NO_PROXY"]).toBe("metadata.google.internal");
   });
 
   test("requires host integration snapshot before starting", async () => {

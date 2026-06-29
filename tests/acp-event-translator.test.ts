@@ -325,4 +325,134 @@ describe("ACP runtime event translation", () => {
       visibility: "owner_debug",
     });
   });
+
+  test("normalizes ACP config options to the Mosoo session config contract", () => {
+    const events = toAcpSessionReadyEvents({
+      mode: "created",
+      nativeSessionId: "native-session-1",
+      setup: {
+        configOptions: [
+          {
+            category: "model",
+            currentValue: "deepseek/deepseek-v4-pro",
+            id: "model",
+            name: "Model",
+            options: [
+              {
+                name: "DeepSeek/DeepSeek V4 Pro",
+                value: "deepseek/deepseek-v4-pro",
+              },
+            ],
+            type: "select",
+          },
+        ],
+      },
+    });
+    const configEvent = events.find((event) => event.kind === "session.config.updated");
+    const payload = eventPayload(configEvent as DriverEventInput);
+
+    expect(payload).toEqual({
+      options: [
+        {
+          category: "model",
+          currentValue: "deepseek/deepseek-v4-pro",
+          id: "model",
+          name: "Model",
+          type: "select",
+          values: [
+            {
+              name: "DeepSeek/DeepSeek V4 Pro",
+              value: "deepseek/deepseek-v4-pro",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  test("normalizes ACP commands to the Mosoo session commands contract", () => {
+    const state = new AcpTurnEventState();
+    const events = state.translateUpdate({
+      update: {
+        availableCommands: [
+          {
+            name: "init",
+          },
+        ],
+        sessionUpdate: "available_commands_update",
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        kind: "session.commands.updated",
+        payload: {
+          commands: [
+            {
+              description: "",
+              input: null,
+              name: "init",
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
+  test("normalizes ACP usage sources to the Mosoo usage contract", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const sessionUsage = state.translateUpdate({
+      update: {
+        cost: {
+          amount: 0.25,
+          currency: "USD",
+        },
+        sessionUpdate: "usage_update",
+        size: 1_000,
+        used: 12,
+      },
+    });
+    const completionUsage = state.completePrompt("end_turn", {
+      inputTokens: 10,
+      outputTokens: 2,
+      totalTokens: 12,
+    });
+
+    expect(sessionUsage).toEqual([
+      {
+        kind: "usage.updated",
+        payload: {
+          costAmount: 0.25,
+          costCurrency: "USD",
+          size: 1_000,
+          source: "session_update",
+          usageContract: "openai_total_with_cached_breakdown",
+          used: 12,
+        },
+      },
+    ]);
+    expect(completionUsage).toContainEqual({
+      kind: "usage.updated",
+      payload: {
+        inputTokens: 10,
+        outputTokens: 2,
+        raw: {
+          inputTokens: 10,
+          outputTokens: 2,
+          totalTokens: 12,
+        },
+        source: "prompt_response",
+        totalTokens: 12,
+        usageContract: "openai_total_with_cached_breakdown",
+      },
+      runId: "run-1",
+    });
+  });
 });

@@ -159,8 +159,9 @@
         "raw": {
           "totalTokens": 12
         },
-        "source": "acp.prompt",
-        "totalTokens": 12
+        "source": "prompt_response",
+        "totalTokens": 12,
+        "usageContract": "openai_total_with_cached_breakdown"
       },
       "runId": "run-1"
     },

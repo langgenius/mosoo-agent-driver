@@ -56,6 +56,20 @@ class AcpPromptTerminalError extends Error {
   }
 }
 
+function toErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+async function withAcpStartupStage<T>(stage: string, task: () => Promise<T>): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    throw new Error(`${stage} failed: ${toErrorMessage(error, "ACP startup step failed.")}`, {
+      cause: error,
+    });
+  }
+}
+
 export class AcpDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "acp-fallback";
   #activeTurn: ActiveAcpTurn | null = null;
@@ -132,16 +146,18 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#agentCapabilities = initResult.agentCapabilities;
     await this.#push(context, "driver.acp.initialize", toAcpInitializeEvents(initResult));
     await this.#authenticateIfConfigured(context, initResult, env);
-    const setup = await this.#setupSession();
+    const setup = await withAcpStartupStage("ACP session setup", () => this.#setupSession());
 
-    await this.#push(
-      context,
-      `driver.acp.session.${setup.mode}`,
-      toAcpSessionReadyEvents({
-        mode: setup.mode,
-        nativeSessionId: setup.sessionId,
-        setup: setup.raw,
-      }),
+    await withAcpStartupStage("ACP session ready event push", () =>
+      this.#push(
+        context,
+        `driver.acp.session.${setup.mode}`,
+        toAcpSessionReadyEvents({
+          mode: setup.mode,
+          nativeSessionId: setup.sessionId,
+          setup: setup.raw,
+        }),
+      ),
     );
 
     if (setup.mode === "created") {
