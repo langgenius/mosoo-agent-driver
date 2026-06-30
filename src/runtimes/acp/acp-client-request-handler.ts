@@ -218,7 +218,10 @@ export class AcpClientRequestHandler {
       return;
     }
 
-    if (this.#replayingSession && shouldIgnoreAcpReplayUpdate(params)) {
+    if (
+      (this.#replayingSession || this.#turnEvents.activeRunId() === null) &&
+      shouldIgnoreAcpReplayUpdate(params)
+    ) {
       return;
     }
 

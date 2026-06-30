@@ -1,11 +1,35 @@
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
-import { readNonEmptyString, readNullableString, readString } from "./acp-types";
+import {
+  isRecord,
+  readNonEmptyString,
+  readNullableString,
+  readString,
+  stringifyForDisplay,
+} from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
 export type RuntimeToolStatus = "completed" | "failed" | "running";
 
 const TERMINAL_TOOL_STATUSES = new Set(["cancelled", "completed", "failed"]);
+
+function readToolDisplayString(value: unknown): string | undefined {
+  const display = stringifyForDisplay(value);
+
+  return display.length > 0 ? display : undefined;
+}
+
+function readToolContentString(value: unknown): string | undefined {
+  if (isRecord(value)) {
+    const text = readString(value, "text");
+
+    if (text !== null && text.length > 0) {
+      return text;
+    }
+  }
+
+  return readToolDisplayString(value);
+}
 
 export class AcpToolEventState {
   readonly #completed = new Set<string>();
@@ -115,12 +139,16 @@ export function toToolCallPayload(
   status: RuntimeToolStatus,
   update: JsonObject | null,
 ): JsonObject {
+  const content = readToolContentString(update?.["content"]);
+  const rawInput = readToolDisplayString(update?.["rawInput"]);
+  const rawOutput = readToolDisplayString(update?.["rawOutput"]);
+
   return {
-    content: update?.["content"],
+    ...(content === undefined ? {} : { content }),
     kind: readNonEmptyString(update, "kind") ?? "tool",
     locations: update?.["locations"],
-    rawInput: update?.["rawInput"],
-    rawOutput: update?.["rawOutput"],
+    ...(rawInput === undefined ? {} : { rawInput }),
+    ...(rawOutput === undefined ? {} : { rawOutput }),
     status,
     title: readNullableString(update, "title") ?? null,
     toolCallId,

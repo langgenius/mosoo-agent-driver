@@ -91,9 +91,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "kind": "shell",
-        "rawInput": {
-          "command": "pwd"
-        },
+        "rawInput": "{\"command\":\"pwd\"}",
         "status": "running",
         "title": "Run command",
         "toolCallId": "tool-1"
@@ -106,9 +104,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "kind": "tool",
-        "rawOutput": {
-          "text": "/workspace"
-        },
+        "rawOutput": "{\"text\":\"/workspace\"}",
         "status": "completed",
         "title": null,
         "toolCallId": "tool-1"
@@ -133,9 +129,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "kind": "tool",
-        "rawOutput": {
-          "text": "/workspace"
-        },
+        "rawOutput": "{\"text\":\"/workspace\"}",
         "status": "completed",
         "title": null,
         "toolCallId": "tool-1"
