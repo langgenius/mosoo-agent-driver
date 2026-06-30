@@ -101,14 +101,7 @@ describe("provider registry", () => {
       },
       {
         id: "acp-fallback",
-        requiredHostPorts: [
-          "event_sink",
-          "permission",
-          "mcp",
-          "skill",
-          "file",
-          "host_integration",
-        ],
+        requiredHostPorts: ["event_sink", "permission", "mcp", "skill", "file", "host_integration"],
       },
     ]);
   });

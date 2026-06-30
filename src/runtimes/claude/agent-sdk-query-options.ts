@@ -67,7 +67,6 @@ function createCanUseTool(context: AgentDriverContext): CanUseTool {
   };
 }
 
-
 function toClaudeMcpServers(
   servers: DriverBootMcpServer[],
 ): Record<string, McpServerConfig> | undefined {

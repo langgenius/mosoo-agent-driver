@@ -85,7 +85,6 @@ export function createAgentDriverProviderRegistry(
 
   for (const provider of providers) {
     registerProviderTransport(providersByTransport, provider, provider.id);
-
   }
 
   return {

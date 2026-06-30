@@ -20,7 +20,6 @@ function isAuthorized(server: DriverBootMcpServer): server is AuthorizedDriverBo
   return server.authorizationState === "active";
 }
 
-
 function toBearerTokenEnvName(index: number): string {
   return `MOSOO_MCP_BEARER_TOKEN_${index}`;
 }
