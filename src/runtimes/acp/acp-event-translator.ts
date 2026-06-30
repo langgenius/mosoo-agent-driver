@@ -45,6 +45,7 @@ export class AcpTurnEventState {
   #sequence = 0;
   #sessionId: string | null = null;
   #thoughtCompleted = false;
+  #thoughtFallbackText = "";
   #thoughtId: string | null = null;
   #thoughtStarted = false;
   readonly #tools = new AcpToolEventState();
@@ -61,6 +62,7 @@ export class AcpTurnEventState {
     this.#sequence = 0;
     this.#sessionId = input.sessionId;
     this.#thoughtCompleted = false;
+    this.#thoughtFallbackText = "";
     this.#thoughtId = `${input.messageId}:thought`;
     this.#thoughtStarted = false;
     this.#tools.clear();
@@ -74,6 +76,7 @@ export class AcpTurnEventState {
     this.#sequence = 0;
     this.#sessionId = null;
     this.#thoughtCompleted = false;
+    this.#thoughtFallbackText = "";
     this.#thoughtId = null;
     this.#thoughtStarted = false;
     this.#tools.clear();
@@ -82,6 +85,8 @@ export class AcpTurnEventState {
   completePrompt(stopReason: AcpPromptStopReason, usage: unknown): DriverEventInput[] {
     const events: DriverEventInput[] = [];
     const runId = this.#requireRunId();
+
+    events.push(...this.#promoteThoughtFallbackToMessage());
 
     if (this.#messageStarted && !this.#messageCompleted) {
       this.#messageCompleted = true;
@@ -348,6 +353,10 @@ export class AcpTurnEventState {
       return [];
     }
 
+    if (!this.#messageStarted && readNonEmptyString(update, "messageId") !== null) {
+      this.#thoughtFallbackText += delta;
+    }
+
     return [
       ...this.#ensureThoughtStarted(),
       {
@@ -444,6 +453,7 @@ export class AcpTurnEventState {
     }
 
     this.#messageStarted = true;
+    this.#thoughtFallbackText = "";
     return [
       {
         kind: "message.started",
@@ -452,6 +462,46 @@ export class AcpTurnEventState {
           role: "agent",
         },
         runId: this.#requireRunId(),
+      },
+    ];
+  }
+
+  #promoteThoughtFallbackToMessage(): DriverEventInput[] {
+    if (this.#messageStarted) {
+      return [];
+    }
+
+    const contentDelta = this.#thoughtFallbackText.trim();
+
+    if (contentDelta.length === 0) {
+      return [];
+    }
+
+    this.#messageStarted = true;
+    this.#thoughtFallbackText = "";
+    return [
+      {
+        kind: "message.started",
+        payload: {
+          messageId: this.#requireMessageId(),
+          role: "agent",
+        },
+        runId: this.#requireRunId(),
+      },
+      {
+        delivery: "best_effort",
+        kind: "message.delta",
+        payload: {
+          contentBlock: {
+            text: contentDelta,
+            type: "text",
+          },
+          contentDelta,
+          messageId: this.#requireMessageId(),
+          role: "agent",
+        },
+        runId: this.#requireRunId(),
+        sourceEventId: this.#nextSourceEventId("agent-thought-fallback-message"),
       },
     ];
   }
