@@ -23,16 +23,19 @@ const ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY";
 const DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY";
 const OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY";
 const OPENAI_API_KEY_ENV = "OPENAI_API_KEY";
+const ZHIPU_API_KEY_ENV = "ZHIPU_API_KEY";
 const LIVE_START_TIMEOUT_MS = 120_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 const OPENCODE_ACP_ARGS = ["acp", "--pure", "--print-logs", "--log-level", "DEBUG"] as const;
 
-type OpenCodeLiveProvider = "anthropic" | "deepseek" | "openai" | "opencode";
+type OpenCodeLiveProvider = "anthropic" | "deepseek" | "openai" | "opencode" | "zhipu";
 
 interface OpenCodeLiveProviderConfig {
+  readonly apiBase?: string;
   readonly defaultModel: string;
   readonly defaultSmallModel: string;
   readonly id: OpenCodeLiveProvider;
+  readonly openCodeProviderId?: string;
   readonly providerApiKeyEnv: string;
 }
 
@@ -60,6 +63,14 @@ const PROVIDER_CONFIGS = {
     defaultSmallModel: "deepseek-v4-flash-free",
     id: "opencode",
     providerApiKeyEnv: OPENCODE_API_KEY_ENV,
+  },
+  zhipu: {
+    apiBase: "https://api.z.ai/api/paas/v4",
+    defaultModel: "glm-4.7",
+    defaultSmallModel: "glm-4.7-flash",
+    id: "zhipu",
+    openCodeProviderId: "zai",
+    providerApiKeyEnv: ZHIPU_API_KEY_ENV,
   },
 } as const satisfies Record<OpenCodeLiveProvider, OpenCodeLiveProviderConfig>;
 
@@ -116,7 +127,8 @@ function readLiveProvider(): OpenCodeLiveProvider {
     provider === "anthropic" ||
     provider === "deepseek" ||
     provider === "openai" ||
-    provider === "opencode"
+    provider === "opencode" ||
+    provider === "zhipu"
   ) {
     return provider;
   }
@@ -196,8 +208,9 @@ function readOpenCodeVersion(command: string): string {
 
 function toOpenCodeModelId(model: string): string {
   const providerConfig = liveProviderConfig ?? PROVIDER_CONFIGS.openai;
+  const providerId = providerConfig.openCodeProviderId ?? providerConfig.id;
 
-  return model.includes("/") ? model : `${providerConfig.id}/${model}`;
+  return model.includes("/") ? model : `${providerId}/${model}`;
 }
 
 function createOpenCodeConfig(): string {
@@ -207,13 +220,18 @@ function createOpenCodeConfig(): string {
   const options: Record<string, string> = {
     apiKey: `{env:${liveProviderConfig.providerApiKeyEnv}}`,
   };
+  const providerId = liveProviderConfig.openCodeProviderId ?? liveProviderConfig.id;
+
+  if (liveProviderConfig.apiBase !== undefined) {
+    options["baseURL"] = liveProviderConfig.apiBase;
+  }
 
   return JSON.stringify({
     $schema: "https://opencode.ai/config.json",
-    enabled_providers: [liveProviderConfig.id],
+    enabled_providers: [providerId],
     model: toOpenCodeModelId(readLiveModel()),
     provider: {
-      [liveProviderConfig.id]: { options },
+      [providerId]: { options },
     },
     small_model: toOpenCodeModelId(readLiveSmallModel()),
   });

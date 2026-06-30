@@ -262,6 +262,56 @@ describe("ACP runtime event translation", () => {
     ).toEqual([]);
   });
 
+  test("promotes message-scoped thought-only ACP output into an assistant message", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: {
+            text: "\n",
+            type: "text",
+          },
+          messageId: "opencode-message-1",
+          sessionUpdate: "agent_thought_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: {
+            text: "pong",
+            type: "text",
+          },
+          messageId: "opencode-message-1",
+          sessionUpdate: "agent_thought_chunk",
+        },
+      }),
+      ...state.completePrompt("end_turn", null),
+    ];
+
+    expect(eventKinds(events)).toEqual([
+      "thought.started",
+      "thought.delta",
+      "thought.delta",
+      "message.started",
+      "message.delta",
+      "message.completed",
+      "thought.completed",
+      "run.completed",
+    ]);
+    expect(eventPayload(events[4])).toMatchObject({
+      contentDelta: "pong",
+      messageId: "message-1",
+      role: "agent",
+    });
+  });
+
   test("closes open stream items before a failed turn event", () => {
     const state = new AcpTurnEventState();
 
