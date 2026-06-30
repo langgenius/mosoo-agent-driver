@@ -69,7 +69,6 @@ export interface AgentDriverHostIntegrationPort {
   snapshot(): Promise<DriverHostIntegrationSnapshot | null>;
 }
 
-
 export interface AgentDriverHostPorts {
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
