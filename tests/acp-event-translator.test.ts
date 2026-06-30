@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
 import {
   AcpTurnEventState,
@@ -7,6 +8,7 @@ import {
   toAcpPermissionResolvedEvent,
   toAcpSessionReadyEvents,
 } from "../src/runtimes/acp/acp-event-translator";
+import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 function eventKinds(events: readonly DriverEventInput[]): string[] {
   return events.map((event) => event.kind);
@@ -83,6 +85,47 @@ describe("ACP runtime event translation", () => {
     expect(kinds.filter((kind) => kind === "item.started")).toHaveLength(1);
     expect(kinds.filter((kind) => kind === "item.completed")).toHaveLength(1);
     expect(kinds.every((kind) => kind.includes("."))).toBe(true);
+  });
+
+  test("omits empty ACP tool input before runtime event ingress", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: DRIVER_TEST_IDS.runId,
+      sessionId: DRIVER_TEST_IDS.sessionId,
+    });
+
+    const events = state.translateUpdate({
+      update: {
+        content: {
+          text: "Creating file",
+          type: "text",
+        },
+        rawInput: "",
+        sessionUpdate: "tool_call",
+        status: "running",
+        title: "Create file",
+        toolCallId: "tool-1",
+      },
+    });
+    const toolEvent = events.find((event) => event.kind === "tool.call.updated");
+
+    expect(toolEvent).toBeDefined();
+    expect(eventPayload(toolEvent as DriverEventInput)).toMatchObject({
+      content: "Creating file",
+    });
+    expect(eventPayload(toolEvent as DriverEventInput)).not.toHaveProperty("rawInput");
+
+    const envelopes = events.flatMap((event) =>
+      toDriverEventEnvelopes(driverBootPayload, event, DRIVER_TEST_IDS.runId),
+    );
+    const canonicalToolEvent = envelopes
+      .map((envelope) => envelope.event)
+      .find((event) => event.kind === "tool.call.updated");
+
+    expect(canonicalToolEvent).toBeDefined();
+    expect(eventPayload(canonicalToolEvent as DriverEventInput)).not.toHaveProperty("rawInput");
   });
 
   test("preserves the ACP request id across permission request and resolution events", () => {

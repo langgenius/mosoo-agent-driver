@@ -48,9 +48,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "kind": "shell",
-        "rawInput": {
-          "command": "pwd"
-        },
+        "rawInput": "{\"command\":\"pwd\"}",
         "status": "running",
         "title": "Run command",
         "toolCallId": "tool-1"
@@ -79,9 +77,7 @@
         "title": "Run command",
         "toolCall": {
           "kind": "shell",
-          "rawInput": {
-            "command": "pwd"
-          },
+          "rawInput": "{\"command\":\"pwd\"}",
           "status": "running",
           "title": "Run command",
           "toolCallId": "tool-1"
