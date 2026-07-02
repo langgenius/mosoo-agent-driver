@@ -43,17 +43,18 @@ interface ActiveClaudeTurn {
 const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 
 /**
- * Prewarm the Claude CLI subprocess during backend start (default on).
+ * Prewarm the Claude CLI subprocess during backend start. OPT-IN (default off).
  *
- * Without it, `@anthropic-ai/claude-agent-sdk` spawns the native CLI lazily on
- * the first `query()` iteration, so the whole spawn + initialize handshake
- * lands inside the first turn's time-to-first-token. The control plane already
- * starts the backend ahead of the first user message (session-create /
- * viewer-connect prewarm), so moving the spawn into `start()` via `startup()`
- * makes the first turn resolve against a ready process. Set to "0" to disable.
+ * Prewarm pre-spawns a SECOND native Claude CLI process via `startup()` to cut
+ * first-token latency. On a memory-constrained container (e.g. the CF "basic"
+ * instance, ~1 GiB) that extra process can OOM-kill the driver before it signals
+ * `ready`, surfacing as RUN FAILED "Driver instance <id> closed before ready".
+ * So it is disabled by default and must be explicitly enabled — and only on an
+ * instance with headroom for a second CLI — via AGENT_DRIVER_CLAUDE_PREWARM=1.
+ * It is also fired non-blocking (see start()) so it never delays `ready`.
  */
 function isClaudePrewarmEnabled(): boolean {
-  return readProcessEnvString(CLAUDE_PREWARM_ENV) !== "0";
+  return readProcessEnvString(CLAUDE_PREWARM_ENV) === "1";
 }
 
 export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
@@ -105,7 +106,10 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       skillCount: this.#materializedSkills.length,
     });
 
-    await this.#prewarmQuery(context);
+    // Fire prewarm non-blocking: it must NOT gate the driver's `ready` handshake
+    // (start() is awaited before socket.ready()). If the first turn arrives
+    // before prewarm finishes, handleInput cold-spawns (warmQuery is still null).
+    void this.#prewarmQuery(context);
   }
 
   /**
