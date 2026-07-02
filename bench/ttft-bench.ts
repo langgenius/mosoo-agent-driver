@@ -409,7 +409,7 @@ async function runTrial(input: {
 
   const gaps: number[] = [];
   for (let i = 1; i < deltaTimestamps.length; i += 1) {
-    gaps.push((deltaTimestamps[i] as number) - (deltaTimestamps[i - 1] as number));
+    gaps.push(deltaTimestamps[i] - deltaTimestamps[i - 1]);
   }
 
   return {
@@ -484,12 +484,12 @@ async function main(): Promise<void> {
   const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as
     | "openai"
     | "anthropic";
-  const scenarioFilter = (
-    readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject"
-  )
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const scenarioFilter = new Set<ScenarioId>(
+    (readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean) as ScenarioId[],
+  );
 
   const cells: CellResult[] = [];
 
@@ -516,7 +516,7 @@ async function main(): Promise<void> {
     cells.push({ runtime, scenario: scenario.id, model, trials: results, agg: aggregate(results) });
   };
 
-  for (const scenario of SCENARIOS.filter((s) => scenarioFilter.includes(s.id))) {
+  for (const scenario of SCENARIOS.filter((s) => scenarioFilter.has(s.id))) {
     if (requested.includes("claude") && anthropicKey) {
       await runCell(
         "claude",
