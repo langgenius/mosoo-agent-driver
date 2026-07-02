@@ -49,8 +49,8 @@ const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
  * first-token latency. On a memory-constrained container (e.g. the CF "basic"
  * instance, ~1 GiB) that extra process can OOM-kill the driver before it signals
  * `ready`, surfacing as RUN FAILED "Driver instance <id> closed before ready".
- * So it is disabled by default and must be explicitly enabled — and only on an
- * instance with headroom for a second CLI — via AGENT_DRIVER_CLAUDE_PREWARM=1.
+ * So it is disabled by default and must be explicitly enabled only on an
+ * instance with headroom for a second CLI via AGENT_DRIVER_CLAUDE_PREWARM=1.
  * It is also fired non-blocking (see start()) so it never delays `ready`.
  */
 function isClaudePrewarmEnabled(): boolean {
