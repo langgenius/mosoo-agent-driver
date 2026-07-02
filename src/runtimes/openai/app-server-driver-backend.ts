@@ -1,3 +1,4 @@
+import { isDriverFullAccess } from "../../core/driver-permission-policy";
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
   createDriverRuntimeTimingEvent,
@@ -32,9 +33,21 @@ import type {
   TurnStartResponse,
 } from "./generated/app-server-protocol";
 
-const OPENAI_RUNTIME_APPROVAL_POLICY = "on-request" satisfies ApprovalPolicy;
+/**
+ * Codex app-server approval policy per driver permission policy.
+ *
+ * `never` = "Never ask the user to approve commands" (== the CLI
+ * `--dangerously-bypass-approvals-and-sandbox` posture). The runtime sandbox is
+ * already `danger-full-access` (see MOSOO_OPENAI_RUNTIME_SANDBOX_MODE), so under
+ * full_access this makes Codex fully autonomous. Supervised keeps `on-request`
+ * so exec/patch approvals surface to the control plane.
+ */
+function resolveOpenAiApprovalPolicy(payload: DriverStartInput): ApprovalPolicy {
+  return isDriverFullAccess(payload) ? "never" : "on-request";
+}
 
 interface OpenAiTurnStartInput {
+  readonly approvalPolicy: ApprovalPolicy;
   readonly cwd: string;
   readonly model: string;
   readonly text: string;
@@ -68,7 +81,7 @@ function isTerminalOpenAiTurnStatus(status: TurnStatus | undefined): boolean {
 
 export function createOpenAiTurnStartParams(input: OpenAiTurnStartInput): TurnStartParams {
   return {
-    approvalPolicy: OPENAI_RUNTIME_APPROVAL_POLICY,
+    approvalPolicy: input.approvalPolicy,
     cwd: input.cwd,
     input: [
       {
@@ -175,7 +188,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     const developerInstructions = buildNativeRuntimeSystemPrompt(this.#payload.execution);
     const nativeResumeThreadId = readOpenAiNativeResumeThreadId(this.#payload);
     const baseThreadParams = {
-      approvalPolicy: OPENAI_RUNTIME_APPROVAL_POLICY,
+      approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
       cwd: this.#payload.execution.session.cwd,
       model: this.#payload.execution.model,
       modelProvider: this.#payload.execution.provider,
@@ -271,6 +284,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       turnResult = await client.request(
         "turn/start",
         createOpenAiTurnStartParams({
+          approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
           cwd: this.#payload.execution.session.cwd,
           model: this.#payload.execution.model,
           text: input.text,

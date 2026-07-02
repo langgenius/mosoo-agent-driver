@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import { query, startup } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, WarmQuery } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
@@ -40,6 +40,22 @@ interface ActiveClaudeTurn {
   runId: RunId;
 }
 
+const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
+
+/**
+ * Prewarm the Claude CLI subprocess during backend start (default on).
+ *
+ * Without it, `@anthropic-ai/claude-agent-sdk` spawns the native CLI lazily on
+ * the first `query()` iteration, so the whole spawn + initialize handshake
+ * lands inside the first turn's time-to-first-token. The control plane already
+ * starts the backend ahead of the first user message (session-create /
+ * viewer-connect prewarm), so moving the spawn into `start()` via `startup()`
+ * makes the first turn resolve against a ready process. Set to "0" to disable.
+ */
+function isClaudePrewarmEnabled(): boolean {
+  return readProcessEnvString(CLAUDE_PREWARM_ENV) !== "0";
+}
+
 export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "claude-agent-sdk";
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
@@ -49,6 +65,8 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   #activeTurn: ActiveClaudeTurn | null = null;
   #materializedSkills: readonly AgentDriverMaterializedSkill[] = [];
   #nativeSessionId: string | null = null;
+  #warmQuery: WarmQuery | null = null;
+  #warmAbortController: AbortController | null = null;
 
   constructor(payload: DriverStartInput) {
     this.#payload = payload;
@@ -86,6 +104,42 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       nativeResumeRefPresent: Boolean(this.#nativeSessionId),
       skillCount: this.#materializedSkills.length,
     });
+
+    await this.#prewarmQuery(context);
+  }
+
+  /**
+   * Pre-spawn the CLI so the first turn writes to a ready process. Best-effort:
+   * a prewarm failure (e.g. missing CLI in a constrained environment) is logged
+   * and the runtime falls back to lazy spawn on the first `query()`.
+   */
+  async #prewarmQuery(context: AgentDriverContext): Promise<void> {
+    if (!isClaudePrewarmEnabled()) {
+      return;
+    }
+
+    const startedAtMs = Date.now();
+    const abortController = new AbortController();
+
+    try {
+      const options = await createClaudeQueryOptions({
+        abortController,
+        context,
+        nativeSessionId: this.#nativeSessionId,
+        payload: this.#payload,
+      });
+      this.#warmQuery = await startup({ options });
+      this.#warmAbortController = abortController;
+      context.logger.debug("driver.claude.prewarm.ready", {
+        prewarmMs: Date.now() - startedAtMs,
+      });
+    } catch (error) {
+      this.#warmQuery = null;
+      this.#warmAbortController = null;
+      context.logger.debug("driver.claude.prewarm.failed", {
+        message: toErrorMessage(error, "Claude prewarm failed."),
+      });
+    }
   }
 
   async handleInput(
@@ -99,23 +153,36 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     this.#messageTranslator.resetTurnMessageState();
 
-    const abortController = new AbortController();
-    const optionsStartedAtMs = Date.now();
-    const queryOptions = await createClaudeQueryOptions({
-      abortController,
-      context,
-      nativeSessionId: this.#nativeSessionId,
-      payload: this.#payload,
-    });
-    const queryOptionsMs = Date.now() - optionsStartedAtMs;
+    const warmQuery = this.#warmQuery;
+    const warmAbortController = this.#warmAbortController;
+    this.#warmQuery = null;
+    this.#warmAbortController = null;
+    const usedWarmQuery = warmQuery !== null && warmAbortController !== null;
+    const abortController = usedWarmQuery ? warmAbortController : new AbortController();
+
     const queryStartedAtMs = Date.now();
+    let queryOptionsMs = 0;
     let activeQuery: Query;
 
     try {
-      activeQuery = query({
-        options: queryOptions,
-        prompt: input.text,
-      });
+      if (warmQuery !== null) {
+        // The subprocess is already spawned and initialized; this just writes
+        // the prompt, so the spawn cost is not on the turn's critical path.
+        activeQuery = warmQuery.query(input.text);
+      } else {
+        const optionsStartedAtMs = Date.now();
+        const queryOptions = await createClaudeQueryOptions({
+          abortController,
+          context,
+          nativeSessionId: this.#nativeSessionId,
+          payload: this.#payload,
+        });
+        queryOptionsMs = Date.now() - optionsStartedAtMs;
+        activeQuery = query({
+          options: queryOptions,
+          prompt: input.text,
+        });
+      }
     } catch (error) {
       await this.#push(context, "driver.claude.query.create_failed", [
         {
@@ -276,6 +343,12 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   }
 
   async stop(context: AgentDriverContext, reason: string): Promise<void> {
+    if (this.#warmQuery !== null) {
+      this.#warmQuery.close();
+      this.#warmQuery = null;
+      this.#warmAbortController = null;
+    }
+
     const activeTurn = this.#activeTurn;
 
     if (!activeTurn) {

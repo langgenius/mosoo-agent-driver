@@ -3,16 +3,17 @@ import { describe, expect, test } from "bun:test";
 import { createOpenAiTurnStartParams } from "../src/runtimes/openai/app-server-driver-backend";
 
 describe("OpenAI app-server turn start params", () => {
-  test("carries runtime policy with every user turn", () => {
+  test("carries the resolved approval policy with every user turn", () => {
     expect(
       createOpenAiTurnStartParams({
+        approvalPolicy: "never",
         cwd: "/workspace",
         model: "gpt-5.4",
         text: "Run pwd",
         threadId: "thread-1",
       }),
     ).toEqual({
-      approvalPolicy: "on-request",
+      approvalPolicy: "never",
       cwd: "/workspace",
       input: [
         {
@@ -24,5 +25,17 @@ describe("OpenAI app-server turn start params", () => {
       model: "gpt-5.4",
       threadId: "thread-1",
     });
+  });
+
+  test("propagates the supervised approval policy unchanged", () => {
+    expect(
+      createOpenAiTurnStartParams({
+        approvalPolicy: "on-request",
+        cwd: "/workspace",
+        model: "gpt-5.4",
+        text: "Run pwd",
+        threadId: "thread-1",
+      }).approvalPolicy,
+    ).toBe("on-request");
   });
 });

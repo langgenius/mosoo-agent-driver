@@ -152,11 +152,27 @@ export interface DriverExecutionSessionSpec {
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
 }
 
+/**
+ * How the driver mediates tool-permission requests.
+ *
+ * - `full_access` (default): the sandbox is the isolation boundary, so tool
+ *   calls are auto-approved inside the runtime without a control-plane
+ *   round-trip. This is the "yolo" posture every comparable agent runtime
+ *   (Vercel harness, OpenHands, opencomputer, Rivet agentos, eve) ships by
+ *   default.
+ * - `supervised`: every tool call is routed to the control plane for an
+ *   interactive allow/deny decision via the permission broker (opt-in).
+ */
+export type DriverPermissionPolicy = "full_access" | "supervised";
+
+export const DEFAULT_DRIVER_PERMISSION_POLICY = "full_access" satisfies DriverPermissionPolicy;
+
 export interface DriverExecutionSpec {
   readonly builtInTools: DriverBuiltInToolConfig[];
   readonly configRevision: DriverConfigRevision;
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
+  readonly permissionPolicy: DriverPermissionPolicy;
   readonly profilePrompt: string;
   readonly provider: string;
   readonly providerOptions: JsonObject;
@@ -377,6 +393,18 @@ function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
   };
 }
 
+function readPermissionPolicy(value: unknown): DriverPermissionPolicy {
+  if (value === undefined || value === null) {
+    return DEFAULT_DRIVER_PERMISSION_POLICY;
+  }
+
+  if (value === "full_access" || value === "supervised") {
+    return value;
+  }
+
+  throw new TypeError("execution.permissionPolicy is unsupported.");
+}
+
 function readExecution(value: unknown): DriverExecutionSpec {
   const record = readRecord(value, "execution");
   const environment = readRecord(record["environment"], "execution.environment");
@@ -388,6 +416,7 @@ function readExecution(value: unknown): DriverExecutionSpec {
       variables: readVariables(environment["variables"]),
     },
     model: readNonEmptyString(record, "model", "execution"),
+    permissionPolicy: readPermissionPolicy(record["permissionPolicy"]),
     profilePrompt: readString(record, "profilePrompt", "execution"),
     provider: readNonEmptyString(record, "provider", "execution"),
     providerOptions:
