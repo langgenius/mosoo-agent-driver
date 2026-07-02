@@ -4,15 +4,15 @@
 code path as the `*-live.test.ts` suites) against live provider APIs and
 measures, per provider runtime and per scenario:
 
-| metric | meaning |
-|---|---|
-| `bootMs` | `kernel.start()` cost (runtime/CLI/SDK init) |
-| `ttftMs` | dispatch → first `message.delta` event (time to first token) |
-| `firstTextMs` | dispatch → first non-empty text delta |
-| `totalMs` | dispatch → `run.completed` |
+| metric              | meaning                                                              |
+| ------------------- | -------------------------------------------------------------------- |
+| `bootMs`            | `kernel.start()` cost (runtime/CLI/SDK init)                         |
+| `ttftMs`            | dispatch → first `message.delta` event (time to first token)         |
+| `firstTextMs`       | dispatch → first non-empty text delta                                |
+| `totalMs`           | dispatch → `run.completed`                                           |
 | `interChunkP50/P95` | gap distribution between consecutive text deltas (streaming cadence) |
-| `fileCreated` | for tool scenarios: did the agent actually write the marker file |
-| `ok` | scenario success (expected output, plus file for tool scenarios) |
+| `fileCreated`       | for tool scenarios: did the agent actually write the marker file     |
+| `ok`                | scenario success (expected output, plus file for tool scenarios)     |
 
 The permission host port is toggled per scenario, so `tool_write_allow` vs
 `tool_write_reject` isolates the **value of the full-access ("yolo") default**

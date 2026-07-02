@@ -30,8 +30,8 @@ import { fileURLToPath } from "node:url";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import type { PermissionDecision } from "../src/core/driver-permission-broker";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverEventInput } from "../src/protocol/events";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { driverBootPayload } from "../tests/driver-boot-payload-fixture";
@@ -388,7 +388,10 @@ async function runTrial(input: {
     if (input.scenario.marker) {
       try {
         const content = await readFile(join(paths.cwd, input.scenario.marker.file), "utf8");
-        fileCreated = content.trim().toLowerCase().includes(input.scenario.marker.content.toLowerCase());
+        fileCreated = content
+          .trim()
+          .toLowerCase()
+          .includes(input.scenario.marker.content.toLowerCase());
       } catch {
         fileCreated = false;
       }
@@ -473,12 +476,17 @@ async function main(): Promise<void> {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean) as RuntimeId[];
-  const anthropicKey = readEnv("ANTHROPIC_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY");
+  const anthropicKey =
+    readEnv("ANTHROPIC_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY");
   const openaiKey = readEnv("OPENAI_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_OPENAI_API_KEY");
   const claudeModel = readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_MODEL") ?? "claude-sonnet-4-5";
   const openaiModel = readEnv("AGENT_DRIVER_LIVE_OPENAI_MODEL") ?? "gpt-5.4";
-  const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as "openai" | "anthropic";
-  const scenarioFilter = (readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject")
+  const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as
+    | "openai"
+    | "anthropic";
+  const scenarioFilter = (
+    readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject"
+  )
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -510,7 +518,14 @@ async function main(): Promise<void> {
 
   for (const scenario of SCENARIOS.filter((s) => scenarioFilter.includes(s.id))) {
     if (requested.includes("claude") && anthropicKey) {
-      await runCell("claude", scenario, claudeModel, (p) => claudeStartInput(p), anthropicKey, false);
+      await runCell(
+        "claude",
+        scenario,
+        claudeModel,
+        (p) => claudeStartInput(p),
+        anthropicKey,
+        false,
+      );
     }
     if (requested.includes("openai") && openaiKey) {
       await runCell("openai", scenario, openaiModel, (p) => openaiStartInput(p), openaiKey, false);
@@ -520,7 +535,8 @@ async function main(): Promise<void> {
       const model = opencodeProvider === "anthropic" ? claudeModel : openaiModel;
       const apiKeyEnv = opencodeProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
       if (key) {
-        process.env["MOSOO_ACP_FALLBACK_COMMAND"] = readEnv("MOSOO_ACP_FALLBACK_COMMAND") ?? "opencode";
+        process.env["MOSOO_ACP_FALLBACK_COMMAND"] =
+          readEnv("MOSOO_ACP_FALLBACK_COMMAND") ?? "opencode";
         process.env["MOSOO_ACP_FALLBACK_ARGS"] =
           readEnv("MOSOO_ACP_FALLBACK_ARGS") ?? JSON.stringify(["acp", "--pure"]);
         await runCell(
@@ -560,7 +576,9 @@ async function main(): Promise<void> {
   if (readEnv("TTFT_UPDATE_BASELINE") === "1") {
     await writeFile(join(OUTPUT_DIR, "baseline.json"), JSON.stringify(results, null, 2));
   }
-  process.stdout.write(`\n\n${summary}\n\nWrote outputs/results-${stamp}.json + summary-${stamp}.md\n`);
+  process.stdout.write(
+    `\n\n${summary}\n\nWrote outputs/results-${stamp}.json + summary-${stamp}.md\n`,
+  );
 }
 
 await main();

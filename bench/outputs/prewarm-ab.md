@@ -11,10 +11,10 @@ AGENT_DRIVER_CLAUDE_PREWARM=0 TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=
 TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=no_tool bun bench/ttft-bench.ts
 ```
 
-| config | TTFT p50 | TTFT p95 | boot p50 | per-trial TTFT (ms) |
-|---|---|---|---|---|
-| prewarm **off** | 6992 | 8366 | ~0 | 8366, 7008, 6992, 6396, 6629 |
-| prewarm **on**  | **4870** | **4896** | 2225 | 4870, 4882, 4896, 4634, 4411 |
+| config          | TTFT p50 | TTFT p95 | boot p50 | per-trial TTFT (ms)          |
+| --------------- | -------- | -------- | -------- | ---------------------------- |
+| prewarm **off** | 6992     | 8366     | ~0       | 8366, 7008, 6992, 6396, 6629 |
+| prewarm **on**  | **4870** | **4896** | 2225     | 4870, 4882, 4896, 4634, 4411 |
 
 Result: **−2122 ms (−30%) at p50, −3470 ms (−41%) at p95.**
 
