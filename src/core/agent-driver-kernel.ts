@@ -15,6 +15,7 @@ import { createPromiseDeferred } from "../utils/async";
 import type { PromiseDeferred } from "../utils/async";
 import { DriverCommandDispatcher } from "./driver-command-dispatcher";
 import { DriverPermissionBroker } from "./driver-permission-broker";
+import { createDriverPermissionRequestHandler } from "./driver-permission-policy";
 import type { DriverRuntimeIo } from "./driver-runtime-io";
 import { DriverRuntimeStateMachine } from "./driver-runtime-state";
 
@@ -313,17 +314,20 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
       payload,
       logger: this.#logger,
       permission: {
-        request: async (input) => {
-          this.#runtimeState.enter("needs_approval");
+        request: createDriverPermissionRequestHandler({
+          payload,
+          supervised: async (input) => {
+            this.#runtimeState.enter("needs_approval");
 
-          try {
-            return await this.#permissionBroker.request(this, input);
-          } finally {
-            if (this.#runtimeState.status() === "needs_approval") {
-              this.#runtimeState.enter("running");
+            try {
+              return await this.#permissionBroker.request(this, input);
+            } finally {
+              if (this.#runtimeState.status() === "needs_approval") {
+                this.#runtimeState.enter("running");
+              }
             }
-          }
-        },
+          },
+        }),
       },
     });
   }

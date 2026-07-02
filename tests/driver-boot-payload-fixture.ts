@@ -44,6 +44,7 @@ export const driverBootPayload = {
       variables: {},
     },
     model: "model-1",
+    permissionPolicy: "full_access",
     profilePrompt: "",
     provider: "provider-1",
     providerOptions: {},

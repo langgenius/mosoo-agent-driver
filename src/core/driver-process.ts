@@ -29,6 +29,7 @@ import { DriverCommandDispatcher } from "./driver-command-dispatcher";
 import { pushDriverDiagnosticEvent } from "./driver-diagnostics";
 import { DriverHeartbeatLoop } from "./driver-heartbeat-loop";
 import { DriverPermissionBroker } from "./driver-permission-broker";
+import { createDriverPermissionRequestHandler } from "./driver-permission-policy";
 import type { DriverRuntimeEventPort, DriverRuntimeRunPort } from "./driver-runtime-io";
 import { DriverRuntimeStateMachine } from "./driver-runtime-state";
 import {
@@ -322,17 +323,20 @@ export class DriverProcess {
       payload: this.#startInput,
       logger,
       permission: {
-        request: async (input) => {
-          this.#runtimeState.enter("needs_approval");
+        request: createDriverPermissionRequestHandler({
+          payload: this.#startInput,
+          supervised: async (input) => {
+            this.#runtimeState.enter("needs_approval");
 
-          try {
-            return await this.#permissionBroker.request(socket, input);
-          } finally {
-            if (this.#runtimeState.status() === "needs_approval") {
-              this.#runtimeState.enter("running");
+            try {
+              return await this.#permissionBroker.request(socket, input);
+            } finally {
+              if (this.#runtimeState.status() === "needs_approval") {
+                this.#runtimeState.enter("running");
+              }
             }
-          }
-        },
+          },
+        }),
       },
       ports: {
         mcp: {

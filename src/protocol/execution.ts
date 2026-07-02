@@ -3,6 +3,7 @@ import type {
   DriverExecutionEnvironment,
   DriverExecutionSpec,
   DriverNativeRuntimeRef,
+  DriverPermissionPolicy,
   DriverResolvedSkill,
   DriverSkillCatalogEntry,
 } from "./boot";
@@ -26,6 +27,7 @@ export interface DriverExecutionInput {
   readonly builtInTools: DriverExecutionSpec["builtInTools"];
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
+  readonly permissionPolicy: DriverPermissionPolicy;
   readonly provider: string;
   readonly providerOptions: DriverExecutionSpec["providerOptions"];
   readonly run: DriverExecutionRunInput;
@@ -42,6 +44,7 @@ export function createDriverExecutionInputFromBootExecution(
     builtInTools: execution.builtInTools,
     environment: execution.environment,
     model: execution.model,
+    permissionPolicy: execution.permissionPolicy,
     provider: execution.provider,
     providerOptions: execution.providerOptions,
     run: {

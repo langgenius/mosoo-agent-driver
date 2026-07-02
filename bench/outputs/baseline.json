@@ -1,0 +1,262 @@
+{
+  "generatedStamp": "claude_baseline",
+  "trials": 3,
+  "cells": [
+    {
+      "runtime": "claude",
+      "scenario": "no_tool",
+      "model": "claude-sonnet-4-5",
+      "trials": [
+        {
+          "bootMs": 0,
+          "ttftMs": 6821,
+          "firstTextMs": 6821,
+          "totalMs": 6863,
+          "deltaCount": 1,
+          "outputChars": 4,
+          "interChunkP50": null,
+          "interChunkP95": null,
+          "interChunkMax": null,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 6404,
+          "firstTextMs": 6404,
+          "totalMs": 6496,
+          "deltaCount": 1,
+          "outputChars": 4,
+          "interChunkP50": null,
+          "interChunkP95": null,
+          "interChunkMax": null,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 7452,
+          "firstTextMs": 7452,
+          "totalMs": 7562,
+          "deltaCount": 1,
+          "outputChars": 4,
+          "interChunkP50": null,
+          "interChunkP95": null,
+          "interChunkMax": null,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        }
+      ],
+      "agg": {
+        "okRate": 1,
+        "fileCreatedRate": null,
+        "bootP50": 0,
+        "bootP95": 0,
+        "ttftP50": 6821,
+        "ttftP95": 7452,
+        "firstTextP50": 6821,
+        "firstTextP95": 7452,
+        "totalP50": 6863,
+        "totalP95": 7562,
+        "interChunkP50": null,
+        "interChunkP95": null,
+        "deltaCountP50": 1
+      }
+    },
+    {
+      "runtime": "claude",
+      "scenario": "long_output",
+      "model": "claude-sonnet-4-5",
+      "trials": [
+        {
+          "bootMs": 0,
+          "ttftMs": 8474,
+          "firstTextMs": 8474,
+          "totalMs": 13040,
+          "deltaCount": 11,
+          "outputChars": 1387,
+          "interChunkP50": 463,
+          "interChunkP95": 582,
+          "interChunkMax": 582,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 8103,
+          "firstTextMs": 8103,
+          "totalMs": 13273,
+          "deltaCount": 12,
+          "outputChars": 1519,
+          "interChunkP50": 466,
+          "interChunkP95": 517,
+          "interChunkMax": 517,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 7505,
+          "firstTextMs": 7505,
+          "totalMs": 12851,
+          "deltaCount": 13,
+          "outputChars": 1476,
+          "interChunkP50": 467,
+          "interChunkP95": 556,
+          "interChunkMax": 556,
+          "fileCreated": null,
+          "ok": true,
+          "error": null
+        }
+      ],
+      "agg": {
+        "okRate": 1,
+        "fileCreatedRate": null,
+        "bootP50": 0,
+        "bootP95": 0,
+        "ttftP50": 8103,
+        "ttftP95": 8474,
+        "firstTextP50": 8103,
+        "firstTextP95": 8474,
+        "totalP50": 13040,
+        "totalP95": 13273,
+        "interChunkP50": 466,
+        "interChunkP95": 582,
+        "deltaCountP50": 12
+      }
+    },
+    {
+      "runtime": "claude",
+      "scenario": "tool_write_allow",
+      "model": "claude-sonnet-4-5",
+      "trials": [
+        {
+          "bootMs": 0,
+          "ttftMs": 11419,
+          "firstTextMs": 11419,
+          "totalMs": 11614,
+          "deltaCount": 2,
+          "outputChars": 5,
+          "interChunkP50": 141,
+          "interChunkP95": 141,
+          "interChunkMax": 141,
+          "fileCreated": true,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 11969,
+          "firstTextMs": 11969,
+          "totalMs": 12107,
+          "deltaCount": 2,
+          "outputChars": 5,
+          "interChunkP50": 95,
+          "interChunkP95": 95,
+          "interChunkMax": 95,
+          "fileCreated": true,
+          "ok": true,
+          "error": null
+        },
+        {
+          "bootMs": 1,
+          "ttftMs": 10227,
+          "firstTextMs": 10227,
+          "totalMs": 10374,
+          "deltaCount": 2,
+          "outputChars": 5,
+          "interChunkP50": 130,
+          "interChunkP95": 130,
+          "interChunkMax": 130,
+          "fileCreated": true,
+          "ok": true,
+          "error": null
+        }
+      ],
+      "agg": {
+        "okRate": 1,
+        "fileCreatedRate": 1,
+        "bootP50": 0,
+        "bootP95": 1,
+        "ttftP50": 11419,
+        "ttftP95": 11969,
+        "firstTextP50": 11419,
+        "firstTextP95": 11969,
+        "totalP50": 11614,
+        "totalP95": 12107,
+        "interChunkP50": 130,
+        "interChunkP95": 141,
+        "deltaCountP50": 2
+      }
+    },
+    {
+      "runtime": "claude",
+      "scenario": "tool_write_reject",
+      "model": "claude-sonnet-4-5",
+      "trials": [
+        {
+          "bootMs": 0,
+          "ttftMs": 11666,
+          "firstTextMs": 11666,
+          "totalMs": 15312,
+          "deltaCount": 5,
+          "outputChars": 181,
+          "interChunkP50": 493,
+          "interChunkP95": 2563,
+          "interChunkMax": 2563,
+          "fileCreated": false,
+          "ok": false,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 6374,
+          "firstTextMs": 6374,
+          "totalMs": 17410,
+          "deltaCount": 9,
+          "outputChars": 363,
+          "interChunkP50": 476,
+          "interChunkP95": 3422,
+          "interChunkMax": 3422,
+          "fileCreated": false,
+          "ok": false,
+          "error": null
+        },
+        {
+          "bootMs": 0,
+          "ttftMs": 8819,
+          "firstTextMs": 8819,
+          "totalMs": 16153,
+          "deltaCount": 5,
+          "outputChars": 98,
+          "interChunkP50": 506,
+          "interChunkP95": 3643,
+          "interChunkMax": 3643,
+          "fileCreated": false,
+          "ok": false,
+          "error": null
+        }
+      ],
+      "agg": {
+        "okRate": 0,
+        "fileCreatedRate": 0,
+        "bootP50": null,
+        "bootP95": null,
+        "ttftP50": null,
+        "ttftP95": null,
+        "firstTextP50": null,
+        "firstTextP95": null,
+        "totalP50": null,
+        "totalP95": null,
+        "interChunkP50": null,
+        "interChunkP95": null,
+        "deltaCountP50": null
+      }
+    }
+  ]
+}
