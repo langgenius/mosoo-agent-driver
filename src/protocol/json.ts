@@ -35,25 +35,11 @@ function assertJsonValue(value: unknown, label: string): asserts value is JsonVa
   throw new TypeError(`${label} must be JSON-serializable.`);
 }
 
-function cloneJsonValue(value: JsonValue): JsonValue {
-  if (Array.isArray(value)) {
-    return value.map(cloneJsonValue);
-  }
-
-  if (isJsonObject(value)) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, cloneJsonValue(entry)]),
-    );
-  }
-
-  return value;
-}
-
 export function readJsonObject(value: unknown, label: string): JsonObject {
   if (!isJsonObject(value)) {
     throw new TypeError(`${label} must be a JSON object.`);
   }
 
   assertJsonValue(value, label);
-  return cloneJsonValue(value) as JsonObject;
+  return structuredClone(value);
 }
