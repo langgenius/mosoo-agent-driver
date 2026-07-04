@@ -1,4 +1,4 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKFilesPersistedEvent, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { isTruthy } from "../../core/truthiness";
 import type { DriverEventInput } from "../../protocol/events";
@@ -403,7 +403,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
   async #handleFilesPersisted(
     context: AgentDriverContext,
-    message: Extract<SDKMessage, { type: "system"; subtype: "files_persisted" }>,
+    message: SDKFilesPersistedEvent,
   ): Promise<void> {
     await this.#options.push(
       context,
