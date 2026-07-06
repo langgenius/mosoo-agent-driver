@@ -118,7 +118,7 @@ This exercises the same `/v1/environments`, `/v1/agents`, and `/v1/sessions` rou
 
 `agent-driver` is the **runtime kernel of the Mosoo agent runtime**. When Mosoo starts an agent session, it boots this driver inside a sandbox; the driver selects a provider backend from the registry, drives the session, and streams a single, runtime-neutral Driver event protocol back to the host. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports, and exposes the session to clients via the CMA-compatible HTTP surface.
 
-We are opening the kernel first. The full Mosoo alpha — the Cloudflare-native open-source Agent Cloud that this driver powers — is being polished and will be open-sourced soon.
+We are opening the kernel first. The full [Mosoo](https://github.com/langgenius/mosoo) alpha — the Cloudflare-native open-source Agent Cloud that this driver powers — is being polished and will be open-sourced soon.
 
 ## Commands
 
