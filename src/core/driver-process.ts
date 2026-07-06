@@ -136,6 +136,7 @@ export class DriverProcess {
         });
 
         const runtimeContext = this.createAgentDriverContext(socket, logger);
+        this.#heartbeatLoop.start(socket, logger, hello.heartbeatIntervalMs);
 
         const backendLoadStartedAtMs = Date.now();
         const backend = await logger.span("driver.backend.load", async () =>
@@ -163,7 +164,6 @@ export class DriverProcess {
           runtime: this.payload.runtime,
         });
 
-        this.#heartbeatLoop.start(socket, logger, hello.heartbeatIntervalMs);
         const commandDispatcher = new DriverCommandDispatcher({
           backend,
           driverInstanceId: this.payload.driverInstanceId,
@@ -353,6 +353,9 @@ export class DriverProcess {
         },
         hostIntegration: {
           snapshot: async () => this.#hostSnapshot,
+        },
+        lifecycle: {
+          shutdown: async (reason) => this.shutdown(socket, reason),
         },
         skill: {
           materialize: async (execution) => materializeResolvedSkills(execution, logger),

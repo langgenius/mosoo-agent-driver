@@ -162,4 +162,35 @@ describe("AgentDriverKernelCore", () => {
     expect(mcpOutput).toBe("port:complete");
     expect(materializedSkillName).toBe("review");
   });
+
+  test("lets backend lifecycle shutdown stop the kernel", async () => {
+    const backend = createBackend();
+    let context: AgentDriverContext | null = null;
+    let stopReason: string | null = null;
+    backend.start = async (inputContext: AgentDriverContext) => {
+      context = inputContext;
+    };
+    backend.stop = async (_inputContext: AgentDriverContext, reason: string) => {
+      stopReason = reason;
+    };
+    const kernel = new AgentDriverKernelCore({
+      backendFactory: async () => backend,
+    });
+
+    await kernel.start(bootPayload);
+    await context?.ports.lifecycle.shutdown("backend.exit");
+
+    expect(stopReason).toBe("backend.exit");
+    await expect(
+      kernel.dispatch({
+        commandId: "input-after-shutdown",
+        input: {
+          text: "hello",
+        },
+        kind: "input.start",
+        requestId: "request-1",
+        runId: DRIVER_TEST_IDS.runId,
+      }),
+    ).rejects.toThrow("Driver kernel is shutting down.");
+  });
 });

@@ -310,7 +310,12 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   #createContext(payload: DriverStartInput): AgentDriverContext {
     return createAgentDriverContext({
       eventSink: this,
-      ...(this.#hostPorts === undefined ? {} : { ports: this.#hostPorts }),
+      ports: {
+        ...this.#hostPorts,
+        lifecycle: {
+          shutdown: async (reason) => this.#shutdown(reason),
+        },
+      },
       payload,
       logger: this.#logger,
       permission: {

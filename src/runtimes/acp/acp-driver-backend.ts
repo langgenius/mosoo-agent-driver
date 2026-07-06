@@ -114,7 +114,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     const env = buildAcpChildProcessEnv(this.#payload);
     const agentProcess = await startAcpAgentProcess(context, this.#payload, env);
     this.#agentProcess = agentProcess;
-    this.#connection = new AcpJsonRpcConnection({
+    const connection = new AcpJsonRpcConnection({
       onInvalidMessage: (error, line) => {
         context.logger.warn("driver.acp.message.invalid", {
           line,
@@ -130,9 +130,18 @@ export class AcpDriverBackend implements AgentDriverBackend {
       stdin: agentProcess.stdin,
       stdout: agentProcess.stdout,
     });
+    this.#connection = connection;
+    agentProcess.once("exit", (code, signal) => {
+      const reason = `ACP agent process exited with ${
+        code === null ? `signal ${signal ?? "unknown"}` : `code ${code}`
+      }.`;
+
+      connection.close(reason);
+      void context.ports.lifecycle.shutdown(reason);
+    });
 
     const initResult = parseAcpInitializeResult(
-      await this.#connection.request("initialize", {
+      await connection.request("initialize", {
         clientCapabilities: buildAcpClientCapabilities(),
         clientInfo: {
           name: "mosoo-driver",
