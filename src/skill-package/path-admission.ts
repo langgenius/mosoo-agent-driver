@@ -160,7 +160,6 @@ export function rejectUnsupportedArchivePath(admitted: AdmittedSkillPackagePath)
       `The skill package manifest path cannot contain child entries: ${admitted.path}`,
     );
   }
-
 }
 
 function isAbsolutePath(path: string): boolean {
