@@ -19,8 +19,8 @@ import type {
 import type { DriverRuntimeClient } from "../../protocol/orpc";
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
 import { isRuntimeEventEnvelope, toRuntimeEventInput } from "../../runtime-events";
-import { acceptDriverControlSocket } from "./driver-local-control-server";
-import type { DriverWireSocket } from "./driver-local-control-server";
+import { dialDriverControlSocket } from "./driver-control-dial";
+import type { DriverWireSocket } from "./driver-control-dial";
 
 interface DriverInstanceSocketHandlers {
   onClose: (code: number, reason: string) => void;
@@ -39,7 +39,7 @@ export class DriverInstanceSocket {
   }
 
   async connect(): Promise<void> {
-    const socket = await acceptDriverControlSocket(this.payload);
+    const socket = await dialDriverControlSocket(this.payload);
     this.#socket = socket;
 
     socket.addEventListener("close", (event) => {
