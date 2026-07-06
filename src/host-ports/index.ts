@@ -11,7 +11,8 @@ export type AgentDriverHostPortName =
   | "mcp"
   | "skill"
   | "file"
-  | "host_integration";
+  | "host_integration"
+  | "lifecycle";
 
 export interface AgentDriverCommandSource {
   nextCommand(): Promise<RuntimeCommand | null>;
@@ -69,11 +70,16 @@ export interface AgentDriverHostIntegrationPort {
   snapshot(): Promise<DriverHostIntegrationSnapshot | null>;
 }
 
+export interface AgentDriverLifecyclePort {
+  shutdown(reason: string): Promise<void>;
+}
+
 export interface AgentDriverHostPorts {
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
   hostIntegration: AgentDriverHostIntegrationPort;
+  lifecycle: AgentDriverLifecyclePort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
   skill: AgentDriverSkillPort;

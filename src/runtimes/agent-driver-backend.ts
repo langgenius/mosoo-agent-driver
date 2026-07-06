@@ -5,6 +5,7 @@ import type {
   AgentDriverFilePort,
   AgentDriverHostIntegrationPort,
   AgentDriverHostPorts,
+  AgentDriverLifecyclePort,
   AgentDriverMcpPort,
   AgentDriverPermissionPort,
   AgentDriverSkillPort,
@@ -27,6 +28,7 @@ export type AgentDriverContextPortOverrides = Partial<{
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
   hostIntegration: AgentDriverHostIntegrationPort;
+  lifecycle: AgentDriverLifecyclePort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
   skill: AgentDriverSkillPort;
@@ -92,6 +94,9 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
     },
     hostIntegration: {
       snapshot: async () => null,
+    },
+    lifecycle: {
+      shutdown: async () => {},
     },
     mcp: {
       execute: async () => {

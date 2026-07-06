@@ -109,9 +109,12 @@ describe("driver artifact contract", () => {
     expect(buildScript).toContain("src/bin/driver.ts");
     expect(buildScript).toContain("dist/driver.mjs");
     expect(buildScript).not.toContain("src/index.ts");
+    expect(dockerfile).toContain("ARG WRANGLER_VERSION=4.103.0");
     expect(dockerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
     expect(dockerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
     expect(dockerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
+    expect(dockerfile).toContain("wrangler@${WRANGLER_VERSION}");
+    expect(dockerfile).toContain("wrangler --version");
     expect(dockerignore).toContain("!dist/driver.mjs");
     expect(dockerBuildScript).toBe("bun run build && docker build -t agent-driver:local .");
   });

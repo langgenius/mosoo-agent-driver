@@ -62,8 +62,11 @@
       "payload": {
         "options": [
           {
+            "currentValue": "",
             "id": "approval",
-            "type": "select"
+            "name": "approval",
+            "type": "select",
+            "values": []
           }
         ]
       }

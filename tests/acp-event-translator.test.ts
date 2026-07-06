@@ -426,11 +426,15 @@ describe("ACP runtime event translation", () => {
       setup: {
         configOptions: [
           {
+            id: "approval",
+          },
+          {
             category: "model",
             currentValue: "deepseek/deepseek-v4-pro",
             id: "model",
             name: "Model",
             options: [
+              "deepseek/deepseek-v4-flash",
               {
                 name: "DeepSeek/DeepSeek V4 Pro",
                 value: "deepseek/deepseek-v4-pro",
@@ -447,12 +451,23 @@ describe("ACP runtime event translation", () => {
     expect(payload).toEqual({
       options: [
         {
+          currentValue: "",
+          id: "approval",
+          name: "approval",
+          type: "select",
+          values: [],
+        },
+        {
           category: "model",
           currentValue: "deepseek/deepseek-v4-pro",
           id: "model",
           name: "Model",
           type: "select",
           values: [
+            {
+              name: "deepseek/deepseek-v4-flash",
+              value: "deepseek/deepseek-v4-flash",
+            },
             {
               name: "DeepSeek/DeepSeek V4 Pro",
               value: "deepseek/deepseek-v4-pro",

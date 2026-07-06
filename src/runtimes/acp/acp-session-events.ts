@@ -235,11 +235,23 @@ function normalizeConfigValueOptions(raw: unknown): JsonObject[] {
   }
 
   return raw.flatMap((entry): JsonObject[] => {
+    if (typeof entry === "string") {
+      return [
+        {
+          name: entry,
+          value: entry,
+        },
+      ];
+    }
+
     if (!isRecord(entry)) {
       return [];
     }
 
-    const value = readNonEmptyString(entry, "value");
+    const value =
+      readNonEmptyString(entry, "value") ??
+      readNonEmptyString(entry, "id") ??
+      readNonEmptyString(entry, "name");
 
     if (value === null) {
       return [];
@@ -267,12 +279,12 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
   }
 
   return raw.flatMap((entry): JsonObject[] => {
-    if (!isRecord(entry) || entry["type"] !== "select") {
+    if (!isRecord(entry) || (entry["type"] !== undefined && entry["type"] !== "select")) {
       return [];
     }
 
-    const id = readNonEmptyString(entry, "id");
-    const currentValue = readString(entry, "currentValue");
+    const id = readNonEmptyString(entry, "id") ?? readNonEmptyString(entry, "name");
+    const currentValue = readString(entry, "currentValue") ?? readString(entry, "value") ?? "";
 
     if (id === null) {
       return [];
@@ -287,12 +299,12 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
     return [
       {
         ...(category === undefined ? {} : { category }),
-        ...(currentValue === null ? {} : { currentValue }),
+        currentValue,
         ...(description === undefined ? {} : { description }),
         id,
-        ...(name === null ? {} : { name }),
+        name: name ?? id,
         type: "select",
-        ...(values === null ? {} : { values }),
+        values: values ?? [],
       },
     ];
   });
