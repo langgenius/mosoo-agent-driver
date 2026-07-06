@@ -183,6 +183,7 @@ export interface DriverExecutionSpec {
 
 export interface DriverBootPayload {
   readonly bootToken: string;
+  readonly controlUrl: string;
   readonly driverControlPort: number;
   readonly driverGeneration: number;
   readonly driverInstanceId: DriverInstanceId;
@@ -466,8 +467,17 @@ export function parseDriverBootPayload(value: unknown): DriverBootPayload {
     throw new TypeError(`Unsupported runtime transport: ${runtimeTransport}.`);
   }
 
+  const controlUrl = readNonEmptyString(record, "controlUrl", "Driver boot payload");
+
+  try {
+    void new URL(controlUrl);
+  } catch {
+    throw new TypeError("Driver boot payload.controlUrl must be an absolute URL.");
+  }
+
   return {
     bootToken: readNonEmptyString(record, "bootToken", "Driver boot payload"),
+    controlUrl,
     driverControlPort,
     driverGeneration,
     driverInstanceId: parseId(record["driverInstanceId"], "Driver instance ID") as DriverInstanceId,
