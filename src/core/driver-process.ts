@@ -3,6 +3,7 @@ import {
   createDriverLogger,
   runWithDriverLogContext,
 } from "../infrastructure/logging/driver-logger";
+import type { DriverLogUplink } from "../infrastructure/logging/driver-logger";
 import { DriverInstanceSocket } from "../infrastructure/runtime/driver-instance-socket";
 import type { Logger } from "../observability";
 import { DRIVER_PROTOCOL_VERSION } from "../protocol/boot";
@@ -50,6 +51,7 @@ export class DriverProcess {
   readonly #heartbeatLoop: DriverHeartbeatLoop;
   #backend: AgentDriverBackend | null = null;
   #logger: Logger | null = null;
+  #logUplink: DriverLogUplink | null = null;
   private readonly payload: DriverBootPayload;
   readonly #permissionBroker: DriverPermissionBroker;
   readonly #hostSnapshot: DriverHostIntegrationSnapshot;
@@ -86,8 +88,9 @@ export class DriverProcess {
 
     this.registerSignals(socket);
     await socket.connect();
-    const logger = createDriverLogger(this.payload, socket);
+    const { logger, uplink } = createDriverLogger(this.payload, socket);
     this.#logger = logger;
+    this.#logUplink = uplink;
 
     try {
       await runWithDriverLogContext(this.payload, async () => {
@@ -114,6 +117,9 @@ export class DriverProcess {
           }),
         );
         const initialRunId = parseNullableRunId(hello.runId);
+        // The server accepts pushLogs only after hello commits; release the
+        // buffered boot logs now instead of racing the handshake round-trip.
+        uplink.open();
         const helloDurationMs = toDriverDurationMs(helloStartedAtMs);
 
         logger.info("driver.runtime.hello.completed", {
@@ -196,6 +202,9 @@ export class DriverProcess {
 
     this.#shuttingDown = true;
     this.#shutdownReason = reason;
+    // If hello never completed, a gated flush may still be pending; open the
+    // gate so log teardown cannot hang shutdown.
+    this.#logUplink?.open();
     this.#logger?.debug("driver.runtime.shutdown.requested", {
       driverInstanceId: this.payload.driverInstanceId,
       reason,

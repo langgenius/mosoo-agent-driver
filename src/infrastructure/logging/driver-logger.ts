@@ -22,7 +22,10 @@ function createFallbackPayload(
 }
 
 function logFallback(message: string, metadata: Record<string, unknown> = {}): void {
-  globalThis.reportError(new Error(JSON.stringify(createFallbackPayload(message, metadata))));
+  // Logging must never kill the driver: reportError is fatal under Bun (an
+  // unhandled error report exits the process), which turned transient log
+  // uplink failures into "closed before ready" driver deaths.
+  process.stderr.write(`${JSON.stringify(createFallbackPayload(message, metadata))}\n`);
 }
 
 function toDriverLogContext(entry: LogEntry): DriverLogEntry["context"] | undefined {
@@ -93,13 +96,31 @@ function toDriverLogEntry(entry: LogEntry, seq: number): DriverLogEntry {
   };
 }
 
+export interface DriverLogUplink {
+  open(): void;
+}
+
+export interface DriverLoggerHandle {
+  logger: Logger;
+  uplink: DriverLogUplink;
+}
+
 export function createDriverLogger(
   payload: DriverBootPayload,
   socket: DriverInstanceSocket,
-): Logger {
+): DriverLoggerHandle {
   let nextSeq = 0;
+  let openUplink: () => void = () => undefined;
+  // The API rejects pushLogs until the hello handshake commits, and the DO
+  // round-trip for hello can take arbitrarily long in production. Hold every
+  // batch behind this event gate (never a timer) until the boot flow opens it;
+  // the transport's ring buffer bounds what accumulates while gated. Shutdown
+  // paths must also open the gate so a pending flush can never hang teardown.
+  const uplinkOpened = new Promise<void>((resolve) => {
+    openUplink = resolve;
+  });
 
-  return createBufferedSinkLogger({
+  const logger = createBufferedSinkLogger({
     context: {
       sandboxId: payload.sandboxId,
     },
@@ -118,6 +139,7 @@ export function createDriverLogger(
     },
     service: "driver",
     sink: async (entries) => {
+      await uplinkOpened;
       await socket.pushLogs({
         logs: entries.map((entry) => {
           const mapped = toDriverLogEntry(entry, nextSeq);
@@ -127,6 +149,8 @@ export function createDriverLogger(
       });
     },
   });
+
+  return { logger, uplink: { open: openUplink } };
 }
 
 export async function runWithDriverLogContext<T>(
