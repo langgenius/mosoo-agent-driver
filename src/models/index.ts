@@ -1,1 +1,1 @@
-export const OPENAI_DEFAULT_MODEL_ID = "gpt-5.4" as const;
+export const OPENAI_DEFAULT_MODEL_ID = "gpt-5.6-terra" as const;

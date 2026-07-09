@@ -1,9 +1,9 @@
 FROM cloudflare/sandbox:0.10.3
 
 # Keep the default base image version in sync with apps/api/package.json -> @cloudflare/sandbox.
-ARG CLAUDE_AGENT_SDK_VERSION=0.3.158
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.205
 ARG ANTHROPIC_SDK_VERSION=0.100.1
-ARG OPENAI_RUNTIME_VERSION=0.135.0
+ARG OPENAI_RUNTIME_VERSION=0.144.0
 ARG OPENCODE_VERSION=1.17.7
 
 # Native agent CLIs pre-installed so the driver can spawn them via PATH.
