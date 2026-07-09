@@ -1,34 +1,22 @@
-interface AsyncTimeoutErrorOptions {
-  readonly label: string;
-  readonly message: string;
-  readonly timeoutMs: number;
-}
-
-export class AsyncTimeoutError extends Error {
-  readonly _tag = "AsyncTimeoutError";
+class AsyncTimeoutError extends Error {
   readonly label: string;
   readonly timeoutMs: number;
 
-  constructor(options: AsyncTimeoutErrorOptions) {
-    super(options.message);
+  constructor(label: string, timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms.`);
     this.name = "AsyncTimeoutError";
-    this.label = options.label;
-    this.timeoutMs = options.timeoutMs;
+    this.label = label;
+    this.timeoutMs = timeoutMs;
   }
 }
 
-export interface PromiseDeferred<T> {
-  readonly promise: Promise<T>;
-  readonly reject: (error: unknown) => void;
-  readonly resolve: (value: T) => void;
-}
-
-export interface PromiseTimeoutOptions {
+interface PromiseTimeoutOptions {
   readonly label: string;
+  readonly signal?: AbortSignal;
   readonly timeoutMs: number;
 }
 
-export type PromiseTimeoutResult<T> =
+type PromiseTimeoutResult<T> =
   | {
       readonly status: "completed";
       readonly value: T;
@@ -42,105 +30,112 @@ export type PromiseTimeoutResult<T> =
       readonly status: "failed";
     };
 
-function enforceFiniteNonNegativeMilliseconds(value: number, label: string): void {
+const MAX_TIMER_MS = 2_147_483_647;
+
+function assertTimerMs(value: number, label: string): void {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`${label} must be a finite non-negative millisecond value.`);
   }
-}
-
-function createUninitializedDeferredCallback(label: string): () => never {
-  return () => {
-    throw new Error(`Promise deferred ${label} callback was not initialized.`);
-  };
-}
-
-export function createPromiseDeferred<T>(): PromiseDeferred<T> {
-  let resolveDeferred: (value: T) => void = createUninitializedDeferredCallback("resolve");
-  let rejectDeferred: (error: unknown) => void = createUninitializedDeferredCallback("reject");
-
-  const promise = new Promise<T>((resolve, reject) => {
-    resolveDeferred = resolve;
-    rejectDeferred = reject;
-  });
-
-  return {
-    promise,
-    reject: rejectDeferred,
-    resolve: resolveDeferred,
-  };
-}
-
-export function createTimeoutError(options: PromiseTimeoutOptions): AsyncTimeoutError {
-  return new AsyncTimeoutError({
-    label: options.label,
-    message: `${options.label} timed out after ${options.timeoutMs}ms.`,
-    timeoutMs: options.timeoutMs,
-  });
-}
-
-export function ignorePromiseRejection(error?: unknown): void {
-  Object.is(error, undefined);
-}
-
-export function isAsyncTimeoutError(error: unknown): error is AsyncTimeoutError {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "_tag" in error &&
-    error["_tag"] === "AsyncTimeoutError"
-  );
 }
 
 export async function promiseWithTimeout<T>(
   promise: Promise<T>,
   options: PromiseTimeoutOptions,
 ): Promise<T> {
-  enforceFiniteNonNegativeMilliseconds(options.timeoutMs, options.label);
+  const result = await settleWithTimeout(promise, options);
+
+  if (result.status === "completed") {
+    return result.value;
+  }
+
+  throw result.error;
+}
+
+async function settleWithTimeout<T>(
+  promise: Promise<T>,
+  options: PromiseTimeoutOptions,
+): Promise<PromiseTimeoutResult<T>> {
+  const operation = promise.then<PromiseTimeoutResult<T>, PromiseTimeoutResult<T>>(
+    (value) => ({ status: "completed", value }),
+    (error: unknown) => ({ error, status: "failed" }),
+  );
+  assertTimerMs(options.timeoutMs, options.label);
+
+  if (options.signal?.aborted) {
+    return { error: options.signal.reason, status: "failed" };
+  }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+  let onAbort: (() => void) | undefined;
+  const timeout = new Promise<PromiseTimeoutResult<T>>((resolve) => {
     timeoutId = setTimeout(() => {
-      reject(createTimeoutError(options));
-    }, options.timeoutMs);
+      resolve({
+        error: new AsyncTimeoutError(options.label, options.timeoutMs),
+        status: "timed_out",
+      });
+    }, Math.min(options.timeoutMs, MAX_TIMER_MS));
+  });
+  const aborted = new Promise<PromiseTimeoutResult<T>>((resolve) => {
+    if (options.signal === undefined) {
+      return;
+    }
+
+    onAbort = () => resolve({ error: options.signal?.reason, status: "failed" });
+    options.signal.addEventListener("abort", onAbort, { once: true });
   });
 
   try {
-    return await Promise.race([promise, timeoutPromise]);
+    return await Promise.race([operation, timeout, aborted]);
   } finally {
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
     }
+    if (onAbort !== undefined) {
+      options.signal?.removeEventListener("abort", onAbort);
+    }
   }
 }
 
-export async function settlePromiseWithTimeout<T>(
+export async function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+
+  if (signal.aborted) {
+    void promise.catch(() => {});
+    throw signal.reason;
+  }
+  const aborted = Promise.withResolvers<never>();
+  const onAbort = () => aborted.reject(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    return await Promise.race([promise, aborted.promise]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+export function settlePromiseWithTimeout<T>(
   promise: Promise<T>,
   options: PromiseTimeoutOptions,
 ): Promise<PromiseTimeoutResult<T>> {
-  try {
-    return {
-      status: "completed",
-      value: await promiseWithTimeout(promise, options),
-    };
-  } catch (error) {
-    if (isAsyncTimeoutError(error)) {
-      return {
-        error,
-        status: "timed_out",
-      };
-    }
-
-    return {
-      error,
-      status: "failed",
-    };
-  }
+  return settleWithTimeout(promise, options);
 }
 
-export async function sleepPromise(ms: number): Promise<void> {
-  enforceFiniteNonNegativeMilliseconds(ms, "sleep");
+export async function sleepPromise(ms: number, signal?: AbortSignal): Promise<void> {
+  assertTimerMs(ms, "sleep");
+  signal?.throwIfAborted();
 
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
+  await new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.min(ms, MAX_TIMER_MS));
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
