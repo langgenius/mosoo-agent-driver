@@ -193,7 +193,6 @@ describe("OpenAi app-server event bridge", () => {
     await bridge.handleNotification(context, "item/completed", {
       item: {
         id: "message-final",
-        text: "完整最终回答：中文 Markdown ✅",
         type: "agentMessage",
       },
       threadId: "thread-1",
@@ -217,9 +216,197 @@ describe("OpenAi app-server event bridge", () => {
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
-    expect(readEventPayloadString(runCompleted as DriverEvent, "finalMessageText")).toBe(
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe(
       "完整最终回答：中文 Markdown ✅",
     );
+  });
+
+  test("does not fall back to progress when the final turn item is incomplete", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-progress",
+        text: "PROGRESS",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          { id: "message-progress", text: "PROGRESS", type: "agentMessage" },
+          { id: "message-final", type: "agentMessage" },
+        ],
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageId")).toBeNull();
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBeNull();
+  });
+
+  test("uses the last completed assistant snapshot when turn items are omitted", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "PROGRESS",
+      itemId: "message-progress",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-progress",
+        text: "PROGRESS",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "最终回答：中文 Markdown ✅",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        text: "最终回答：中文 Markdown ✅",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageId")).not.toBeNull();
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe(
+      "最终回答：中文 Markdown ✅",
+    );
+  });
+
+  test("uses completed snapshots when terminal items are not loaded", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-final", text: "FINAL", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [],
+        itemsView: "notLoaded",
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe("FINAL");
+  });
+
+  test("does not fall back when a full terminal item list has no assistant", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-progress", text: "PROGRESS", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [],
+        itemsView: "full",
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBeNull();
+  });
+
+  test("uses first-seen item order when older completions arrive late", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    for (const [itemId, delta] of [
+      ["message-progress", "PROGRESS"],
+      ["message-final", "FINAL"],
+    ] as const) {
+      await bridge.handleNotification(context, "item/agentMessage/delta", {
+        delta,
+        itemId,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+    }
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-final", text: "FINAL", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-progress", text: "PROGRESS", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe("FINAL");
   });
 
   test("completed turns app final items before run finish", async () => {
@@ -489,6 +676,17 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          { id: "message-a", text: "消息甲", type: "agentMessage" },
+          { id: "message-b", text: "消息乙", type: "agentMessage" },
+        ],
+        status: "completed",
+      },
+    });
     await logger.destroy();
 
     const deltas = events().flatMap((event) => {
@@ -504,6 +702,16 @@ describe("OpenAi app-server event bridge", () => {
     expect(deltas.map((entry) => entry.contentDelta)).toEqual(["消息甲", "消息乙"]);
     expect(new Set(deltas.map((entry) => entry.messageId)).size).toBe(2);
     expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(2);
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    if (runCompleted === undefined) {
+      throw new Error("Expected a run.completed event.");
+    }
+
+    const finalMessageId = readEventPayloadString(runCompleted, "finalMessageId");
+
+    expect(finalMessageId).toBe(deltas.find((entry) => entry.contentDelta === "消息乙")?.messageId);
+    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe("消息乙");
   });
 
   test("command output streams as tool result content", async () => {

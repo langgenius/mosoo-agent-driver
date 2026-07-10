@@ -1,5 +1,6 @@
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
+import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 import { toAcpPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
 import {
@@ -37,16 +38,30 @@ export interface AcpTurnEventStateInput {
   readonly sessionId: string;
 }
 
+interface AcpAssistantMessageState {
+  readonly id: string;
+  readonly nativeMessageId: string | null;
+  text: string;
+}
+
+interface AcpAssistantMessageStart {
+  readonly events: DriverEventInput[];
+  readonly message: AcpAssistantMessageState;
+}
+
 export class AcpTurnEventState {
-  #messageCompleted = false;
-  #messageId: string | null = null;
-  #messageStarted = false;
-  #messageText = "";
+  #activeAssistantMessage: AcpAssistantMessageState | null = null;
+  readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
+  #lastCompletedAssistantMessage: Pick<AcpAssistantMessageState, "id" | "text"> | null = null;
+  #promptMessageId: string | null = null;
   #runId: RunId | null = null;
   #sequence = 0;
   #sessionId: string | null = null;
+  readonly #settledAssistantNativeMessageIds = new Set<string>();
+  #unidentifiedAssistantMessageSequence = 0;
   #thoughtCompleted = false;
   #thoughtFallbackText = "";
+  #thoughtFallbackNativeMessageId: string | null = null;
   #thoughtId: string | null = null;
   #thoughtStarted = false;
   readonly #tools = new AcpToolEventState();
@@ -56,30 +71,36 @@ export class AcpTurnEventState {
   }
 
   begin(input: AcpTurnEventStateInput): void {
-    this.#messageCompleted = false;
-    this.#messageId = input.messageId;
-    this.#messageStarted = false;
-    this.#messageText = "";
+    this.#activeAssistantMessage = null;
+    this.#assistantMessageIds.reset();
+    this.#lastCompletedAssistantMessage = null;
+    this.#promptMessageId = input.messageId;
     this.#runId = input.runId;
     this.#sequence = 0;
     this.#sessionId = input.sessionId;
+    this.#settledAssistantNativeMessageIds.clear();
+    this.#unidentifiedAssistantMessageSequence = 0;
     this.#thoughtCompleted = false;
     this.#thoughtFallbackText = "";
+    this.#thoughtFallbackNativeMessageId = null;
     this.#thoughtId = `${input.messageId}:thought`;
     this.#thoughtStarted = false;
     this.#tools.clear();
   }
 
   clear(): void {
-    this.#messageCompleted = false;
-    this.#messageId = null;
-    this.#messageStarted = false;
-    this.#messageText = "";
+    this.#activeAssistantMessage = null;
+    this.#assistantMessageIds.reset();
+    this.#lastCompletedAssistantMessage = null;
+    this.#promptMessageId = null;
     this.#runId = null;
     this.#sequence = 0;
     this.#sessionId = null;
+    this.#settledAssistantNativeMessageIds.clear();
+    this.#unidentifiedAssistantMessageSequence = 0;
     this.#thoughtCompleted = false;
     this.#thoughtFallbackText = "";
+    this.#thoughtFallbackNativeMessageId = null;
     this.#thoughtId = null;
     this.#thoughtStarted = false;
     this.#tools.clear();
@@ -90,18 +111,7 @@ export class AcpTurnEventState {
     const runId = this.#requireRunId();
 
     events.push(...this.#promoteThoughtFallbackToMessage());
-
-    if (this.#messageStarted && !this.#messageCompleted) {
-      this.#messageCompleted = true;
-      events.push({
-        kind: "message.completed",
-        payload: {
-          messageId: this.#requireMessageId(),
-          role: "agent",
-        },
-        runId,
-      });
-    }
+    events.push(...this.#completeActiveAssistantMessage());
 
     if (this.#thoughtStarted && !this.#thoughtCompleted) {
       this.#thoughtCompleted = true;
@@ -164,15 +174,17 @@ export class AcpTurnEventState {
         runId,
       });
     } else {
+      const finalMessage = this.#lastCompletedAssistantMessage;
+
       events.push({
         kind: "run.completed",
         payload: {
-          ...(this.#messageStarted
-            ? {
-                finalMessageId: this.#requireMessageId(),
-                finalMessageText: this.#messageText,
-              }
-            : {}),
+          ...(finalMessage === null
+            ? {}
+            : {
+                finalMessageId: finalMessage.id,
+                finalMessageText: finalMessage.text,
+              }),
           stopReason,
         },
         runId,
@@ -192,19 +204,9 @@ export class AcpTurnEventState {
     }
 
     const events: DriverEventInput[] = [];
-    const messageId = this.#messageId;
     const thoughtId = this.#thoughtId;
 
-    if (this.#messageStarted && !this.#messageCompleted && messageId !== null) {
-      events.push({
-        kind: "message.completed",
-        payload: {
-          messageId,
-          role: "agent",
-        },
-        runId,
-      });
-    }
+    events.push(...this.#completeActiveAssistantMessage());
 
     if (this.#thoughtStarted && !this.#thoughtCompleted && thoughtId !== null) {
       events.push({
@@ -317,7 +319,7 @@ export class AcpTurnEventState {
       ...translation,
       events: [
         ...this.#tools.ensureStarted({
-          parentMessageId: this.#messageId ?? undefined,
+          parentMessageId: this.#toolParentMessageId(),
           runId,
           title: translation.title,
           toolCallId: translation.targetItemId,
@@ -338,17 +340,30 @@ export class AcpTurnEventState {
       return [];
     }
 
-    this.#messageText += delta;
+    const nativeMessageId = readNonEmptyString(update, "messageId");
+    const started =
+      nativeMessageId === null
+        ? this.#startUnidentifiedAssistantMessage()
+        : this.#startIdentifiedAssistantMessage(nativeMessageId);
+
+    if (started === null) {
+      // An already settled native message can only be a late replay. Keeping
+      // the newer active message intact avoids letting a progress replay win
+      // the final-message identity by arrival order.
+      return [];
+    }
+
+    started.message.text += delta;
 
     return [
-      ...this.#ensureMessageStarted(),
+      ...started.events,
       {
         delivery: "best_effort",
         kind: "message.delta",
         payload: {
           contentBlock: update?.["content"],
           contentDelta: delta,
-          messageId: this.#requireMessageId(),
+          messageId: started.message.id,
           role: "agent",
         },
         runId: this.#requireRunId(),
@@ -364,25 +379,51 @@ export class AcpTurnEventState {
       return [];
     }
 
-    if (!this.#messageStarted && readNonEmptyString(update, "messageId") !== null) {
-      this.#thoughtFallbackText += delta;
+    const nativeMessageId = readNonEmptyString(update, "messageId");
+    const events: DriverEventInput[] = [];
+
+    if (nativeMessageId === null) {
+      // Thought updates can carry the provider's final answer. Without a
+      // native identity there is no safe way to decide whether this text
+      // belongs to the active assistant message or starts a newer one. Close
+      // the live message boundary, then fail closed instead of projecting an
+      // earlier identified progress message as canonical final output.
+      events.push(...this.#completeActiveAssistantMessage());
+      this.#lastCompletedAssistantMessage = null;
+      this.#clearThoughtFallback();
+    } else if (!this.#settledAssistantNativeMessageIds.has(nativeMessageId)) {
+      const active = this.#activeAssistantMessage;
+
+      if (active !== null && active.nativeMessageId !== nativeMessageId) {
+        // ACP runtimes can expose final answer text through a thought update.
+        // A new native identity is an explicit message boundary: settle the
+        // active progress message so this thought can become the final fallback.
+        events.push(...this.#completeActiveAssistantMessage());
+      }
+
+      if (this.#activeAssistantMessage === null) {
+        if (this.#thoughtFallbackNativeMessageId === nativeMessageId) {
+          this.#thoughtFallbackText += delta;
+        } else {
+          this.#thoughtFallbackNativeMessageId = nativeMessageId;
+          this.#thoughtFallbackText = delta;
+        }
+      }
     }
 
-    return [
-      ...this.#ensureThoughtStarted(),
-      {
-        delivery: "best_effort",
-        kind: "thought.delta",
-        payload: {
-          channel: "summary",
-          contentBlock: update?.["content"],
-          contentDelta: delta,
-          thoughtId: this.#requireThoughtId(),
-        },
-        runId: this.#requireRunId(),
-        sourceEventId: this.#nextSourceEventId("agent-thought"),
+    events.push(...this.#ensureThoughtStarted(), {
+      delivery: "best_effort",
+      kind: "thought.delta",
+      payload: {
+        channel: "summary",
+        contentBlock: update?.["content"],
+        contentDelta: delta,
+        thoughtId: this.#requireThoughtId(),
       },
-    ];
+      runId: this.#requireRunId(),
+      sourceEventId: this.#nextSourceEventId("agent-thought"),
+    });
+    return events;
   }
 
   #translateToolCall(update: JsonObject | null): DriverEventInput[] {
@@ -397,7 +438,7 @@ export class AcpTurnEventState {
     const title =
       readNonEmptyString(update, "title") ?? readNonEmptyString(update, "kind") ?? "tool";
     const events = this.#tools.ensureStarted({
-      parentMessageId: this.#messageId ?? undefined,
+      parentMessageId: this.#toolParentMessageId(),
       runId,
       title,
       toolCallId,
@@ -433,7 +474,7 @@ export class AcpTurnEventState {
     const title =
       readNonEmptyString(update, "title") ?? readNonEmptyString(update, "kind") ?? "tool";
     const events = this.#tools.ensureStarted({
-      parentMessageId: this.#messageId ?? undefined,
+      parentMessageId: this.#toolParentMessageId(),
       runId,
       title,
       toolCallId,
@@ -458,48 +499,28 @@ export class AcpTurnEventState {
     return events;
   }
 
-  #ensureMessageStarted(): DriverEventInput[] {
-    if (this.#messageStarted) {
-      return [];
-    }
-
-    this.#messageStarted = true;
-    this.#thoughtFallbackText = "";
-    return [
-      {
-        kind: "message.started",
-        payload: {
-          messageId: this.#requireMessageId(),
-          role: "agent",
-        },
-        runId: this.#requireRunId(),
-      },
-    ];
-  }
-
   #promoteThoughtFallbackToMessage(): DriverEventInput[] {
-    if (this.#messageStarted) {
+    if (this.#activeAssistantMessage !== null) {
       return [];
     }
 
-    const contentDelta = this.#thoughtFallbackText.trim();
+    const contentDelta = this.#thoughtFallbackText;
+    const nativeMessageId = this.#thoughtFallbackNativeMessageId;
 
-    if (contentDelta.length === 0) {
+    if (contentDelta.trim().length === 0 || nativeMessageId === null) {
       return [];
     }
 
-    this.#messageStarted = true;
-    this.#messageText = contentDelta;
-    this.#thoughtFallbackText = "";
+    this.#clearThoughtFallback();
+    const started = this.#startIdentifiedAssistantMessage(nativeMessageId);
+
+    if (started === null) {
+      return [];
+    }
+
+    started.message.text += contentDelta;
     return [
-      {
-        kind: "message.started",
-        payload: {
-          messageId: this.#requireMessageId(),
-          role: "agent",
-        },
-        runId: this.#requireRunId(),
-      },
+      ...started.events,
       {
         delivery: "best_effort",
         kind: "message.delta",
@@ -509,13 +530,113 @@ export class AcpTurnEventState {
             type: "text",
           },
           contentDelta,
-          messageId: this.#requireMessageId(),
+          messageId: started.message.id,
           role: "agent",
         },
         runId: this.#requireRunId(),
         sourceEventId: this.#nextSourceEventId("agent-thought-fallback-message"),
       },
     ];
+  }
+
+  #clearThoughtFallback(): void {
+    this.#thoughtFallbackNativeMessageId = null;
+    this.#thoughtFallbackText = "";
+  }
+
+  #completeActiveAssistantMessage(): DriverEventInput[] {
+    const message = this.#activeAssistantMessage;
+
+    if (message === null) {
+      return [];
+    }
+
+    this.#activeAssistantMessage = null;
+
+    if (message.nativeMessageId !== null) {
+      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+      this.#lastCompletedAssistantMessage = {
+        id: message.id,
+        text: message.text,
+      };
+    } else {
+      // ACP v1 does not give anonymous chunks a stable message boundary. If
+      // this is the last assistant message, do not let an earlier progress
+      // message become the canonical final output.
+      this.#lastCompletedAssistantMessage = null;
+    }
+
+    return [
+      {
+        kind: "message.completed",
+        payload: {
+          messageId: message.id,
+          role: "agent",
+        },
+        runId: this.#requireRunId(),
+      },
+    ];
+  }
+
+  #startIdentifiedAssistantMessage(nativeMessageId: string): AcpAssistantMessageStart | null {
+    if (this.#settledAssistantNativeMessageIds.has(nativeMessageId)) {
+      return null;
+    }
+
+    const active = this.#activeAssistantMessage;
+
+    if (active?.nativeMessageId === nativeMessageId) {
+      return { events: [], message: active };
+    }
+
+    const events = this.#completeActiveAssistantMessage();
+    const message: AcpAssistantMessageState = {
+      id: this.#assistantMessageIds.getOrCreate(`native:${nativeMessageId}`),
+      nativeMessageId,
+      text: "",
+    };
+
+    this.#activeAssistantMessage = message;
+    this.#clearThoughtFallback();
+    events.push({
+      kind: "message.started",
+      payload: {
+        messageId: message.id,
+        role: "agent",
+      },
+      runId: this.#requireRunId(),
+    });
+    return { events, message };
+  }
+
+  #startUnidentifiedAssistantMessage(): AcpAssistantMessageStart {
+    const active = this.#activeAssistantMessage;
+
+    if (active?.nativeMessageId === null) {
+      return { events: [], message: active };
+    }
+
+    const events = this.#completeActiveAssistantMessage();
+    this.#unidentifiedAssistantMessageSequence += 1;
+    const message: AcpAssistantMessageState = {
+      id: this.#assistantMessageIds.getOrCreate(
+        `fallback:unidentified:${this.#unidentifiedAssistantMessageSequence}`,
+      ),
+      nativeMessageId: null,
+      text: "",
+    };
+
+    this.#activeAssistantMessage = message;
+    this.#clearThoughtFallback();
+    events.push({
+      kind: "message.started",
+      payload: {
+        messageId: message.id,
+        role: "agent",
+      },
+      runId: this.#requireRunId(),
+    });
+    return { events, message };
   }
 
   #ensureThoughtStarted(): DriverEventInput[] {
@@ -536,14 +657,6 @@ export class AcpTurnEventState {
     ];
   }
 
-  #requireMessageId(): string {
-    if (this.#messageId === null) {
-      throw new Error("ACP turn message id is not initialized.");
-    }
-
-    return this.#messageId;
-  }
-
   #requireRunId(): RunId {
     if (this.#runId === null) {
       throw new Error("ACP turn run id is not initialized.");
@@ -558,5 +671,9 @@ export class AcpTurnEventState {
     }
 
     return this.#thoughtId;
+  }
+
+  #toolParentMessageId(): string | undefined {
+    return this.#activeAssistantMessage?.id ?? this.#promptMessageId ?? undefined;
   }
 }

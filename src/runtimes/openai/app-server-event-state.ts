@@ -10,10 +10,20 @@ export type OpenAiEventPush = (
 ) => Promise<void>;
 
 export class OpenAiMessageState {
+  readonly #completedSnapshots = new Map<
+    string,
+    {
+      itemId: string;
+      messageId: MessageId;
+      sequence: number;
+      text: string;
+      turnId: string;
+    }
+  >();
   readonly #ended = new Set<string>();
+  readonly #itemSequences = new Map<string, number>();
   readonly #itemByMessageId = new Map<MessageId, string>();
   readonly #itemMessageIds = new Map<string, MessageId>();
-  readonly #lastEndedMessageIds = new Map<string, MessageId>();
   readonly #reasoningStarted = new Set<string>();
   readonly #started = new Set<string>();
   readonly #textById = new Map<string, string>();
@@ -21,6 +31,7 @@ export class OpenAiMessageState {
   readonly #turnMessages = new RuntimeAssistantMessageIdIndex<string>();
   readonly #turnMessageIds = new Map<string, MessageId>();
   readonly #turnMessageSequences = new Map<string, number>();
+  readonly #turnNextItemSequences = new Map<string, number>();
 
   appendText(messageId: string, delta: string): void {
     if (delta.length === 0 || this.#ended.has(messageId)) {
@@ -80,6 +91,7 @@ export class OpenAiMessageState {
     push: OpenAiEventPush,
   ): Promise<MessageId> {
     const itemKey = `${input.turnId}:${input.itemId}`;
+    this.#observeItem(itemKey, input.turnId);
     const existing = this.#itemMessageIds.get(itemKey);
 
     if (existing !== undefined) {
@@ -104,6 +116,43 @@ export class OpenAiMessageState {
     this.#turnByMessageId.set(messageId, input.turnId);
     await this.ensureMessageStarted(context, messageId, push);
     return messageId;
+  }
+
+  recordCompletedSnapshot(input: {
+    itemId: string;
+    messageId: MessageId;
+    text: string;
+    turnId: string;
+  }): void {
+    const itemKey = `${input.turnId}:${input.itemId}`;
+    const sequence = this.#observeItem(itemKey, input.turnId);
+
+    this.#completedSnapshots.set(itemKey, { ...input, sequence });
+  }
+
+  finalCompletedSnapshotForTurn(turnId: string): { id: MessageId; text: string } | null {
+    let finalSnapshot:
+      | {
+          itemId: string;
+          messageId: MessageId;
+          sequence: number;
+          text: string;
+          turnId: string;
+        }
+      | undefined;
+
+    for (const snapshot of this.#completedSnapshots.values()) {
+      if (
+        snapshot.turnId === turnId &&
+        (finalSnapshot === undefined || snapshot.sequence > finalSnapshot.sequence)
+      ) {
+        finalSnapshot = snapshot;
+      }
+    }
+
+    return finalSnapshot === undefined
+      ? null
+      : { id: finalSnapshot.messageId, text: finalSnapshot.text };
   }
 
   async ensureMessageStarted(
@@ -136,7 +185,6 @@ export class OpenAiMessageState {
     const turnId = this.#turnByMessageId.get(messageId);
 
     if (turnId !== undefined) {
-      this.#lastEndedMessageIds.set(turnId, messageId);
       this.#turnByMessageId.delete(messageId);
 
       if (this.#turnMessageIds.get(turnId) === messageId) {
@@ -151,12 +199,21 @@ export class OpenAiMessageState {
     return this.#ended.has(messageId);
   }
 
-  finalMessageForTurn(turnId: string): MessageId | null {
-    return this.#lastEndedMessageIds.get(turnId) ?? null;
-  }
-
   messageForTurn(turnId: string): MessageId | null {
     return this.#turnMessageIds.get(turnId) ?? null;
+  }
+
+  #observeItem(itemKey: string, turnId: string): number {
+    const existing = this.#itemSequences.get(itemKey);
+
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const sequence = (this.#turnNextItemSequences.get(turnId) ?? 0) + 1;
+    this.#turnNextItemSequences.set(turnId, sequence);
+    this.#itemSequences.set(itemKey, sequence);
+    return sequence;
   }
 }
 

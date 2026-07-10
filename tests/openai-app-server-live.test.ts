@@ -164,6 +164,7 @@ describe("OpenAI app-server live provider", () => {
           timeoutMs: LIVE_TURN_TIMEOUT_MS,
         });
         const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
+        const completedEvent = turnEvents.find((event) => event.kind === "run.completed");
         logLiveStatus("received output", {
           text: outputText,
         });
@@ -175,6 +176,10 @@ describe("OpenAI app-server live provider", () => {
           outputChars: outputText.length,
         });
         expect(outputText).toContain("pong");
+        expect(completedEvent?.payload).toMatchObject({
+          finalMessageId: expect.any(String),
+          finalMessageText: expect.stringContaining("pong"),
+        });
       } finally {
         if (kernelStarted) {
           logLiveStatus("stopping driver kernel");

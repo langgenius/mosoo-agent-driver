@@ -255,6 +255,27 @@ describe("OpenAI app-server provider fixtures", () => {
     ).toThrow("itemId");
   });
 
+  test("preserves the terminal turn item loading state", () => {
+    expect(
+      parseServerNotificationParams("turn/completed", {
+        threadId: "thread-1",
+        turn: {
+          id: "turn-1",
+          items: [],
+          itemsView: "notLoaded",
+          status: "completed",
+        },
+      }),
+    ).toMatchObject({
+      turn: {
+        id: "turn-1",
+        items: [],
+        itemsView: "notLoaded",
+        status: "completed",
+      },
+    });
+  });
+
   test.each(providerFixtureNames)("apps provider-native fixture %s", async (name) => {
     const fixture = readProviderFixtureCase(
       `./fixtures/providers/openai-app-server/cases/${name}.json`,

@@ -355,6 +355,11 @@ export class OpenAiAppServerEventBridge {
 
     await this.publishRunStarted(context, { runId, turnId });
     await this.#itemEvents.handleTurnCompletedItems(context, params, turnId);
+    const authoritativeFinalMessage = await this.#itemEvents.resolveTurnFinalAssistantSnapshot(
+      context,
+      params,
+      turnId,
+    );
     const status = turn ? readString(turn, "status") : null;
     const error = turn ? readRecord(turn, "error") : null;
     const cancellationReason = this.#turns.takeCancellationReason(turnId);
@@ -393,15 +398,6 @@ export class OpenAiAppServerEventBridge {
       return;
     }
 
-    const finalMessageId = this.#messages.finalMessageForTurn(turnId);
-    const finalMessage =
-      finalMessageId === null
-        ? null
-        : {
-            id: finalMessageId,
-            text: this.#messages.currentText(finalMessageId),
-          };
-
     await this.#push(context, "driver.openai.turn.completed", [
       {
         ...createOpenAiTurnEventFields({
@@ -411,11 +407,11 @@ export class OpenAiAppServerEventBridge {
         }),
         kind: "run.completed",
         payload: {
-          ...(finalMessage === null
+          ...(authoritativeFinalMessage === null
             ? {}
             : {
-                finalMessageId: finalMessage.id,
-                finalMessageText: finalMessage.text,
+                finalMessageId: authoritativeFinalMessage.id,
+                finalMessageText: authoritativeFinalMessage.text,
               }),
           stopReason: "end_turn",
         },
