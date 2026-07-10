@@ -1,6 +1,7 @@
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
+import type { RunId } from "../protocol/id";
 import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type { McpExecuteCommand, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
 
@@ -14,7 +15,7 @@ export type AgentDriverHostPortName =
   | "host_integration";
 
 export interface AgentDriverCommandSource {
-  nextCommand(): Promise<RuntimeCommand | null>;
+  nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
 }
 
 export interface AgentDriverEventSink {
@@ -22,22 +23,32 @@ export interface AgentDriverEventSink {
     commandId: string;
     result?: RuntimeCommandResult;
     status: "accepted" | "cancelled" | "completed" | "failed";
-  }): Promise<void>;
-  pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput>;
+  }, signal: AbortSignal): Promise<void>;
+  currentRunId?(): RunId | null;
+  pushEvents(input: {
+    events: DriverEventInput[];
+    signal?: AbortSignal;
+  }): Promise<DriverEventBatchOutput>;
 }
 
 export interface AgentDriverPermissionPort {
-  request(input: {
-    rawInput: string | null;
-    requestId: string;
-    title: string;
-    toolCallId: string | null;
-    toolKind: string | null;
-  }): Promise<"allow_once" | "reject_once">;
+  request(
+    input: {
+      rawInput: string | null;
+      requestId: string;
+      title: string;
+      toolCallId: string | null;
+      toolKind: string | null;
+    },
+    signal?: AbortSignal,
+  ): Promise<"allow_once" | "reject_once">;
 }
 
 export interface AgentDriverMcpPort {
-  execute(command: McpExecuteCommand): Promise<{
+  execute(
+    command: McpExecuteCommand,
+    signal: AbortSignal,
+  ): Promise<{
     outputText: string;
     requestId: string;
     serverId: string;

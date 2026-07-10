@@ -131,20 +131,35 @@ export interface DriverCompletionInput {
   readonly driverInstanceId: string;
 }
 
+export interface DriverRpcOptions {
+  readonly signal?: AbortSignal;
+}
+
 export interface DriverRuntimeClient {
   readonly driver: {
-    commandUpdate(input: DriverCommandUpdateInput): Promise<{ ok: true }>;
-    completeRun(input: DriverCompletionInput): Promise<{ ok: true }>;
-    failRun(input: DriverFailureInput): Promise<{ ok: true }>;
-    heartbeat(input: DriverHeartbeatInput): Promise<DriverHeartbeatOutput>;
-    hello(input: DriverHelloInput): Promise<DriverHelloOutput>;
-    pushEvents(input: DriverEventBatchInput): Promise<DriverEventBatchOutput>;
-    pushLogs(input: DriverLogBatchInput): Promise<DriverLogBatchOutput>;
-    ready(input: DriverReadyInput): Promise<{ ok: true }>;
+    commandUpdate(
+      input: DriverCommandUpdateInput,
+      options?: DriverRpcOptions,
+    ): Promise<{ ok: true }>;
+    completeRun(input: DriverCompletionInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
+    failRun(input: DriverFailureInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
+    heartbeat(
+      input: DriverHeartbeatInput,
+      options?: DriverRpcOptions,
+    ): Promise<DriverHeartbeatOutput>;
+    hello(input: DriverHelloInput, options?: DriverRpcOptions): Promise<DriverHelloOutput>;
+    pushEvents(
+      input: DriverEventBatchInput,
+      options?: DriverRpcOptions,
+    ): Promise<DriverEventBatchOutput>;
+    pushLogs(input: DriverLogBatchInput, options?: DriverRpcOptions): Promise<DriverLogBatchOutput>;
+    ready(input: DriverReadyInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
   };
   readonly driverInstance: {
-    nextCommand(input: DriverNextCommandInput): Promise<DriverNextCommandOutput>;
-    watchCommands(): Promise<AsyncIterable<RuntimeCommand>>;
+    nextCommand(
+      input: DriverNextCommandInput,
+      options?: DriverRpcOptions,
+    ): Promise<DriverNextCommandOutput>;
   };
 }
 
