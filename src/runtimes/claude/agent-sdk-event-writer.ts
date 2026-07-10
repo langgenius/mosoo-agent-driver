@@ -1,7 +1,7 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
-import type { RunId } from "../../protocol/id";
+import type { MessageId, RunId } from "../../protocol/id";
 import type { AgentDriverContext } from "../agent-driver-backend";
 import type { JsonObject } from "./agent-sdk-json";
 import { toClaudeDiagnosticEvent, toClaudeUsageUpdatedEvents } from "./agent-sdk-message-events";
@@ -76,9 +76,9 @@ export class ClaudeAgentSdkEventWriter {
     return this.#toolParentMessage.get(toolCallId) ?? null;
   }
 
-  async endMessage(context: AgentDriverContext, messageId: string): Promise<void> {
+  async endMessage(context: AgentDriverContext, messageId: string): Promise<boolean> {
     if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
-      return;
+      return false;
     }
 
     this.#messageEnded.add(messageId);
@@ -91,6 +91,7 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    return true;
   }
 
   async ensureMessageStarted(context: AgentDriverContext, messageId: string): Promise<void> {
@@ -179,12 +180,22 @@ export class ClaudeAgentSdkEventWriter {
     ]);
   }
 
-  async pushRunFinished(context: AgentDriverContext, runId: RunId): Promise<void> {
+  async pushRunFinished(
+    context: AgentDriverContext,
+    runId: RunId,
+    finalMessage: { id: MessageId; text: string } | null,
+  ): Promise<void> {
     await this.#push(context, "driver.claude.turn.completed", [
       {
         runId,
         kind: "run.completed",
         payload: {
+          ...(finalMessage === null
+            ? {}
+            : {
+                finalMessageId: finalMessage.id,
+                finalMessageText: finalMessage.text,
+              }),
           stopReason: "end_turn",
         },
       },

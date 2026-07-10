@@ -41,6 +41,7 @@ export class AcpTurnEventState {
   #messageCompleted = false;
   #messageId: string | null = null;
   #messageStarted = false;
+  #messageText = "";
   #runId: RunId | null = null;
   #sequence = 0;
   #sessionId: string | null = null;
@@ -58,6 +59,7 @@ export class AcpTurnEventState {
     this.#messageCompleted = false;
     this.#messageId = input.messageId;
     this.#messageStarted = false;
+    this.#messageText = "";
     this.#runId = input.runId;
     this.#sequence = 0;
     this.#sessionId = input.sessionId;
@@ -72,6 +74,7 @@ export class AcpTurnEventState {
     this.#messageCompleted = false;
     this.#messageId = null;
     this.#messageStarted = false;
+    this.#messageText = "";
     this.#runId = null;
     this.#sequence = 0;
     this.#sessionId = null;
@@ -164,6 +167,12 @@ export class AcpTurnEventState {
       events.push({
         kind: "run.completed",
         payload: {
+          ...(this.#messageStarted
+            ? {
+                finalMessageId: this.#requireMessageId(),
+                finalMessageText: this.#messageText,
+              }
+            : {}),
           stopReason,
         },
         runId,
@@ -329,6 +338,8 @@ export class AcpTurnEventState {
       return [];
     }
 
+    this.#messageText += delta;
+
     return [
       ...this.#ensureMessageStarted(),
       {
@@ -478,6 +489,7 @@ export class AcpTurnEventState {
     }
 
     this.#messageStarted = true;
+    this.#messageText = contentDelta;
     this.#thoughtFallbackText = "";
     return [
       {

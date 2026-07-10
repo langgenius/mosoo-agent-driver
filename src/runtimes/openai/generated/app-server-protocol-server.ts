@@ -16,6 +16,7 @@ import {
   readRequiredString,
 } from "./app-server-protocol-common";
 import type {
+  AgentMessageDeltaNotification,
   ConfigWarningNotification,
   ErrorNotification,
   FileChangePatchUpdatedNotification,
@@ -124,16 +125,15 @@ function parseThreadSettingsUpdatedNotification(value: unknown): ThreadSettingsU
   };
 }
 
-function parseOptionalDeltaNotification(
-  value: unknown,
-  method: string,
-): { delta?: string; threadId?: string; turnId?: string } {
-  const record = readParams(value, method);
+function parseAgentMessageDeltaNotification(value: unknown): AgentMessageDeltaNotification {
+  const label = "item/agentMessage/delta params";
+  const record = readParams(value, "item/agentMessage/delta");
 
   return {
-    ...parseOptionalNotificationString(record, "delta", `${method} params`),
-    ...parseOptionalNotificationString(record, "threadId", `${method} params`),
-    ...parseOptionalNotificationString(record, "turnId", `${method} params`),
+    delta: readRequiredString(record, "delta", label),
+    itemId: readRequiredString(record, "itemId", label),
+    threadId: readRequiredString(record, "threadId", label),
+    turnId: readRequiredString(record, "turnId", label),
   };
 }
 
@@ -301,8 +301,7 @@ const SERVER_NOTIFICATION_PARAM_PARSERS: {
 } = {
   configWarning: parseConfigWarningNotification,
   error: parseErrorNotification,
-  "item/agentMessage/delta": (value) =>
-    parseOptionalDeltaNotification(value, "item/agentMessage/delta"),
+  "item/agentMessage/delta": parseAgentMessageDeltaNotification,
   "item/commandExecution/outputDelta": (value) =>
     parseOptionalToolDeltaNotification(value, "item/commandExecution/outputDelta"),
   "item/completed": (value) => parseItemNotificationBase(value, "item/completed"),

@@ -11,6 +11,9 @@ export type OpenAiEventPush = (
 
 export class OpenAiMessageState {
   readonly #ended = new Set<string>();
+  readonly #itemByMessageId = new Map<MessageId, string>();
+  readonly #itemMessageIds = new Map<string, MessageId>();
+  readonly #lastEndedMessageIds = new Map<string, MessageId>();
   readonly #reasoningStarted = new Set<string>();
   readonly #started = new Set<string>();
   readonly #textById = new Map<string, string>();
@@ -20,7 +23,7 @@ export class OpenAiMessageState {
   readonly #turnMessageSequences = new Map<string, number>();
 
   appendText(messageId: string, delta: string): void {
-    if (delta.length === 0) {
+    if (delta.length === 0 || this.#ended.has(messageId)) {
       return;
     }
 
@@ -29,6 +32,10 @@ export class OpenAiMessageState {
 
   currentText(messageId: string): string {
     return this.#textById.get(messageId) ?? "";
+  }
+
+  setText(messageId: string, text: string): void {
+    this.#textById.set(messageId, text);
   }
 
   ensureReasoningStarted(messageId: string, events: DriverEventInput[]): void {
@@ -67,6 +74,38 @@ export class OpenAiMessageState {
     return generated;
   }
 
+  async ensureItemMessage(
+    context: AgentDriverContext,
+    input: { itemId: string; turnId: string },
+    push: OpenAiEventPush,
+  ): Promise<MessageId> {
+    const itemKey = `${input.turnId}:${input.itemId}`;
+    const existing = this.#itemMessageIds.get(itemKey);
+
+    if (existing !== undefined) {
+      if (!this.#ended.has(existing)) {
+        this.#turnMessageIds.set(input.turnId, existing);
+      }
+      await this.ensureMessageStarted(context, existing, push);
+      return existing;
+    }
+
+    const activeMessageId = this.#turnMessageIds.get(input.turnId);
+    const messageId =
+      activeMessageId !== undefined &&
+      !this.#ended.has(activeMessageId) &&
+      !this.#itemByMessageId.has(activeMessageId)
+        ? activeMessageId
+        : this.#turnMessages.getOrCreate(`item:${itemKey}`);
+
+    this.#itemMessageIds.set(itemKey, messageId);
+    this.#itemByMessageId.set(messageId, itemKey);
+    this.#turnMessageIds.set(input.turnId, messageId);
+    this.#turnByMessageId.set(messageId, input.turnId);
+    await this.ensureMessageStarted(context, messageId, push);
+    return messageId;
+  }
+
   async ensureMessageStarted(
     context: AgentDriverContext,
     messageId: string,
@@ -97,6 +136,7 @@ export class OpenAiMessageState {
     const turnId = this.#turnByMessageId.get(messageId);
 
     if (turnId !== undefined) {
+      this.#lastEndedMessageIds.set(turnId, messageId);
       this.#turnByMessageId.delete(messageId);
 
       if (this.#turnMessageIds.get(turnId) === messageId) {
@@ -105,6 +145,14 @@ export class OpenAiMessageState {
     }
 
     return true;
+  }
+
+  isEnded(messageId: MessageId): boolean {
+    return this.#ended.has(messageId);
+  }
+
+  finalMessageForTurn(turnId: string): MessageId | null {
+    return this.#lastEndedMessageIds.get(turnId) ?? null;
   }
 
   messageForTurn(turnId: string): MessageId | null {

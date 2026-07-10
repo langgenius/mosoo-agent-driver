@@ -393,6 +393,15 @@ export class OpenAiAppServerEventBridge {
       return;
     }
 
+    const finalMessageId = this.#messages.finalMessageForTurn(turnId);
+    const finalMessage =
+      finalMessageId === null
+        ? null
+        : {
+            id: finalMessageId,
+            text: this.#messages.currentText(finalMessageId),
+          };
+
     await this.#push(context, "driver.openai.turn.completed", [
       {
         ...createOpenAiTurnEventFields({
@@ -402,6 +411,12 @@ export class OpenAiAppServerEventBridge {
         }),
         kind: "run.completed",
         payload: {
+          ...(finalMessage === null
+            ? {}
+            : {
+                finalMessageId: finalMessage.id,
+                finalMessageText: finalMessage.text,
+              }),
           stopReason: "end_turn",
         },
       },

@@ -232,6 +232,29 @@ async function assertTrackTurnFixture(
 }
 
 describe("OpenAI app-server provider fixtures", () => {
+  test("preserves the assistant item identity on text deltas", () => {
+    expect(
+      parseServerNotificationParams("item/agentMessage/delta", {
+        delta: "中文 delta",
+        itemId: "message-1",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toEqual({
+      delta: "中文 delta",
+      itemId: "message-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(() =>
+      parseServerNotificationParams("item/agentMessage/delta", {
+        delta: "missing identity",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toThrow("itemId");
+  });
+
   test.each(providerFixtureNames)("apps provider-native fixture %s", async (name) => {
     const fixture = readProviderFixtureCase(
       `./fixtures/providers/openai-app-server/cases/${name}.json`,

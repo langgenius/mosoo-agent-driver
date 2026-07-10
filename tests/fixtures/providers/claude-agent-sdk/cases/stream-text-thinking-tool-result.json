@@ -209,6 +209,8 @@
     {
       "kind": "run.completed",
       "payload": {
+        "finalMessageId": "<driver-id>",
+        "finalMessageText": "hello",
         "stopReason": "end_turn"
       },
       "runId": "run-1"

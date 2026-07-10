@@ -39,13 +39,23 @@ export class OpenAiAppServerItemEventBridge {
 
   async handleAgentMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turnId = readNonEmptyString(params, "turnId");
+    const itemId = readNonEmptyString(params, "itemId");
     const delta = readNonEmptyString(params, "delta");
 
-    if (turnId === null || delta === null) {
+    if (turnId === null || itemId === null || delta === null) {
       return;
     }
 
-    const messageId = await this.#messages.ensureTurnMessage(context, turnId, this.#push);
+    const messageId = await this.#messages.ensureItemMessage(
+      context,
+      { itemId, turnId },
+      this.#push,
+    );
+
+    if (this.#messages.isEnded(messageId)) {
+      return;
+    }
+
     this.#messages.appendText(messageId, delta);
     await this.#push(context, "driver.openai.agent.delta", [
       {
@@ -293,7 +303,11 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     const finalText = readString(item, "text");
-    const messageId = await this.#messages.ensureTurnMessage(context, turnId, this.#push);
+    const messageId = await this.#messages.ensureItemMessage(
+      context,
+      { itemId, turnId },
+      this.#push,
+    );
     const currentText = this.#messages.currentText(messageId);
 
     if (finalText !== null && finalText.length > currentText.length) {
@@ -327,6 +341,13 @@ export class OpenAiAppServerItemEventBridge {
           itemId,
         });
       }
+    }
+
+    if (finalText !== null) {
+      // item/completed is the provider's authoritative snapshot. Streaming
+      // deltas may be missing or replayed, so canonical completion must not
+      // inherit a corrupted accumulator even when live deltas cannot be undone.
+      this.#messages.setText(messageId, finalText);
     }
 
     if (this.#messages.markEnded(messageId)) {

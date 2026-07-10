@@ -162,6 +162,8 @@
     {
       "kind": "run.completed",
       "payload": {
+        "finalMessageId": "message-1",
+        "finalMessageText": "hello",
         "stopReason": "end_turn"
       },
       "runId": "run-1"

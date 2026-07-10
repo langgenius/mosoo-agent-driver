@@ -181,6 +181,47 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
+  test("uses item completion text as the authoritative final snapshot", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "损坏的流式片段",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        text: "完整最终回答：中文 Markdown ✅",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          {
+            id: "message-final",
+            text: "完整最终回答：中文 Markdown ✅",
+            type: "agentMessage",
+          },
+        ],
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    expect(readEventPayloadString(runCompleted as DriverEvent, "finalMessageText")).toBe(
+      "完整最终回答：中文 Markdown ✅",
+    );
+  });
+
   test("completed turns app final items before run finish", async () => {
     const { bridge, context, events, logger } = createHarness();
 
@@ -320,6 +361,7 @@ describe("OpenAi app-server event bridge", () => {
     for (const [index, progressMessage] of progressMessages.entries()) {
       await bridge.handleNotification(context, "item/agentMessage/delta", {
         delta: progressMessage,
+        itemId: `message-progress-${index + 1}`,
         threadId: "thread-1",
         turnId: "turn-1",
       });
@@ -352,6 +394,7 @@ describe("OpenAi app-server event bridge", () => {
     });
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "| 最终：表格 | `代码` | https://example.test/😀",
+      itemId: "message-final",
       threadId: "thread-1",
       turnId: "turn-1",
     });
@@ -413,6 +456,54 @@ describe("OpenAi app-server event bridge", () => {
     expect(toolParentMessageId).toBe(assistantMessages.at(-1)?.messageId);
     expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(4);
     expect(events().filter((event) => event.kind === "run.completed")).toHaveLength(1);
+  });
+
+  test("keeps interleaved assistant item identities isolated and ignores late replay", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "消息甲",
+      itemId: "message-a",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "消息乙",
+      itemId: "message-b",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-b", text: "消息乙", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: { id: "message-a", text: "消息甲", type: "agentMessage" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "消息甲",
+      itemId: "message-a",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await logger.destroy();
+
+    const deltas = events().flatMap((event) => {
+      if (event.kind !== "message.delta") {
+        return [];
+      }
+
+      const messageId = readEventPayloadString(event, "messageId");
+      const contentDelta = readEventPayloadString(event, "contentDelta");
+      return messageId === null || contentDelta === null ? [] : [{ contentDelta, messageId }];
+    });
+
+    expect(deltas.map((entry) => entry.contentDelta)).toEqual(["消息甲", "消息乙"]);
+    expect(new Set(deltas.map((entry) => entry.messageId)).size).toBe(2);
+    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(2);
   });
 
   test("command output streams as tool result content", async () => {
