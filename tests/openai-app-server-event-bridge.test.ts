@@ -308,6 +308,113 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
+  test("rotates assistant message identity after each completed agent item", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    const progressMessages = [
+      "进度 1：已完成读取。",
+      "进度 2：已完成工具准备。",
+      "进度 3：准备最终总结。",
+    ];
+
+    for (const [index, progressMessage] of progressMessages.entries()) {
+      await bridge.handleNotification(context, "item/agentMessage/delta", {
+        delta: progressMessage,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+      await bridge.handleNotification(context, "item/completed", {
+        item: {
+          id: `message-progress-${index + 1}`,
+          text: progressMessage,
+          type: "agentMessage",
+        },
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+    }
+    await bridge.handleNotification(context, "item/started", {
+      item: {
+        id: "artifact-tool",
+        type: "commandExecution",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        aggregatedOutput: "artifact 已创建。",
+        id: "artifact-tool",
+        type: "commandExecution",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "| 最终：表格 | `代码` | https://example.test/😀",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        text: "| 最终：表格 | `代码` | https://example.test/😀",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          ...progressMessages.map((text, index) => ({
+            id: `message-progress-${index + 1}`,
+            text,
+            type: "agentMessage",
+          })),
+          {
+            aggregatedOutput: "artifact 已创建。",
+            id: "artifact-tool",
+            type: "commandExecution",
+          },
+          {
+            id: "message-final",
+            text: "| 最终：表格 | `代码` | https://example.test/😀",
+            type: "agentMessage",
+          },
+        ],
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const assistantMessages = events().flatMap((event) => {
+      if (event.kind !== "message.delta") {
+        return [];
+      }
+
+      const messageId = readEventPayloadString(event, "messageId");
+      const contentDelta = readEventPayloadString(event, "contentDelta");
+      return messageId === null || contentDelta === null ? [] : [{ contentDelta, messageId }];
+    });
+
+    expect(assistantMessages.map((message) => message.contentDelta)).toEqual([
+      ...progressMessages,
+      "| 最终：表格 | `代码` | https://example.test/😀",
+    ]);
+    expect(new Set(assistantMessages.map((message) => message.messageId)).size).toBe(4);
+    const toolParentMessageId = events()
+      .filter((event) => event.kind === "item.started")
+      .map((event) => readEventPayloadString(event, "parentMessageId"))
+      .find((messageId): messageId is string => messageId !== null);
+
+    expect(toolParentMessageId).toBe(assistantMessages.at(-1)?.messageId);
+    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(4);
+    expect(events().filter((event) => event.kind === "run.completed")).toHaveLength(1);
+  });
+
   test("command output streams as tool result content", async () => {
     const { bridge, context, events, logger } = createHarness();
 

@@ -14,8 +14,10 @@ export class OpenAiMessageState {
   readonly #reasoningStarted = new Set<string>();
   readonly #started = new Set<string>();
   readonly #textById = new Map<string, string>();
+  readonly #turnByMessageId = new Map<MessageId, string>();
   readonly #turnMessages = new RuntimeAssistantMessageIdIndex<string>();
   readonly #turnMessageIds = new Map<string, MessageId>();
+  readonly #turnMessageSequences = new Map<string, number>();
 
   appendText(messageId: string, delta: string): void {
     if (delta.length === 0) {
@@ -56,8 +58,11 @@ export class OpenAiMessageState {
       return existing;
     }
 
-    const generated = this.#turnMessages.getOrCreate(turnId);
+    const nextSequence = (this.#turnMessageSequences.get(turnId) ?? 0) + 1;
+    this.#turnMessageSequences.set(turnId, nextSequence);
+    const generated = this.#turnMessages.getOrCreate(`${turnId}:${nextSequence}`);
     this.#turnMessageIds.set(turnId, generated);
+    this.#turnByMessageId.set(generated, turnId);
     await this.ensureMessageStarted(context, generated, push);
     return generated;
   }
@@ -83,12 +88,22 @@ export class OpenAiMessageState {
     ]);
   }
 
-  markEnded(messageId: string): boolean {
+  markEnded(messageId: MessageId): boolean {
     if (this.#ended.has(messageId)) {
       return false;
     }
 
     this.#ended.add(messageId);
+    const turnId = this.#turnByMessageId.get(messageId);
+
+    if (turnId !== undefined) {
+      this.#turnByMessageId.delete(messageId);
+
+      if (this.#turnMessageIds.get(turnId) === messageId) {
+        this.#turnMessageIds.delete(turnId);
+      }
+    }
+
     return true;
   }
 

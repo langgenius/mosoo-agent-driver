@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
+import {
+  DriverEventSourceIdAllocator,
+  toDriverEventEnvelopes,
+} from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
 import {
   AcpTurnEventState,
@@ -117,8 +120,17 @@ describe("ACP runtime event translation", () => {
     });
     expect(eventPayload(toolEvent as DriverEventInput)).not.toHaveProperty("rawInput");
 
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "acp-empty-input-test",
+    );
     const envelopes = events.flatMap((event) =>
-      toDriverEventEnvelopes(driverBootPayload, event, DRIVER_TEST_IDS.runId),
+      toDriverEventEnvelopes(
+        driverBootPayload,
+        event,
+        DRIVER_TEST_IDS.runId,
+        sourceIds.sourceEventIdFor(event),
+      ),
     );
     const canonicalToolEvent = envelopes
       .map((envelope) => envelope.event)
