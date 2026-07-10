@@ -66,7 +66,7 @@
     "test:live:opencode": "AGENT_DRIVER_LIVE_OPENCODE=1 vp exec bun test tests/opencode-acp-live.test.ts"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.158",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.205",
     "@anthropic-ai/sdk": "^0.100.1",
     "@modelcontextprotocol/client": "^2.0.0-alpha.2",
     "@orpc/client": "^1.14.3",

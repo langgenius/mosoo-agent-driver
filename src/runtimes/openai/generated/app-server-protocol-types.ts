@@ -1,4 +1,4 @@
-export const OPENAI_APP_SERVER_SCHEMA_VERSION = "0.135.0" as const;
+export const OPENAI_APP_SERVER_SCHEMA_VERSION = "0.144.0" as const;
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];

@@ -1,12 +1,10 @@
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKFilesPersistedEvent, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
 import { isRecord, readNumber, readString } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 
-export function toClaudeFilesPersistedEvents(
-  message: Extract<SDKMessage, { type: "system"; subtype: "files_persisted" }>,
-): DriverEventInput[] {
+export function toClaudeFilesPersistedEvents(message: SDKFilesPersistedEvent): DriverEventInput[] {
   const events: DriverEventInput[] = message.files.map((file) => ({
     actor: "tool",
     kind: "file.change.updated",

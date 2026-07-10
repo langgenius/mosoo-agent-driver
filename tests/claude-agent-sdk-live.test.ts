@@ -12,7 +12,7 @@ import { textDeltaFrom, waitForTerminalTurnEvent } from "./live-driver-events";
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
 const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_MODEL";
-const DEFAULT_LIVE_MODEL = "claude-sonnet-4-5";
+const DEFAULT_LIVE_MODEL = "claude-sonnet-5";
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 
 const tempRoots: string[] = [];
