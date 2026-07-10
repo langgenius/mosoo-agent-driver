@@ -27,7 +27,7 @@ The Mosoo Agent Driver — the runtime that drives a sandbox-hosted agent sessio
 ---
 
 `mosoo-agent-driver` (workspace/package name `agent-driver`) is the standalone
-runtime driver for sandbox-hosted agent sessions. The npm package is not
+Agent Driver for sandbox-hosted agent sessions. The npm package is not
 published yet. It runs inside the sandbox and drives a single agent session from
 boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands,
 events, host ports, provider backends, and the provider registry.

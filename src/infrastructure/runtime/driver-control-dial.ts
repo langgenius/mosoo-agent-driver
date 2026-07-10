@@ -58,7 +58,7 @@ async function dialOnce(url: URL): Promise<WebSocket> {
   );
 
   const result = await settlePromiseWithTimeout(opened.promise, {
-    label: "runtime driver control socket dial",
+    label: "Agent Driver control socket dial",
     timeoutMs: DRIVER_CONTROL_DIAL_ATTEMPT_TIMEOUT_MS,
   });
 
