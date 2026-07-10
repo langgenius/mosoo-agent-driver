@@ -29,7 +29,10 @@ import {
 } from "../src/orpc";
 import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "../src/orpc";
 import { SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH } from "../src/paths";
-import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "../src/runtime";
+import {
+  AGENT_DRIVER_PROVIDER_CONTRACTS,
+  isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath,
+} from "../src/runtime";
 
 describe("public API", () => {
   test("imports without starting the driver process", () => {
@@ -59,6 +62,7 @@ describe("public API", () => {
     const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
 
     expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(1);
+    expect(AGENT_DRIVER_PROVIDER_CONTRACTS).toHaveLength(3);
     expect(createCmaHttpHandler).toBeFunction();
     expect(createCmaSdkClient).toBeFunction();
     expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();

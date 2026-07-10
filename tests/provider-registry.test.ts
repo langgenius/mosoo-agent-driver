@@ -1,8 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
 import type { DriverRuntimeTransport } from "../src/protocol/runtime";
+import {
+  SUPPORTED_DRIVER_RUNTIMES,
+  SUPPORTED_DRIVER_RUNTIME_TRANSPORTS,
+} from "../src/protocol/runtime";
 import type { DriverStartInput } from "../src/protocol/start";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
+import { AGENT_DRIVER_PROVIDER_CONTRACTS } from "../src/runtimes/provider-contract";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   createAgentDriverProviderCapabilities,
@@ -25,6 +30,28 @@ function startInputFor(transport: DriverRuntimeTransport): DriverStartInput {
 }
 
 describe("provider registry", () => {
+  test("keeps the pure provider contract aligned with protocol runtime ids", () => {
+    expect(AGENT_DRIVER_PROVIDER_CONTRACTS.map((provider) => provider.runtime).toSorted()).toEqual(
+      [...SUPPORTED_DRIVER_RUNTIMES].toSorted(),
+    );
+    expect(AGENT_DRIVER_PROVIDER_CONTRACTS.map((provider) => provider.id).toSorted()).toEqual(
+      [...SUPPORTED_DRIVER_RUNTIME_TRANSPORTS].toSorted(),
+    );
+  });
+
+  test("builds the executable registry from the pure provider contract", () => {
+    expect(
+      AGENT_DRIVER_PROVIDER_REGISTRY.list().map(
+        ({ capabilities, id, requiredHostPorts, runtime }) => ({
+          capabilities,
+          id,
+          requiredHostPorts,
+          runtime,
+        }),
+      ),
+    ).toEqual(AGENT_DRIVER_PROVIDER_CONTRACTS);
+  });
+
   test("declares every launch transport through one public registry", () => {
     expect(AGENT_DRIVER_PROVIDER_REGISTRY.list()).toMatchObject([
       {

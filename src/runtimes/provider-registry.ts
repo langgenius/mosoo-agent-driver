@@ -1,18 +1,15 @@
-import type { AgentDriverHostPortName } from "../host-ports";
-import type { DriverRuntime, DriverRuntimeTransport } from "../protocol/runtime";
+import type { DriverRuntimeTransport } from "../protocol/runtime";
 import type { DriverStartInput } from "../protocol/start";
 import type { DriverCapability } from "../runtime-command";
 import { AcpDriverBackend } from "./acp/acp-driver-backend";
 import type { AgentDriverBackend } from "./agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "./claude/agent-sdk-driver-backend";
 import { OpenAiAppServerDriverBackend } from "./openai/app-server-driver-backend";
+import { AGENT_DRIVER_PROVIDER_CONTRACTS } from "./provider-contract";
+import type { AgentDriverProviderContract } from "./provider-contract";
 
-export interface AgentDriverProviderDescriptor {
-  readonly capabilities: readonly DriverCapability[];
+export interface AgentDriverProviderDescriptor extends AgentDriverProviderContract {
   createBackend(input: DriverStartInput): AgentDriverBackend;
-  readonly id: DriverRuntimeTransport;
-  readonly requiredHostPorts: readonly AgentDriverHostPortName[];
-  readonly runtime: DriverRuntime;
 }
 
 export interface AgentDriverProviderRegistry {
@@ -21,62 +18,21 @@ export interface AgentDriverProviderRegistry {
   list(): readonly AgentDriverProviderDescriptor[];
 }
 
-const SHARED_REQUIRED_HOST_PORTS = [
-  "event_sink",
-  "permission",
-  "mcp",
-  "skill",
-] as const satisfies readonly AgentDriverHostPortName[];
+type AgentDriverBackendFactory = (input: DriverStartInput) => AgentDriverBackend;
 
-const TEXT_TOOL_CAPABILITIES = [
-  { id: "custom_tool_execute", status: "unsupported", version: 1 },
-  { id: "file_change", status: "supported", version: 1 },
-  { id: "input_start", status: "supported", version: 1 },
-  { id: "mcp_execute", status: "supported", version: 1 },
-  { id: "permission_request", status: "supported", version: 1 },
-  { id: "session_stop", status: "supported", version: 1 },
-  { id: "text_stream", status: "supported", version: 1 },
-  { id: "tool_stream", status: "supported", version: 1 },
-  { id: "turn_cancel", status: "supported", version: 1 },
-  { id: "usage", status: "supported", version: 1 },
-  { id: "visible_activity", status: "supported", version: 1 },
-] as const satisfies readonly DriverCapability[];
+const BACKEND_FACTORIES = {
+  "acp-fallback": (payload) => new AcpDriverBackend(payload),
+  "claude-agent-sdk": (payload) => new ClaudeAgentSdkDriverBackend(payload),
+  "openai-app-server": (payload) => new OpenAiAppServerDriverBackend(payload),
+} satisfies Record<DriverRuntimeTransport, AgentDriverBackendFactory>;
 
-const PROVIDERS = [
-  {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "unsupported", version: 1 },
-    ],
-    createBackend: (payload) => new OpenAiAppServerDriverBackend(payload),
-    id: "openai-app-server",
-    requiredHostPorts: SHARED_REQUIRED_HOST_PORTS,
-    runtime: "openai-runtime",
-  },
-  {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "supported", version: 1 },
-    ],
-    createBackend: (payload) => new ClaudeAgentSdkDriverBackend(payload),
-    id: "claude-agent-sdk",
-    requiredHostPorts: SHARED_REQUIRED_HOST_PORTS,
-    runtime: "claude-agent-sdk",
-  },
-  {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "supported", version: 1 },
-    ],
-    createBackend: (payload) => new AcpDriverBackend(payload),
-    id: "acp-fallback",
-    requiredHostPorts: [...SHARED_REQUIRED_HOST_PORTS, "file", "host_integration"],
-    runtime: "acp-fallback",
-  },
-] as const satisfies readonly AgentDriverProviderDescriptor[];
+const PROVIDERS = AGENT_DRIVER_PROVIDER_CONTRACTS.map((contract) => ({
+  capabilities: contract.capabilities,
+  createBackend: BACKEND_FACTORIES[contract.id],
+  id: contract.id,
+  requiredHostPorts: contract.requiredHostPorts,
+  runtime: contract.runtime,
+})) satisfies readonly AgentDriverProviderDescriptor[];
 
 export function createAgentDriverProviderRegistry(
   providers: readonly AgentDriverProviderDescriptor[] = PROVIDERS,

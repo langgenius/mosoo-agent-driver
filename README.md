@@ -77,7 +77,7 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - Package root `agent-driver`: Driver Kernel, provider registry, host ports,
   commands, events, and diagnostics. It deliberately excludes preview helpers.
 - `agent-driver/boot`: process boot payload, protocol version, boot environment names, and host snapshot contracts.
-- `agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
+- `agent-driver/runtime`: runtime-neutral runtime, transport, provider capability, and native resume contracts.
 - `agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
 - `agent-driver/events`: canonical driver event envelope contracts.
 - `agent-driver/orpc`: Driver control WebSocket RPC wire input/output contracts.

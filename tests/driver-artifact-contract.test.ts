@@ -98,6 +98,18 @@ describe("driver artifact contract", () => {
     expect(packageJson.exports).not.toHaveProperty("./bin/driver");
   });
 
+  test("keeps the runtime provider contract free of backend imports", () => {
+    const runtimeEntry = readText("../src/runtime.ts");
+    const providerContract = readText("../src/runtimes/provider-contract.ts");
+
+    expect(runtimeEntry).toContain("./runtimes/provider-contract");
+    expect(runtimeEntry).not.toContain("provider-registry");
+    expect(providerContract).not.toMatch(/^import(?! type )/mu);
+    expect(providerContract).not.toMatch(
+      /DriverBackend|agent-sdk-driver-backend|app-server-driver-backend/u,
+    );
+  });
+
   test("keeps the root library entry free of boot and transport internals", () => {
     const publicApi = readText("../src/index.ts");
 
