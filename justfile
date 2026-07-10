@@ -4,7 +4,10 @@ default:
 fmt:
     vp fmt .
 
-lint: fmt
+fmt-check:
+    bun run fmt:check
+
+lint: fmt-check
     bun run lint
 
 tc: lint
@@ -20,6 +23,7 @@ ci: lint
     bun run tc
     bun run test
     bun run build
+    bun run test:package
 
 docker-build:
     bun run docker:build

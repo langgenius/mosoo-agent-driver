@@ -35,5 +35,5 @@
     "useUnknownInCatchVariables": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["bench/**/*.ts", "scripts/**/*.ts", "src/**/*.ts"]
 }

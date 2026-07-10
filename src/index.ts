@@ -11,64 +11,6 @@ export type {
   DriverDiagnosticInput,
   DriverDiagnosticSeverity,
 } from "./core/driver-diagnostics";
-export {
-  CmaUnsupportedFieldError,
-  parseCmaInboundEvent,
-  projectCmaInboundToDriverCommand,
-  projectDriverEventToCma,
-} from "./projections/cma";
-export type {
-  CmaInboundEvent,
-  CmaOutboundEvent,
-  CmaSessionStatus,
-  CmaUserCustomToolResultEvent,
-  CmaUserInterruptEvent,
-  CmaUserMessageEvent,
-  CmaUserToolConfirmationEvent,
-} from "./projections/cma";
-export {
-  CMA_DEFAULT_BETA_HEADER_NAME,
-  CMA_DEFAULT_BETA_HEADER_VALUE,
-  createCmaHttpHandler,
-} from "./surfaces/cma-http";
-export type {
-  CmaHttpAuthorizationContext,
-  CmaHttpAuthorizer,
-  CmaHttpBetaHeaderRequirement,
-  CmaHttpDriverCommandDispatcher,
-  CmaHttpDriverCommandDispatchInput,
-  CmaHttpHandler,
-  CmaHttpHandlerOptions,
-} from "./surfaces/cma-http";
-export { CmaSdkError, createCmaSdkClient } from "./surfaces/cma-sdk";
-export type {
-  CmaSdkBetaHeader,
-  CmaSdkClient,
-  CmaSdkClientOptions,
-  CmaSdkFetch,
-  CmaSessionEventDispatchRecord,
-} from "./surfaces/cma-sdk";
-export { CmaMemoryStore, createCmaMemoryStore } from "./stores/memory";
-export type { CmaMemoryStoreIdFactory, CmaMemoryStoreOptions } from "./stores/memory";
-export { CmaStoreConflictError, CmaStoreNotFoundError } from "./stores/cma-store";
-export type {
-  CmaAgentRecord,
-  CmaAppendInboundEventInput,
-  CmaCreateAgentInput,
-  CmaCreateEnvironmentInput,
-  CmaCreateSessionInput,
-  CmaEnvironmentConfig,
-  CmaEnvironmentLimitedNetworking,
-  CmaEnvironmentRecord,
-  CmaEnvironmentNetworking,
-  CmaEnvironmentPackageManager,
-  CmaEnvironmentPackages,
-  CmaEnvironmentUnrestrictedNetworking,
-  CmaSessionEventRecord,
-  CmaSessionRecord,
-  CmaStore,
-  CmaStoreResourceKind,
-} from "./stores/cma-store";
 export type {
   AgentDriverHostPortName,
   AgentDriverHostPorts,
@@ -90,7 +32,6 @@ export type {
 } from "./runtimes/agent-driver-backend";
 export { createAgentDriverContext } from "./runtimes/agent-driver-backend";
 export { createAgentDriverBackend } from "./runtimes/create-agent-driver-backend";
-export { OPENAI_DEFAULT_MODEL_ID } from "./models";
 export {
   isSupportedDriverRuntime,
   isSupportedDriverRuntimeTransport,

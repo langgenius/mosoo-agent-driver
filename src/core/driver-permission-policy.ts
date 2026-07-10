@@ -17,9 +17,10 @@ export function isDriverFullAccess(payload: DriverStartInput): boolean {
  *
  * Under the `full_access` policy (the default) every tool call is approved
  * synchronously inside the runtime — no control-plane round-trip, no
- * `needs_approval` state churn, and no 5-minute reject-on-timeout window. The
- * sandbox is the isolation boundary, so this is safe and removes permission
- * latency from the critical path entirely.
+ * `needs_approval` state churn, and no 5-minute reject-on-timeout window. This
+ * grants tools the Sandbox and credential access provisioned for that run; it
+ * does not make untrusted input, shared Agent state, credentials, or external
+ * side effects safe.
  *
  * Under `supervised` the caller's interactive handler (the permission broker)
  * is used unchanged.

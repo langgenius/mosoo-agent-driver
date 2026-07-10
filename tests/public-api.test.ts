@@ -1,26 +1,26 @@
 import { describe, expect, test } from "bun:test";
 
 import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "../src/boot";
-import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "../src/cma-http";
-import { createCmaSdkClient as createCmaSdkClientFromSubpath } from "../src/cma-sdk";
 import { parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath } from "../src/events";
+import {
+  CMA_DEFAULT_BETA_HEADER_VALUE,
+  CmaSdkError,
+  createCmaHttpHandler,
+  createCmaMemoryStore,
+  createCmaSdkClient,
+  projectCmaInboundToDriverCommand,
+  projectDriverEventToCma,
+} from "../src/experimental/cma";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   AgentDriverKernelCore,
-  CMA_DEFAULT_BETA_HEADER_VALUE,
-  CmaSdkError,
   SUPPORTED_DRIVER_RUNTIMES,
   createAgentDriverBackend,
   createAgentDriverContext,
   createDriverDiagnosticEvent,
   createAgentDriverProviderCapabilities,
-  createCmaHttpHandler,
-  createCmaMemoryStore,
-  createCmaSdkClient,
   parseDriverNativeRuntimeRef,
   pushDriverDiagnosticEvent,
-  projectCmaInboundToDriverCommand,
-  projectDriverEventToCma,
 } from "../src/index";
 import {
   parseDriverHeartbeatInput as parseDriverHeartbeatInputFromOrpcSubpath,
@@ -59,8 +59,8 @@ describe("public API", () => {
     const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
 
     expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(1);
-    expect(createCmaHttpHandlerFromSubpath).toBe(createCmaHttpHandler);
-    expect(createCmaSdkClientFromSubpath).toBe(createCmaSdkClient);
+    expect(createCmaHttpHandler).toBeFunction();
+    expect(createCmaSdkClient).toBeFunction();
     expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();
     expect(heartbeatReason).toBe("ping");
     expect(parseDriverHeartbeatInputFromOrpcSubpath({ at: "now", pid: 1, reason: "ping" })).toEqual(

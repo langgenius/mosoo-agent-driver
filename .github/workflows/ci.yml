@@ -23,6 +23,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Format
+        run: bun run fmt:check
+
       - name: Lint
         run: bun run lint
 
@@ -37,6 +40,9 @@ jobs:
 
       - name: Verify driver artifact
         run: test -f dist/driver.mjs
+
+      - name: Verify npm tarball
+        run: bun run test:package
 
   docker:
     runs-on: ubuntu-latest
@@ -63,7 +69,18 @@ jobs:
           docker run --rm --entrypoint /bin/sh agent-driver:ci -c '
             test -x /usr/local/bin/agent-driver
             test -x /usr/local/bin/mosoo-claude-code
+            bun --version
+            codex --version
             opencode --version
             opencode acp --help >/dev/null
             test "$MOSOO_ACP_FALLBACK_COMMAND" = opencode
           '
+
+      - name: Verify runtime contracts with image Bun
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -v "$PWD:/workspace-driver" \
+            -w /workspace-driver \
+            agent-driver:ci \
+            -c 'bun --version && bun test tests'

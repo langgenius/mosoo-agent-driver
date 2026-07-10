@@ -9,11 +9,12 @@
  *   - totalMs        dispatch -> run.completed
  *   - interChunkGap  distribution (p50/p95/max) between consecutive message.delta
  *   - deltaCount / outputChars
- *   - ok             whether the turn completed with the expected output
+ *   - taskCompleted  whether the requested output and marker were produced
+ *   - policyEnforced whether a supervised rejection was observed and obeyed
  *
- * The permission host port is toggled per scenario to measure the value of
- * full-access ("yolo") vs the current supervised/reject default on a
- * tool-requiring task, without needing the eventual code changes in place.
+ * Both the execution permission policy and permission host port are explicit
+ * per scenario. This lets the tool scenarios compare full access with a
+ * supervised rejection without silently bypassing the host decision.
  *
  * Run (from apps/driver):
  *   ANTHROPIC_API_KEY=... OPENAI_API_KEY=... bun bench/ttft-bench.ts
@@ -29,19 +30,24 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import type { PermissionDecision } from "../src/core/driver-permission-broker";
+import { parseDriverBootPayload } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverStartInput } from "../src/protocol/start";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
-import { driverBootPayload } from "../tests/driver-boot-payload-fixture";
-import { DRIVER_TEST_IDS, bootPayload } from "../tests/driver-runtime-boundary-fixtures";
-import { textDeltaFrom } from "../tests/live-driver-events";
+import { aggregateBenchmarkTrials } from "./benchmark-metrics";
+import type { BenchmarkTrialAggregate, BenchmarkTrialMetrics } from "./benchmark-metrics";
+import { applyBenchmarkPermissionPolicy } from "./benchmark-permission-policy";
+import { BENCHMARK_SCENARIOS, evaluateBenchmarkOutcome } from "./benchmark-scenarios";
+import type { BenchmarkScenario, BenchmarkScenarioId } from "./benchmark-scenarios";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(HERE, "outputs");
 const TURN_TIMEOUT_MS = 120_000;
-const BOOT_TIMEOUT_MS = Number(process.env["TTFT_BOOT_TIMEOUT_MS"] ?? "100000");
+const TURN_CANCEL_TIMEOUT_MS = 10_000;
+const STOP_TIMEOUT_MS = 10_000;
+const BOOT_TIMEOUT_MS = readPositiveIntegerEnv("TTFT_BOOT_TIMEOUT_MS", 100_000);
 
 async function withTimeout<T>(label: string, ms: number, task: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -58,46 +64,105 @@ async function withTimeout<T>(label: string, ms: number, task: Promise<T>): Prom
 }
 
 type RuntimeId = "claude" | "openai" | "opencode";
-type ScenarioId = "no_tool" | "long_output" | "tool_write_allow" | "tool_write_reject";
-
-interface Scenario {
-  readonly id: ScenarioId;
-  readonly prompt: string;
-  readonly systemPrompt: string;
-  /** permission decision the host port returns for this scenario */
-  readonly permission: PermissionDecision;
-  /** substring the final output must contain for ok=true */
-  readonly expect: string;
-  /** when set, ok additionally requires cwd/<marker> to contain the value */
-  readonly marker?: { file: string; content: string };
-}
-
-interface TrialMetrics {
-  readonly bootMs: number;
-  readonly ttftMs: number | null;
-  readonly firstTextMs: number | null;
-  readonly totalMs: number | null;
-  readonly deltaCount: number;
-  readonly outputChars: number;
-  readonly interChunkP50: number | null;
-  readonly interChunkP95: number | null;
-  readonly interChunkMax: number | null;
-  readonly fileCreated: boolean | null;
-  readonly ok: boolean;
-  readonly error: string | null;
-}
 
 interface CellResult {
   readonly runtime: RuntimeId;
-  readonly scenario: ScenarioId;
+  readonly scenario: BenchmarkScenarioId;
   readonly model: string;
-  readonly trials: TrialMetrics[];
-  readonly agg: Record<string, number | null>;
+  readonly trials: BenchmarkTrialMetrics[];
+  readonly agg: BenchmarkTrialAggregate;
 }
+
+const benchmarkDriverBootPayload = parseDriverBootPayload({
+  bootToken: "benchmark-token",
+  controlUrl: "http://host.docker.internal:8787/api/driver/socket",
+  driverControlPort: 20_000,
+  driverGeneration: 0,
+  driverInstanceId: "01J0000000000000000000000F",
+  execution: {
+    builtInTools: [
+      { enabled: true, name: "bash" },
+      { enabled: true, name: "read" },
+      { enabled: true, name: "write" },
+      { enabled: true, name: "edit" },
+      { enabled: true, name: "glob" },
+      { enabled: true, name: "grep" },
+      { enabled: true, name: "web_fetch" },
+      { enabled: true, name: "web_search" },
+    ],
+    configRevision: {
+      agentId: "01J00000000000000000000009",
+      deploymentVersionId: null,
+      deploymentVersionNumber: null,
+      environmentId: "01J00000000000000000000010",
+      environmentRevisionId: "01J00000000000000000000011",
+      runId: "01J00000000000000000000012",
+      sessionId: "01J00000000000000000000008",
+    },
+    environment: { variables: {} },
+    model: "benchmark-model",
+    permissionPolicy: "full_access",
+    profilePrompt: "",
+    provider: "benchmark-provider",
+    providerOptions: {},
+    session: {
+      additionalDirectories: [],
+      context: {
+        homePath: "/tmp/home",
+        origin: {
+          callerUserId: "01J00000000000000000000001",
+          entrypoint: "api",
+          executionOwnerUserId: "01J00000000000000000000001",
+          type: "agent",
+        },
+        sandboxId: "01J0000000000000000000000D",
+        sandboxKind: "cattle",
+        sandboxSessionId: "01J0000000000000000000000E",
+        sandboxSubjectId: "01J00000000000000000000008",
+        sandboxSubjectKind: "session",
+        sessionOrganizationPath: "/tmp/organization",
+      },
+      cwd: "/tmp/organization",
+      mcpServers: [],
+      nativeResumeRef: null,
+    },
+    skillCatalog: [],
+    skills: [],
+  },
+  heartbeatIntervalMs: 1_000,
+  protocolVersion: 1,
+  runtime: "openai-runtime",
+  runtimeTransport: "openai-app-server",
+  sandboxId: "01J0000000000000000000000D",
+  traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
+});
+const bootPayload = createDriverStartInputFromBootPayload(benchmarkDriverBootPayload);
+const benchmarkRunId = (() => {
+  const runId = bootPayload.execution.run.runId;
+  if (runId === null) {
+    throw new Error("Benchmark fixture requires a run ID.");
+  }
+  return runId;
+})();
 
 function readEnv(name: string): string | null {
   const value = process.env[name]?.trim();
   return value && value.length > 0 ? value : null;
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(readEnv(name) ?? fallback);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+
+  return value;
+}
+
+function appendTrialError(current: string | null, label: string, caught: unknown): string {
+  const message = caught instanceof Error ? caught.message : String(caught);
+  const next = `${label}:${message}`;
+  return current === null ? next : `${current};${next}`;
 }
 
 function percentile(values: number[], p: number): number | null {
@@ -109,29 +174,18 @@ function percentile(values: number[], p: number): number | null {
   return clean[idx] ?? null;
 }
 
-function aggregate(trials: TrialMetrics[]): Record<string, number | null> {
-  const okTrials = trials.filter((t) => t.ok);
-  const pick = (key: keyof TrialMetrics): number[] =>
-    okTrials.map((t) => t[key]).filter((v): v is number => typeof v === "number");
-  const fileTrials = trials.filter((t) => t.fileCreated !== null);
-  return {
-    okRate: trials.length === 0 ? null : okTrials.length / trials.length,
-    fileCreatedRate:
-      fileTrials.length === 0
-        ? null
-        : fileTrials.filter((t) => t.fileCreated === true).length / fileTrials.length,
-    bootP50: percentile(pick("bootMs"), 50),
-    bootP95: percentile(pick("bootMs"), 95),
-    ttftP50: percentile(pick("ttftMs"), 50),
-    ttftP95: percentile(pick("ttftMs"), 95),
-    firstTextP50: percentile(pick("firstTextMs"), 50),
-    firstTextP95: percentile(pick("firstTextMs"), 95),
-    totalP50: percentile(pick("totalMs"), 50),
-    totalP95: percentile(pick("totalMs"), 95),
-    interChunkP50: percentile(pick("interChunkP50"), 50),
-    interChunkP95: percentile(pick("interChunkP95"), 95),
-    deltaCountP50: percentile(pick("deltaCount"), 50),
-  };
+function textDeltaFrom(event: DriverEventInput): string {
+  if (event.kind !== "message.delta") {
+    return "";
+  }
+
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return "";
+  }
+
+  const contentDelta = (payload as Record<string, unknown>)["contentDelta"];
+  return typeof contentDelta === "string" ? contentDelta : "";
 }
 
 async function makePaths(prefix: string): Promise<{
@@ -208,7 +262,6 @@ function openaiStartInput(a: StartInputArgs): DriverStartInput {
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: a.sharedRootPath,
       },
@@ -255,7 +308,6 @@ function opencodeStartInput(
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: a.sharedRootPath,
       },
@@ -270,17 +322,15 @@ function opencodeStartInput(
 
 function opencodeHostSnapshot(paths: { cwd: string; homePath: string; sharedRootPath: string }) {
   return createDriverHostIntegrationSnapshotFromBootExecution({
-    ...driverBootPayload.execution,
+    ...benchmarkDriverBootPayload.execution,
     profilePrompt: "",
     session: {
-      ...driverBootPayload.execution.session,
+      ...benchmarkDriverBootPayload.execution.session,
       additionalDirectories: [],
       context: {
-        ...driverBootPayload.execution.session.context,
-        appAccessSnapshot: { entries: [] },
+        ...benchmarkDriverBootPayload.execution.session.context,
         homePath: paths.homePath,
         sessionOrganizationPath: paths.sharedRootPath,
-        spaceAliases: [],
       },
       cwd: paths.cwd,
       mcpServers: [],
@@ -293,12 +343,12 @@ function opencodeHostSnapshot(paths: { cwd: string; homePath: string; sharedRoot
 
 async function runTrial(input: {
   runtime: RuntimeId;
-  scenario: Scenario;
+  scenario: BenchmarkScenario;
   startInput: (paths: StartInputArgs) => DriverStartInput;
   apiKey: string;
   model: string;
   isOpenCode: boolean;
-}): Promise<TrialMetrics> {
+}): Promise<BenchmarkTrialMetrics> {
   const paths = await makePaths(`ttft-${input.runtime}-`);
   const args: StartInputArgs = {
     apiKey: input.apiKey,
@@ -309,10 +359,16 @@ async function runTrial(input: {
     systemPrompt: input.scenario.systemPrompt,
   };
   const hostSnapshot = input.isOpenCode ? opencodeHostSnapshot(paths) : null;
+  let permissionRequestCount = 0;
   const kernel = new AgentDriverKernelCore({
     backendFactory: (i) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(i),
     hostPorts: {
-      permission: { request: async () => input.scenario.permission },
+      permission: {
+        request: async () => {
+          permissionRequestCount += 1;
+          return input.scenario.permission;
+        },
+      },
       skill: { materialize: async () => [] },
       ...(hostSnapshot === null ? {} : { hostIntegration: { snapshot: async () => hostSnapshot } }),
     },
@@ -326,14 +382,18 @@ async function runTrial(input: {
   let deltaCount = 0;
   let outputChars = 0;
   let fileCreated: boolean | null = input.scenario.marker ? false : null;
-  let ok = false;
+  let markerPresent: boolean | null = input.scenario.marker ? false : null;
   let error: string | null = null;
   const deltaTimestamps: number[] = [];
   let outputText = "";
 
   try {
     const bootStart = Date.now();
-    await withTimeout("boot", BOOT_TIMEOUT_MS, kernel.start(input.startInput(args)));
+    const startInput = applyBenchmarkPermissionPolicy(
+      input.startInput(args),
+      input.scenario.permissionPolicy,
+    );
+    await withTimeout("boot", BOOT_TIMEOUT_MS, kernel.start(startInput));
     bootMs = Date.now() - bootStart;
 
     const dispatchStart = Date.now();
@@ -342,75 +402,136 @@ async function runTrial(input: {
       input: { text: input.scenario.prompt },
       kind: "input.start",
       requestId: `ttft-${input.runtime}-req`,
-      runId: DRIVER_TEST_IDS.runId,
+      runId: benchmarkRunId,
     });
 
-    const timeout = new Promise<"timeout">((resolve) =>
-      setTimeout(() => resolve("timeout"), TURN_TIMEOUT_MS),
-    );
-    const iterator = events[Symbol.asyncIterator]();
-    let done = false;
-    while (!done) {
-      const next = await Promise.race([iterator.next(), timeout]);
-      if (next === "timeout") {
-        error = "turn_timeout";
-        break;
-      }
-      if (next.done) {
-        error = error ?? "stream_closed_early";
-        break;
-      }
-      const event: DriverEventInput = next.value;
-      const now = Date.now();
-      if (event.kind === "message.delta") {
-        if (ttftMs === null) {
-          ttftMs = now - dispatchStart;
+    let turnTimeout: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<"timeout">((resolve) => {
+      turnTimeout = setTimeout(() => resolve("timeout"), TURN_TIMEOUT_MS);
+    });
+    try {
+      const iterator = events[Symbol.asyncIterator]();
+      let done = false;
+      while (!done) {
+        const next = await Promise.race([iterator.next(), timeout]);
+        if (next === "timeout") {
+          error = "turn_timeout";
+          break;
         }
-        deltaTimestamps.push(now);
-        const text = textDeltaFrom(event);
-        if (text.length > 0) {
-          if (firstTextMs === null) {
-            firstTextMs = now - dispatchStart;
+        if (next.done) {
+          error = error ?? "stream_closed_early";
+          break;
+        }
+        const event: DriverEventInput = next.value;
+        const now = Date.now();
+        if (event.kind === "message.delta") {
+          if (ttftMs === null) {
+            ttftMs = now - dispatchStart;
           }
-          outputChars += text.length;
-          outputText += text;
-          deltaCount += 1;
+          deltaTimestamps.push(now);
+          const text = textDeltaFrom(event);
+          if (text.length > 0) {
+            if (firstTextMs === null) {
+              firstTextMs = now - dispatchStart;
+            }
+            outputChars += text.length;
+            outputText += text;
+            deltaCount += 1;
+          }
+        } else if (event.kind === "run.failed") {
+          error = "run_failed";
+          done = true;
+        } else if (event.kind === "run.completed") {
+          totalMs = now - dispatchStart;
+          done = true;
         }
-      } else if (event.kind === "run.failed") {
-        error = "run_failed";
-        done = true;
-      } else if (event.kind === "run.completed") {
-        totalMs = now - dispatchStart;
-        done = true;
+      }
+    } finally {
+      if (turnTimeout !== null) {
+        clearTimeout(turnTimeout);
       }
     }
-    await dispatch.catch(() => {});
+    if (error === "turn_timeout") {
+      try {
+        await withTimeout(
+          "turn_cancel",
+          TURN_CANCEL_TIMEOUT_MS,
+          kernel.cancel("bench.turn_timeout"),
+        );
+      } catch (caught) {
+        error = appendTrialError(error, "turn_cancel_failed", caught);
+      }
+
+      try {
+        await withTimeout("dispatch_settle", TURN_CANCEL_TIMEOUT_MS, dispatch);
+      } catch (caught) {
+        error = appendTrialError(error, "dispatch_settle_failed", caught);
+      }
+    } else {
+      try {
+        await withTimeout("dispatch_settle", TURN_CANCEL_TIMEOUT_MS, dispatch);
+      } catch (caught) {
+        error = appendTrialError(error, "dispatch_failed", caught);
+      }
+    }
     if (input.scenario.marker) {
       try {
         const content = await readFile(join(paths.cwd, input.scenario.marker.file), "utf8");
+        markerPresent = true;
         fileCreated = content
           .trim()
           .toLowerCase()
           .includes(input.scenario.marker.content.toLowerCase());
-      } catch {
-        fileCreated = false;
+      } catch (caught) {
+        if (
+          typeof caught === "object" &&
+          caught !== null &&
+          "code" in caught &&
+          caught.code === "ENOENT"
+        ) {
+          markerPresent = false;
+          fileCreated = false;
+        } else {
+          markerPresent = null;
+          throw caught;
+        }
       }
     }
-    const textOk =
-      totalMs !== null &&
-      outputText.trim().toLowerCase().includes(input.scenario.expect.toLowerCase());
-    ok = input.scenario.marker ? textOk && fileCreated === true : textOk;
   } catch (caught) {
     error = caught instanceof Error ? caught.message : String(caught);
   } finally {
-    await kernel.stop("bench.stop").catch(() => {});
-    await paths.cleanup().catch(() => {});
+    try {
+      await withTimeout("stop", STOP_TIMEOUT_MS, kernel.stop("bench.stop"));
+    } catch (caught) {
+      error = appendTrialError(error, "stop_failed", caught);
+    }
+
+    try {
+      await paths.cleanup();
+    } catch (caught) {
+      error = appendTrialError(error, "cleanup_failed", caught);
+    }
   }
 
   const gaps: number[] = [];
   for (let i = 1; i < deltaTimestamps.length; i += 1) {
-    gaps.push(deltaTimestamps[i] - deltaTimestamps[i - 1]);
+    const current = deltaTimestamps[i];
+    const previous = deltaTimestamps[i - 1];
+    if (current !== undefined && previous !== undefined) {
+      gaps.push(current - previous);
+    }
   }
+
+  const textCompleted =
+    totalMs !== null &&
+    outputText.trim().toLowerCase().includes(input.scenario.expect.toLowerCase());
+  const outcome = evaluateBenchmarkOutcome({
+    fileCreated,
+    markerPresent,
+    permissionRequestCount,
+    scenario: input.scenario,
+    textCompleted,
+  });
 
   return {
     bootMs,
@@ -423,55 +544,15 @@ async function runTrial(input: {
     interChunkP95: percentile(gaps, 95),
     interChunkMax: gaps.length > 0 ? Math.max(...gaps) : null,
     fileCreated,
-    ok,
+    markerPresent,
+    permissionRequestCount,
+    ...outcome,
     error,
   };
 }
 
-const TOOL_PROMPT =
-  "Create a file named marker.txt in the current directory containing exactly the word ready, then reply with exactly: done.";
-const TOOL_SYSTEM = "You are a coding agent. Use tools to complete the task, then reply concisely.";
-const TOOL_MARKER = { file: "marker.txt", content: "ready" } as const;
-
-const SCENARIOS: Scenario[] = [
-  {
-    id: "no_tool",
-    prompt: "Reply with exactly one lowercase word: pong. Do not call tools.",
-    systemPrompt: "Reply with exactly one lowercase word: pong. Do not call tools.",
-    permission: "allow_once",
-    expect: "pong",
-  },
-  {
-    // Long output to measure streaming cadence (inter-chunk gaps) with many deltas.
-    id: "long_output",
-    prompt:
-      "Without calling any tools, write a single paragraph of about 200 words describing how a compiler works. Plain prose only.",
-    systemPrompt: "You are a helpful assistant. Do not call tools.",
-    permission: "allow_once",
-    expect: "compiler",
-  },
-  {
-    // yolo target: tool auto-allowed.
-    id: "tool_write_allow",
-    prompt: TOOL_PROMPT,
-    systemPrompt: TOOL_SYSTEM,
-    permission: "allow_once",
-    expect: "done",
-    marker: TOOL_MARKER,
-  },
-  {
-    // current supervised default effect: tool rejected (== non-interactive / 5-min timeout).
-    id: "tool_write_reject",
-    prompt: TOOL_PROMPT,
-    systemPrompt: TOOL_SYSTEM,
-    permission: "reject_once",
-    expect: "done",
-    marker: TOOL_MARKER,
-  },
-];
-
 async function main(): Promise<void> {
-  const trials = Number(readEnv("TTFT_TRIALS") ?? "5");
+  const trials = readPositiveIntegerEnv("TTFT_TRIALS", 5);
   const requested = (readEnv("TTFT_RUNTIMES") ?? "claude,openai,opencode")
     .split(",")
     .map((s) => s.trim())
@@ -479,44 +560,58 @@ async function main(): Promise<void> {
   const anthropicKey =
     readEnv("ANTHROPIC_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY");
   const openaiKey = readEnv("OPENAI_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_OPENAI_API_KEY");
-  const claudeModel = readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_MODEL") ?? "claude-sonnet-4-5";
-  const openaiModel = readEnv("AGENT_DRIVER_LIVE_OPENAI_MODEL") ?? "gpt-5.4";
+  const claudeModel = readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_MODEL") ?? "claude-sonnet-5";
+  const openaiModel = readEnv("AGENT_DRIVER_LIVE_OPENAI_MODEL") ?? "gpt-5.5";
   const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as
     | "openai"
     | "anthropic";
-  const scenarioFilter = new Set<ScenarioId>(
+  const scenarioFilter = new Set<BenchmarkScenarioId>(
     (readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject")
       .split(",")
       .map((s) => s.trim())
-      .filter(Boolean) as ScenarioId[],
+      .filter(Boolean) as BenchmarkScenarioId[],
   );
 
   const cells: CellResult[] = [];
 
   const runCell = async (
     runtime: RuntimeId,
-    scenario: Scenario,
+    scenario: BenchmarkScenario,
     model: string,
     build: (paths: StartInputArgs) => DriverStartInput,
     apiKey: string,
     isOpenCode: boolean,
   ): Promise<void> => {
     process.stdout.write(`\n[${runtime}/${scenario.id}] model=${model} warmup...`);
-    await runTrial({ runtime, scenario, startInput: build, apiKey, model, isOpenCode }).catch(
-      () => undefined,
-    );
-    const results: TrialMetrics[] = [];
+    const warmup = await runTrial({
+      runtime,
+      scenario,
+      startInput: build,
+      apiKey,
+      model,
+      isOpenCode,
+    });
+    if (warmup.error !== null) {
+      throw new Error(`[${runtime}/${scenario.id}] warmup failed: ${warmup.error}`);
+    }
+    const results: BenchmarkTrialMetrics[] = [];
     for (let i = 0; i < trials; i += 1) {
       const m = await runTrial({ runtime, scenario, startInput: build, apiKey, model, isOpenCode });
       results.push(m);
       process.stdout.write(
-        ` t${i + 1}=${m.ok ? "ok" : "FAIL"}(ttft=${m.ttftMs ?? "-"},total=${m.totalMs ?? "-"})`,
+        ` t${i + 1}=task:${m.taskCompleted ? "done" : "not_done"},policy:${m.policyEnforced === null ? "n/a" : m.policyEnforced ? "enforced" : "BYPASSED"}(ttft=${m.ttftMs ?? "-"},total=${m.totalMs ?? "-"})`,
       );
     }
-    cells.push({ runtime, scenario: scenario.id, model, trials: results, agg: aggregate(results) });
+    cells.push({
+      runtime,
+      scenario: scenario.id,
+      model,
+      trials: results,
+      agg: aggregateBenchmarkTrials(results),
+    });
   };
 
-  for (const scenario of SCENARIOS.filter((s) => scenarioFilter.has(s.id))) {
+  for (const scenario of BENCHMARK_SCENARIOS.filter((s) => scenarioFilter.has(s.id))) {
     if (requested.includes("claude") && anthropicKey) {
       await runCell(
         "claude",
@@ -551,6 +646,12 @@ async function main(): Promise<void> {
     }
   }
 
+  if (cells.length === 0) {
+    throw new Error(
+      "No benchmark cells ran. Check TTFT_RUNTIMES, TTFT_SCENARIOS, and provider credentials.",
+    );
+  }
+
   await mkdir(OUTPUT_DIR, { recursive: true });
   const stamp = readEnv("TTFT_STAMP") ?? "latest";
   const results = { generatedStamp: stamp, trials, cells };
@@ -561,14 +662,14 @@ async function main(): Promise<void> {
     "",
     `trials per cell: ${trials} (+1 warmup discarded)`,
     "",
-    "| runtime | scenario | model | ok% | file% | boot p50 | ttft p50 | ttft p95 | firstText p50 | total p50 | interChunk p50/p95 | deltas |",
-    "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    "| runtime | scenario | model | turn% | task% | policy% | file% | boot p50 | ttft p50 | ttft p95 | firstText p50 | total p50 | interChunk p50/p95 | deltas |",
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   const fmt = (v: number | null): string => (v === null ? "-" : `${Math.round(v)}`);
   const pct = (v: number | null): string => (v === null ? "-" : `${Math.round(v * 100)}%`);
   for (const c of cells) {
     lines.push(
-      `| ${c.runtime} | ${c.scenario} | ${c.model} | ${pct(c.agg.okRate)} | ${pct(c.agg.fileCreatedRate)} | ${fmt(c.agg.bootP50)} | ${fmt(c.agg.ttftP50)} | ${fmt(c.agg.ttftP95)} | ${fmt(c.agg.firstTextP50)} | ${fmt(c.agg.totalP50)} | ${fmt(c.agg.interChunkP50)}/${fmt(c.agg.interChunkP95)} | ${fmt(c.agg.deltaCountP50)} |`,
+      `| ${c.runtime} | ${c.scenario} | ${c.model} | ${pct(c.agg.turnCompletedRate)} | ${pct(c.agg.taskCompletedRate)} | ${pct(c.agg.policyEnforcedRate)} | ${pct(c.agg.fileCreatedRate)} | ${fmt(c.agg.bootP50)} | ${fmt(c.agg.ttftP50)} | ${fmt(c.agg.ttftP95)} | ${fmt(c.agg.firstTextP50)} | ${fmt(c.agg.totalP50)} | ${fmt(c.agg.interChunkP50)}/${fmt(c.agg.interChunkP95)} | ${fmt(c.agg.deltaCountP50)} |`,
     );
   }
   const summary = lines.join("\n");

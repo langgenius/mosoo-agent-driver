@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
 import { query, startup } from "@anthropic-ai/claude-agent-sdk";
-import type { Query, WarmQuery } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
@@ -36,22 +36,42 @@ import { readClaudeNativeResumeSessionId } from "./agent-sdk-resume";
 interface ActiveClaudeTurn {
   abortController: AbortController;
   cancelled: boolean;
-  query: Query;
+  query: ClaudeAgentSdkQuery;
   runId: RunId;
 }
+
+interface ClaudeAgentSdkQuery extends AsyncIterable<SDKMessage> {
+  interrupt(): Promise<unknown>;
+}
+
+interface ClaudeAgentSdkWarmQuery {
+  close(): void;
+  query(prompt: string): ClaudeAgentSdkQuery;
+}
+
+export interface ClaudeAgentSdkRuntimeAdapter {
+  query(input: Parameters<typeof query>[0]): ClaudeAgentSdkQuery;
+  startup(input?: Parameters<typeof startup>[0]): Promise<ClaudeAgentSdkWarmQuery>;
+}
+
+const DEFAULT_CLAUDE_AGENT_SDK_RUNTIME = {
+  query,
+  startup,
+} satisfies ClaudeAgentSdkRuntimeAdapter;
 
 const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 
 /**
  * Prewarm the Claude CLI subprocess during backend start. OPT-IN (default off).
  *
- * Prewarm pre-spawns a SECOND native Claude CLI process via `startup()` to cut
- * first-token latency. On a memory-constrained container (e.g. the CF "basic"
- * instance, ~1 GiB) that extra process can OOM-kill the driver before it signals
- * `ready`, surfacing as RUN FAILED "Driver instance <id> closed before ready".
- * So it is disabled by default and must be explicitly enabled only on an
- * instance with headroom for a second CLI via AGENT_DRIVER_CLAUDE_PREWARM=1.
- * It is also fired non-blocking (see start()) so it never delays `ready`.
+ * Prewarm starts a native Claude CLI process via `startup()` to cut first-token
+ * latency. If the first turn arrives before startup finishes, the cold fallback
+ * can briefly overlap it with a second CLI process. On a memory-constrained
+ * container (e.g. the CF "basic" instance, ~1 GiB), that overlap can OOM-kill
+ * the driver around session startup. It is therefore disabled by default and
+ * must be explicitly enabled only with headroom for that overlap via
+ * AGENT_DRIVER_CLAUDE_PREWARM=1. It is fired non-blocking (see start()) so it
+ * never delays `ready`.
  */
 function isClaudePrewarmEnabled(): boolean {
   return readProcessEnvString(CLAUDE_PREWARM_ENV) === "1";
@@ -62,15 +82,21 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
   readonly #messageTranslator: ClaudeAgentSdkMessageTranslator;
   readonly #payload: DriverStartInput;
+  readonly #runtimeAdapter: ClaudeAgentSdkRuntimeAdapter;
   readonly #runtimeBootstrapDigest: string | null;
   #activeTurn: ActiveClaudeTurn | null = null;
   #materializedSkills: readonly AgentDriverMaterializedSkill[] = [];
   #nativeSessionId: string | null = null;
-  #warmQuery: WarmQuery | null = null;
+  #warmQuery: ClaudeAgentSdkWarmQuery | null = null;
   #warmAbortController: AbortController | null = null;
+  #prewarmGeneration = 0;
 
-  constructor(payload: DriverStartInput) {
+  constructor(
+    payload: DriverStartInput,
+    runtimeAdapter: ClaudeAgentSdkRuntimeAdapter = DEFAULT_CLAUDE_AGENT_SDK_RUNTIME,
+  ) {
     this.#payload = payload;
+    this.#runtimeAdapter = runtimeAdapter;
     this.#runtimeBootstrapDigest = computeRuntimeBootstrapDigest(payload.execution);
     this.#nativeSessionId = readClaudeNativeResumeSessionId(payload);
     this.#messageTranslator = new ClaudeAgentSdkMessageTranslator({
@@ -122,8 +148,20 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       return;
     }
 
+    if (this.#warmAbortController !== null || this.#warmQuery !== null) {
+      this.#discardPrewarm(context, "claude.prewarm.replaced");
+    }
+
     const startedAtMs = Date.now();
+    const generation = this.#prewarmGeneration + 1;
     const abortController = new AbortController();
+    this.#prewarmGeneration = generation;
+    this.#warmAbortController = abortController;
+
+    const isCurrentPrewarm = (): boolean =>
+      this.#prewarmGeneration === generation &&
+      this.#warmAbortController === abortController &&
+      !abortController.signal.aborted;
 
     try {
       const options = await createClaudeQueryOptions({
@@ -132,17 +170,32 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         nativeSessionId: this.#nativeSessionId,
         payload: this.#payload,
       });
-      this.#warmQuery = await startup({ options });
-      this.#warmAbortController = abortController;
+
+      if (!isCurrentPrewarm()) {
+        return;
+      }
+
+      const warmQuery = await this.#runtimeAdapter.startup({ options });
+
+      if (!isCurrentPrewarm()) {
+        this.#closeWarmQuery(context, warmQuery, "claude.prewarm.stale");
+        return;
+      }
+
+      this.#warmQuery = warmQuery;
       context.logger.debug("driver.claude.prewarm.ready", {
         prewarmMs: Date.now() - startedAtMs,
       });
     } catch (error) {
-      this.#warmQuery = null;
-      this.#warmAbortController = null;
-      context.logger.debug("driver.claude.prewarm.failed", {
-        message: toErrorMessage(error, "Claude prewarm failed."),
-      });
+      if (isCurrentPrewarm()) {
+        context.logger.debug("driver.claude.prewarm.failed", {
+          message: toErrorMessage(error, "Claude prewarm failed."),
+        });
+      }
+    } finally {
+      if (this.#prewarmGeneration === generation && this.#warmQuery === null) {
+        this.#warmAbortController = null;
+      }
     }
   }
 
@@ -157,16 +210,28 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     this.#messageTranslator.resetTurnMessageState();
 
-    const warmQuery = this.#warmQuery;
-    const warmAbortController = this.#warmAbortController;
-    this.#warmQuery = null;
-    this.#warmAbortController = null;
-    const usedWarmQuery = warmQuery !== null && warmAbortController !== null;
-    const abortController = usedWarmQuery ? warmAbortController : new AbortController();
+    const pendingWarmQuery = this.#warmQuery;
+    const pendingWarmAbortController = this.#warmAbortController;
+    let abortController = new AbortController();
+    let warmQuery: ClaudeAgentSdkWarmQuery | null = null;
+
+    if (
+      pendingWarmQuery !== null &&
+      pendingWarmAbortController !== null &&
+      !pendingWarmAbortController.signal.aborted
+    ) {
+      abortController = pendingWarmAbortController;
+      warmQuery = pendingWarmQuery;
+      this.#prewarmGeneration += 1;
+      this.#warmQuery = null;
+      this.#warmAbortController = null;
+    } else {
+      this.#discardPrewarm(context, "claude.turn.cold_start");
+    }
 
     const queryStartedAtMs = Date.now();
     let queryOptionsMs = 0;
-    let activeQuery: Query;
+    let activeQuery: ClaudeAgentSdkQuery;
 
     try {
       if (warmQuery !== null) {
@@ -182,12 +247,17 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           payload: this.#payload,
         });
         queryOptionsMs = Date.now() - optionsStartedAtMs;
-        activeQuery = query({
+        activeQuery = this.#runtimeAdapter.query({
           options: queryOptions,
           prompt: input.text,
         });
       }
     } catch (error) {
+      if (warmQuery !== null) {
+        abortController.abort("claude.warm_query.create_failed");
+        this.#closeWarmQuery(context, warmQuery, "claude.warm_query.create_failed");
+      }
+
       await this.#push(context, "driver.claude.query.create_failed", [
         {
           kind: "diagnostic.reported",
@@ -347,11 +417,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   }
 
   async stop(context: AgentDriverContext, reason: string): Promise<void> {
-    if (this.#warmQuery !== null) {
-      this.#warmQuery.close();
-      this.#warmQuery = null;
-      this.#warmAbortController = null;
-    }
+    this.#discardPrewarm(context, reason);
 
     const activeTurn = this.#activeTurn;
 
@@ -360,6 +426,38 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     }
 
     await this.cancelActiveTurn(context, reason);
+  }
+
+  #discardPrewarm(context: AgentDriverContext, reason: string): void {
+    this.#prewarmGeneration += 1;
+
+    const abortController = this.#warmAbortController;
+    const warmQuery = this.#warmQuery;
+    this.#warmAbortController = null;
+    this.#warmQuery = null;
+
+    if (abortController !== null && !abortController.signal.aborted) {
+      abortController.abort(reason);
+    }
+
+    if (warmQuery !== null) {
+      this.#closeWarmQuery(context, warmQuery, reason);
+    }
+  }
+
+  #closeWarmQuery(
+    context: AgentDriverContext,
+    warmQuery: ClaudeAgentSdkWarmQuery,
+    reason: string,
+  ): void {
+    try {
+      warmQuery.close();
+    } catch (error) {
+      context.logger.debug("driver.claude.prewarm.close_failed", {
+        message: toErrorMessage(error, "Claude prewarm close failed."),
+        reason,
+      });
+    }
   }
 
   async #recordNativeSessionId(context: AgentDriverContext, sessionId: string): Promise<void> {

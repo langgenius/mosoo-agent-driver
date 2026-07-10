@@ -10,14 +10,19 @@ type DriverPackageExportTarget =
 
 interface DriverPackageJson {
   readonly bin?: Record<string, string>;
+  readonly bugs?: { readonly url?: string };
   readonly dependencies?: Record<string, string>;
   readonly description?: string;
+  readonly engines?: { readonly bun?: string };
   readonly exports?: Record<string, DriverPackageExportTarget>;
   readonly files?: readonly string[];
+  readonly homepage?: string;
   readonly license?: string;
   readonly name?: string;
   readonly packageManager?: string;
   readonly private?: boolean;
+  readonly publishConfig?: { readonly access?: string };
+  readonly repository?: { readonly type?: string; readonly url?: string };
   readonly scripts?: Record<string, string>;
   readonly types?: string;
   readonly type?: string;
@@ -26,11 +31,9 @@ interface DriverPackageJson {
 
 const PUBLIC_EXPORTS = [
   ".",
-  "./bin/driver",
   "./boot",
-  "./cma-http",
-  "./cma-sdk",
   "./events",
+  "./experimental/cma",
   "./orpc",
   "./paths",
   "./runtime",
@@ -54,12 +57,29 @@ describe("driver artifact contract", () => {
     expect(packageJson.description).toContain("Agent Driver");
     expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.packageManager).toBe("bun@1.3.14");
+    expect(packageJson.repository).toEqual({
+      type: "git",
+      url: "git+https://github.com/langgenius/mosoo-agent-driver.git",
+    });
+    expect(packageJson.homepage).toBe("https://github.com/langgenius/mosoo-agent-driver#readme");
+    expect(packageJson.bugs).toEqual({
+      url: "https://github.com/langgenius/mosoo-agent-driver/issues",
+    });
+    expect(packageJson.publishConfig).toEqual({ access: "public" });
+    expect(packageJson.engines).toEqual({ bun: ">=1.3.12" });
     expect(packageJson.bin).toEqual({
       "agent-driver": "./dist/driver.mjs",
     });
     expect(packageJson.types).toBe("./dist/types/index.d.ts");
     expect(packageJson.files).toEqual(
-      expect.arrayContaining(["dist", "src", "Dockerfile", ".dockerignore", "README.md"]),
+      expect.arrayContaining([
+        "assets/logo.svg",
+        "dist",
+        "src",
+        "Dockerfile",
+        ".dockerignore",
+        "README.md",
+      ]),
     );
     expect(packageJson.files).not.toContain("tests/fixtures");
   });
@@ -75,10 +95,7 @@ describe("driver artifact contract", () => {
       default: "./src/index.ts",
       types: "./dist/types/index.d.ts",
     });
-    expect(packageJson.exports?.["./bin/driver"]).toEqual({
-      default: "./src/bin/driver.ts",
-      types: "./dist/types/bin/driver.d.ts",
-    });
+    expect(packageJson.exports).not.toHaveProperty("./bin/driver");
   });
 
   test("keeps the root library entry free of boot and transport internals", () => {
@@ -95,6 +112,7 @@ describe("driver artifact contract", () => {
     expect(publicApi).not.toContain("DriverBootPayload");
     expect(publicApi).not.toContain("DriverRuntimeClient");
     expect(publicApi).not.toContain("createDriverStartInputFromBootPayload");
+    expect(publicApi).not.toMatch(/Cma|CMA/u);
   });
 
   test("builds and packages only the process runner artifact", () => {
@@ -107,13 +125,22 @@ describe("driver artifact contract", () => {
 
     expect(processEntry.startsWith("#!/usr/bin/env bun\n")).toBe(true);
     expect(buildScript).toContain("src/bin/driver.ts");
+    expect(buildScript.startsWith("bun scripts/clean-dist.ts &&")).toBe(true);
     expect(buildScript).toContain("dist/driver.mjs");
     expect(buildScript).not.toContain("src/index.ts");
     expect(dockerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
     expect(dockerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
     expect(dockerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
     expect(dockerignore).toContain("!dist/driver.mjs");
-    expect(dockerBuildScript).toBe("bun run build && docker build -t agent-driver:local .");
+    expect(dockerfile).toContain("@anthropic-ai/claude-agent-sdk-linux-x64");
+    expect(dockerfile).toContain('test "$TARGETARCH" = amd64');
+    expect(dockerfile).not.toContain("linux-arm64");
+    expect(dockerfile).not.toContain("process.arch");
+    expect(dockerBuildScript).toBe(
+      "bun run build && docker build --platform linux/amd64 -t agent-driver:local .",
+    );
+    expect(packageJson.scripts?.["prepack"]).toBe("bun run build");
+    expect(packageJson.scripts?.["test:package"]).toBe("bun scripts/package-smoke.ts");
   });
 
   test("keeps the standalone package out of Mosoo workspace dependencies", () => {

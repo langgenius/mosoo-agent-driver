@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import { OPENAI_DEFAULT_MODEL_ID } from "../src/models";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
@@ -14,6 +13,7 @@ const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_OPENAI_API_KEY";
 const PROVIDER_API_KEY_ENV = "OPENAI_API_KEY";
 const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_OPENAI_MODEL";
 const LIVE_TURN_TIMEOUT_MS = 120_000;
+const DEFAULT_LIVE_MODEL = "gpt-5.5";
 
 const tempRoots: string[] = [];
 
@@ -44,7 +44,7 @@ function readLiveApiKey(): string | null {
 }
 
 function readLiveModel(): string {
-  return readEnvString(LIVE_MODEL_ENV) ?? OPENAI_DEFAULT_MODEL_ID;
+  return readEnvString(LIVE_MODEL_ENV) ?? DEFAULT_LIVE_MODEL;
 }
 
 async function createLiveDriverPaths(): Promise<{

@@ -155,11 +155,10 @@ export interface DriverExecutionSessionSpec {
 /**
  * How the driver mediates tool-permission requests.
  *
- * - `full_access` (default): the sandbox is the isolation boundary, so tool
- *   calls are auto-approved inside the runtime without a control-plane
- *   round-trip. This is the "yolo" posture every comparable agent runtime
- *   (Vercel harness, OpenHands, opencomputer, Rivet agentos, eve) ships by
- *   default.
+ * - `full_access` (default): tool calls are auto-approved without a
+ *   control-plane round-trip and receive the Sandbox/credential access
+ *   provisioned for the run. Safety still depends on the Agent, runtime, tools,
+ *   credentials, and input trust boundary.
  * - `supervised`: every tool call is routed to the control plane for an
  *   interactive allow/deny decision via the permission broker (opt-in).
  */
