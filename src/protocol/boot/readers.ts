@@ -1,7 +1,7 @@
 import type { DriverId } from "../id";
 import { parseDriverId } from "../id";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -60,6 +60,20 @@ export function readNumber(record: Record<string, unknown>, field: string, label
 
   if (typeof value !== "number" || !Number.isFinite(value)) {
     throw new TypeError(`${label}.${field} must be a finite number.`);
+  }
+
+  return value;
+}
+
+export function readBoolean(
+  record: Record<string, unknown>,
+  field: string,
+  label: string,
+): boolean {
+  const value = record[field];
+
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${label}.${field} must be a boolean.`);
   }
 
   return value;

@@ -41,7 +41,7 @@ interface OpenCodeLiveProviderConfig {
 
 const PROVIDER_CONFIGS = {
   anthropic: {
-    defaultModel: "claude-sonnet-5",
+    defaultModel: "claude-sonnet-4-5",
     defaultSmallModel: "claude-haiku-4-5",
     id: "anthropic",
     providerApiKeyEnv: ANTHROPIC_API_KEY_ENV,
@@ -53,7 +53,7 @@ const PROVIDER_CONFIGS = {
     providerApiKeyEnv: DEEPSEEK_API_KEY_ENV,
   },
   openai: {
-    defaultModel: "gpt-5.5",
+    defaultModel: "gpt-5.4",
     defaultSmallModel: "gpt-5-nano",
     id: "openai",
     providerApiKeyEnv: OPENAI_API_KEY_ENV,

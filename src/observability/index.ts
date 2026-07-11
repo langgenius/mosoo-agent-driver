@@ -1,11 +1,13 @@
 import {
   createLogger,
+  createTraceparent,
   createWideEvent,
   generateRequestId,
   generateSpanId,
   generateTraceId,
   getContext,
   parseTraceparent,
+  withContext,
   withContextAsync,
 } from "vestig";
 import type {
@@ -330,6 +332,11 @@ function isNonEmptyString(value: string | null | undefined): value is string {
   return value !== null && value !== undefined && value.length > 0;
 }
 
+function readContextString(context: Partial<LogContext> | null | undefined, key: string): string {
+  const value = context?.[key];
+  return typeof value === "string" && value.length > 0 ? value : "";
+}
+
 function createBaseLogger(options: BaseLoggerOptions): Logger {
   const config: LoggerConfig = {
     context: normalizeLogContext({
@@ -345,6 +352,10 @@ function createBaseLogger(options: BaseLoggerOptions): Logger {
   };
 
   return createLogger(config);
+}
+
+export function createConsoleLogger(options: BaseLoggerOptions): Logger {
+  return createBaseLogger(options);
 }
 
 export function createBufferedSinkLogger(options: CreateBufferedSinkLoggerOptions): Logger {
@@ -365,6 +376,31 @@ export function createBufferedSinkLogger(options: CreateBufferedSinkLoggerOption
   );
 
   return logger;
+}
+
+export function createErrorLogContext(error: unknown): LogMetadata {
+  if (error instanceof Error) {
+    return {
+      error,
+    };
+  }
+
+  return {
+    error: {
+      message: typeof error === "string" ? error : "Unknown error.",
+      name: "UnknownError",
+    },
+  };
+}
+
+export function createRequestLogMetadata(request: Request): LogMetadata {
+  const url = new URL(request.url);
+
+  return {
+    cfRay: request.headers.get("cf-ray"),
+    method: request.method,
+    path: url.pathname,
+  };
 }
 
 export function createScopedWideEvent(config: WideEventConfig): WideEventBuilder {
@@ -398,6 +434,38 @@ export function createTraceLogContext(input: CreateTraceLogContextInput): TraceL
     traceId,
     ...(isNonEmptyString(parentSpanId) ? { parentSpanId } : {}),
   };
+}
+
+export function createRequestTraceLogContext(
+  request: Request,
+  input: {
+    context?: Record<string, unknown>;
+    service: string;
+  },
+): TraceLogContext {
+  const requestUrl = new URL(request.url);
+  const requestId = request.headers.get("x-request-id");
+  const traceparent =
+    request.headers.get("traceparent") ?? requestUrl.searchParams.get("traceparent");
+
+  return createTraceLogContext({
+    service: input.service,
+    ...(input.context === undefined ? {} : { context: input.context }),
+    ...(isNonEmptyString(requestId) ? { requestId } : {}),
+    ...(isNonEmptyString(traceparent) ? { traceparent } : {}),
+  });
+}
+
+export function createTraceparentFromContext(context?: Partial<LogContext> | null): string {
+  const activeContext = context ?? getContext();
+
+  const traceId = readContextString(activeContext, "traceId");
+  const spanId = readContextString(activeContext, "spanId");
+
+  return createTraceparent(
+    traceId.length > 0 ? traceId : generateTraceId(),
+    spanId.length > 0 ? spanId : generateSpanId(),
+  );
 }
 
 export function emitWideEvent(
@@ -438,21 +506,25 @@ export function formatLogValue(value: unknown): string {
   }
 }
 
-function getActiveLogContext(): LogContext | undefined {
+export function getActiveLogContext(): LogContext | undefined {
   return getContext();
 }
 
-function normalizeLogContext(context: Record<string, unknown> = {}): LogContext {
+export function normalizeLogContext(context: Record<string, unknown> = {}): LogContext {
   return normalizeLogMetadata(context) as LogContext;
 }
 
-function normalizeLogMetadata(metadata: Record<string, unknown> = {}): LogMetadata {
+export function normalizeLogMetadata(metadata: Record<string, unknown> = {}): LogMetadata {
   return Object.fromEntries(
     Object.entries(metadata).flatMap(([key, value]) => {
       const normalized = normalizeValue(value);
       return normalized === undefined ? [] : [[key, normalized]];
     }),
   );
+}
+
+export function runWithLogContext<T>(context: Record<string, unknown>, fn: () => T): T {
+  return withContext(normalizeLogContext(context), fn);
 }
 
 export async function runWithLogContextAsync<T>(

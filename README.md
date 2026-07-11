@@ -46,12 +46,12 @@ flowchart LR
     Runtime -->|"writes file and starts process with<br/>MOSOO_DRIVER_BOOT_PAYLOAD_FILE"| Boot
     Boot -->|"read and removed"| Driver
     Driver -->|"outbound authenticated WebSocket"| Ingress
-    Ingress -->|"validated upgrade handoff"| DriverDO
+    Ingress -->|"upgrade handoff"| DriverDO
     Driver <-->|"ORPC: hello, ready, heartbeats,<br/>commands, events, and logs"| DriverDO
     Driver -->|"launches and supervises"| Backend
 ```
 
-The Driver does not open a sandbox-local control listener. In Mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker validates the upgrade and hands it to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
+The Driver does not open a sandbox-local control listener. In Mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
 
 ## Why agent-driver
 
