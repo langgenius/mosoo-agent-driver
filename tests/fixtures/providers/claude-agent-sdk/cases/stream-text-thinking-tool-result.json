@@ -78,6 +78,7 @@
       "type": "stream_event"
     },
     {
+      "result": "hello",
       "subtype": "success",
       "total_cost_usd": 0.02,
       "type": "result",

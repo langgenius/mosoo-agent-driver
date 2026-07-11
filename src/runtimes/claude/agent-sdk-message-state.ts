@@ -10,17 +10,5 @@ export function isDuplicateClaudeFinalText(
   messageId: string,
   text: string,
 ): boolean {
-  const sameMessageText = streamedTextByMessageId.get(messageId);
-
-  if (sameMessageText === text) {
-    return true;
-  }
-
-  for (const streamedText of streamedTextByMessageId.values()) {
-    if (streamedText === text) {
-      return true;
-    }
-  }
-
-  return false;
+  return streamedTextByMessageId.get(messageId) === text;
 }

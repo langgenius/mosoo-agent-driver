@@ -220,14 +220,63 @@ function stripUndefined(value: unknown): unknown {
   return Object.fromEntries(entries);
 }
 
-function normalizeAcpEvent(event: DriverEventInput): Record<string, unknown> {
+function readAssistantMessageId(event: DriverEventInput): string | null {
+  if (event.kind !== "message.started" || !isRecord(event.payload)) {
+    return null;
+  }
+
+  return event.payload["role"] === "agent" ? readStringField(event.payload, "messageId") : null;
+}
+
+function replaceAssistantMessageIds(value: unknown, aliases: ReadonlyMap<string, string>): unknown {
+  if (typeof value === "string") {
+    return aliases.get(value) ?? value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => replaceAssistantMessageIds(entry, aliases));
+  }
+
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, replaceAssistantMessageIds(entry, aliases)]),
+  );
+}
+
+function normalizeAcpEvent(
+  event: DriverEventInput,
+  aliases: ReadonlyMap<string, string>,
+): Record<string, unknown> {
   const eventRecord = stripUndefined(event);
 
   if (!isRecord(eventRecord)) {
     throw new Error("ACP translator event must be an object.");
   }
 
-  return eventRecord;
+  const normalized = replaceAssistantMessageIds(eventRecord, aliases);
+
+  if (!isRecord(normalized)) {
+    throw new Error("ACP normalized event must be an object.");
+  }
+
+  return normalized;
+}
+
+function normalizeAcpEvents(events: readonly DriverEventInput[]): Record<string, unknown>[] {
+  const aliases = new Map<string, string>();
+
+  for (const event of events) {
+    const messageId = readAssistantMessageId(event);
+
+    if (messageId !== null && !aliases.has(messageId)) {
+      aliases.set(messageId, `assistant-message-${aliases.size + 1}`);
+    }
+  }
+
+  return events.map((event) => normalizeAcpEvent(event, aliases));
 }
 
 function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
@@ -267,6 +316,6 @@ describe("ACP provider fixtures", () => {
   test.each(acpFixtureNames)("apps provider-native fixture %s", (name) => {
     const fixture = readAcpProviderFixtureCase(`./fixtures/providers/acp/cases/${name}.json`);
 
-    expect(appAcpFixture(fixture).map(normalizeAcpEvent)).toEqual(fixture.expectedEvents);
+    expect(normalizeAcpEvents(appAcpFixture(fixture))).toEqual(fixture.expectedEvents);
   });
 });
