@@ -81,7 +81,7 @@ Every public entry has a matching declaration file under `dist/types`.
 `agent-driver` targets [Bun](https://bun.sh). It is not currently available from npm; work from this repository checkout, install dependencies, and run the test suite:
 
 ```sh
-bun install
+bun install --frozen-lockfile
 bun test
 ```
 
@@ -137,7 +137,7 @@ This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessio
 ## Commands
 
 ```sh
-bun install
+bun install --frozen-lockfile
 bun run lint
 bun run tc
 bun run test
