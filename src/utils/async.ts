@@ -70,7 +70,7 @@ export function createPromiseDeferred<T>(): PromiseDeferred<T> {
   };
 }
 
-export function createTimeoutError(options: PromiseTimeoutOptions): AsyncTimeoutError {
+function createTimeoutError(options: PromiseTimeoutOptions): AsyncTimeoutError {
   return new AsyncTimeoutError({
     label: options.label,
     message: `${options.label} timed out after ${options.timeoutMs}ms.`,
@@ -82,7 +82,7 @@ export function ignorePromiseRejection(error?: unknown): void {
   Object.is(error, undefined);
 }
 
-export function isAsyncTimeoutError(error: unknown): error is AsyncTimeoutError {
+function isAsyncTimeoutError(error: unknown): error is AsyncTimeoutError {
   return (
     typeof error === "object" &&
     error !== null &&
@@ -91,7 +91,7 @@ export function isAsyncTimeoutError(error: unknown): error is AsyncTimeoutError 
   );
 }
 
-export async function promiseWithTimeout<T>(
+async function promiseWithTimeout<T>(
   promise: Promise<T>,
   options: PromiseTimeoutOptions,
 ): Promise<T> {

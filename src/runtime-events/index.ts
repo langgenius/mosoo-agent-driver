@@ -293,11 +293,11 @@ const payloadIdentityFields = new Set<string>([
   "traceId",
 ]);
 
-export function isRuntimeEventRecord(value: unknown): value is RuntimeEventRecord {
+function isRuntimeEventRecord(value: unknown): value is RuntimeEventRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function createRuntimeEvent<TPayload>(
+function createRuntimeEvent<TPayload>(
   draft: RuntimeEventDraft<TPayload>,
 ): RuntimeEventEnvelope<TPayload> {
   return {

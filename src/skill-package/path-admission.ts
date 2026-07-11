@@ -11,7 +11,7 @@ export interface SkillPackagePathAdmission {
   admit(path: string, entryKind: SkillPackagePathKind): AdmittedSkillPackagePath;
 }
 
-export const SKILL_PACKAGE_MANIFEST_PATH = "SKILL.md";
+const SKILL_PACKAGE_MANIFEST_PATH = "SKILL.md";
 
 const RESERVED_PATH_KEYS = new Set([
   "__proto__",
