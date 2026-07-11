@@ -4,6 +4,10 @@ import type { MessageId } from "../protocol/id";
 export class RuntimeAssistantMessageIdIndex<TKey extends string> {
   readonly #messageIds = new Map<TKey, MessageId>();
 
+  get(key: TKey): MessageId | null {
+    return this.#messageIds.get(key) ?? null;
+  }
+
   getOrCreate(key: TKey): MessageId {
     const existing = this.#messageIds.get(key);
 

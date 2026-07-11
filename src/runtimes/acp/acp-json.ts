@@ -53,31 +53,43 @@ export class AcpJsonRpcError extends Error {
 export class AcpJsonRpcConnection {
   readonly #interface: Interface;
   #closed = false;
+  #inboundQueue: Promise<void> = Promise.resolve();
   #nextRequestId = 1;
   readonly #options: AcpJsonRpcConnectionOptions;
+  #pendingInboundLineCount = 0;
   readonly #pending = new Map<AcpJsonRpcId, PendingAcpRequest>();
+  #pendingTransportCloseError: Error | null = null;
+  #transportCloseScheduled = false;
+  #writeError: Error | null = null;
 
   constructor(options: AcpJsonRpcConnectionOptions) {
     this.#options = options;
     this.#interface = createInterface({ input: options.stdout });
     this.#interface.on("line", (line) => {
-      void this.#handleLine(line).catch((error: unknown) => {
-        this.#failTransport(
-          error instanceof Error ? error : new Error("ACP JSON-RPC line handler failed."),
-        );
-      });
+      this.#enqueueInboundLine(line);
+    });
+    this.#interface.on("error", (error) => {
+      this.#failTransportAfterInboundQueue(
+        error instanceof Error ? error : new Error("ACP stdout failed."),
+      );
     });
     this.#interface.on("close", () => {
-      this.#failTransport(new Error("ACP JSON-RPC stream closed."));
+      // readline can emit close immediately after the last line. Drain frames
+      // already accepted from stdout before rejecting pending requests so a
+      // final session/update and its prompt response cannot be discarded at
+      // EOF merely because their async handlers have not settled yet.
+      this.#failTransportAfterInboundQueue(new Error("ACP JSON-RPC stream closed."));
     });
     options.stdout.on("error", (error) => {
-      this.#failTransport(error instanceof Error ? error : new Error("ACP stdout failed."));
+      this.#failTransportAfterInboundQueue(
+        error instanceof Error ? error : new Error("ACP stdout failed."),
+      );
     });
     options.stdin.on("error", (error) => {
-      this.#failTransport(error instanceof Error ? error : new Error("ACP stdin failed."));
+      this.#recordWriteError(error instanceof Error ? error : new Error("ACP stdin failed."));
     });
     options.stdin.on("close", () => {
-      this.#failTransport(new Error("ACP stdin closed."));
+      this.#recordWriteError(new Error("ACP stdin closed."));
     });
   }
 
@@ -102,6 +114,10 @@ export class AcpJsonRpcConnection {
   async request<T>(method: string, params: unknown): Promise<T> {
     if (this.#closed) {
       throw new Error("ACP JSON-RPC connection is closed.");
+    }
+
+    if (this.#writeError !== null) {
+      throw this.#writeError;
     }
 
     const id = this.#nextRequestId;
@@ -153,6 +169,51 @@ export class AcpJsonRpcConnection {
     }
 
     this.#handleInboundResponse(parsed);
+  }
+
+  #enqueueInboundLine(line: string): void {
+    this.#pendingInboundLineCount += 1;
+    this.#inboundQueue = this.#inboundQueue.then(() => this.#processInboundLine(line));
+  }
+
+  #failTransportAfterInboundQueue(error: Error): void {
+    if (this.#closed || this.#transportCloseScheduled) {
+      return;
+    }
+
+    this.#transportCloseScheduled = true;
+    this.#pendingTransportCloseError = error;
+    this.#failTransportIfInboundQueueDrained();
+  }
+
+  #recordWriteError(error: Error): void {
+    this.#writeError ??= error;
+  }
+
+  #failTransportIfInboundQueueDrained(): void {
+    const error = this.#pendingTransportCloseError;
+
+    if (error === null || this.#pendingInboundLineCount > 0) {
+      return;
+    }
+
+    this.#pendingTransportCloseError = null;
+    this.#failTransport(error);
+  }
+
+  async #processInboundLine(line: string): Promise<void> {
+    try {
+      if (!this.#closed) {
+        await this.#handleLine(line);
+      }
+    } catch (error) {
+      this.#failTransport(
+        error instanceof Error ? error : new Error("ACP JSON-RPC line handler failed."),
+      );
+    } finally {
+      this.#pendingInboundLineCount -= 1;
+      this.#failTransportIfInboundQueueDrained();
+    }
   }
 
   async #handleInboundRequestOrNotification(message: JsonObject): Promise<void> {
@@ -230,6 +291,10 @@ export class AcpJsonRpcConnection {
   async #write(message: JsonObject): Promise<void> {
     if (this.#closed) {
       throw new Error("ACP JSON-RPC connection is closed.");
+    }
+
+    if (this.#writeError !== null) {
+      throw this.#writeError;
     }
 
     const line = `${JSON.stringify(message)}\n`;

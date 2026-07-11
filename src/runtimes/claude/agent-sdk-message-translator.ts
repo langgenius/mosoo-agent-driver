@@ -22,18 +22,30 @@ interface ClaudeMessageTranslatorOptions {
   recordNativeSessionId(context: AgentDriverContext, sessionId: string): Promise<void>;
 }
 
+interface ClaudeAssistantFinalCandidate {
+  readonly id: MessageId;
+  readonly ordinal: number;
+}
+
 function toClaudeThoughtId(messageId: string): string {
   return `${messageId}:thought`;
 }
 
 export class ClaudeAgentSdkMessageTranslator {
+  readonly #activeAssistantMessageIds = new Map<RunId, MessageId>();
   #activeThoughtId: string | null = null;
-  readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<RunId>();
+  readonly #authoritativeAssistantMessageIds = new Set<MessageId>();
+  readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
+  readonly #assistantMessageOrdinals = new Map<MessageId, number>();
+  readonly #assistantMessageRunIds = new Map<MessageId, RunId>();
+  readonly #assistantMessageSequences = new Map<RunId, number>();
   readonly #blockIndexToToolCallId = new Map<number, string>();
   readonly #events: ClaudeAgentSdkEventWriter;
+  readonly #lastCompletedAssistantMessages = new Map<RunId, ClaudeAssistantFinalCandidate>();
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #streamedTextMessages = new Set<string>();
   readonly #streamedTextByMessageId = new Map<string, string>();
+  readonly #textByAssistantMessageId = new Map<MessageId, string>();
 
   constructor(options: ClaudeMessageTranslatorOptions) {
     this.#options = options;
@@ -41,12 +53,19 @@ export class ClaudeAgentSdkMessageTranslator {
   }
 
   resetTurnMessageState(): void {
+    this.#activeAssistantMessageIds.clear();
     this.#activeThoughtId = null;
+    this.#authoritativeAssistantMessageIds.clear();
     this.#assistantMessageIds.reset();
+    this.#assistantMessageOrdinals.clear();
+    this.#assistantMessageRunIds.clear();
+    this.#assistantMessageSequences.clear();
     this.#blockIndexToToolCallId.clear();
     this.#events.resetTurnState();
+    this.#lastCompletedAssistantMessages.clear();
     this.#streamedTextByMessageId.clear();
     this.#streamedTextMessages.clear();
+    this.#textByAssistantMessageId.clear();
   }
 
   async endActiveThought(context: AgentDriverContext): Promise<void> {
@@ -113,8 +132,9 @@ export class ClaudeAgentSdkMessageTranslator {
     message: Extract<SDKMessage, { type: "assistant" }>,
     runId: RunId,
   ): Promise<void> {
-    const messageId = this.#assistantMessageId(runId);
+    const messageId = this.#assistantMessageId(runId, this.#readNativeMessageId(message));
     const content = Array.isArray(message.message.content) ? message.message.content : [];
+    const authoritativeText: string[] = [];
 
     for (const [index, block] of content.entries()) {
       if (!isRecord(block)) {
@@ -125,12 +145,17 @@ export class ClaudeAgentSdkMessageTranslator {
 
       if (blockType === "text") {
         const text = readString(block, "text");
+
+        if (text !== null) {
+          authoritativeText.push(text);
+        }
         const isDuplicateStreamedText =
           text === null ||
           this.#streamedTextMessages.has(messageId) ||
           isDuplicateClaudeFinalText(this.#streamedTextByMessageId, messageId, text);
 
         if (isTruthy(text) && !isDuplicateStreamedText) {
+          this.#appendAssistantText(messageId, text);
           // Claude content blocks are protocol-ordered; push each derived event before reading the next block.
           await this.#events.pushTextDelta({
             context,
@@ -167,7 +192,12 @@ export class ClaudeAgentSdkMessageTranslator {
       }
     }
 
-    await this.#events.endMessage(context, messageId);
+    if (authoritativeText.length > 0) {
+      this.#authoritativeAssistantMessageIds.add(messageId);
+      this.#textByAssistantMessageId.set(messageId, authoritativeText.join(""));
+    }
+
+    await this.#endAssistantMessage(context, runId, messageId);
   }
 
   async #handleStreamEvent(
@@ -179,10 +209,14 @@ export class ClaudeAgentSdkMessageTranslator {
     const eventType = readString(event, "type");
 
     if (eventType === "message_start") {
+      await this.#events.ensureMessageStarted(
+        context,
+        this.#assistantMessageId(runId, this.#readNativeMessageId(message)),
+      );
       return;
     }
 
-    const messageId = this.#assistantMessageId(runId);
+    const messageId = this.#assistantMessageId(runId, this.#readNativeMessageId(message));
 
     if (eventType === "content_block_start") {
       await this.#handleContentBlockStart(context, messageId, event);
@@ -205,7 +239,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (eventType === "message_stop") {
       await this.endActiveThought(context);
-      await this.#events.endMessage(context, messageId);
+      await this.#endAssistantMessage(context, runId, messageId);
       this.#blockIndexToToolCallId.clear();
       return;
     }
@@ -222,6 +256,14 @@ export class ClaudeAgentSdkMessageTranslator {
     this.#streamedTextByMessageId.set(
       messageId,
       `${this.#streamedTextByMessageId.get(messageId) ?? ""}${text}`,
+    );
+    this.#appendAssistantText(messageId as MessageId, text);
+  }
+
+  #appendAssistantText(messageId: MessageId, text: string): void {
+    this.#textByAssistantMessageId.set(
+      messageId,
+      `${this.#textByAssistantMessageId.get(messageId) ?? ""}${text}`,
     );
   }
 
@@ -370,14 +412,114 @@ export class ClaudeAgentSdkMessageTranslator {
       await this.#events.pushToolResult({
         content: resultText,
         context,
-        messageId: this.#events.toolParentMessageId(toolCallId) ?? this.#assistantMessageId(runId),
+        messageId:
+          this.#events.toolParentMessageId(toolCallId) ??
+          this.#activeAssistantMessageIds.get(runId) ??
+          this.#lastCompletedAssistantMessages.get(runId)?.id ??
+          this.#assistantMessageId(runId, null),
         toolCallId,
       });
     }
   }
 
-  #assistantMessageId(runId: RunId): MessageId {
-    return this.#assistantMessageIds.getOrCreate(runId);
+  #assistantMessageId(runId: RunId, nativeMessageId: string | null): MessageId {
+    const active = this.#activeAssistantMessageIds.get(runId);
+    let messageId: MessageId;
+
+    if (nativeMessageId !== null) {
+      messageId = this.#assistantMessageIds.getOrCreate(`${runId}:native:${nativeMessageId}`);
+    } else if (active !== undefined) {
+      messageId = active;
+    } else {
+      const ordinal = this.#nextAssistantMessageSequence(runId);
+      messageId = this.#assistantMessageIds.getOrCreate(`${runId}:sequence:${ordinal}`);
+      this.#assistantMessageOrdinals.set(messageId, ordinal);
+    }
+
+    this.#ensureAssistantMessageOrdinal(runId, messageId);
+    this.#assistantMessageRunIds.set(messageId, runId);
+    this.#activeAssistantMessageIds.set(runId, messageId);
+    return messageId;
+  }
+
+  async #endAssistantMessage(
+    context: AgentDriverContext,
+    runId: RunId,
+    messageId: MessageId,
+  ): Promise<void> {
+    const ended = await this.#events.endMessage(context, messageId);
+
+    if (ended) {
+      const ordinal = this.#requireAssistantMessageOrdinal(messageId);
+      const current = this.#lastCompletedAssistantMessages.get(runId);
+
+      // A reconnect can deliver an older complete assistant snapshot after a
+      // newer message has already completed. Keep the snapshot repair for the
+      // old message, but never let arrival order move the canonical final
+      // candidate backwards.
+      if (current === undefined || ordinal > current.ordinal) {
+        this.#lastCompletedAssistantMessages.set(runId, { id: messageId, ordinal });
+      }
+    }
+
+    if (this.#activeAssistantMessageIds.get(runId) === messageId) {
+      this.#activeAssistantMessageIds.delete(runId);
+    }
+  }
+
+  #nextAssistantMessageSequence(runId: RunId): number {
+    const sequence = (this.#assistantMessageSequences.get(runId) ?? 0) + 1;
+    this.#assistantMessageSequences.set(runId, sequence);
+    return sequence;
+  }
+
+  #ensureAssistantMessageOrdinal(runId: RunId, messageId: MessageId): number {
+    const existing = this.#assistantMessageOrdinals.get(messageId);
+
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const ordinal = this.#nextAssistantMessageSequence(runId);
+    this.#assistantMessageOrdinals.set(messageId, ordinal);
+    return ordinal;
+  }
+
+  #requireAssistantMessageOrdinal(messageId: MessageId): number {
+    const ordinal = this.#assistantMessageOrdinals.get(messageId);
+
+    if (ordinal === undefined) {
+      throw new Error("Claude assistant message ordinal is not initialized.");
+    }
+
+    return ordinal;
+  }
+
+  #resolveFinalAssistantSnapshot(
+    runId: RunId,
+    resultText: string,
+  ): { id: MessageId; text: string } | null {
+    let selected: ClaudeAssistantFinalCandidate | null = null;
+
+    for (const [messageId, ordinal] of this.#assistantMessageOrdinals) {
+      if (
+        this.#assistantMessageRunIds.get(messageId) !== runId ||
+        !this.#authoritativeAssistantMessageIds.has(messageId) ||
+        this.#textByAssistantMessageId.get(messageId) !== resultText
+      ) {
+        continue;
+      }
+
+      if (selected === null || ordinal > selected.ordinal) {
+        selected = { id: messageId, ordinal };
+      }
+    }
+
+    return selected === null ? null : { id: selected.id, text: resultText };
+  }
+
+  #readNativeMessageId(message: SDKMessage): string | null {
+    return isRecord(message) ? readString(message, "uuid") : null;
   }
 
   async #handleSystemMessage(
@@ -424,7 +566,14 @@ export class ClaudeAgentSdkMessageTranslator {
     );
 
     if (message.subtype === "success") {
-      await this.#events.pushRunFinished(context, runId);
+      const resultText = isRecord(message) ? readString(message, "result") : null;
+      // SDKResultSuccess.result is the provider's terminal text. Bind it only
+      // to a complete assistant snapshot with identical bytes; arrival order
+      // alone cannot distinguish a late replayed progress frame from final.
+      const finalMessage =
+        resultText === null ? null : this.#resolveFinalAssistantSnapshot(runId, resultText);
+
+      await this.#events.pushRunFinished(context, runId, finalMessage);
       return;
     }
 

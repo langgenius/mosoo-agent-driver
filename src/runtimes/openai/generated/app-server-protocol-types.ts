@@ -91,6 +91,7 @@ export interface TurnStartParams {
 }
 
 export type TurnStatus = "completed" | "interrupted" | "failed" | "inProgress";
+export type TurnItemsView = "notLoaded" | "summary" | "full";
 
 export type PatchChangeKind =
   | { type: "add" }
@@ -121,6 +122,7 @@ export interface Turn {
   error?: { message?: string } | null;
   id: string;
   items?: ThreadItem[];
+  itemsView?: TurnItemsView;
   startedAt?: number | null;
   status?: TurnStatus;
 }
@@ -257,10 +259,17 @@ export interface ThreadSettingsUpdatedNotification {
   threadSettings: JsonObject;
 }
 
+export interface AgentMessageDeltaNotification {
+  delta: string;
+  itemId: string;
+  threadId: string;
+  turnId: string;
+}
+
 export interface ServerNotificationParams {
   configWarning: ConfigWarningNotification;
   error: ErrorNotification;
-  "item/agentMessage/delta": { delta?: string; threadId?: string; turnId?: string };
+  "item/agentMessage/delta": AgentMessageDeltaNotification;
   "item/commandExecution/outputDelta": {
     delta?: string;
     itemId?: string;

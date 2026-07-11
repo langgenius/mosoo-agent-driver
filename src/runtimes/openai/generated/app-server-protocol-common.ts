@@ -11,6 +11,7 @@ import type {
   ThreadTokenUsage,
   TokenUsageBreakdown,
   Turn,
+  TurnItemsView,
   TurnPlanStep,
   TurnPlanStepStatus,
   TurnStatus,
@@ -359,6 +360,18 @@ function parseTurnStatus(value: unknown, label: string): TurnStatus | undefined 
   throw new Error(`${label} is unsupported.`);
 }
 
+function parseTurnItemsView(value: unknown, label: string): TurnItemsView | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (value === "notLoaded" || value === "summary" || value === "full") {
+    return value;
+  }
+
+  throw new Error(`${label} is unsupported.`);
+}
+
 export function parseTurn(value: unknown, label: string): Turn {
   const record = expectRecord(value, label);
   const id = readString(record, "id");
@@ -372,6 +385,7 @@ export function parseTurn(value: unknown, label: string): Turn {
     error === undefined || error === null ? null : expectRecord(error, `${label}.error`);
   const errorMessage = parsedError === null ? null : readString(parsedError, "message");
   const items = parseOptionalThreadItems(record["items"], `${label}.items`);
+  const itemsView = parseTurnItemsView(record["itemsView"], `${label}.itemsView`);
   const startedAt = readOptionalNullableNumber(record, "startedAt", label);
   const completedAt = readOptionalNullableNumber(record, "completedAt", label);
   const durationMs = readOptionalNullableNumber(record, "durationMs", label);
@@ -383,6 +397,7 @@ export function parseTurn(value: unknown, label: string): Turn {
     ...(durationMs === undefined ? {} : { durationMs }),
     ...(errorMessage === null ? {} : { error: { message: errorMessage } }),
     ...(items === undefined ? {} : { items }),
+    ...(itemsView === undefined ? {} : { itemsView }),
     ...(startedAt === undefined ? {} : { startedAt }),
     ...(status === undefined ? {} : { status }),
   };

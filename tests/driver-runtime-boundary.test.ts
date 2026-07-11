@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { createDriverRuntimeTimingEvent } from "../src/core/driver-runtime-timing";
-import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
+import {
+  DriverEventSourceIdAllocator,
+  toDriverEventEnvelopes,
+} from "../src/infrastructure/runtime/driver-instance-socket";
 import { createPromiseDeferred } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import {
   FakeDriverRuntimeIo,
-  bootPayload,
   createBackend,
   createDispatcher,
   waitForUpdate,
@@ -36,79 +38,191 @@ describe("driver runtime boundary", () => {
   });
 
   test("driver socket stamps warm turn events with the active run id", () => {
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "warm-turn-test",
+    );
+    const draft = {
+      kind: "run.started",
+      payload: {
+        startedAt: new Date(1_000).toISOString(),
+      },
+      runId: "sdk-internal-run",
+    } as const;
     const [event] = toDriverEventEnvelopes(
       driverBootPayload,
-      {
-        kind: "run.started",
-        payload: {
-          startedAt: new Date(1_000).toISOString(),
-        },
-        runId: "sdk-internal-run",
-      },
+      draft,
       DRIVER_TEST_IDS.secondRunId,
+      sourceIds.sourceEventIdFor(draft),
     );
 
     expect(event?.event.runId).toBe(DRIVER_TEST_IDS.secondRunId);
   });
 
   test("driver socket rejects provider turn ids outside an active platform run", () => {
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "invalid-turn-test",
+    );
+    const draft = {
+      kind: "run.started",
+      payload: {
+        startedAt: new Date(1_000).toISOString(),
+      },
+      runId: "provider-turn-1",
+    } as const;
+
     expect(() =>
-      toDriverEventEnvelopes(
-        driverBootPayload,
-        {
-          kind: "run.started",
-          payload: {
-            startedAt: new Date(1_000).toISOString(),
-          },
-          runId: "provider-turn-1",
-        },
-        null,
-      ),
+      toDriverEventEnvelopes(driverBootPayload, draft, null, sourceIds.sourceEventIdFor(draft)),
     ).toThrow("Run ID must be a valid ULID.");
   });
 
   test("driver socket preserves explicit event run ids outside active turns", () => {
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "explicit-turn-test",
+    );
+    const draft = {
+      kind: "run.started",
+      payload: {
+        startedAt: new Date(1_000).toISOString(),
+      },
+      runId: DRIVER_TEST_IDS.thirdRunId,
+    } as const;
     const [event] = toDriverEventEnvelopes(
       driverBootPayload,
-      {
-        kind: "run.started",
-        payload: {
-          startedAt: new Date(1_000).toISOString(),
-        },
-        runId: DRIVER_TEST_IDS.thirdRunId,
-      },
+      draft,
       null,
+      sourceIds.sourceEventIdFor(draft),
     );
 
     expect(event?.event.runId).toBe(DRIVER_TEST_IDS.thirdRunId);
   });
 
-  test("driver socket creates deterministic source ids for draft event replay", () => {
+  test("driver socket keeps retries idempotent without aliasing equal draft events", () => {
     const draft = {
-      kind: "message.started",
+      delivery: "best_effort",
+      kind: "message.delta",
       payload: {
+        contentDelta: "的",
         messageId: "message-1",
         role: "agent",
       },
     } as const;
-    const occurrences = new Map<string, number>();
+    const laterEqualDraft = {
+      ...draft,
+      payload: { ...draft.payload },
+    };
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "retry-test",
+    );
     const [first] = toDriverEventEnvelopes(
       driverBootPayload,
       draft,
       DRIVER_TEST_IDS.runId,
-      occurrences,
+      sourceIds.sourceEventIdFor(draft),
     );
-    const [second] = toDriverEventEnvelopes(
+    const [retry] = toDriverEventEnvelopes(
       driverBootPayload,
       draft,
       DRIVER_TEST_IDS.runId,
-      occurrences,
+      sourceIds.sourceEventIdFor(draft),
     );
-    const [retry] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
+    const [laterEqual] = toDriverEventEnvelopes(
+      driverBootPayload,
+      laterEqualDraft,
+      DRIVER_TEST_IDS.runId,
+      sourceIds.sourceEventIdFor(laterEqualDraft),
+    );
 
-    expect(first?.event.sourceEventId).toMatch(/^sha256:/);
-    expect(second?.event.sourceEventId).toBe(`${first?.event.sourceEventId}:2`);
+    expect(first?.event.sourceEventId).toBe(
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:retry-test:event:1`,
+    );
     expect(retry?.event.sourceEventId).toBe(first?.event.sourceEventId);
+    expect(laterEqual?.event.sourceEventId).toBe(
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:retry-test:event:2`,
+    );
+  });
+
+  test("driver socket assigns unique identities to repeated Unicode stream chunks", () => {
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "unicode-test",
+    );
+    const chunks = [
+      "001|中文长文本校验-Aa0-表格字符|END001\\n",
+      "002|中文长文本校验-Aa1-表格字符|END002\\n",
+      "的",
+      "的",
+      "| ✅ 😀 | https://example.test/final |",
+    ];
+    const drafts = chunks.map((contentDelta) => ({
+      delivery: "best_effort" as const,
+      kind: "message.delta" as const,
+      payload: {
+        contentDelta,
+        messageId: "message-unicode",
+        role: "agent" as const,
+      },
+    }));
+    const envelopes = drafts.map(
+      (draft) =>
+        toDriverEventEnvelopes(
+          driverBootPayload,
+          draft,
+          DRIVER_TEST_IDS.runId,
+          sourceIds.sourceEventIdFor(draft),
+        )[0],
+    );
+
+    expect(envelopes.map((event) => event?.event.sourceEventId)).toEqual([
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:unicode-test:event:1`,
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:unicode-test:event:2`,
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:unicode-test:event:3`,
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:unicode-test:event:4`,
+      `driver:${DRIVER_TEST_IDS.driverInstanceId}:unicode-test:event:5`,
+    ]);
+    expect(
+      envelopes
+        .map((event) => {
+          const payload = event?.event.payload;
+          if (
+            typeof payload === "object" &&
+            payload !== null &&
+            "contentDelta" in payload &&
+            typeof payload.contentDelta === "string"
+          ) {
+            return payload.contentDelta;
+          }
+
+          return null;
+        })
+        .join(""),
+    ).toBe(chunks.join(""));
+  });
+
+  test("driver socket separates source identities across process boots", () => {
+    const firstBoot = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "boot-one",
+    );
+    const secondBoot = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "boot-two",
+    );
+    const firstDraft = {
+      kind: "message.delta",
+      payload: { contentDelta: "相同内容", messageId: "message-1", role: "agent" },
+    } as const;
+    const secondDraft = {
+      ...firstDraft,
+      payload: { ...firstDraft.payload },
+    };
+
+    expect(firstBoot.sourceEventIdFor(firstDraft)).not.toBe(
+      secondBoot.sourceEventIdFor(secondDraft),
+    );
   });
 
   test("runs input commands through the backend and reports completion to API", async () => {

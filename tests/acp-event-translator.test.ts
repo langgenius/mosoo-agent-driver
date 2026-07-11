@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
+import {
+  DriverEventSourceIdAllocator,
+  toDriverEventEnvelopes,
+} from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
 import {
   AcpTurnEventState,
@@ -19,7 +22,228 @@ function eventPayload(event: DriverEventInput): Record<string, unknown> {
   return event.payload as Record<string, unknown>;
 }
 
+function eventPayloadString(event: DriverEventInput, field: string): string {
+  const value = eventPayload(event)[field];
+
+  if (typeof value !== "string") {
+    throw new Error(`Expected ACP event payload ${field} to be a string.`);
+  }
+
+  return value;
+}
+
+function requireEvent(events: readonly DriverEventInput[], kind: string): DriverEventInput {
+  const event = events.find((candidate) => candidate.kind === kind);
+
+  if (event === undefined) {
+    throw new Error(`Expected ACP event ${kind}.`);
+  }
+
+  return event;
+}
+
 describe("ACP runtime event translation", () => {
+  test("keeps native assistant messages separate across tools and projects only the final one", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "prompt-message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const progressOne = "进度 1：正在读取上游报告。";
+    const progressTwo = "进度 2：已完成工具校验。";
+    const finalChunkOne = [
+      "CANARY-FINAL-START：中文与 ASCII 最终回答必须逐字保留。",
+      "",
+      "| 校验项 | 结果 |",
+      "| --- | --- |",
+      "| 多字节 | ✅ 中文😀 |",
+      "",
+      "链接：https://example.com/final-output",
+      "",
+    ].join("\n");
+    const finalChunkTwo = ["```text", "最终代码块|中文😀|END", "```", "CANARY-FINAL-END"].join(
+      "\n",
+    );
+    const finalText = `${finalChunkOne}${finalChunkTwo}`;
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: { text: progressOne, type: "text" },
+          messageId: "native-progress-1",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          sessionUpdate: "tool_call",
+          status: "running",
+          title: "Read report",
+          toolCallId: "tool-1",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: progressTwo, type: "text" },
+          messageId: "native-progress-2",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: finalChunkOne, type: "text" },
+          messageId: "native-final",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: finalChunkTwo, type: "text" },
+          messageId: "native-final",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      // A late replay of a settled progress message must not replace the
+      // newer final message by arrival order.
+      ...state.translateUpdate({
+        update: {
+          content: { text: "late progress replay", type: "text" },
+          messageId: "native-progress-1",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.completePrompt("end_turn", null),
+    ];
+    const messageDeltas = events.filter((event) => event.kind === "message.delta");
+    const toolStarted = requireEvent(events, "item.started");
+    const completed = requireEvent(events, "run.completed");
+
+    expect(messageDeltas).toHaveLength(4);
+    expect(messageDeltas.map((event) => eventPayloadString(event, "contentDelta"))).toEqual([
+      progressOne,
+      progressTwo,
+      finalChunkOne,
+      finalChunkTwo,
+    ]);
+
+    const [progressOneEvent, progressTwoEvent, finalChunkOneEvent, finalChunkTwoEvent] =
+      messageDeltas;
+    const progressOneId = eventPayloadString(progressOneEvent, "messageId");
+    const progressTwoId = eventPayloadString(progressTwoEvent, "messageId");
+    const finalMessageId = eventPayloadString(finalChunkOneEvent, "messageId");
+
+    expect([...new Set([progressOneId, progressTwoId, finalMessageId])]).toHaveLength(3);
+    expect(eventPayloadString(finalChunkTwoEvent, "messageId")).toBe(finalMessageId);
+    expect(eventPayload(toolStarted)).toMatchObject({
+      parentMessageId: progressOneId,
+    });
+    expect(eventPayload(completed)).toMatchObject({
+      finalMessageId,
+      finalMessageText: finalText,
+    });
+    expect(eventPayloadString(completed, "finalMessageText")).not.toContain(progressOne);
+    expect(new TextEncoder().encode(eventPayloadString(completed, "finalMessageText"))).toEqual(
+      new TextEncoder().encode(finalText),
+    );
+  });
+
+  test("uses a later identified final after anonymous progress, but fails closed for an anonymous final", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "prompt-message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const identifiedFinalText = "最终回答：native identity 使它可安全成为 canonical final。";
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: { text: "进度消息，不能作为 canonical final。", type: "text" },
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: identifiedFinalText, type: "text" },
+          messageId: "native-final",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.completePrompt("end_turn", null),
+    ];
+    const completed = requireEvent(events, "run.completed");
+    const finalDelta = requireEvent(
+      events.filter(
+        (event) =>
+          event.kind === "message.delta" &&
+          eventPayloadString(event, "contentDelta") === identifiedFinalText,
+      ),
+      "message.delta",
+    );
+
+    expect(eventPayload(completed)).toMatchObject({
+      finalMessageId: eventPayloadString(finalDelta, "messageId"),
+      finalMessageText: identifiedFinalText,
+    });
+
+    const anonymousFinalState = new AcpTurnEventState();
+
+    anonymousFinalState.begin({
+      messageId: "prompt-message-2",
+      runId: "run-2",
+      sessionId: "session-1",
+    });
+    const anonymousFinalEvents = [
+      ...anonymousFinalState.translateUpdate({
+        update: {
+          content: { text: "匿名进度消息，必须与后续匿名消息分隔。", type: "text" },
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...anonymousFinalState.translateUpdate({
+        update: {
+          content: { text: "已识别的进度消息。", type: "text" },
+          messageId: "native-progress",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...anonymousFinalState.translateUpdate({
+        update: {
+          content: { text: "匿名最终消息，不能猜测身份。", type: "text" },
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...anonymousFinalState.completePrompt("end_turn", null),
+    ];
+    const anonymousCompleted = requireEvent(anonymousFinalEvents, "run.completed");
+    const firstAnonymousDelta = requireEvent(
+      anonymousFinalEvents.filter(
+        (event) =>
+          event.kind === "message.delta" &&
+          eventPayloadString(event, "contentDelta") === "匿名进度消息，必须与后续匿名消息分隔。",
+      ),
+      "message.delta",
+    );
+    const finalAnonymousDelta = requireEvent(
+      anonymousFinalEvents.filter(
+        (event) =>
+          event.kind === "message.delta" &&
+          eventPayloadString(event, "contentDelta") === "匿名最终消息，不能猜测身份。",
+      ),
+      "message.delta",
+    );
+
+    expect(eventPayloadString(firstAnonymousDelta, "messageId")).not.toBe(
+      eventPayloadString(finalAnonymousDelta, "messageId"),
+    );
+    expect(eventPayload(anonymousCompleted)).not.toHaveProperty("finalMessageId");
+    expect(eventPayload(anonymousCompleted)).not.toHaveProperty("finalMessageText");
+  });
+
   test("maps ACP turn updates onto canonical runtime events with one tool lifecycle", () => {
     const state = new AcpTurnEventState();
 
@@ -117,8 +341,17 @@ describe("ACP runtime event translation", () => {
     });
     expect(eventPayload(toolEvent as DriverEventInput)).not.toHaveProperty("rawInput");
 
+    const sourceIds = new DriverEventSourceIdAllocator(
+      DRIVER_TEST_IDS.driverInstanceId,
+      "acp-empty-input-test",
+    );
     const envelopes = events.flatMap((event) =>
-      toDriverEventEnvelopes(driverBootPayload, event, DRIVER_TEST_IDS.runId),
+      toDriverEventEnvelopes(
+        driverBootPayload,
+        event,
+        DRIVER_TEST_IDS.runId,
+        sourceIds.sourceEventIdFor(event),
+      ),
     );
     const canonicalToolEvent = envelopes
       .map((envelope) => envelope.event)
@@ -328,7 +561,7 @@ describe("ACP runtime event translation", () => {
       ...state.translateUpdate({
         update: {
           content: {
-            text: "pong",
+            text: "pong\n",
             type: "text",
           },
           messageId: "opencode-message-1",
@@ -348,11 +581,110 @@ describe("ACP runtime event translation", () => {
       "thought.completed",
       "run.completed",
     ]);
+    const fallbackMessageId = eventPayloadString(events[3], "messageId");
+
     expect(eventPayload(events[4])).toMatchObject({
-      contentDelta: "pong",
-      messageId: "message-1",
+      contentDelta: "\npong\n",
+      messageId: fallbackMessageId,
       role: "agent",
     });
+    expect(eventPayload(events[7])).toMatchObject({
+      finalMessageId: fallbackMessageId,
+      finalMessageText: "\npong\n",
+    });
+  });
+
+  test("treats a different native thought as the final assistant message boundary", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const progressText = "PROGRESS：正在整理资料。";
+    const finalText = "FINAL：中文表格与结论均已完成。";
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: { text: progressText, type: "text" },
+          messageId: "native-progress",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: finalText, type: "text" },
+          messageId: "native-final-thought",
+          sessionUpdate: "agent_thought_chunk",
+        },
+      }),
+      ...state.completePrompt("end_turn", null),
+    ];
+    const messageDeltas = events.filter((event) => event.kind === "message.delta");
+    const progressMessageId = eventPayloadString(messageDeltas[0], "messageId");
+    const finalMessageId = eventPayloadString(messageDeltas[1], "messageId");
+    const completed = requireEvent(events, "run.completed");
+
+    expect(eventKinds(events)).toEqual([
+      "message.started",
+      "message.delta",
+      "message.completed",
+      "thought.started",
+      "thought.delta",
+      "message.started",
+      "message.delta",
+      "message.completed",
+      "thought.completed",
+      "run.completed",
+    ]);
+    expect(progressMessageId).not.toBe(finalMessageId);
+    expect(eventPayload(completed)).toMatchObject({
+      finalMessageId,
+      finalMessageText: finalText,
+    });
+    expect(eventPayloadString(completed, "finalMessageText")).not.toContain(progressText);
+  });
+
+  test("fails closed when an anonymous thought follows identified progress", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: { text: "PROGRESS：已识别但不是最终回答。", type: "text" },
+          messageId: "native-progress",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: "匿名 thought 可能是更新的最终回答。", type: "text" },
+          sessionUpdate: "agent_thought_chunk",
+        },
+      }),
+      ...state.completePrompt("end_turn", null),
+    ];
+    const completed = requireEvent(events, "run.completed");
+
+    expect(eventKinds(events)).toEqual([
+      "message.started",
+      "message.delta",
+      "message.completed",
+      "thought.started",
+      "thought.delta",
+      "thought.completed",
+      "run.completed",
+    ]);
+    expect(eventPayload(completed)).not.toHaveProperty("finalMessageId");
+    expect(eventPayload(completed)).not.toHaveProperty("finalMessageText");
   });
 
   test("closes open stream items before a failed turn event", () => {

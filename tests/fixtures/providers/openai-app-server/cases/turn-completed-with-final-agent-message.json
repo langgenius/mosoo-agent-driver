@@ -66,6 +66,8 @@
         "turnId": "turn-1"
       },
       "payload": {
+        "finalMessageId": "<driver-id>",
+        "finalMessageText": "pong",
         "stopReason": "end_turn"
       },
       "sourceEventId": "openai.turn.completed:turn-1"

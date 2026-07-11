@@ -39,13 +39,23 @@ export class OpenAiAppServerItemEventBridge {
 
   async handleAgentMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turnId = readNonEmptyString(params, "turnId");
+    const itemId = readNonEmptyString(params, "itemId");
     const delta = readNonEmptyString(params, "delta");
 
-    if (turnId === null || delta === null) {
+    if (turnId === null || itemId === null || delta === null) {
       return;
     }
 
-    const messageId = await this.#messages.ensureTurnMessage(context, turnId, this.#push);
+    const messageId = await this.#messages.ensureItemMessage(
+      context,
+      { itemId, turnId },
+      this.#push,
+    );
+
+    if (this.#messages.isEnded(messageId)) {
+      return;
+    }
+
     this.#messages.appendText(messageId, delta);
     await this.#push(context, "driver.openai.agent.delta", [
       {
@@ -249,6 +259,55 @@ export class OpenAiAppServerItemEventBridge {
     }
   }
 
+  async resolveTurnFinalAssistantSnapshot(
+    context: AgentDriverContext,
+    params: JsonObject,
+    turnId: string,
+  ): Promise<{ id: string; text: string } | null> {
+    const turn = readRecord(params, "turn");
+
+    if (turn === null) {
+      return null;
+    }
+
+    const items = readArray(turn, "items");
+    const itemsView = readString(turn, "itemsView");
+
+    const finalAssistantItem = items.findLast(
+      (item) => isRecord(item) && readString(item, "type") === "agentMessage",
+    );
+
+    if (!isRecord(finalAssistantItem)) {
+      // Terminal notifications commonly use `itemsView: "notLoaded"` with an
+      // empty items list. The provider's item/completed frames are complete
+      // snapshots; first-seen item order remains stable when older completion
+      // frames arrive late. A full or legacy non-empty list stays authoritative.
+      if (itemsView === "full" || (itemsView === null && items.length > 0)) {
+        return null;
+      }
+
+      return this.#messages.finalCompletedSnapshotForTurn(turnId);
+    }
+
+    const itemId = readNonEmptyString(finalAssistantItem, "id");
+    const text = readString(finalAssistantItem, "text");
+
+    // The provider's ordered turn snapshot is the only authoritative final
+    // identity. If its final assistant item is incomplete, fail closed instead
+    // of selecting an earlier progress item or an arrival-ordered stream item.
+    if (itemId === null || text === null) {
+      return null;
+    }
+
+    const messageId = await this.#messages.ensureItemMessage(
+      context,
+      { itemId, turnId },
+      this.#push,
+    );
+    this.#messages.setText(messageId, text);
+    return { id: messageId, text };
+  }
+
   async handleTurnPlanUpdated(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const plan = readArray(params, "plan").flatMap((entry) => {
       if (!isRecord(entry)) {
@@ -293,7 +352,11 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     const finalText = readString(item, "text");
-    const messageId = await this.#messages.ensureTurnMessage(context, turnId, this.#push);
+    const messageId = await this.#messages.ensureItemMessage(
+      context,
+      { itemId, turnId },
+      this.#push,
+    );
     const currentText = this.#messages.currentText(messageId);
 
     if (finalText !== null && finalText.length > currentText.length) {
@@ -327,6 +390,19 @@ export class OpenAiAppServerItemEventBridge {
           itemId,
         });
       }
+    }
+
+    if (finalText !== null) {
+      // item/completed is the provider's authoritative snapshot. Streaming
+      // deltas may be missing or replayed, so canonical completion must not
+      // inherit a corrupted accumulator even when live deltas cannot be undone.
+      this.#messages.setText(messageId, finalText);
+      this.#messages.recordCompletedSnapshot({
+        itemId,
+        messageId,
+        text: finalText,
+        turnId,
+      });
     }
 
     if (this.#messages.markEnded(messageId)) {

@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
 
@@ -29,6 +27,7 @@ interface DriverInstanceSocketHandlers {
 export class DriverInstanceSocket {
   #activeRunId: RunId | null = null;
   #client: DriverRuntimeClient | null = null;
+  readonly #sourceEventIdAllocator: DriverEventSourceIdAllocator;
   private readonly handlers: DriverInstanceSocketHandlers;
   private readonly payload: DriverBootPayload;
   #socket: DriverWireSocket | null = null;
@@ -36,6 +35,7 @@ export class DriverInstanceSocket {
   constructor(payload: DriverBootPayload, handlers: DriverInstanceSocketHandlers) {
     this.handlers = handlers;
     this.payload = payload;
+    this.#sourceEventIdAllocator = new DriverEventSourceIdAllocator(payload.driverInstanceId);
   }
 
   async connect(): Promise<void> {
@@ -125,11 +125,15 @@ export class DriverInstanceSocket {
   }
 
   async pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput> {
-    const sourceEventIdOccurrences = new Map<string, number>();
     return this.#requireClient().driver.pushEvents({
       driverInstanceId: this.payload.driverInstanceId,
       events: input.events.flatMap((event) =>
-        toDriverEventEnvelopes(this.payload, event, this.#activeRunId, sourceEventIdOccurrences),
+        toDriverEventEnvelopes(
+          this.payload,
+          event,
+          this.#activeRunId,
+          this.#sourceEventIdAllocator.sourceEventIdFor(event),
+        ),
       ),
     });
   }
@@ -170,49 +174,65 @@ export class DriverInstanceSocket {
   }
 }
 
+/**
+ * Assigns a stable source identity to draft events that do not already carry
+ * one. A publisher retries the same draft object after a transport failure, so
+ * the WeakMap keeps that retry idempotent. A distinct later draft with identical
+ * text receives a new identity instead of being mistaken for a replay. The boot
+ * identity prevents a replacement process from restarting the sequence in the
+ * same driver-instance namespace.
+ */
+export class DriverEventSourceIdAllocator {
+  readonly #sourceEventIds = new WeakMap<object, string>();
+  #nextSourceEventSequence = 0;
+  private readonly prefix: string;
+
+  constructor(driverInstanceId: DriverInstanceId, bootId: string = createDriverId()) {
+    this.prefix = `driver:${driverInstanceId}:${bootId}:event`;
+  }
+
+  sourceEventIdFor(event: DriverEventInput): string | undefined {
+    if (isRuntimeEventEnvelope(event) || readExplicitSourceEventId(event) !== undefined) {
+      return undefined;
+    }
+
+    const existing = this.#sourceEventIds.get(event);
+
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    this.#nextSourceEventSequence += 1;
+    const sourceEventId = `${this.prefix}:${this.#nextSourceEventSequence}`;
+    this.#sourceEventIds.set(event, sourceEventId);
+    return sourceEventId;
+  }
+}
+
+function readExplicitSourceEventId(event: DriverEventInput): string | undefined {
+  return typeof event.sourceEventId === "string" && event.sourceEventId.length > 0
+    ? event.sourceEventId
+    : undefined;
+}
+
 function readEventOccurredAt(event: DriverEventInput): number {
   const occurredAt = isRuntimeEventEnvelope(event) ? event.occurredAt : event.occurredAt;
   const timestamp = occurredAt === undefined ? Date.now() : Date.parse(occurredAt);
   return Number.isFinite(timestamp) ? timestamp : Date.now();
 }
 
-function readSourceEventId(event: DriverEventInput): string {
+function readSourceEventId(event: DriverEventInput, generatedSourceEventId?: string): string {
   if (isRuntimeEventEnvelope(event)) {
-    return event.sourceEventId ?? event.id;
+    return readExplicitSourceEventId(event) ?? event.id;
   }
 
-  return event.sourceEventId ?? createDeterministicSourceEventId(event);
-}
+  const sourceEventId = readExplicitSourceEventId(event) ?? generatedSourceEventId;
 
-function addSourceEventIdOccurrence(
-  sourceEventId: string,
-  occurrences: Map<string, number>,
-): string {
-  const nextOccurrence = (occurrences.get(sourceEventId) ?? 0) + 1;
-  occurrences.set(sourceEventId, nextOccurrence);
-
-  return nextOccurrence === 1 ? sourceEventId : `${sourceEventId}:${nextOccurrence}`;
-}
-
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
+  if (sourceEventId === undefined) {
+    throw new Error("Driver draft event must have an allocated source event ID.");
   }
 
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  }
-
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .filter((key) => record[key] !== undefined)
-    .toSorted()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
-    .join(",")}}`;
-}
-
-function createDeterministicSourceEventId(event: DriverEventInput): string {
-  return `sha256:${createHash("sha256").update(stableJson(event)).digest("hex")}`;
+  return sourceEventId;
 }
 
 function parseRunId(value: string): RunId {
@@ -233,13 +253,10 @@ export function toDriverEventEnvelopes(
   payload: DriverBootPayload,
   event: DriverEventInput,
   activeRunId: RunId | null,
-  sourceEventIdOccurrences = new Map<string, number>(),
+  generatedSourceEventId?: string,
 ): DriverEventEnvelope[] {
   const occurredAtMs = readEventOccurredAt(event);
-  const sourceEventId = addSourceEventIdOccurrence(
-    readSourceEventId(event),
-    sourceEventIdOccurrences,
-  );
+  const sourceEventId = readSourceEventId(event, generatedSourceEventId);
   const occurredAt = new Date(occurredAtMs).toISOString();
   const runId = readEventRunId(event, activeRunId);
 
