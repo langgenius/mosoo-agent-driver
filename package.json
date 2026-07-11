@@ -45,6 +45,10 @@
       "types": "./dist/types/orpc.d.ts",
       "default": "./src/orpc.ts"
     },
+    "./provider-output": {
+      "types": "./dist/types/provider-output.d.ts",
+      "default": "./src/provider-output.ts"
+    },
     "./cma-http": {
       "types": "./dist/types/cma-http.d.ts",
       "default": "./src/cma-http.ts"

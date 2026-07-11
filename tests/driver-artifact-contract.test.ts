@@ -33,6 +33,7 @@ const PUBLIC_EXPORTS = [
   "./events",
   "./orpc",
   "./paths",
+  "./provider-output",
   "./runtime",
 ] as const;
 

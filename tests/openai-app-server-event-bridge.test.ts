@@ -225,6 +225,98 @@ describe("OpenAi app-server event bridge", () => {
     );
   });
 
+  test("removes OpenAI private citation markup from streamed and final assistant text", async () => {
+    const { bridge, context, events, logger } = createHarness();
+    const privateCitation = "\uE200cite\uE202turn7search12\uE202turn8view0\uE201";
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "before\uE200ci",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "te\uE202turn7search12\uE202turn8view0",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "\uE201after",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        text: `before${privateCitation}after`,
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          {
+            id: "message-final",
+            text: `before${privateCitation}after`,
+            type: "agentMessage",
+          },
+        ],
+        status: "completed",
+      },
+    });
+    await logger.destroy();
+
+    const allEvents = events();
+    const streamedText = allEvents
+      .filter((event) => event.kind === "message.delta")
+      .map((event) => readEventPayloadString(event, "contentDelta") ?? "")
+      .join("");
+    const runCompleted = allEvents.find((event) => event.kind === "run.completed");
+    const diagnostics = allEvents.filter(
+      (event) =>
+        event.kind === "diagnostic.reported" &&
+        readEventPayloadString(event, "code") === "openai.private_citation_markup_removed",
+    );
+
+    expect(streamedText).toBe("beforeafter");
+    expect(runCompleted).toBeDefined();
+    expect(readEventPayloadString(runCompleted!, "finalMessageText")).toBe("beforeafter");
+    expect(diagnostics).toHaveLength(1);
+  });
+
+  test("flushes incomplete private markup when an item completes without a text snapshot", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "before\uE200cite\uE202turn7search12",
+      itemId: "message-final",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await logger.destroy();
+
+    const streamedText = events()
+      .filter((event) => event.kind === "message.delta")
+      .map((event) => readEventPayloadString(event, "contentDelta") ?? "")
+      .join("");
+
+    expect(streamedText).toBe("before\uE200cite\uE202turn7search12");
+  });
+
   test("does not fall back to progress when the final turn item is incomplete", async () => {
     const { bridge, context, events, logger } = createHarness();
 
