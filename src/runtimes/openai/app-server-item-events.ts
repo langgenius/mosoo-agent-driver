@@ -15,8 +15,14 @@ import {
   toOpenAiToolName,
   toOpenAiToolResultText,
 } from "./event-translator";
+import {
+  filterOpenAiPrivateCitations,
+  OpenAiPrivateCitationStreamFilter,
+} from "./private-citation-filter";
 
 export class OpenAiAppServerItemEventBridge {
+  readonly #citationDiagnosticsEmitted = new Set<string>();
+  readonly #citationFilters = new Map<string, OpenAiPrivateCitationStreamFilter>();
   readonly #items: OpenAiItemState;
   readonly #messages: OpenAiMessageState;
   readonly #plans: OpenAiPlanState;
@@ -56,13 +62,19 @@ export class OpenAiAppServerItemEventBridge {
       return;
     }
 
-    this.#messages.appendText(messageId, delta);
+    const filteredDelta = this.#filterCitationDelta(messageId, delta);
+
+    if (filteredDelta.length === 0) {
+      return;
+    }
+
+    this.#messages.appendText(messageId, filteredDelta);
     await this.#push(context, "driver.openai.agent.delta", [
       {
         delivery: "best_effort",
         kind: "message.delta",
         payload: {
-          contentDelta: delta,
+          contentDelta: filteredDelta,
           messageId,
           role: "agent",
         },
@@ -286,7 +298,13 @@ export class OpenAiAppServerItemEventBridge {
         return null;
       }
 
-      return this.#messages.finalCompletedSnapshotForTurn(turnId);
+      const completedSnapshot = this.#messages.finalCompletedSnapshotForTurn(turnId);
+
+      if (completedSnapshot !== null) {
+        this.#releaseCitationState(completedSnapshot.id);
+      }
+
+      return completedSnapshot;
     }
 
     const itemId = readNonEmptyString(finalAssistantItem, "id");
@@ -304,8 +322,11 @@ export class OpenAiAppServerItemEventBridge {
       { itemId, turnId },
       this.#push,
     );
-    this.#messages.setText(messageId, text);
-    return { id: messageId, text };
+    const filteredText = filterOpenAiPrivateCitations(text);
+    await this.#reportPrivateCitations(context, messageId, filteredText.privateCitationCount);
+    this.#messages.setText(messageId, filteredText.text);
+    this.#releaseCitationState(messageId);
+    return { id: messageId, text: filteredText.text };
   }
 
   async handleTurnPlanUpdated(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -357,11 +378,37 @@ export class OpenAiAppServerItemEventBridge {
       { itemId, turnId },
       this.#push,
     );
+    const filteredFinalText = finalText === null ? null : filterOpenAiPrivateCitations(finalText);
     const currentText = this.#messages.currentText(messageId);
 
-    if (finalText !== null && finalText.length > currentText.length) {
-      if (finalText.startsWith(currentText)) {
-        const delta = finalText.slice(currentText.length);
+    if (filteredFinalText === null) {
+      const trailingText = this.#citationFilters.get(messageId)?.finish().text ?? "";
+
+      if (trailingText.length > 0) {
+        this.#messages.appendText(messageId, trailingText);
+        events.push({
+          delivery: "best_effort",
+          kind: "message.delta",
+          payload: {
+            contentDelta: trailingText,
+            messageId,
+            role: "agent",
+          },
+        });
+      }
+    }
+
+    if (filteredFinalText !== null) {
+      this.#appendPrivateCitationDiagnostic(
+        events,
+        messageId,
+        filteredFinalText.privateCitationCount,
+      );
+    }
+
+    if (filteredFinalText !== null && filteredFinalText.text.length > currentText.length) {
+      if (filteredFinalText.text.startsWith(currentText)) {
+        const delta = filteredFinalText.text.slice(currentText.length);
         this.#messages.appendText(messageId, delta);
         events.push({
           delivery: "best_effort",
@@ -373,12 +420,12 @@ export class OpenAiAppServerItemEventBridge {
           },
         });
       } else if (currentText.length === 0) {
-        this.#messages.appendText(messageId, finalText);
+        this.#messages.appendText(messageId, filteredFinalText.text);
         events.push({
           delivery: "best_effort",
           kind: "message.delta",
           payload: {
-            contentDelta: finalText,
+            contentDelta: filteredFinalText.text,
             messageId,
             role: "agent",
           },
@@ -386,24 +433,26 @@ export class OpenAiAppServerItemEventBridge {
       } else {
         context.logger.warn("driver.openai.agent.final_text.mismatch", {
           currentLength: currentText.length,
-          finalLength: finalText.length,
+          finalLength: filteredFinalText.text.length,
           itemId,
         });
       }
     }
 
-    if (finalText !== null) {
+    if (filteredFinalText !== null) {
       // item/completed is the provider's authoritative snapshot. Streaming
       // deltas may be missing or replayed, so canonical completion must not
       // inherit a corrupted accumulator even when live deltas cannot be undone.
-      this.#messages.setText(messageId, finalText);
+      this.#messages.setText(messageId, filteredFinalText.text);
       this.#messages.recordCompletedSnapshot({
         itemId,
         messageId,
-        text: finalText,
+        text: filteredFinalText.text,
         turnId,
       });
     }
+
+    this.#citationFilters.delete(messageId);
 
     if (this.#messages.markEnded(messageId)) {
       events.push({
@@ -414,6 +463,60 @@ export class OpenAiAppServerItemEventBridge {
         },
       });
     }
+  }
+
+  #appendPrivateCitationDiagnostic(
+    events: DriverEventInput[],
+    messageId: string,
+    privateCitationCount: number,
+  ): void {
+    if (privateCitationCount === 0 || this.#citationDiagnosticsEmitted.has(messageId)) {
+      return;
+    }
+
+    this.#citationDiagnosticsEmitted.add(messageId);
+    events.push({
+      kind: "diagnostic.reported",
+      payload: {
+        code: "openai.private_citation_markup_removed",
+        details: {
+          count: privateCitationCount,
+        },
+        message: "OpenAI private citation markup was removed from public assistant text.",
+        severity: "warn",
+        source: "openai",
+      },
+      visibility: "owner_debug",
+    });
+  }
+
+  #filterCitationDelta(messageId: string, delta: string): string {
+    let filter = this.#citationFilters.get(messageId);
+
+    if (filter === undefined) {
+      filter = new OpenAiPrivateCitationStreamFilter();
+      this.#citationFilters.set(messageId, filter);
+    }
+
+    return filter.push(delta).text;
+  }
+
+  async #reportPrivateCitations(
+    context: AgentDriverContext,
+    messageId: string,
+    privateCitationCount: number,
+  ): Promise<void> {
+    const events: DriverEventInput[] = [];
+    this.#appendPrivateCitationDiagnostic(events, messageId, privateCitationCount);
+
+    if (events.length > 0) {
+      await this.#push(context, "driver.openai.private_citation_markup_removed", events);
+    }
+  }
+
+  #releaseCitationState(messageId: string): void {
+    this.#citationDiagnosticsEmitted.delete(messageId);
+    this.#citationFilters.delete(messageId);
   }
 
   #appendCompletedPlanEvents(events: DriverEventInput[], item: JsonObject, itemId: string): void {
