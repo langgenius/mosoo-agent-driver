@@ -30,6 +30,7 @@ const PUBLIC_EXPORTS = [
   "./boot",
   "./cma-http",
   "./cma-sdk",
+  "./contract",
   "./events",
   "./orpc",
   "./paths",

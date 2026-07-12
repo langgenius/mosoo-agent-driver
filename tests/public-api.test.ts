@@ -3,6 +3,11 @@ import { describe, expect, test } from "bun:test";
 import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "../src/boot";
 import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "../src/cma-http";
 import { createCmaSdkClient as createCmaSdkClientFromSubpath } from "../src/cma-sdk";
+import {
+  CONTRACT_VERSION as CONTRACT_VERSION_FROM_SUBPATH,
+  parseSessionCommand as parseSessionCommandFromSubpath,
+  parseSessionEvent as parseSessionEventFromSubpath,
+} from "../src/contract";
 import { parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath } from "../src/events";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
@@ -59,6 +64,9 @@ describe("public API", () => {
     const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
 
     expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(1);
+    expect(CONTRACT_VERSION_FROM_SUBPATH).toBe(2);
+    expect(parseSessionEventFromSubpath).toBeFunction();
+    expect(parseSessionCommandFromSubpath).toBeFunction();
     expect(createCmaHttpHandlerFromSubpath).toBe(createCmaHttpHandler);
     expect(createCmaSdkClientFromSubpath).toBe(createCmaSdkClient);
     expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();

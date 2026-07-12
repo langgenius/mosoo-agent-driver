@@ -70,6 +70,7 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - `agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
 - `agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
 - `agent-driver/events`: canonical driver event envelope contracts.
+- `agent-driver/contract`: Driver Contract v2 — session events, items, commands, and the coalescing buffer (see `docs/contract.md`).
 - `agent-driver/orpc`: Driver-to-`DriverInstance` ORPC wire input/output contracts.
 - `agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
 - `agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.

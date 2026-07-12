@@ -41,6 +41,10 @@
       "types": "./dist/types/events.d.ts",
       "default": "./src/events.ts"
     },
+    "./contract": {
+      "types": "./dist/types/contract/index.d.ts",
+      "default": "./src/contract/index.ts"
+    },
     "./orpc": {
       "types": "./dist/types/orpc.d.ts",
       "default": "./src/orpc.ts"
