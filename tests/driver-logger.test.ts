@@ -77,10 +77,10 @@ describe("createDriverLogger", () => {
 
     const stderrWrites: string[] = [];
     const originalWrite = process.stderr.write.bind(process.stderr);
-    process.stderr.write = ((chunk: string | Uint8Array) => {
+    process.stderr.write = (chunk: string | Uint8Array) => {
       stderrWrites.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
       return true;
-    }) as typeof process.stderr.write;
+    };
 
     try {
       fake.failNextPush = new Error("Internal server error");

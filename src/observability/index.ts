@@ -511,7 +511,7 @@ export function getActiveLogContext(): LogContext | undefined {
 }
 
 export function normalizeLogContext(context: Record<string, unknown> = {}): LogContext {
-  return normalizeLogMetadata(context) as LogContext;
+  return normalizeLogMetadata(context);
 }
 
 export function normalizeLogMetadata(metadata: Record<string, unknown> = {}): LogMetadata {
