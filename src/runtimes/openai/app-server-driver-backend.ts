@@ -28,6 +28,7 @@ import type {
   ApprovalPolicy,
   ThreadResumeParams,
   ThreadStartParams,
+  ThreadStartResponse,
   TurnStatus,
   TurnStartParams,
   TurnStartResponse,
@@ -77,6 +78,10 @@ function readOpenAiNativeResumeThreadId(payload: DriverStartInput): string | nul
 
 function isTerminalOpenAiTurnStatus(status: TurnStatus | undefined): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
+}
+
+function isMissingOpenAiRollout(error: unknown, threadId: string): boolean {
+  return error instanceof Error && error.message === `no rollout found for thread id ${threadId}`;
 }
 
 export function createOpenAiTurnStartParams(input: OpenAiTurnStartInput): TurnStartParams {
@@ -194,22 +199,39 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       modelProvider: this.#payload.execution.provider,
       sandbox: MOSOO_OPENAI_RUNTIME_SANDBOX_MODE,
     } satisfies ThreadStartParams;
+    const threadStartParams = {
+      ...baseThreadParams,
+      ...(developerInstructions === null ? {} : { developerInstructions }),
+      sessionStartSource: "startup",
+    } satisfies ThreadStartParams;
+    let threadResult: ThreadStartResponse;
 
-    const threadResult = await measureStartupPhase(
-      nativeResumeThreadId === null ? "thread.start" : "thread.resume",
-      () =>
-        nativeResumeThreadId === null
-          ? client.request("thread/start", {
-              ...baseThreadParams,
-              ...(developerInstructions === null ? {} : { developerInstructions }),
-              sessionStartSource: "startup",
-            })
-          : client.request("thread/resume", {
-              ...baseThreadParams,
-              ...(developerInstructions === null ? {} : { developerInstructions }),
-              threadId: nativeResumeThreadId,
-            } satisfies ThreadResumeParams),
-    );
+    if (nativeResumeThreadId === null) {
+      threadResult = await measureStartupPhase("thread.start", () =>
+        client.request("thread/start", threadStartParams),
+      );
+    } else {
+      try {
+        threadResult = await measureStartupPhase("thread.resume", () =>
+          client.request("thread/resume", {
+            ...baseThreadParams,
+            ...(developerInstructions === null ? {} : { developerInstructions }),
+            threadId: nativeResumeThreadId,
+          } satisfies ThreadResumeParams),
+        );
+      } catch (error) {
+        if (!isMissingOpenAiRollout(error, nativeResumeThreadId)) {
+          throw error;
+        }
+
+        context.logger.warn("driver.openai.native_resume_ref.missing_rollout", {
+          nativeResumeRefPresent: true,
+        });
+        threadResult = await measureStartupPhase("thread.start_after_missing_rollout", () =>
+          client.request("thread/start", threadStartParams),
+        );
+      }
+    }
     this.#threadId = threadResult.thread.id;
     await measureStartupPhase("native_resume.publish", () =>
       this.#events.publishNativeResumeRef(context),
