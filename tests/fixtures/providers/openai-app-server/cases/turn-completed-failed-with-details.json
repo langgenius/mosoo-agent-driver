@@ -1,0 +1,55 @@
+{
+  "notifications": [
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turn": {
+          "id": "turn-1",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "failed",
+          "error": {
+            "additionalDetails": "HTTP 429 from upstream.",
+            "codexErrorInfo": "usageLimitExceeded",
+            "message": "Quota exceeded."
+          }
+        }
+      }
+    }
+  ],
+  "trackTurnAfterNotifications": {
+    "expectation": "reject",
+    "turnId": "turn-1"
+  },
+  "expectedEvents": [
+    {
+      "kind": "run.started",
+      "native": {
+        "eventName": "turn.started",
+        "provider": "openai",
+        "turnId": "turn-1"
+      },
+      "payload": {
+        "startedAt": "<iso-timestamp>"
+      },
+      "sourceEventId": "openai.turn.started:turn-1"
+    },
+    {
+      "kind": "run.failed",
+      "native": {
+        "eventName": "turn.failed",
+        "provider": "openai",
+        "turnId": "turn-1"
+      },
+      "payload": {
+        "error": {
+          "code": "openai.turn_failed",
+          "message": "Quota exceeded.\nHTTP 429 from upstream."
+        },
+        "recoverable": false
+      },
+      "sourceEventId": "openai.turn.failed:turn-1"
+    }
+  ]
+}

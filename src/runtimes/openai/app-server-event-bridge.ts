@@ -23,6 +23,8 @@ interface OpenAiAppServerEventBridgeOptions {
   requireThreadId(): string;
 }
 
+const OPENAI_SYSTEM_ERROR_FALLBACK_DELAY_MS = 100;
+
 function createOpenAiTurnSourceEventId(eventName: string, turnId: string): string {
   return `openai.${eventName}:${turnId}`;
 }
@@ -56,6 +58,7 @@ export class OpenAiAppServerEventBridge {
   readonly #tools = new OpenAiToolState();
   readonly #turns = new OpenAiTurnTracker();
   #runtimeErrorEmitted = false;
+  #systemErrorFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: OpenAiAppServerEventBridgeOptions) {
     this.#options = options;
@@ -73,6 +76,7 @@ export class OpenAiAppServerEventBridge {
   }
 
   clearActiveTurns(): void {
+    this.#clearSystemErrorFallback();
     this.#turns.clearActiveTurns();
   }
 
@@ -89,6 +93,7 @@ export class OpenAiAppServerEventBridge {
   }
 
   resetRuntimeError(): void {
+    this.#clearSystemErrorFallback();
     this.#runtimeErrorEmitted = false;
   }
 
@@ -272,11 +277,12 @@ export class OpenAiAppServerEventBridge {
       threadIdPresent: readString(params, "threadId") !== null,
     });
 
-    if (statusType === "systemError") {
-      await this.#handleRuntimeError(context, {
-        message: "OpenAi app-server thread entered systemError.",
-      });
+    if (statusType !== "systemError") {
+      this.#clearSystemErrorFallback();
+      return;
     }
+
+    this.#scheduleSystemErrorFallback(context);
   }
 
   #handleWarning(context: AgentDriverContext, params: JsonObject): void {
@@ -287,6 +293,7 @@ export class OpenAiAppServerEventBridge {
   }
 
   async #handleRuntimeError(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    this.#clearSystemErrorFallback();
     const error = readRecord(params, "error");
     const message =
       readString(error, "message") ?? readString(params, "message") ?? "OpenAi app-server error.";
@@ -364,6 +371,10 @@ export class OpenAiAppServerEventBridge {
     const error = turn ? readRecord(turn, "error") : null;
     const cancellationReason = this.#turns.takeCancellationReason(turnId);
 
+    if (status !== "inProgress") {
+      this.#clearSystemErrorFallback();
+    }
+
     if (cancellationReason !== null || status === "interrupted") {
       this.#turns.settle(turnId, {
         error: new DriverTurnCancelledError(cancellationReason ?? "OpenAI turn was interrupted."),
@@ -373,7 +384,10 @@ export class OpenAiAppServerEventBridge {
     }
 
     if (status === "failed") {
-      const message = readString(error, "message") ?? "OpenAi turn failed.";
+      const message = toOpenAiErrorMessage(
+        readString(error, "message") ?? "OpenAi turn failed.",
+        readString(error, "additionalDetails"),
+      );
       await this.#push(context, "driver.openai.turn.failed", [
         {
           ...createOpenAiTurnEventFields({
@@ -462,6 +476,27 @@ export class OpenAiAppServerEventBridge {
         payload: toOpenAiSessionUsageSummary(params),
       },
     ]);
+  }
+
+  #clearSystemErrorFallback(): void {
+    if (this.#systemErrorFallbackTimer === null) {
+      return;
+    }
+
+    clearTimeout(this.#systemErrorFallbackTimer);
+    this.#systemErrorFallbackTimer = null;
+  }
+
+  #scheduleSystemErrorFallback(context: AgentDriverContext): void {
+    this.#clearSystemErrorFallback();
+    this.#systemErrorFallbackTimer = setTimeout(() => {
+      this.#systemErrorFallbackTimer = null;
+      void this.#handleRuntimeError(context, {
+        message: "OpenAi app-server thread entered systemError.",
+      }).catch((error: unknown) => {
+        context.logger.error("driver.openai.system_error_fallback.failed", error);
+      });
+    }, OPENAI_SYSTEM_ERROR_FALLBACK_DELAY_MS);
   }
 
   async #push(

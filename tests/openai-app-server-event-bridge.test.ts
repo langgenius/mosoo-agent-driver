@@ -139,6 +139,32 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
+  test("system errors fall back to a generic failure when no detailed error arrives", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "thread/status/changed", {
+      status: {
+        type: "systemError",
+      },
+      threadId: "thread-1",
+    });
+    await Bun.sleep(150);
+    await logger.destroy();
+
+    expect(events()).toMatchObject([
+      {
+        kind: "run.failed",
+        payload: {
+          error: {
+            code: "openai.app_server.error",
+            message: "OpenAi app-server thread entered systemError.",
+          },
+          recoverable: false,
+        },
+      },
+    ]);
+  });
+
   test("completed agent messages backfill text when no deltas streamed", async () => {
     const { bridge, context, events, logger } = createHarness();
 
