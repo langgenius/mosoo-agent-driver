@@ -5,8 +5,8 @@ import type { RuntimeTimingPayload, RuntimeTimingPhase } from "../runtime-events
 type DriverRuntimeTimingPath = RuntimeTimingPayload["path"];
 type DriverRuntimeTimingStage = RuntimeTimingPayload["stage"];
 
-interface CreateDriverRuntimeTimingEventInput {
-  readonly completedAtMs?: number;
+interface TimingEventInput {
+  readonly completedAt?: string;
   readonly native?: DriverEventInput["native"] | undefined;
   readonly path: DriverRuntimeTimingPath;
   readonly phases: readonly RuntimeTimingPhase[];
@@ -14,11 +14,11 @@ interface CreateDriverRuntimeTimingEventInput {
   readonly sessionId: string;
   readonly sourceEventId?: string | undefined;
   readonly stage: DriverRuntimeTimingStage;
-  readonly startedAtMs: number;
+  readonly startedAt: string;
   readonly traceId?: string | null;
 }
 
-export function toDriverDurationMs(
+export function toDurationMs(
   startedAtMs: number,
   completedAtMs: number = Date.now(),
 ): number {
@@ -31,7 +31,7 @@ export function toDriverDurationMs(
   return Math.max(0, Math.round(durationMs));
 }
 
-export function createDriverRuntimeTimingPhase(
+export function createTimingPhase(
   name: string,
   durationMs: number,
 ): RuntimeTimingPhase {
@@ -45,27 +45,29 @@ export function createDriverRuntimeTimingPhase(
   };
 }
 
-export function createDriverRuntimeTimingEvent(
-  input: CreateDriverRuntimeTimingEventInput,
+export function createTimingEvent(
+  input: TimingEventInput,
 ): DriverEventInput {
-  const completedAtMs = input.completedAtMs ?? Date.now();
+  const completedAt = input.completedAt ?? new Date().toISOString();
+  const completedAtMs = Date.parse(completedAt);
+  const startedAtMs = Date.parse(input.startedAt);
 
   return {
     kind: "runtime.timing.recorded",
     ...(input.native === undefined ? {} : { native: input.native }),
-    occurredAt: new Date(completedAtMs).toISOString(),
+    occurredAt: completedAt,
     payload: {
-      completedAtMs,
+      completedAt,
       path: input.path,
       phases: input.phases.map((phase) =>
-        createDriverRuntimeTimingPhase(phase.name, phase.durationMs),
+        createTimingPhase(phase.name, phase.durationMs),
       ),
       runId: input.runId,
       sessionId: input.sessionId,
       source: "driver",
       stage: input.stage,
-      startedAtMs: input.startedAtMs,
-      totalMs: toDriverDurationMs(input.startedAtMs, completedAtMs),
+      startedAt: input.startedAt,
+      totalMs: toDurationMs(startedAtMs, completedAtMs),
       traceId: input.traceId ?? null,
     },
     ...(input.sourceEventId === undefined ? {} : { sourceEventId: input.sourceEventId }),

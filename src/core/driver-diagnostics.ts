@@ -1,5 +1,6 @@
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
+import { pushLosslessEvents } from "./driver-runtime-io";
 import type { DriverRuntimeEventPort } from "./driver-runtime-io";
 
 export type DriverDiagnosticCode =
@@ -43,9 +44,7 @@ export async function pushDriverDiagnosticEvent(
   logger?: Logger,
 ): Promise<void> {
   try {
-    await port.pushEvents({
-      events: [createDriverDiagnosticEvent(input)],
-    });
+    await pushLosslessEvents(port, [createDriverDiagnosticEvent(input)]);
   } catch (error) {
     logger?.error("driver.diagnostic.report_failed", error, {
       code: input.code,
