@@ -119,7 +119,7 @@ export type ThreadItem = JsonObject & {
 export interface Turn {
   completedAt?: number | null;
   durationMs?: number | null;
-  error?: { message?: string } | null;
+  error?: TurnError | null;
   id: string;
   items?: ThreadItem[];
   itemsView?: TurnItemsView;

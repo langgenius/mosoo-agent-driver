@@ -222,8 +222,14 @@ export class OpenAiAppServerClient {
         });
       });
       child.once("exit", (code, signal) => {
-        const message = `OpenAi app-server exited with ${code === null ? `signal ${signal ?? "unknown"}` : `code ${code}`}.`;
-        this.#rejectPending(new Error(message));
+        const error = new Error(
+          `OpenAi app-server exited with ${code === null ? `signal ${signal ?? "unknown"}` : `code ${code}`}.`,
+        );
+        this.#rejectPending(error);
+        this.#serverMessageQueue = this.#notifyProtocolErrorAfterQueuedMessages(
+          this.#serverMessageQueue,
+          error,
+        );
       });
     });
 
@@ -373,6 +379,14 @@ export class OpenAiAppServerClient {
         this.respondError(id, error instanceof Error ? error.message : "Server request failed.");
       }
     }
+  }
+
+  async #notifyProtocolErrorAfterQueuedMessages(
+    previousMessage: Promise<void>,
+    error: Error,
+  ): Promise<void> {
+    await previousMessage;
+    await this.#context.handleProtocolError(error);
   }
 
   #handleClientResponse(id: RequestId, message: JsonObject): void {

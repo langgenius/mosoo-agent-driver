@@ -10,6 +10,7 @@ import {
   parseThreadTokenUsage,
   parseThreadTurnIds,
   parseTurn,
+  parseTurnError,
   parseTurnPlan,
   readOptionalNullableString,
   readRequiredBoolean,
@@ -32,7 +33,6 @@ import type {
   ServerNotificationParams,
   ThreadSettingsUpdatedNotification,
   TurnDiffUpdatedNotification,
-  TurnError,
   TurnPlanUpdatedNotification,
   WarningNotification,
 } from "./app-server-protocol-types";
@@ -66,21 +66,12 @@ function parseWarningNotification(value: unknown): WarningNotification {
   };
 }
 
-function parseTurnErrorPayload(value: unknown, label: string): TurnError {
-  const record = expectRecord(value, label);
-
-  return {
-    additionalDetails: readOptionalNullableString(record, "additionalDetails", label) ?? null,
-    message: readRequiredString(record, "message", label),
-  };
-}
-
 function parseErrorNotification(value: unknown): ErrorNotification {
   const label = "error params";
   const record = readParams(value, "error");
 
   return {
-    error: parseTurnErrorPayload(record["error"], `${label}.error`),
+    error: parseTurnError(record["error"], `${label}.error`),
     threadId: readRequiredString(record, "threadId", label),
     turnId: readRequiredString(record, "turnId", label),
     willRetry: readRequiredBoolean(record, "willRetry", label),

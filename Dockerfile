@@ -26,6 +26,8 @@ RUN OPENAI_RUNTIME_PACKAGE="@openai/co""dex@${OPENAI_RUNTIME_VERSION}" \
       @anthropic-ai/sdk@${ANTHROPIC_SDK_VERSION} \
       opencode-ai@${OPENCODE_VERSION} \
       "$OPENAI_RUNTIME_PACKAGE" \
+    && codex --version \
+    && codex app-server --help >/dev/null \
     && opencode --version \
     && opencode acp --help >/dev/null \
     && CLAUDE_ARCH_PACKAGE="$(node -p "'@anthropic-ai/claude-agent-sdk-' + (process.arch === 'arm64' ? 'linux-arm64' : 'linux-x64')")" \

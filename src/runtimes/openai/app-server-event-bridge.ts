@@ -55,7 +55,6 @@ export class OpenAiAppServerEventBridge {
   readonly #plans = new OpenAiPlanState();
   readonly #tools = new OpenAiToolState();
   readonly #turns = new OpenAiTurnTracker();
-  #runtimeErrorEmitted = false;
 
   constructor(options: OpenAiAppServerEventBridgeOptions) {
     this.#options = options;
@@ -88,10 +87,6 @@ export class OpenAiAppServerEventBridge {
     this.#turns.markCancelled(turnId, reason);
   }
 
-  resetRuntimeError(): void {
-    this.#runtimeErrorEmitted = false;
-  }
-
   async trackTurn(turnId: string, runId: RunId): Promise<void> {
     return this.#turns.track(turnId, runId);
   }
@@ -121,7 +116,7 @@ export class OpenAiAppServerEventBridge {
         return;
       }
       case "thread/status/changed": {
-        await this.#handleThreadStatusChanged(context, payload);
+        this.#handleThreadStatusChanged(context, payload);
         return;
       }
       case "thread/settings/updated": {
@@ -182,7 +177,7 @@ export class OpenAiAppServerEventBridge {
         return;
       }
       case "error": {
-        await this.#handleRuntimeError(context, payload);
+        this.#handleRuntimeError(context, payload);
         return;
       }
       default: {
@@ -263,7 +258,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  async #handleThreadStatusChanged(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  #handleThreadStatusChanged(context: AgentDriverContext, params: JsonObject): void {
     const status = readRecord(params, "status");
     const statusType = readString(status, "type");
 
@@ -273,8 +268,8 @@ export class OpenAiAppServerEventBridge {
     });
 
     if (statusType === "systemError") {
-      await this.#handleRuntimeError(context, {
-        message: "OpenAi app-server thread entered systemError.",
+      context.logger.warn("driver.openai.thread.system_error.awaiting_turn_completion", {
+        threadIdPresent: readString(params, "threadId") !== null,
       });
     }
   }
@@ -286,61 +281,21 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  async #handleRuntimeError(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  #handleRuntimeError(context: AgentDriverContext, params: JsonObject): void {
     const error = readRecord(params, "error");
     const message =
       readString(error, "message") ?? readString(params, "message") ?? "OpenAi app-server error.";
     const additionalDetails = readString(error, "additionalDetails");
-    const displayMessage = toOpenAiErrorMessage(message, additionalDetails);
     const turnId = readString(params, "turnId");
     const willRetry = params["willRetry"] === true;
 
-    if (willRetry) {
-      context.logger.warn("driver.openai.error.retrying", {
-        additionalDetails,
-        message,
-        threadIdPresent: readString(params, "threadId") !== null,
-        turnIdPresent: turnId !== null,
-      });
-      return;
-    }
-
-    const errorResult = new Error(displayMessage);
-    const runId = turnId === null ? undefined : (this.#turns.activeRunId(turnId) ?? undefined);
-
-    if (turnId !== null) {
-      this.#turns.settle(turnId, { error: errorResult, kind: "failed" });
-    } else {
-      for (const activeTurnId of this.activeTurnIds()) {
-        this.#turns.settle(activeTurnId, { error: errorResult, kind: "failed" });
-      }
-    }
-
-    if (this.#runtimeErrorEmitted) {
-      return;
-    }
-
-    this.#runtimeErrorEmitted = true;
-
-    await this.#push(context, "driver.openai.error", [
-      {
-        ...(turnId === null
-          ? {}
-          : createOpenAiTurnEventFields({
-              eventName: "turn.failed",
-              runId,
-              turnId,
-            })),
-        kind: "run.failed",
-        payload: {
-          error: {
-            code: "openai.app_server.error",
-            message: displayMessage,
-          },
-          recoverable: false,
-        },
-      },
-    ]);
+    context.logger.warn("driver.openai.error.awaiting_turn_completion", {
+      additionalDetails,
+      message,
+      threadIdPresent: readString(params, "threadId") !== null,
+      turnIdPresent: turnId !== null,
+      willRetry,
+    });
   }
 
   async #handleTurnCompleted(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -373,7 +328,10 @@ export class OpenAiAppServerEventBridge {
     }
 
     if (status === "failed") {
-      const message = readString(error, "message") ?? "OpenAi turn failed.";
+      const message = toOpenAiErrorMessage(
+        readString(error, "message") ?? "OpenAi turn failed.",
+        readString(error, "additionalDetails"),
+      );
       await this.#push(context, "driver.openai.turn.failed", [
         {
           ...createOpenAiTurnEventFields({

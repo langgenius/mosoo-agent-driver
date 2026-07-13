@@ -262,7 +262,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const client = this.#requireClient();
     const threadId = this.#requireThreadId();
-    this.#events.resetRuntimeError();
     await this.#events.publishNativeResumeRef(context);
 
     context.logger.info("driver.openai.prompt.sending", {

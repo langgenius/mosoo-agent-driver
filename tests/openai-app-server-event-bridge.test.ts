@@ -107,7 +107,7 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
-  test("turn errors can arrive before the turn response is tracked", async () => {
+  test("turn errors wait for the authoritative failed turn", async () => {
     const { bridge, context, events, logger } = createHarness();
 
     await bridge.handleNotification(context, "error", {
@@ -120,20 +120,73 @@ describe("OpenAi app-server event bridge", () => {
       willRetry: false,
     });
 
-    await expect(bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId)).rejects.toThrow();
+    expect(events()).toEqual([]);
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        error: {
+          additionalDetails: "HTTP 502 from upstream.",
+          message: "Response stream disconnected.",
+        },
+        id: "turn-1",
+        status: "failed",
+      },
+    });
+
+    await expect(trackedTurn).rejects.toThrow(
+      "Response stream disconnected.\nHTTP 502 from upstream.",
+    );
     await logger.destroy();
 
-    const [failedEvent] = events();
-    expect(failedEvent?.runId).toBeUndefined();
+    const failedEvent = events().find((event) => event.kind === "run.failed");
+    expect(failedEvent?.runId).toBe(DRIVER_TEST_IDS.runId);
     expect(events()).toMatchObject([
+      {
+        kind: "run.started",
+      },
       {
         kind: "run.failed",
         payload: {
           error: {
-            code: "openai.app_server.error",
-            message: expect.any(String),
+            code: "openai.turn_failed",
+            message: "Response stream disconnected.\nHTTP 502 from upstream.",
           },
           recoverable: false,
+        },
+      },
+    ]);
+  });
+
+  test("thread systemError waits for the authoritative failed turn", async () => {
+    const { bridge, context, events, logger } = createHarness();
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+
+    await bridge.handleNotification(context, "thread/status/changed", {
+      status: { type: "systemError" },
+      threadId: "thread-1",
+    });
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        error: {
+          message: "The model returned an empty response.",
+        },
+        id: "turn-1",
+        status: "failed",
+      },
+    });
+
+    await expect(trackedTurn).rejects.toThrow("The model returned an empty response.");
+    await logger.destroy();
+    expect(events().filter((event) => event.kind === "run.failed")).toMatchObject([
+      {
+        payload: {
+          error: {
+            code: "openai.turn_failed",
+            message: "The model returned an empty response.",
+          },
         },
       },
     ]);
