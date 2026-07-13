@@ -63,6 +63,8 @@ jobs:
           docker run --rm --entrypoint /bin/sh agent-driver:ci -c '
             test -x /usr/local/bin/agent-driver
             test -x /usr/local/bin/mosoo-claude-code
+            codex --version
+            codex app-server --help >/dev/null
             opencode --version
             opencode acp --help >/dev/null
             test "$MOSOO_ACP_FALLBACK_COMMAND" = opencode
