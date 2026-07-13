@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,13 +27,21 @@ afterEach(async () => {
   );
 });
 
-async function createHarness(resumeErrorMessage: string) {
+async function createHarness(
+  resumeErrorMessage: string,
+  recoveryMessages = [
+    { content: "Earlier question", role: "user" as const },
+    { content: "Earlier answer", role: "assistant" as const },
+  ],
+) {
   const directory = await mkdtemp(join(tmpdir(), "mosoo-openai-startup-"));
   temporaryDirectories.push(directory);
   const executable = join(directory, "fake-app-server");
+  const requestLog = join(directory, "requests.jsonl");
   await Bun.write(
     executable,
     `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -42,6 +50,7 @@ process.stdin.on("data", (chunk) => {
   while (newline >= 0) {
     const request = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
+    appendFileSync(${JSON.stringify(requestLog)}, JSON.stringify(request) + "\\n");
     const response = request.method === "thread/resume"
       ? { id: request.id, error: { code: -32600, message: ${JSON.stringify(resumeErrorMessage)} } }
       : request.method === "thread/start"
@@ -73,6 +82,7 @@ process.stdin.on("data", (chunk) => {
           runtimeId: "openai-runtime",
           value: "stale-thread",
         },
+        recoveryMessages,
       },
     },
   });
@@ -106,24 +116,37 @@ process.stdin.on("data", (chunk) => {
     context,
     events,
     logger,
+    requestLog,
   };
 }
 
 describe("OpenAI app-server startup", () => {
-  test("starts a fresh thread when the persisted rollout is missing", async () => {
-    const { backend, context, events, logger } = await createHarness(
+  test("injects platform transcript without publishing an unmaterialized thread", async () => {
+    const { backend, context, events, logger, requestLog } = await createHarness(
       "no rollout found for thread id stale-thread",
     );
 
     await backend.start(context);
 
-    expect(events).toContainEqual({
-      kind: "runtime.resume.updated",
-      payload: {
-        resumePointer: "fresh-thread",
-        threadId: "fresh-thread",
-      },
-      visibility: "owner_debug",
+    expect(events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+    const requests = (await readFile(requestLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method: string; params?: unknown });
+    expect(requests.find((request) => request.method === "thread/inject_items")?.params).toEqual({
+      items: [
+        {
+          content: [{ text: "Earlier question", type: "input_text" }],
+          role: "user",
+          type: "message",
+        },
+        {
+          content: [{ text: "Earlier answer", type: "output_text" }],
+          role: "assistant",
+          type: "message",
+        },
+      ],
+      threadId: "fresh-thread",
     });
     await backend.stop(context, "test complete");
     await logger.destroy();

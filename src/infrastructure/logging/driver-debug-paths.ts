@@ -114,6 +114,7 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
       mcpServerCount: session.mcpServers.length,
       profilePrompt: summarizeTextDigest(payload.execution.profilePrompt),
       readySkillCount: payload.execution.skills.filter((skill) => skill.snapshotId).length,
+      recoveryMessageCount: session.recoveryMessages.length,
       sessionContext: {
         homePath: summarizePath(context.homePath),
         origin: {

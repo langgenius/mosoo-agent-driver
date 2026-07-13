@@ -26,6 +26,7 @@ import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "./app-server-env";
 import { OpenAiAppServerEventBridge } from "./app-server-event-bridge";
 import type {
   ApprovalPolicy,
+  JsonObject,
   ThreadResumeParams,
   ThreadStartParams,
   ThreadStartResponse,
@@ -82,6 +83,21 @@ function isTerminalOpenAiTurnStatus(status: TurnStatus | undefined): boolean {
 
 function isMissingOpenAiRollout(error: unknown, threadId: string): boolean {
   return error instanceof Error && error.message === `no rollout found for thread id ${threadId}`;
+}
+
+function toOpenAiRecoveryItems(
+  messages: DriverStartInput["execution"]["session"]["recoveryMessages"],
+): JsonObject[] {
+  return messages.map((message) => ({
+    content: [
+      {
+        text: message.content,
+        type: message.role === "user" ? "input_text" : "output_text",
+      },
+    ],
+    role: message.role,
+    type: "message",
+  }));
 }
 
 export function createOpenAiTurnStartParams(input: OpenAiTurnStartInput): TurnStartParams {
@@ -230,12 +246,25 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         threadResult = await measureStartupPhase("thread.start_after_missing_rollout", () =>
           client.request("thread/start", threadStartParams),
         );
+        const recoveryItems = toOpenAiRecoveryItems(
+          this.#payload.execution.session.recoveryMessages,
+        );
+
+        if (recoveryItems.length > 0) {
+          await measureStartupPhase("thread.inject_recovery_items", () =>
+            client.request("thread/inject_items", {
+              items: recoveryItems,
+              threadId: threadResult.thread.id,
+            }),
+          );
+        }
+
+        context.logger.warn("driver.openai.native_resume_ref.semantic_recovery", {
+          recoveryMessageCount: recoveryItems.length,
+        });
       }
     }
     this.#threadId = threadResult.thread.id;
-    await measureStartupPhase("native_resume.publish", () =>
-      this.#events.publishNativeResumeRef(context),
-    );
     void this.#emitStartupTimingEvent(context, startupStartedAtMs, startupPhases);
 
     context.logger.info("driver.openai.runtime.started", {
@@ -284,7 +313,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const client = this.#requireClient();
     const threadId = this.#requireThreadId();
-    await this.#events.publishNativeResumeRef(context);
 
     context.logger.info("driver.openai.prompt.sending", {
       textLength: input.text.length,

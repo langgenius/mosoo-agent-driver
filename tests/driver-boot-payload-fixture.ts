@@ -69,6 +69,7 @@ export const driverBootPayload = {
       cwd: "/tmp/organization",
       mcpServers: [],
       nativeResumeRef: null,
+      recoveryMessages: [],
     },
     skillCatalog: [],
     skills: [],
