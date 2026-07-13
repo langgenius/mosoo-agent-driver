@@ -1,4 +1,5 @@
 import type { Logger } from "../observability";
+import { sleepPromise } from "../utils/async";
 import type { DriverRuntimeHeartbeatPort } from "./driver-runtime-io";
 
 interface DriverHeartbeatLoopOptions {
@@ -9,14 +10,19 @@ interface DriverHeartbeatLoopOptions {
 export class DriverHeartbeatLoop {
   readonly #driverInstanceId: string;
   readonly #isShuttingDown: () => boolean;
-  #timer: ReturnType<typeof setInterval> | null = null;
+  #controller: AbortController | null = null;
 
   constructor(options: DriverHeartbeatLoopOptions) {
     this.#driverInstanceId = options.driverInstanceId;
-    this.#isShuttingDown = () => options.isShuttingDown();
+    this.#isShuttingDown = options.isShuttingDown;
   }
 
-  start(socket: DriverRuntimeHeartbeatPort, logger: Logger, heartbeatIntervalMs: number): void {
+  start(
+    socket: DriverRuntimeHeartbeatPort,
+    logger: Logger,
+    heartbeatIntervalMs: number,
+    onFailure: (error: unknown) => void,
+  ): void {
     this.stop(logger, "restart");
 
     logger.debug("driver.runtime.heartbeat.started", {
@@ -24,41 +30,54 @@ export class DriverHeartbeatLoop {
       heartbeatIntervalMs,
     });
 
-    this.#timer = setInterval(() => {
-      const at = new Date().toISOString();
-      void this.#sendHeartbeat(socket, logger, at);
-    }, heartbeatIntervalMs);
+    const controller = new AbortController();
+    this.#controller = controller;
+    void this.#run(socket, logger, heartbeatIntervalMs, controller, onFailure);
   }
 
-  async #sendHeartbeat(
+  async #run(
     socket: DriverRuntimeHeartbeatPort,
     logger: Logger,
-    at: string,
+    heartbeatIntervalMs: number,
+    controller: AbortController,
+    onFailure: (error: unknown) => void,
   ): Promise<void> {
     try {
-      await socket.heartbeat({
-        at,
-        reason: "interval",
-      });
+      while (!controller.signal.aborted && !this.#isShuttingDown()) {
+        await sleepPromise(heartbeatIntervalMs, controller.signal);
+
+        if (controller.signal.aborted || this.#isShuttingDown()) {
+          return;
+        }
+
+        await socket.heartbeat({
+          at: new Date().toISOString(),
+          reason: "interval",
+        });
+      }
     } catch (error) {
-      if (this.#isShuttingDown()) {
+      if (controller.signal.aborted || this.#isShuttingDown()) {
         return;
       }
 
       logger.error("driver.runtime.heartbeat-failed", error, {
-        at,
         driverInstanceId: this.#driverInstanceId,
       });
+      onFailure(error);
+    } finally {
+      if (this.#controller === controller) {
+        this.#controller = null;
+      }
     }
   }
 
   stop(logger: Logger | null, reason: string): void {
-    if (!this.#timer) {
+    if (!this.#controller) {
       return;
     }
 
-    clearInterval(this.#timer);
-    this.#timer = null;
+    this.#controller.abort(new Error(reason));
+    this.#controller = null;
     logger?.debug("driver.runtime.heartbeat.stopped", {
       driverInstanceId: this.#driverInstanceId,
       reason,
