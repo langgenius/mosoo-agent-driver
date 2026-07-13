@@ -11,6 +11,20 @@
         "turnId": "turn-1",
         "willRetry": false
       }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turn": {
+          "error": {
+            "additionalDetails": "HTTP 502 from upstream.",
+            "message": "Response stream disconnected."
+          },
+          "id": "turn-1",
+          "status": "failed"
+        }
+      }
     }
   ],
   "trackTurnAfterNotifications": {
@@ -18,6 +32,18 @@
     "turnId": "turn-1"
   },
   "expectedEvents": [
+    {
+      "kind": "run.started",
+      "native": {
+        "eventName": "turn.started",
+        "provider": "openai",
+        "turnId": "turn-1"
+      },
+      "payload": {
+        "startedAt": "<iso-timestamp>"
+      },
+      "sourceEventId": "openai.turn.started:turn-1"
+    },
     {
       "kind": "run.failed",
       "native": {
@@ -27,7 +53,7 @@
       },
       "payload": {
         "error": {
-          "code": "openai.app_server.error",
+          "code": "openai.turn_failed",
           "message": "Response stream disconnected.\nHTTP 502 from upstream."
         },
         "recoverable": false
