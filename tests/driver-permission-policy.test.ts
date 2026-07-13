@@ -4,7 +4,6 @@ import type { DriverPermissionRequest } from "../src/core/driver-permission-brok
 import {
   createDriverPermissionRequestHandler,
   isDriverFullAccess,
-  resolveDriverPermissionPolicy,
 } from "../src/core/driver-permission-policy";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
 import { parseDriverBootPayload } from "../src/protocol/boot";
@@ -51,8 +50,7 @@ describe("driver permission policy", () => {
     expect(() => parseDriverBootPayload(raw)).toThrow(/permissionPolicy/);
   });
 
-  test("resolveDriverPermissionPolicy / isDriverFullAccess reflect the payload", () => {
-    expect(resolveDriverPermissionPolicy(startInputWithPolicy("full_access"))).toBe("full_access");
+  test("isDriverFullAccess reflects the payload", () => {
     expect(isDriverFullAccess(startInputWithPolicy("full_access"))).toBe(true);
     expect(isDriverFullAccess(startInputWithPolicy("supervised"))).toBe(false);
   });
@@ -73,15 +71,19 @@ describe("driver permission policy", () => {
 
   test("supervised delegates to the interactive handler", async () => {
     const seen: DriverPermissionRequest[] = [];
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
     const handler = createDriverPermissionRequestHandler({
       payload: startInputWithPolicy("supervised"),
-      supervised: async (request) => {
+      supervised: async (request, signal) => {
         seen.push(request);
+        seenSignal = signal;
         return "reject_once";
       },
     });
 
-    await expect(handler(SAMPLE_REQUEST)).resolves.toBe("reject_once");
+    await expect(handler(SAMPLE_REQUEST, controller.signal)).resolves.toBe("reject_once");
     expect(seen).toEqual([SAMPLE_REQUEST]);
+    expect(seenSignal).toBe(controller.signal);
   });
 });
