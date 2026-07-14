@@ -4,7 +4,6 @@ import { readDriverBootPayload } from "../boot/read-driver-boot-payload";
 import { DriverProcess } from "../core/driver-process";
 import { logDriverFatal } from "../infrastructure/logging/driver-logger";
 import { isSupportedDriverRuntime, isSupportedDriverRuntimeTransport } from "../protocol/runtime";
-import { createAgentDriverBackend } from "../runtimes/create-agent-driver-backend";
 
 async function main(): Promise<void> {
   const payload = await readDriverBootPayload();
@@ -17,7 +16,7 @@ async function main(): Promise<void> {
     throw new Error(`Unsupported runtime transport: ${String(payload.runtimeTransport)}.`);
   }
 
-  const driver = new DriverProcess(payload, createAgentDriverBackend);
+  const driver = new DriverProcess(payload);
   await driver.run();
 }
 
