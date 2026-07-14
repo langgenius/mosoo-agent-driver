@@ -4,6 +4,7 @@ import type {
   DriverExecutionSpec,
   DriverNativeRuntimeRef,
   DriverPermissionPolicy,
+  DriverRecoveryMessage,
   DriverResolvedSkill,
   DriverSkillCatalogEntry,
 } from "./boot";
@@ -20,6 +21,7 @@ export interface DriverExecutionSessionInput {
   readonly homePath: string;
   readonly mcpServers: DriverBootMcpServer[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
+  readonly recoveryMessages: DriverRecoveryMessage[];
   readonly sharedRootPath: string;
 }
 
@@ -57,6 +59,7 @@ export function createDriverExecutionInputFromBootExecution(
       homePath: execution.session.context.homePath,
       mcpServers: execution.session.mcpServers,
       nativeResumeRef: execution.session.nativeResumeRef,
+      recoveryMessages: execution.session.recoveryMessages,
       sharedRootPath: execution.session.context.sessionOrganizationPath,
     },
     skillCatalog: execution.skillCatalog,

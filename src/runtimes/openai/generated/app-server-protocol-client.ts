@@ -3,6 +3,7 @@ import type {
   ClientRequestMethod,
   ClientRequestResult,
   InitializeResponse,
+  ThreadInjectItemsResponse,
   ThreadResumeResponse,
   ThreadStartResponse,
   TurnInterruptResponse,
@@ -43,10 +44,17 @@ function parseTurnInterruptResponse(value: unknown): TurnInterruptResponse {
   return turn === undefined ? {} : { turn: parseTurn(turn, "turn/interrupt result.turn") };
 }
 
+function parseEmptyResponse(value: unknown, method: string): Record<string, never> {
+  expectRecord(value ?? {}, `${method} result`);
+  return {};
+}
+
 export const CLIENT_REQUEST_RESULT_PARSERS: {
   [Method in ClientRequestMethod]: (value: unknown) => ClientRequestResult[Method];
 } = {
   initialize: parseInitializeResponse,
+  "thread/inject_items": (value: unknown): ThreadInjectItemsResponse =>
+    parseEmptyResponse(value, "thread/inject_items"),
   "thread/resume": (value: unknown): ThreadResumeResponse =>
     parseThreadResponse(value, "thread/resume"),
   "thread/start": (value: unknown): ThreadStartResponse =>
@@ -56,6 +64,10 @@ export const CLIENT_REQUEST_RESULT_PARSERS: {
 };
 
 export function parseClientRequestResult(method: "initialize", value: unknown): InitializeResponse;
+export function parseClientRequestResult(
+  method: "thread/inject_items",
+  value: unknown,
+): ThreadInjectItemsResponse;
 export function parseClientRequestResult(
   method: "thread/resume",
   value: unknown,

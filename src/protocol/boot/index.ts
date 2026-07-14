@@ -144,12 +144,18 @@ export interface UnavailableDriverBootMcpServer {
 
 export type DriverBootMcpServer = AuthorizedDriverBootMcpServer | UnavailableDriverBootMcpServer;
 
+export interface DriverRecoveryMessage {
+  readonly content: string;
+  readonly role: "assistant" | "user";
+}
+
 export interface DriverExecutionSessionSpec {
   readonly additionalDirectories: string[];
   readonly context: DriverExecutionSessionContext;
   readonly cwd: string;
   readonly mcpServers: DriverBootMcpServer[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
+  readonly recoveryMessages: DriverRecoveryMessage[];
 }
 
 /**
@@ -382,6 +388,25 @@ function readBootMcpServer(value: unknown, index: number): DriverBootMcpServer {
 
 function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
   const record = readRecord(value, "execution.session");
+  const recoveryMessages =
+    record["recoveryMessages"] === undefined
+      ? []
+      : readArray(record["recoveryMessages"], "execution.session.recoveryMessages").map(
+          (entry, index): DriverRecoveryMessage => {
+            const label = `execution.session.recoveryMessages[${index}]`;
+            const message = readRecord(entry, label);
+            const role = readNonEmptyString(message, "role", label);
+
+            if (role !== "assistant" && role !== "user") {
+              throw new TypeError(`${label}.role is unsupported.`);
+            }
+
+            return {
+              content: readNonEmptyString(message, "content", label),
+              role,
+            };
+          },
+        );
 
   return {
     additionalDirectories: readStringArray(record, "additionalDirectories", "execution.session"),
@@ -391,6 +416,7 @@ function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
       readBootMcpServer,
     ),
     nativeResumeRef: readNativeRuntimeRef(record["nativeResumeRef"]),
+    recoveryMessages,
   };
 }
 

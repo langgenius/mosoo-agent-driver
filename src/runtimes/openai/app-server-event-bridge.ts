@@ -375,6 +375,20 @@ export class OpenAiAppServerEventBridge {
         },
       },
     ]);
+
+    // A fresh app-server thread may not have a rollout until its first successful
+    // turn is materialized. Resume metadata must never turn that successful turn
+    // into a failure, so publish it only after the canonical completion settles.
+    try {
+      await this.publishNativeResumeRef(context);
+    } catch (publishError) {
+      context.logger.warn("driver.openai.native_resume_ref.publish_failed", {
+        message:
+          publishError instanceof Error
+            ? publishError.message
+            : "Native resume ref publish failed.",
+      });
+    }
     this.#turns.settle(turnId, { kind: "completed" });
   }
 

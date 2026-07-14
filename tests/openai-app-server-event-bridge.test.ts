@@ -40,7 +40,7 @@ function readAssistantMessageId(events: readonly DriverEvent[]): string {
   throw new Error("Expected a platform assistant message ID.");
 }
 
-function createHarness() {
+function createHarness(options: { failNativeResumePublish?: boolean } = {}) {
   const batches: EventBatch[] = [];
   const logger = createBufferedSinkLogger({
     level: "debug",
@@ -60,6 +60,12 @@ function createHarness() {
   const bridge = new OpenAiAppServerEventBridge({
     push: async (_context, reason, events) => {
       batches.push({ events, reason });
+      if (
+        options.failNativeResumePublish === true &&
+        reason === "driver.openai.native_resume_ref.updated"
+      ) {
+        throw new Error("event sink unavailable");
+      }
     },
     requireThreadId: () => "thread-1",
   });
@@ -104,7 +110,35 @@ describe("OpenAi app-server event bridge", () => {
           stopReason: "end_turn",
         },
       },
+      {
+        kind: "runtime.resume.updated",
+        payload: {
+          resumePointer: "thread-1",
+          threadId: "thread-1",
+        },
+      },
     ]);
+  });
+
+  test("resume metadata failure does not reject a completed turn", async () => {
+    const { bridge, context, events, logger } = createHarness({
+      failNativeResumePublish: true,
+    });
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+
+    await expect(
+      bridge.handleNotification(context, "turn/completed", {
+        threadId: "thread-1",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+        },
+      }),
+    ).resolves.toBeUndefined();
+    await expect(trackedTurn).resolves.toBeUndefined();
+    await logger.destroy();
+
+    expect(events().some((event) => event.kind === "run.completed")).toBe(true);
   });
 
   test("turn errors wait for the authoritative failed turn", async () => {
@@ -610,6 +644,13 @@ describe("OpenAi app-server event bridge", () => {
           stopReason: "end_turn",
         },
       },
+      {
+        kind: "runtime.resume.updated",
+        payload: {
+          resumePointer: "thread-1",
+          threadId: "thread-1",
+        },
+      },
     ]);
   });
 
@@ -676,6 +717,13 @@ describe("OpenAi app-server event bridge", () => {
         kind: "run.completed",
         payload: {
           stopReason: "end_turn",
+        },
+      },
+      {
+        kind: "runtime.resume.updated",
+        payload: {
+          resumePointer: "thread-1",
+          threadId: "thread-1",
         },
       },
     ]);

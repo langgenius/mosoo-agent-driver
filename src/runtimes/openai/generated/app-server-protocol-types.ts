@@ -76,6 +76,13 @@ export interface ThreadResumeResponse {
   thread: Thread;
 }
 
+export interface ThreadInjectItemsParams {
+  items: JsonObject[];
+  threadId: string;
+}
+
+export type ThreadInjectItemsResponse = Record<string, never>;
+
 export interface TurnStartParams {
   approvalPolicy?: ApprovalPolicy | null;
   approvalsReviewer?: string | JsonObject | null;
@@ -305,6 +312,7 @@ export type ServerNotificationMethod = keyof ServerNotificationParams;
 
 export interface ClientRequestParams {
   initialize: InitializeParams;
+  "thread/inject_items": ThreadInjectItemsParams;
   "thread/resume": ThreadResumeParams;
   "thread/start": ThreadStartParams;
   "turn/interrupt": TurnInterruptParams;
@@ -313,6 +321,7 @@ export interface ClientRequestParams {
 
 export interface ClientRequestResult {
   initialize: InitializeResponse;
+  "thread/inject_items": ThreadInjectItemsResponse;
   "thread/resume": ThreadResumeResponse;
   "thread/start": ThreadStartResponse;
   "turn/interrupt": TurnInterruptResponse;
