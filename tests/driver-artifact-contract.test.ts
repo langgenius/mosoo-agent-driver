@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
+import { OPENAI_APP_SERVER_SCHEMA_VERSION } from "../src/runtimes/openai/generated/app-server-protocol-types";
+
 type DriverPackageExportTarget =
   | string
   | {
@@ -11,6 +13,7 @@ type DriverPackageExportTarget =
 interface DriverPackageJson {
   readonly bin?: Record<string, string>;
   readonly dependencies?: Record<string, string>;
+  readonly devDependencies?: Record<string, string>;
   readonly description?: string;
   readonly exports?: Record<string, DriverPackageExportTarget>;
   readonly files?: readonly string[];
@@ -30,6 +33,7 @@ const PUBLIC_EXPORTS = [
   "./boot",
   "./cma-http",
   "./cma-sdk",
+  "./contract",
   "./events",
   "./orpc",
   "./paths",
@@ -115,6 +119,16 @@ describe("driver artifact contract", () => {
     expect(dockerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
     expect(dockerignore).toContain("!dist/driver.mjs");
     expect(dockerBuildScript).toBe("bun run build && docker build -t agent-driver:local .");
+  });
+
+  test("pins the OpenAI runtime, SDK, and app-server schema to one stable version", () => {
+    const packageJson = readDriverPackageJson();
+    const dockerfile = readText("../Dockerfile");
+
+    expect(packageJson.devDependencies?.["@openai/codex-sdk"]).toBe(
+      OPENAI_APP_SERVER_SCHEMA_VERSION,
+    );
+    expect(dockerfile).toContain(`ARG OPENAI_RUNTIME_VERSION=${OPENAI_APP_SERVER_SCHEMA_VERSION}`);
   });
 
   test("keeps the standalone package out of Mosoo workspace dependencies", () => {

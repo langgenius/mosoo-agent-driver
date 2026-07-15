@@ -5,6 +5,7 @@ import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state
 import { createBufferedSinkLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
+import type { AgentDriverMcpPort } from "../src/host-ports";
 import type { AgentDriverBackend, AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
@@ -40,7 +41,7 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
     };
   }
 
-  async nextCommand(): Promise<RuntimeCommand | null> {
+  async nextCommand(_signal: AbortSignal): Promise<RuntimeCommand | null> {
     const command = this.#commands[this.#commandIndex] ?? null;
 
     if (command !== null) {
@@ -54,15 +55,21 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
     return this.#commandIndex >= this.#commands.length;
   }
 
-  async commandUpdate(input: Parameters<DriverRuntimeIo["commandUpdate"]>[0]): Promise<void> {
+  async commandUpdate(
+    input: Parameters<DriverRuntimeIo["commandUpdate"]>[0],
+    _signal: AbortSignal,
+  ): Promise<void> {
     this.updates.push(input);
   }
 
-  async completeRun(): Promise<void> {
+  async completeRun(_signal?: AbortSignal): Promise<void> {
     this.completedRunReasons.push("completed");
   }
 
-  async failRun(error: Parameters<DriverRuntimeIo["failRun"]>[0]): Promise<void> {
+  async failRun(
+    error: Parameters<DriverRuntimeIo["failRun"]>[0],
+    _signal?: AbortSignal,
+  ): Promise<void> {
     this.failedRuns.push(error);
   }
 
@@ -101,23 +108,21 @@ export function createBackend(): RecordingBackend {
 
       this.handledInputs.push(context.payload.execution.session);
     },
-    async handleMcpExecute(_context, command) {
-      return {
-        outputText: `ran ${command.toolName}`,
-        requestId: command.requestId,
-        serverId: command.serverId,
-        toolName: command.toolName,
-      };
+    async start(_context, signal) {
+      signal.throwIfAborted();
     },
-    async start() {},
-    async stop() {},
+    async stop(_context, _reason, signal) {
+      signal.throwIfAborted();
+    },
   };
 }
 
 export function createDispatcher(input: {
   backend: AgentDriverBackend;
   isShuttingDown?: () => boolean;
+  mcpExecute?: AgentDriverMcpPort["execute"];
   runtimeState: DriverRuntimeStateMachine;
+  shutdownSignal?: AbortSignal;
   shutdown?: (socket: DriverRuntimeIo, reason: string) => Promise<void>;
 }) {
   const logger = createBufferedSinkLogger({
@@ -145,23 +150,26 @@ export function createDispatcher(input: {
         },
         ports: {
           commandSource: {
-            nextCommand: async () => {
+            nextCommand: async (signal) => {
               commandReads.count += 1;
-              return socket.nextCommand();
+              return socket.nextCommand(signal);
             },
           },
           mcp: {
-            execute: async (command) => ({
-              outputText: `ran ${command.toolName}`,
-              requestId: command.requestId,
-              serverId: command.serverId,
-              toolName: command.toolName,
-            }),
+            execute:
+              input.mcpExecute ??
+              (async (command) => ({
+                outputText: `ran ${command.toolName}`,
+                requestId: command.requestId,
+                serverId: command.serverId,
+                toolName: command.toolName,
+              })),
           },
         },
       }),
     runtimeState: input.runtimeState,
     sandboxId: DRIVER_TEST_IDS.sandboxId,
+    shutdownSignal: input.shutdownSignal ?? new AbortController().signal,
     shutdown:
       input.shutdown ??
       (async (_socket, reason) => {
