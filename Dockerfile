@@ -6,6 +6,13 @@ ARG ANTHROPIC_SDK_VERSION=0.100.1
 ARG OPENAI_RUNTIME_VERSION=0.144.0
 ARG OPENCODE_VERSION=1.17.7
 
+# Environment package setup invokes `pip`, so the runtime image must provide it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pip python-is-python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python --version \
+    && pip --version
+
 # Native agent CLIs pre-installed so the driver can spawn them via PATH.
 # Installed in a single npm invocation so Docker caches the whole agent
 # layer as one unit.
