@@ -151,6 +151,12 @@ export class AcpTurnEventState {
       });
     }
 
+    const finalMessage = this.#lastCompletedAssistantMessage;
+    const emptyTurn =
+      stopReason === "end_turn" &&
+      (finalMessage === null || finalMessage.text.trim().length === 0) &&
+      !this.#tools.hasActivity();
+
     if (stopReason === "cancelled") {
       events.push({
         kind: "run.cancelled",
@@ -173,9 +179,20 @@ export class AcpTurnEventState {
         },
         runId,
       });
+    } else if (emptyTurn) {
+      events.push({
+        kind: "run.failed",
+        payload: {
+          error: {
+            code: "acp.empty_turn",
+            message: "ACP prompt ended without assistant output or tool activity.",
+          },
+          recoverable: true,
+          stopReason,
+        },
+        runId,
+      });
     } else {
-      const finalMessage = this.#lastCompletedAssistantMessage;
-
       events.push({
         kind: "run.completed",
         payload: {

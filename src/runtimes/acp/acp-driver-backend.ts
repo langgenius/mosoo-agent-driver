@@ -231,7 +231,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       const completionEvents = this.#turnEvents.completePrompt(stopReason, promptResult.usage);
       const promptCancelled =
         this.#activeTurn.cancelRequested || promptResult.stopReason === "cancelled";
-      const promptFailed = stopReason === "max_turn_requests";
+      const promptFailed = completionEvents.some((event) => event.kind === "run.failed");
 
       await this.#push(
         context,
