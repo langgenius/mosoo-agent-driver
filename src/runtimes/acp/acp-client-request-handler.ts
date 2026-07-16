@@ -1,37 +1,67 @@
-import type { DriverExecutionEnvironment } from "../../protocol/boot";
+import type {
+  CreateTerminalRequest,
+  CreateTerminalResponse,
+  JsonRpcId,
+  KillTerminalRequest,
+  KillTerminalResponse,
+  ReadTextFileRequest,
+  ReadTextFileResponse,
+  ReleaseTerminalRequest,
+  ReleaseTerminalResponse,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionNotification,
+  TerminalOutputRequest,
+  TerminalOutputResponse,
+  WaitForTerminalExitRequest,
+  WaitForTerminalExitResponse,
+  WriteTextFileRequest,
+  WriteTextFileResponse,
+} from "@agentclientprotocol/sdk";
+
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../agent-driver-backend";
-import { shouldIgnoreAcpReplayUpdate, toAcpPermissionResolvedEvent } from "./acp-event-translator";
+import { shouldIgnoreReplay } from "./acp-event-translator";
 import type { AcpPermissionOption, AcpTurnEventState } from "./acp-event-translator";
 import { AcpFileSystem } from "./acp-file-system";
-import { createAcpMethodNotFoundError } from "./acp-json";
-import type { AcpJsonRpcNotification, AcpJsonRpcRequest } from "./acp-json";
 import { AcpTerminalManager } from "./acp-terminal-manager";
-import { isRecord, readNonEmptyString, stringifyForDisplay } from "./acp-types";
+import { isRecord, raceWithAbort, readNonEmptyString, stringifyForDisplay } from "./acp-types";
+
+const MAX_PENDING_UPDATES = 1_024;
+const MAX_PENDING_UPDATE_BYTES = 32 * 1_024 * 1_024;
 
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
-  readonly paths?: DriverExecutionEnvironment["paths"];
-  isTurnCancelRequested(): boolean;
+  readonly env: Readonly<Record<string, string>>;
+  isCancelling(): boolean;
   nativeSessionId(): string | null;
+  onUpdateFailure(error: Error): void;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
   readonly turnEvents: AcpTurnEventState;
 }
 
 export class AcpClientRequestHandler {
   readonly #fileSystem: AcpFileSystem;
-  readonly #isTurnCancelRequested: () => boolean;
+  readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
+  readonly #onUpdateFailure: AcpClientRequestHandlerOptions["onUpdateFailure"];
+  #pendingUpdateBytes = 0;
+  #pendingUpdates = 0;
   readonly #push: AcpClientRequestHandlerOptions["push"];
   #replayingSession = false;
-  #suppressSessionUpdates = false;
+  #stopping = false;
+  #updatesClosed = false;
+  #updateTail: Promise<void> = Promise.resolve();
+  #updateFailure: Error | null = null;
+  #updatesSuppressed = false;
   readonly #terminalManager: AcpTerminalManager;
   readonly #turnEvents: AcpTurnEventState;
 
   constructor(options: AcpClientRequestHandlerOptions) {
-    this.#isTurnCancelRequested = options.isTurnCancelRequested;
+    this.#isCancelling = options.isCancelling;
     this.#nativeSessionId = options.nativeSessionId;
+    this.#onUpdateFailure = options.onUpdateFailure;
     this.#push = options.push;
     this.#turnEvents = options.turnEvents;
     this.#fileSystem = new AcpFileSystem({
@@ -41,82 +71,168 @@ export class AcpClientRequestHandler {
     this.#terminalManager = new AcpTerminalManager({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
-      paths: options.paths,
+      env: options.env,
       push: options.push,
     });
   }
 
-  async handleNotification(
-    context: AgentDriverContext,
-    notification: AcpJsonRpcNotification,
-  ): Promise<void> {
-    if (notification.method === "session/update") {
-      await this.#handleSessionUpdate(context, notification.params);
-      return;
+  enqueueUpdate(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
+    if (this.#updatesClosed) {
+      return Promise.reject(new Error("ACP session update ingress is closed."));
     }
 
-    await this.#push(context, "driver.acp.notification.unsupported", [
-      {
-        kind: "diagnostic.reported",
-        payload: {
-          message: `Unsupported ACP notification: ${notification.method}.`,
-          params: notification.params,
-          severity: "info",
-        },
-        visibility: "owner_debug",
-      },
-    ]);
+    if (this.#updateFailure !== null) {
+      return Promise.reject(this.#updateFailure);
+    }
+
+    const bytes = Buffer.byteLength(JSON.stringify(notification), "utf8");
+
+    if (
+      this.#pendingUpdates >= MAX_PENDING_UPDATES ||
+      bytes > MAX_PENDING_UPDATE_BYTES - this.#pendingUpdateBytes
+    ) {
+      const error = new Error("ACP session update queue limit exceeded.");
+      this.#failUpdates(error);
+      return Promise.reject(error);
+    }
+
+    this.#pendingUpdateBytes += bytes;
+    this.#pendingUpdates += 1;
+    const replaying = this.#replayingSession;
+    const suppressed = this.#updatesSuppressed;
+    const update = this.#updateTail
+      .then(() => {
+        if (this.#updateFailure !== null) {
+          throw this.#updateFailure;
+        }
+
+        return this.#applyUpdate(context, notification, { replaying, suppressed });
+      })
+      .finally(() => {
+        this.#pendingUpdateBytes -= bytes;
+        this.#pendingUpdates -= 1;
+      });
+    this.#updateTail = update.catch((error: unknown) => {
+      this.#failUpdates(error);
+    });
+    return update;
   }
 
-  async handleRequest(context: AgentDriverContext, request: AcpJsonRpcRequest): Promise<unknown> {
-    switch (request.method) {
-      case "elicitation/create": {
-        return this.#handleElicitationCreate(context, request);
-      }
-      case "fs/read_text_file": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#fileSystem.readTextFile(request.params);
-      }
-      case "fs/write_text_file": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#fileSystem.writeTextFile(context, request.params);
-      }
-      case "session/request_permission": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#handlePermissionRequest(context, request);
-      }
-      case "session/update": {
-        await this.#handleSessionUpdate(context, request.params);
-        return null;
-      }
-      case "terminal/create": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#terminalManager.create(context, request.params);
-      }
-      case "terminal/kill": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#terminalManager.kill(context, request.params);
-      }
-      case "terminal/output": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#terminalManager.output(request.params);
-      }
-      case "terminal/release": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#terminalManager.release(context, request.params);
-      }
-      case "terminal/wait_for_exit": {
-        this.#assertSessionScopedParams(request.method, request.params);
-        return this.#terminalManager.waitForExit(request.params);
-      }
-      default: {
-        throw createAcpMethodNotFoundError(request.method);
-      }
+  async readTextFile(
+    params: ReadTextFileRequest,
+    signal?: AbortSignal,
+  ): Promise<ReadTextFileResponse> {
+    this.#assertSession("fs/read_text_file", params);
+    return this.#fileSystem.readTextFile(params, signal);
+  }
+
+  async writeTextFile(
+    context: AgentDriverContext,
+    params: WriteTextFileRequest,
+    signal?: AbortSignal,
+  ): Promise<WriteTextFileResponse> {
+    this.#assertSession("fs/write_text_file", params);
+    return this.#fileSystem.writeTextFile(context, params, signal);
+  }
+
+  async requestPermission(
+    context: AgentDriverContext,
+    requestId: JsonRpcId,
+    params: RequestPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    this.#assertSession("session/request_permission", params);
+
+    if (this.#stopping || this.#isCancelling() || signal?.aborted) {
+      return { outcome: { outcome: "cancelled" } };
     }
+
+    try {
+      if (!this.#updatesSuppressed) {
+        await raceWithAbort(this.drainUpdates(), signal);
+      }
+
+      if (this.#stopping || this.#isCancelling() || signal?.aborted) {
+        return { outcome: { outcome: "cancelled" } };
+      }
+
+      return await this.#requestPermission(context, this.#requestKey(requestId), params, signal);
+    } catch (error) {
+      if (signal?.aborted) {
+        return { outcome: { outcome: "cancelled" } };
+      }
+
+      throw error;
+    }
+  }
+
+  async createTerminal(
+    context: AgentDriverContext,
+    params: CreateTerminalRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateTerminalResponse> {
+    this.#assertSession("terminal/create", params);
+    return this.#terminalManager.create(context, params, signal);
+  }
+
+  async killTerminal(
+    context: AgentDriverContext,
+    params: KillTerminalRequest,
+    signal?: AbortSignal,
+  ): Promise<KillTerminalResponse> {
+    this.#assertSession("terminal/kill", params);
+    return this.#terminalManager.kill(context, params, signal);
+  }
+
+  terminalOutput(params: TerminalOutputRequest, signal?: AbortSignal): TerminalOutputResponse {
+    this.#assertSession("terminal/output", params);
+    return this.#terminalManager.output(params, signal);
+  }
+
+  async releaseTerminal(
+    context: AgentDriverContext,
+    params: ReleaseTerminalRequest,
+    signal?: AbortSignal,
+  ): Promise<ReleaseTerminalResponse> {
+    this.#assertSession("terminal/release", params);
+    return this.#terminalManager.release(context, params, signal);
+  }
+
+  async waitForTerminalExit(
+    params: WaitForTerminalExitRequest,
+    signal?: AbortSignal,
+  ): Promise<WaitForTerminalExitResponse> {
+    this.#assertSession("terminal/wait_for_exit", params);
+    return this.#terminalManager.waitForExit(params, signal);
   }
 
   async stopTerminals(context: AgentDriverContext): Promise<void> {
+    this.#stopping = true;
     await this.#terminalManager.stopAll(context);
+  }
+
+  async closeUpdates(): Promise<void> {
+    this.#stopping = true;
+    this.#updatesClosed = true;
+    await this.drainUpdates();
+  }
+
+  async drainUpdates(): Promise<void> {
+    for (;;) {
+      const tail = this.#updateTail;
+      await tail;
+      await Promise.resolve();
+
+      if (tail !== this.#updateTail) {
+        continue;
+      }
+
+      if (this.#updateFailure !== null) {
+        throw this.#updateFailure;
+      }
+
+      return;
+    }
   }
 
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
@@ -126,81 +242,57 @@ export class AcpClientRequestHandler {
     try {
       return await operation();
     } finally {
-      this.#replayingSession = previous;
+      try {
+        await this.drainUpdates();
+      } finally {
+        this.#replayingSession = previous;
+      }
     }
   }
 
-  async withSuppressedSessionUpdates<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.#suppressSessionUpdates;
-    this.#suppressSessionUpdates = true;
+  async suppressUpdates<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#updatesSuppressed;
+    this.#updatesSuppressed = true;
 
     try {
       return await operation();
     } finally {
-      this.#suppressSessionUpdates = previous;
+      try {
+        await this.drainUpdates();
+      } finally {
+        this.#updatesSuppressed = previous;
+      }
     }
   }
 
-  async #handleElicitationCreate(
+  async #requestPermission(
     context: AgentDriverContext,
-    request: AcpJsonRpcRequest,
-  ): Promise<{ action: "decline" }> {
-    const requestId = String(request.id);
-    const runId = this.#turnEvents.activeRunId();
-    const params = isRecord(request.params) ? request.params : null;
-    await this.#push(context, "driver.acp.elicitation.declined", [
-      {
-        kind: "user.input.requested",
-        payload: {
-          mode: readNonEmptyString(params, "mode"),
-          prompt: readNonEmptyString(params, "message") ?? "User input requested",
-          requestId,
-          schema: params?.["requestedSchema"] ?? null,
-        },
-        ...(runId === null ? {} : { runId }),
-      },
-      {
-        kind: "user.input.resolved",
-        payload: {
-          outcome: "declined",
-          requestId,
-        },
-        ...(runId === null ? {} : { runId }),
-      },
-    ]);
-
-    return { action: "decline" };
-  }
-
-  async #handlePermissionRequest(
-    context: AgentDriverContext,
-    request: AcpJsonRpcRequest,
-  ): Promise<{ outcome: { optionId?: string; outcome: "cancelled" | "selected" } }> {
-    if (this.#suppressSessionUpdates) {
+    requestId: string,
+    params: RequestPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    if (this.#updatesSuppressed) {
       return { outcome: { outcome: "cancelled" } };
     }
 
-    const requestId = String(request.id);
-    const runId = this.#turnEvents.activeRunId();
-    const translation = this.#turnEvents.translatePermissionRequest({
-      params: request.params,
+    const translation = this.#turnEvents.translatePermission({
+      params,
       requestId,
     });
-    await this.#push(context, "driver.acp.permission.requested", translation.events);
-    const chosen = await this.#resolvePermission(
-      context,
-      requestId,
-      translation.options,
-      request.params,
-    );
-    const resolvedOption = this.#isTurnCancelRequested() ? null : chosen;
-    await this.#push(context, "driver.acp.permission.resolved", [
-      toAcpPermissionResolvedEvent({
-        option: resolvedOption,
-        requestId,
-        runId,
-      }),
-    ]);
+    const toolEvents = translation.events.filter((event) => event.kind !== "permission.requested");
+
+    if (toolEvents.length > 0) {
+      await raceWithAbort(this.#push(context, "driver.acp.permission.tool", toolEvents), signal);
+    }
+
+    const chosen =
+      this.#isCancelling() || signal?.aborted
+        ? null
+        : await raceWithAbort(
+            this.#resolvePermission(context, requestId, translation.options, params, signal),
+            signal,
+          );
+    const resolvedOption = this.#isCancelling() || signal?.aborted ? null : chosen;
 
     if (resolvedOption === null) {
       return { outcome: { outcome: "cancelled" } };
@@ -214,16 +306,31 @@ export class AcpClientRequestHandler {
     };
   }
 
-  async #handleSessionUpdate(context: AgentDriverContext, params: unknown): Promise<void> {
-    this.#assertSessionScopedParams("session/update", params);
+  #failUpdates(cause: unknown): void {
+    if (this.#updateFailure !== null) {
+      return;
+    }
 
-    if (this.#suppressSessionUpdates) {
+    const error =
+      cause instanceof Error ? cause : new Error("ACP session update handling failed.", { cause });
+    this.#updateFailure = error;
+    this.#onUpdateFailure(error);
+  }
+
+  async #applyUpdate(
+    context: AgentDriverContext,
+    params: SessionNotification,
+    scope: { readonly replaying: boolean; readonly suppressed: boolean },
+  ): Promise<void> {
+    this.#assertSession("session/update", params);
+
+    if (scope.suppressed && shouldIgnoreReplay(params)) {
       return;
     }
 
     if (
-      (this.#replayingSession || this.#turnEvents.activeRunId() === null) &&
-      shouldIgnoreAcpReplayUpdate(params)
+      (scope.replaying || this.#turnEvents.activeRunId() === null) &&
+      shouldIgnoreReplay(params)
     ) {
       return;
     }
@@ -237,8 +344,8 @@ export class AcpClientRequestHandler {
     await this.#push(context, "driver.acp.session.update", events);
   }
 
-  #assertSessionScopedParams(method: string, params: unknown): void {
-    const expectedSessionId = this.#requireNativeSessionId();
+  #assertSession(method: string, params: unknown): void {
+    const expectedSessionId = this.#requireSessionId();
     const record = isRecord(params) ? params : null;
     const actualSessionId = readNonEmptyString(record, "sessionId");
 
@@ -256,31 +363,35 @@ export class AcpClientRequestHandler {
     requestId: string,
     options: readonly AcpPermissionOption[],
     params: unknown,
+    signal?: AbortSignal,
   ): Promise<AcpPermissionOption | null> {
-    const allowOnce = options.find((option) => option.kind === "allow_once") ?? null;
-    const rejectOnce = options.find((option) => option.kind === "reject_once") ?? null;
+    const allow = options.find((option) => option.kind === "allow_once") ?? null;
+    const reject = options.find((option) => option.kind === "reject_once") ?? null;
 
-    if (allowOnce === null && rejectOnce === null) {
+    if (allow === null && reject === null) {
       return null;
     }
 
     const record = isRecord(params) ? params : {};
     const toolCall = isRecord(record["toolCall"]) ? record["toolCall"] : {};
-    const decision = await context.ports.permission.request({
-      rawInput: stringifyForDisplay(toolCall["rawInput"]),
-      requestId,
-      title:
-        readNonEmptyString(toolCall, "title") ??
-        readNonEmptyString(toolCall, "kind") ??
-        "Allow tool call?",
-      toolCallId: readNonEmptyString(toolCall, "toolCallId"),
-      toolKind: readNonEmptyString(toolCall, "kind"),
-    });
+    const decision = await context.ports.permission.request(
+      {
+        rawInput: stringifyForDisplay(toolCall["rawInput"]),
+        requestId,
+        title:
+          readNonEmptyString(toolCall, "title") ??
+          readNonEmptyString(toolCall, "kind") ??
+          "Allow tool call?",
+        toolCallId: readNonEmptyString(toolCall, "toolCallId"),
+        toolKind: readNonEmptyString(toolCall, "kind"),
+      },
+      signal,
+    );
 
-    return decision === "allow_once" ? allowOnce : rejectOnce;
+    return decision === "allow_once" ? allow : reject;
   }
 
-  #requireNativeSessionId(): string {
+  #requireSessionId(): string {
     const sessionId = this.#nativeSessionId();
 
     if (sessionId === null) {
@@ -288,5 +399,9 @@ export class AcpClientRequestHandler {
     }
 
     return sessionId;
+  }
+
+  #requestKey(requestId: JsonRpcId): string {
+    return requestId === null ? "null" : `${typeof requestId}:${requestId}`;
   }
 }
