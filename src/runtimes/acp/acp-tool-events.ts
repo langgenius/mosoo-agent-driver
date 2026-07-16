@@ -35,6 +35,10 @@ export class AcpToolEventState {
   readonly #completed = new Set<string>();
   readonly #started = new Set<string>();
 
+  hasActivity(): boolean {
+    return this.#started.size > 0;
+  }
+
   clear(): void {
     this.#completed.clear();
     this.#started.clear();

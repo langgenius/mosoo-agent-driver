@@ -219,7 +219,7 @@ describe("ACP runtime event translation", () => {
       }),
       ...anonymousFinalState.completePrompt("end_turn", null),
     ];
-    const anonymousCompleted = requireEvent(anonymousFinalEvents, "run.completed");
+    const anonymousFailed = requireEvent(anonymousFinalEvents, "run.failed");
     const firstAnonymousDelta = requireEvent(
       anonymousFinalEvents.filter(
         (event) =>
@@ -240,8 +240,13 @@ describe("ACP runtime event translation", () => {
     expect(eventPayloadString(firstAnonymousDelta, "messageId")).not.toBe(
       eventPayloadString(finalAnonymousDelta, "messageId"),
     );
-    expect(eventPayload(anonymousCompleted)).not.toHaveProperty("finalMessageId");
-    expect(eventPayload(anonymousCompleted)).not.toHaveProperty("finalMessageText");
+    expect(eventPayload(anonymousFailed)).toMatchObject({
+      error: {
+        code: "acp.empty_turn",
+      },
+      recoverable: true,
+      stopReason: "end_turn",
+    });
   });
 
   test("maps ACP turn updates onto canonical runtime events with one tool lifecycle", () => {
@@ -516,6 +521,32 @@ describe("ACP runtime event translation", () => {
     });
   });
 
+  test("fails an empty end turn instead of reporting a blank completed run", () => {
+    const state = new AcpTurnEventState();
+
+    state.begin({
+      messageId: "message-1",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+
+    const events = state.completePrompt("end_turn", {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    });
+
+    expect(eventKinds(events)).toEqual(["usage.updated", "run.failed"]);
+    expect(eventPayload(events[1])).toMatchObject({
+      error: {
+        code: "acp.empty_turn",
+        message: "ACP prompt ended without assistant output or tool activity.",
+      },
+      recoverable: true,
+      stopReason: "end_turn",
+    });
+  });
+
   test("ignores ACP user message echo chunks because driver input is the source of truth", () => {
     const state = new AcpTurnEventState();
 
@@ -672,7 +703,7 @@ describe("ACP runtime event translation", () => {
       }),
       ...state.completePrompt("end_turn", null),
     ];
-    const completed = requireEvent(events, "run.completed");
+    const failed = requireEvent(events, "run.failed");
 
     expect(eventKinds(events)).toEqual([
       "message.started",
@@ -681,10 +712,15 @@ describe("ACP runtime event translation", () => {
       "thought.started",
       "thought.delta",
       "thought.completed",
-      "run.completed",
+      "run.failed",
     ]);
-    expect(eventPayload(completed)).not.toHaveProperty("finalMessageId");
-    expect(eventPayload(completed)).not.toHaveProperty("finalMessageText");
+    expect(eventPayload(failed)).toMatchObject({
+      error: {
+        code: "acp.empty_turn",
+      },
+      recoverable: true,
+      stopReason: "end_turn",
+    });
   });
 
   test("closes open stream items before a failed turn event", () => {
