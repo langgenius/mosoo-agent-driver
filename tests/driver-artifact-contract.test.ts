@@ -33,6 +33,11 @@ interface DriverPackageJson {
   readonly version?: string;
 }
 
+interface EnvironmentPackageManagerManifest {
+  readonly managers?: readonly string[];
+  readonly schemaVersion?: number;
+}
+
 const PUBLIC_EXPORTS = [
   ".",
   "./boot",
@@ -52,6 +57,12 @@ function readText(path: string): string {
 
 function readDriverPackageJson(): DriverPackageJson {
   return JSON.parse(readText("../package.json")) as DriverPackageJson;
+}
+
+function readEnvironmentPackageManagerManifest(): EnvironmentPackageManagerManifest {
+  return JSON.parse(
+    readText("../environment-package-managers.json"),
+  ) as EnvironmentPackageManagerManifest;
 }
 
 describe("driver artifact contract", () => {
@@ -79,7 +90,15 @@ describe("driver artifact contract", () => {
       "agent-driver": "./dist/driver.mjs",
     });
     expect(packageJson.types).toBe("./dist/types/index.d.ts");
-    expect(packageJson.files).toEqual(["dist", "src", "assets"]);
+    expect(packageJson.files).toEqual(
+      expect.arrayContaining([
+        "dist",
+        "src",
+        "assets",
+        "environment-package-managers.json",
+        "scripts/environment-package-manager-check.mjs",
+      ]),
+    );
     expect(packageJson.files).not.toContain("tests/fixtures");
   });
 
@@ -209,7 +228,59 @@ describe("driver artifact contract", () => {
     expect(imageIndex).toBeGreaterThan(liveIndex);
   });
 
-  test("keeps the standalone package out of mosoo workspace dependencies", () => {
+  test("declares and verifies writable Environment package managers", () => {
+    const manifest = readEnvironmentPackageManagerManifest();
+    const packageJson = readDriverPackageJson();
+    const containerfile = readText("../Containerfile");
+    const containerignore = readText("../.containerignore");
+    const packageManagerCheck = readText("../scripts/environment-package-manager-check.mjs");
+
+    expect(manifest).toEqual({
+      managers: ["npm", "pip"],
+      schemaVersion: 1,
+    });
+    expect(containerfile).toContain(
+      "FROM cloudflare/sandbox:0.12.3@sha256:23f67e16131b780865a5fa5aa3c8607408a730105c248836409f4e02bb6bf042",
+    );
+    expect(containerfile).not.toContain("EXPECTED_NODE_VERSION");
+    expect(containerfile).not.toContain("EXPECTED_NPM_VERSION");
+    expect(containerfile).not.toContain("EXPECTED_PYTHON_VERSION");
+    expect(containerfile).not.toContain("EXPECTED_PIP_VERSION");
+    expect(containerfile).not.toContain("ENV PIP_");
+    expect(containerfile).not.toContain('sed -i "s|http://|https://|g"');
+    expect(containerfile).toContain("python-is-python3");
+    expect(containerfile).toContain(
+      "COPY environment-package-managers.json /etc/mosoo/environment-package-managers.json",
+    );
+    expect(containerfile).toContain(
+      "COPY scripts/environment-package-manager-check.mjs /usr/local/libexec/mosoo/environment-package-manager-check.mjs",
+    );
+    expect(containerfile).toContain(
+      "node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify",
+    );
+    expect(containerfile).not.toContain('manifest.managers.join(",")');
+    expect(containerignore).toContain("!environment-package-managers.json");
+    expect(containerignore).toContain("!scripts/environment-package-manager-check.mjs");
+    expect(packageManagerCheck).toContain("MOSOO_ENVIRONMENT_PACKAGE_MANAGER_MANIFEST");
+    expect(packageManagerCheck).not.toContain("EXPECTED_NODE_VERSION");
+    expect(packageManagerCheck).not.toContain("EXPECTED_NPM_VERSION");
+    expect(packageManagerCheck).not.toContain("EXPECTED_PYTHON_VERSION");
+    expect(packageManagerCheck).not.toContain("EXPECTED_PIP_VERSION");
+    expect(packageManagerCheck).toContain(
+      'readSemanticVersion("node", "node", ["--version"], "v")',
+    );
+    expect(packageManagerCheck).toContain("assertMatchingVersions");
+    expect(packageManagerCheck).toContain("prettier@3.3.3");
+    expect(packageManagerCheck).toContain("six==1.16.0");
+    expect(packageManagerCheck).toContain('readPipVersion("python -m pip", "python", [');
+    expect(packageManagerCheck).toContain('"--prefix"');
+    expect(packageManagerCheck).not.toContain('"-g"');
+    expect(packageJson.scripts?.["docker:smoke:environment"]).toContain(
+      "/usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
+    );
+  });
+
+  test("keeps the standalone package out of Mosoo workspace dependencies", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});
     const tsconfig = readText("../tsconfig.json");
