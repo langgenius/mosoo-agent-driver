@@ -96,6 +96,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       cwd: payload.execution.session.cwd,
       isTurnCancelRequested: () => this.#activeTurn?.cancelRequested ?? false,
       nativeSessionId: () => this.#nativeSessionId,
+      paths: payload.execution.environment.paths,
       push: async (context, reason, events) => this.#push(context, reason, events),
       turnEvents: this.#turnEvents,
     });

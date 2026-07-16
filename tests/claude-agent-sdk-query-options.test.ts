@@ -115,7 +115,7 @@ describe("Claude Agent SDK query options", () => {
     ]);
   });
 
-  test("passes reasoning effort, turn budget, and tools into Claude SDK query options", async () => {
+  test("passes runtime options and artifact paths into Claude SDK query options", async () => {
     const runtimeHome = await createRuntimeHome();
     const payload = createDriverStartInputFromBootPayload({
       ...driverBootPayload,
@@ -126,9 +126,21 @@ describe("Claude Agent SDK query options", () => {
             ? { enabled: false, name: tool.name }
             : tool,
         ),
+        environment: {
+          paths: {
+            executable: ["/artifact/bin"],
+            node: [],
+            python: [],
+          },
+          variables: {},
+        },
         model: "claude-sonnet-4-5",
         provider: "anthropic",
         providerOptions: {
+          env: {
+            MOSOO_DRIVER_BOOT_PAYLOAD: "must-not-leak",
+            PATH: "/provider/bin",
+          },
           effort: "max",
           maxTurns: 7,
           tools: ["Bash", "Read", "WebFetch"],
@@ -173,5 +185,8 @@ describe("Claude Agent SDK query options", () => {
       permissionMode: "default",
       tools: ["Read", "Write", "Edit", "Glob", "Grep", "WebFetch"],
     });
+
+    expect(options.env?.["PATH"]).toBe("/artifact/bin:/provider/bin");
+    expect(options.env?.["MOSOO_DRIVER_BOOT_PAYLOAD"]).toBeUndefined();
   });
 });
