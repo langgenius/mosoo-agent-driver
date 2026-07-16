@@ -65,6 +65,11 @@ export type {
 } from "../runtime";
 
 export interface DriverExecutionEnvironment {
+  readonly paths?: {
+    readonly executable: string[];
+    readonly node: string[];
+    readonly python: string[];
+  };
   readonly variables: Record<string, string>;
 }
 
@@ -215,6 +220,28 @@ function readVariables(value: unknown): Record<string, string> {
   }
 
   return variables;
+}
+
+function readAbsolutePathArray(record: Record<string, unknown>, field: string): string[] {
+  const label = "execution.environment.paths";
+  return readStringArray(record, field, label).map((path, index) => {
+    if (!path.startsWith("/") || path.includes("\0")) {
+      throw new TypeError(
+        `${label}.${field}[${index}] must be an absolute path without null bytes.`,
+      );
+    }
+
+    return path;
+  });
+}
+
+function readEnvironmentPaths(value: unknown): NonNullable<DriverExecutionEnvironment["paths"]> {
+  const paths = readRecord(value, "execution.environment.paths");
+  return {
+    executable: readAbsolutePathArray(paths, "executable"),
+    node: readAbsolutePathArray(paths, "node"),
+    python: readAbsolutePathArray(paths, "python"),
+  };
 }
 
 function readNativeRuntimeRef(value: unknown): DriverNativeRuntimeRef | null {
@@ -440,6 +467,9 @@ function readExecution(value: unknown): DriverExecutionSpec {
     builtInTools: readArray(record["builtInTools"], "execution.builtInTools").map(readBuiltInTool),
     configRevision: readConfigRevision(record["configRevision"]),
     environment: {
+      ...(environment["paths"] === undefined
+        ? {}
+        : { paths: readEnvironmentPaths(environment["paths"]) }),
       variables: readVariables(environment["variables"]),
     },
     model: readNonEmptyString(record, "model", "execution"),

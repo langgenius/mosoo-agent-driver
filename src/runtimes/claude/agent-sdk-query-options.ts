@@ -91,11 +91,12 @@ function toClaudeMcpServers(
 }
 
 function toClaudeEnv(payload: DriverStartInput, claudeConfigDir: string): NodeJS.ProcessEnv {
-  return buildRuntimeChildProcessEnv({
+  return {
+    ...process.env,
     ...payload.execution.environment.variables,
     CLAUDE_AGENT_SDK_CLIENT_APP: "mosoo-driver/0.1.0",
     CLAUDE_CONFIG_DIR: claudeConfigDir,
-  });
+  };
 }
 
 export function toClaudeBuiltInTools(payload: DriverStartInput): string[] {
@@ -168,6 +169,10 @@ export async function createClaudeQueryOptions(input: {
   }
 
   const mergedOptions = mergeClaudeQueryOptions(options, input.payload.execution.providerOptions);
+  mergedOptions.env = buildRuntimeChildProcessEnv(
+    input.payload.execution.environment.paths,
+    mergedOptions.env ?? {},
+  );
   mergedOptions.tools = builtInTools;
   return mergedOptions;
 }

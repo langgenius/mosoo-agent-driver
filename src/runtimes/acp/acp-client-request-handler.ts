@@ -1,3 +1,4 @@
+import type { DriverExecutionEnvironment } from "../../protocol/boot";
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../agent-driver-backend";
 import { shouldIgnoreAcpReplayUpdate, toAcpPermissionResolvedEvent } from "./acp-event-translator";
@@ -11,6 +12,7 @@ import { isRecord, readNonEmptyString, stringifyForDisplay } from "./acp-types";
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
+  readonly paths?: DriverExecutionEnvironment["paths"];
   isTurnCancelRequested(): boolean;
   nativeSessionId(): string | null;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
@@ -39,6 +41,7 @@ export class AcpClientRequestHandler {
     this.#terminalManager = new AcpTerminalManager({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
+      paths: options.paths,
       push: options.push,
     });
   }

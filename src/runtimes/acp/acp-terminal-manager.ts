@@ -3,8 +3,10 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 
+import type { DriverExecutionEnvironment } from "../../protocol/boot";
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../agent-driver-backend";
+import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { isRecord, readArray, readNonEmptyString, readNumber, readString } from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
@@ -27,6 +29,7 @@ interface AcpTerminalExitStatus {
 interface AcpTerminalManagerOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
+  readonly paths?: DriverExecutionEnvironment["paths"];
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
 }
 
@@ -64,10 +67,10 @@ export class AcpTerminalManager {
     const terminalId = randomUUID();
     const child = spawn(command, args, {
       cwd,
-      env: {
+      env: buildRuntimeChildProcessEnv(this.#options.paths, {
         ...process.env,
         ...env,
-      },
+      }),
       stdio: ["pipe", "pipe", "pipe"],
     });
     const exited = new Promise<AcpTerminalExitStatus>((resolveExit) => {

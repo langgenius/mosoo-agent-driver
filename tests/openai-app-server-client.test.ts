@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,13 +27,16 @@ afterEach(async () => {
 });
 
 describe("OpenAi app-server client", () => {
-  test("reports process exit after queued server messages", async () => {
+  test("injects artifact paths and reports process exit after queued server messages", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mosoo-openai-client-"));
     temporaryDirectories.push(directory);
     const executable = join(directory, "fake-app-server");
+    const environmentLog = join(directory, "environment.json");
     await Bun.write(
       executable,
-      `#!/usr/bin/env bun
+      `#!${process.execPath}
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(environmentLog)}, process.env.PATH ?? "");
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -53,6 +56,14 @@ process.stdin.on("data", (chunk) => {
       ...driverBootPayload,
       execution: {
         ...driverBootPayload.execution,
+        environment: {
+          paths: {
+            executable: ["/artifact/bin"],
+            node: [],
+            python: [],
+          },
+          variables: { PATH: "/environment/bin" },
+        },
         session: {
           ...driverBootPayload.execution.session,
           context: {
@@ -85,6 +96,8 @@ process.stdin.on("data", (chunk) => {
     });
 
     await client.start();
+
+    expect(await readFile(environmentLog, "utf8")).toBe("/artifact/bin:/environment/bin");
 
     for (let attempt = 0; attempt < 50 && protocolErrors.length === 0; attempt += 1) {
       await Bun.sleep(10);

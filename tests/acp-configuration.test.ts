@@ -50,19 +50,35 @@ describe("ACP runtime configuration", () => {
     ).toThrow();
   });
 
-  test("inherits runtime proxy env for ACP child processes only", () => {
-    const env = buildAcpChildProcessEnv(bootPayload, {
-      HTTPS_PROXY: "http://host.docker.internal:7897",
-      NODE_USE_ENV_PROXY: "1",
-      PATH: "/usr/local/bin:/usr/bin",
-      RANDOM_SECRET: "secret",
-      http_proxy: "http://host.docker.internal:7897",
-    });
+  test("inherits only runtime proxy env and prepends artifact paths", () => {
+    const env = buildAcpChildProcessEnv(
+      {
+        ...bootPayload,
+        execution: {
+          ...bootPayload.execution,
+          environment: {
+            paths: {
+              executable: ["/artifact/bin"],
+              node: [],
+              python: [],
+            },
+            variables: {},
+          },
+        },
+      },
+      {
+        HTTPS_PROXY: "http://host.docker.internal:7897",
+        NODE_USE_ENV_PROXY: "1",
+        PATH: "/usr/local/bin:/usr/bin",
+        RANDOM_SECRET: "secret",
+        http_proxy: "http://host.docker.internal:7897",
+      },
+    );
 
     expect(env).toMatchObject({
       HTTPS_PROXY: "http://host.docker.internal:7897",
       NODE_USE_ENV_PROXY: "1",
-      PATH: "/usr/local/bin:/usr/bin",
+      PATH: "/artifact/bin:/usr/local/bin:/usr/bin",
       http_proxy: "http://host.docker.internal:7897",
     });
     expect(env["RANDOM_SECRET"]).toBeUndefined();

@@ -1,5 +1,6 @@
 import type { DriverExecutionSessionContext } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
+import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import type { AcpAuthMethod, AcpInitializeResult, AcpMcpServer, JsonObject } from "./acp-types";
 import { isRecord, readRecord } from "./acp-types";
 
@@ -61,7 +62,7 @@ export function buildAcpChildProcessEnv(
 ): Record<string, string> {
   const { homePath } = payload.execution.session;
 
-  return {
+  return buildRuntimeChildProcessEnv(payload.execution.environment.paths, {
     ...buildAcpInheritedProcessEnv(processEnv),
     ...payload.execution.environment.variables,
     DISABLE_AUTOUPDATER: "1",
@@ -72,7 +73,7 @@ export function buildAcpChildProcessEnv(
     IS_SANDBOX: "1",
     PATH: processEnv["PATH"] ?? "",
     PWD: payload.execution.session.cwd,
-  };
+  });
 }
 
 export function buildAcpClientCapabilities(): JsonObject {

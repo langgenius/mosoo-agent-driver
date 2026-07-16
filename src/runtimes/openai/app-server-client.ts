@@ -166,7 +166,8 @@ export class OpenAiAppServerClient {
     await measure("app_server.home.mkdir", () => mkdir(runtimeHome, { recursive: true }));
 
     const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
-    const env = buildRuntimeChildProcessEnv({
+    const env = buildRuntimeChildProcessEnv(this.#payload.execution.environment.paths, {
+      ...process.env,
       ...this.#payload.execution.environment.variables,
       ...mcpConfig.env,
       [OPENAI_RUNTIME_HOME_ENV_NAME]: runtimeHome,
