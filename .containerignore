@@ -1,4 +1,7 @@
 *
 !Containerfile
+!environment-package-managers.json
+!scripts/
+!scripts/environment-package-manager-check.mjs
 !dist/
 !dist/driver.mjs

@@ -18,7 +18,9 @@
   "files": [
     "dist",
     "src",
-    "assets"
+    "assets",
+    "environment-package-managers.json",
+    "scripts/environment-package-manager-check.mjs"
   ],
   "type": "module",
   "types": "./dist/types/index.d.ts",
@@ -84,6 +86,7 @@
     "build": "vp run build:types && bun build src/bin/driver.ts --target bun --outfile dist/driver.mjs",
     "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
     "build:image": "vp run build && buildah build -t agent-driver:local .",
+    "docker:smoke:environment": "docker run --rm --entrypoint node agent-driver:local /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
     "check": "vp check && vp run tc && vp run test && vp run build",
     "prepack": "vp run build"
   },

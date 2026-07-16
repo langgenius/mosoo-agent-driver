@@ -1,4 +1,4 @@
-FROM cloudflare/sandbox:0.12.3
+FROM cloudflare/sandbox:0.12.3@sha256:23f67e16131b780865a5fa5aa3c8607408a730105c248836409f4e02bb6bf042
 
 # Keep the default base image version in sync with apps/api/package.json -> @cloudflare/sandbox.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.211
@@ -6,12 +6,21 @@ ARG ANTHROPIC_SDK_VERSION=0.111.0
 ARG OPENAI_RUNTIME_VERSION=0.144.5
 ARG OPENCODE_VERSION=1.18.4
 
-# Environment package setup invokes `pip`, so the runtime image must provide it.
+# Install the Python runtime behind writable pip package declarations.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3-pip python-is-python3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && python --version \
-    && pip --version
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      python3 \
+      python3-pip \
+      python-is-python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY environment-package-managers.json /etc/mosoo/environment-package-managers.json
+COPY scripts/environment-package-manager-check.mjs /usr/local/libexec/mosoo/environment-package-manager-check.mjs
+
+# Environment writes expose only package managers verified by this image.
+# Check executables, parseable versions, and runtime aliases here so capability
+# failures surface while building the image rather than during a user Run.
+RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 
 # Native agent CLIs pre-installed so the driver can spawn them via PATH.
 # Installed in a single npm invocation to keep the agent packages in one layer.
