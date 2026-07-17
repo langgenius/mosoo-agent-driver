@@ -1,35 +1,32 @@
+import type { StopReason } from "@agentclientprotocol/sdk";
+
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
-import { toAcpPermissionRequest } from "./acp-permission-events";
+import { toPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
 import {
   normalizePromptUsage,
   summarizeContentBlock,
-  toAvailableCommandsEvents,
+  toCommandEvents,
   toPlanEvents,
-  toSessionConfigEvents,
-  toSessionInfoEvents,
-  toSessionModeEvents,
-  toUsageUpdateEvents,
+  toConfigEvents,
+  toInfoEvents,
+  toModeEvents,
+  toUsageEvents,
 } from "./acp-session-events";
-import {
-  AcpToolEventState,
-  isTerminalToolStatus,
-  toRuntimeToolStatus,
-  toToolCallPayload,
-} from "./acp-tool-events";
+import { AcpToolEventState, toRuntimeToolStatus } from "./acp-tool-events";
 import { isRecord, readNonEmptyString, readRecord, readString } from "./acp-types";
-import type { AcpPromptStopReason, JsonObject } from "./acp-types";
+import type { JsonObject } from "./acp-types";
 
 export type { AcpPermissionOption, AcpPermissionTranslation } from "./acp-permission-events";
-export { toAcpPermissionRequest, toAcpPermissionResolvedEvent } from "./acp-permission-events";
+export { toPermissionRequest, toPermissionResolvedEvent } from "./acp-permission-events";
 export {
-  shouldIgnoreAcpReplayUpdate,
-  toAcpAuthSessionEvent,
-  toAcpInitializeEvents,
-  toAcpPromptStartEvents,
-  toAcpSessionReadyEvents,
+  shouldIgnoreReplay,
+  toAuthEvent,
+  toInitializeEvents,
+  toPromptStartEvents,
+  toSessionReadyEvents,
 } from "./acp-session-events";
 
 export interface AcpTurnEventStateInput {
@@ -106,12 +103,12 @@ export class AcpTurnEventState {
     this.#tools.clear();
   }
 
-  completePrompt(stopReason: AcpPromptStopReason, usage: unknown): DriverEventInput[] {
+  completePrompt(stopReason: StopReason, usage: unknown): DriverEventInput[] {
     const events: DriverEventInput[] = [];
     const runId = this.#requireRunId();
 
-    events.push(...this.#promoteThoughtFallbackToMessage());
-    events.push(...this.#completeActiveAssistantMessage());
+    events.push(...this.#promoteThought());
+    events.push(...this.#finishMessage());
 
     if (this.#thoughtStarted && !this.#thoughtCompleted) {
       this.#thoughtCompleted = true;
@@ -125,14 +122,9 @@ export class AcpTurnEventState {
       });
     }
 
-    const promptFailed = stopReason === "max_turn_requests";
-    const toolStatus = stopReason === "cancelled" || promptFailed ? "failed" : "completed";
+    const toolStatus = stopReason === "cancelled" ? "failed" : "completed";
     const toolError =
-      stopReason === "cancelled"
-        ? "Turn cancelled before tool completion."
-        : promptFailed
-          ? "Turn failed after the maximum turn request limit."
-          : undefined;
+      stopReason === "cancelled" ? "Turn cancelled before tool completion." : undefined;
     events.push(
       ...this.#tools.completeOpen({
         runId,
@@ -163,19 +155,6 @@ export class AcpTurnEventState {
         payload: {
           requestedBy: "user",
           stopReason: "cancelled",
-        },
-        runId,
-      });
-    } else if (promptFailed) {
-      events.push({
-        kind: "run.failed",
-        payload: {
-          error: {
-            code: "acp.max_turn_requests",
-            message: "ACP prompt stopped after the maximum turn request limit.",
-          },
-          recoverable: false,
-          stopReason,
         },
         runId,
       });
@@ -223,7 +202,7 @@ export class AcpTurnEventState {
     const events: DriverEventInput[] = [];
     const thoughtId = this.#thoughtId;
 
-    events.push(...this.#completeActiveAssistantMessage());
+    events.push(...this.#finishMessage());
 
     if (this.#thoughtStarted && !this.#thoughtCompleted && thoughtId !== null) {
       events.push({
@@ -267,34 +246,32 @@ export class AcpTurnEventState {
 
     switch (sessionUpdate) {
       case "agent_message_chunk": {
-        return this.#translateAgentMessageChunk(update);
+        return this.#messageChunk(update);
       }
       case "agent_thought_chunk": {
-        return this.#translateThoughtChunk(update);
+        return this.#thoughtChunk(update);
       }
       case "available_commands_update": {
-        return toAvailableCommandsEvents(update);
+        return toCommandEvents(update);
       }
       case "config_option_update": {
-        return toSessionConfigEvents(update);
+        return toConfigEvents(update);
       }
       case "current_mode_update": {
-        return toSessionModeEvents(update);
+        return toModeEvents(update);
       }
       case "plan": {
         return toPlanEvents(update);
       }
       case "session_info_update": {
-        return toSessionInfoEvents(update);
+        return toInfoEvents(update);
       }
-      case "tool_call": {
-        return this.#translateToolCall(update);
-      }
+      case "tool_call":
       case "tool_call_update": {
-        return this.#translateToolCallUpdate(update);
+        return this.#tool(update, sessionUpdate);
       }
       case "usage_update": {
-        return toUsageUpdateEvents(update);
+        return toUsageEvents(update);
       }
       case "user_message_chunk":
       case undefined:
@@ -317,12 +294,9 @@ export class AcpTurnEventState {
     }
   }
 
-  translatePermissionRequest(input: {
-    params: unknown;
-    requestId: string;
-  }): AcpPermissionTranslation {
+  translatePermission(input: { params: unknown; requestId: string }): AcpPermissionTranslation {
     const runId = this.activeRunId();
-    const translation = toAcpPermissionRequest({
+    const translation = toPermissionRequest({
       params: input.params,
       requestId: input.requestId,
       runId,
@@ -346,12 +320,12 @@ export class AcpTurnEventState {
     };
   }
 
-  #nextSourceEventId(kind: string): string {
+  #nextEventId(kind: string): string {
     this.#sequence += 1;
     return `acp:${this.#sessionId ?? "session"}:${this.#runId ?? "run"}:${kind}:${this.#sequence}`;
   }
 
-  #translateAgentMessageChunk(update: JsonObject | null): DriverEventInput[] {
+  #messageChunk(update: JsonObject | null): DriverEventInput[] {
     const delta = summarizeContentBlock(update?.["content"]);
     if (delta === null) {
       return [];
@@ -360,8 +334,8 @@ export class AcpTurnEventState {
     const nativeMessageId = readNonEmptyString(update, "messageId");
     const started =
       nativeMessageId === null
-        ? this.#startUnidentifiedAssistantMessage()
-        : this.#startIdentifiedAssistantMessage(nativeMessageId);
+        ? this.#startAnonymousMessage()
+        : this.#startMessage(nativeMessageId);
 
     if (started === null) {
       // An already settled native message can only be a late replay. Keeping
@@ -384,12 +358,12 @@ export class AcpTurnEventState {
           role: "agent",
         },
         runId: this.#requireRunId(),
-        sourceEventId: this.#nextSourceEventId("agent-message"),
+        sourceEventId: this.#nextEventId("agent-message"),
       },
     ];
   }
 
-  #translateThoughtChunk(update: JsonObject | null): DriverEventInput[] {
+  #thoughtChunk(update: JsonObject | null): DriverEventInput[] {
     const delta = summarizeContentBlock(update?.["content"]);
 
     if (delta === null) {
@@ -405,7 +379,7 @@ export class AcpTurnEventState {
       // belongs to the active assistant message or starts a newer one. Close
       // the live message boundary, then fail closed instead of projecting an
       // earlier identified progress message as canonical final output.
-      events.push(...this.#completeActiveAssistantMessage());
+      events.push(...this.#finishMessage());
       this.#lastCompletedAssistantMessage = null;
       this.#clearThoughtFallback();
     } else if (!this.#settledAssistantNativeMessageIds.has(nativeMessageId)) {
@@ -415,7 +389,7 @@ export class AcpTurnEventState {
         // ACP runtimes can expose final answer text through a thought update.
         // A new native identity is an explicit message boundary: settle the
         // active progress message so this thought can become the final fallback.
-        events.push(...this.#completeActiveAssistantMessage());
+        events.push(...this.#finishMessage());
       }
 
       if (this.#activeAssistantMessage === null) {
@@ -438,12 +412,15 @@ export class AcpTurnEventState {
         thoughtId: this.#requireThoughtId(),
       },
       runId: this.#requireRunId(),
-      sourceEventId: this.#nextSourceEventId("agent-thought"),
+      sourceEventId: this.#nextEventId("agent-thought"),
     });
     return events;
   }
 
-  #translateToolCall(update: JsonObject | null): DriverEventInput[] {
+  #tool(
+    update: JsonObject | null,
+    type: "tool_call" | "tool_call_update",
+  ): DriverEventInput[] {
     const toolCallId = readNonEmptyString(update, "toolCallId");
 
     if (toolCallId === null) {
@@ -451,9 +428,20 @@ export class AcpTurnEventState {
     }
 
     const runId = this.#requireRunId();
-    const status = toRuntimeToolStatus(readString(update, "status"));
+    const nativeStatus = readString(update, "status");
+    const projected = this.#tools.patch({
+      status: nativeStatus === null ? null : toRuntimeToolStatus(nativeStatus),
+      toolCallId,
+      update,
+    });
+
+    if (!projected.changed) {
+      return [];
+    }
+
     const title =
-      readNonEmptyString(update, "title") ?? readNonEmptyString(update, "kind") ?? "tool";
+      (typeof projected.payload["title"] === "string" ? projected.payload["title"] : null) ??
+      (typeof projected.payload["kind"] === "string" ? projected.payload["kind"] : "tool");
     const events = this.#tools.ensureStarted({
       parentMessageId: this.#toolParentMessageId(),
       runId,
@@ -462,14 +450,22 @@ export class AcpTurnEventState {
     });
 
     events.push({
+      ...(type === "tool_call_update"
+        ? { delivery: projected.status === "running" ? "best_effort" : "lossless" }
+        : {}),
       kind: "tool.call.updated",
-      payload: toToolCallPayload(toolCallId, status, update),
+      payload: projected.payload,
       runId,
-      sourceEventId: this.#nextSourceEventId("tool-call"),
+      sourceEventId: this.#nextEventId(type.replaceAll("_", "-")),
     });
 
-    if (isTerminalToolStatus(readString(update, "status"))) {
-      const completion = this.#tools.complete({ runId, status, toolCallId, update });
+    if (projected.status !== "running") {
+      const completion = this.#tools.complete({
+        runId,
+        status: projected.status,
+        toolCallId,
+        update,
+      });
 
       if (completion !== null) {
         events.push(completion);
@@ -479,44 +475,7 @@ export class AcpTurnEventState {
     return events;
   }
 
-  #translateToolCallUpdate(update: JsonObject | null): DriverEventInput[] {
-    const toolCallId = readNonEmptyString(update, "toolCallId");
-
-    if (toolCallId === null) {
-      return [];
-    }
-
-    const runId = this.#requireRunId();
-    const status = toRuntimeToolStatus(readString(update, "status"));
-    const title =
-      readNonEmptyString(update, "title") ?? readNonEmptyString(update, "kind") ?? "tool";
-    const events = this.#tools.ensureStarted({
-      parentMessageId: this.#toolParentMessageId(),
-      runId,
-      title,
-      toolCallId,
-    });
-
-    events.push({
-      delivery: status === "running" ? "best_effort" : "lossless",
-      kind: "tool.call.updated",
-      payload: toToolCallPayload(toolCallId, status, update),
-      runId,
-      sourceEventId: this.#nextSourceEventId("tool-call-update"),
-    });
-
-    if (isTerminalToolStatus(readString(update, "status"))) {
-      const completion = this.#tools.complete({ runId, status, toolCallId, update });
-
-      if (completion !== null) {
-        events.push(completion);
-      }
-    }
-
-    return events;
-  }
-
-  #promoteThoughtFallbackToMessage(): DriverEventInput[] {
+  #promoteThought(): DriverEventInput[] {
     if (this.#activeAssistantMessage !== null) {
       return [];
     }
@@ -529,7 +488,7 @@ export class AcpTurnEventState {
     }
 
     this.#clearThoughtFallback();
-    const started = this.#startIdentifiedAssistantMessage(nativeMessageId);
+    const started = this.#startMessage(nativeMessageId);
 
     if (started === null) {
       return [];
@@ -551,7 +510,7 @@ export class AcpTurnEventState {
           role: "agent",
         },
         runId: this.#requireRunId(),
-        sourceEventId: this.#nextSourceEventId("agent-thought-fallback-message"),
+        sourceEventId: this.#nextEventId("agent-thought-fallback-message"),
       },
     ];
   }
@@ -561,7 +520,7 @@ export class AcpTurnEventState {
     this.#thoughtFallbackText = "";
   }
 
-  #completeActiveAssistantMessage(): DriverEventInput[] {
+  #finishMessage(): DriverEventInput[] {
     const message = this.#activeAssistantMessage;
 
     if (message === null) {
@@ -595,7 +554,7 @@ export class AcpTurnEventState {
     ];
   }
 
-  #startIdentifiedAssistantMessage(nativeMessageId: string): AcpAssistantMessageStart | null {
+  #startMessage(nativeMessageId: string): AcpAssistantMessageStart | null {
     if (this.#settledAssistantNativeMessageIds.has(nativeMessageId)) {
       return null;
     }
@@ -606,7 +565,7 @@ export class AcpTurnEventState {
       return { events: [], message: active };
     }
 
-    const events = this.#completeActiveAssistantMessage();
+    const events = this.#finishMessage();
     const message: AcpAssistantMessageState = {
       id: this.#assistantMessageIds.getOrCreate(`native:${nativeMessageId}`),
       nativeMessageId,
@@ -626,14 +585,14 @@ export class AcpTurnEventState {
     return { events, message };
   }
 
-  #startUnidentifiedAssistantMessage(): AcpAssistantMessageStart {
+  #startAnonymousMessage(): AcpAssistantMessageStart {
     const active = this.#activeAssistantMessage;
 
     if (active?.nativeMessageId === null) {
       return { events: [], message: active };
     }
 
-    const events = this.#completeActiveAssistantMessage();
+    const events = this.#finishMessage();
     this.#unidentifiedAssistantMessageSequence += 1;
     const message: AcpAssistantMessageState = {
       id: this.#assistantMessageIds.getOrCreate(

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import {
@@ -10,8 +12,6 @@ import {
 import type { JsonObject } from "./acp-types";
 
 export type RuntimeToolStatus = "completed" | "failed" | "running";
-
-const TERMINAL_TOOL_STATUSES = new Set(["cancelled", "completed", "failed"]);
 
 function readToolDisplayString(value: unknown): string | undefined {
   const display = stringifyForDisplay(value);
@@ -33,6 +33,7 @@ function readToolContentString(value: unknown): string | undefined {
 
 export class AcpToolEventState {
   readonly #completed = new Set<string>();
+  readonly #snapshots = new Map<string, JsonObject>();
   readonly #started = new Set<string>();
 
   hasActivity(): boolean {
@@ -41,7 +42,36 @@ export class AcpToolEventState {
 
   clear(): void {
     this.#completed.clear();
+    this.#snapshots.clear();
     this.#started.clear();
+  }
+
+  patch(input: {
+    status: RuntimeToolStatus | null;
+    toolCallId: string;
+    update: JsonObject | null;
+  }): { changed: boolean; payload: JsonObject; status: RuntimeToolStatus } {
+    const previous = this.#snapshots.get(input.toolCallId);
+    const previousStatus = previous?.["status"];
+    const status =
+      previousStatus === "completed" || previousStatus === "failed"
+        ? previousStatus
+        : (input.status ?? "running");
+    const payload = {
+      ...previous,
+      ...toToolCallPayload(input.toolCallId, status, input.update),
+      kind: readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool",
+      status,
+      title: readNullableString(input.update, "title") ?? previous?.["title"] ?? null,
+      toolCallId: input.toolCallId,
+    };
+    const changed = previous === undefined || !isDeepStrictEqual(previous, payload);
+
+    if (changed) {
+      this.#snapshots.set(input.toolCallId, structuredClone(payload));
+    }
+
+    return { changed, payload, status };
   }
 
   complete(input: {
@@ -122,10 +152,6 @@ export class AcpToolEventState {
   }
 }
 
-export function isTerminalToolStatus(status: string | null): boolean {
-  return status !== null && TERMINAL_TOOL_STATUSES.has(status);
-}
-
 export function toRuntimeToolStatus(status: string | null): RuntimeToolStatus {
   if (status === "completed") {
     return "completed";
@@ -144,17 +170,20 @@ export function toToolCallPayload(
   update: JsonObject | null,
 ): JsonObject {
   const content = readToolContentString(update?.["content"]);
+  const kind = readNonEmptyString(update, "kind");
   const rawInput = readToolDisplayString(update?.["rawInput"]);
   const rawOutput = readToolDisplayString(update?.["rawOutput"]);
+  const title = readNullableString(update, "title");
+  const locations = update?.["locations"];
 
   return {
     ...(content === undefined ? {} : { content }),
-    kind: readNonEmptyString(update, "kind") ?? "tool",
-    locations: update?.["locations"],
+    ...(kind === null ? {} : { kind }),
+    ...(locations === undefined || locations === null ? {} : { locations }),
     ...(rawInput === undefined ? {} : { rawInput }),
     ...(rawOutput === undefined ? {} : { rawOutput }),
     status,
-    title: readNullableString(update, "title") ?? null,
+    ...(title === undefined || title === null ? {} : { title }),
     toolCallId,
   };
 }
