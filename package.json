@@ -2,7 +2,7 @@
   "name": "agent-driver",
   "version": "0.1.0",
   "private": false,
-  "description": "Multi-provider Agent Driver runtime for sandbox-hosted agent sessions.",
+  "description": "Runtime-neutral Agent Driver and AI agent harness for Claude Agent SDK, Codex app-server, and ACP inside isolated sandboxes.",
   "license": "Apache-2.0",
   "bin": {
     "agent-driver": "./dist/driver.mjs"
