@@ -1,6 +1,5 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { isTruthy } from "../../core/truthiness";
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId, RunId } from "../../protocol/id";
 import type { AgentDriverContext } from "../agent-driver-backend";
@@ -15,7 +14,7 @@ import {
 } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 import { toClaudeFilesPersistedEvents } from "./agent-sdk-message-events";
-import { isDuplicateClaudeFinalText, readClaudeSdkSessionId } from "./agent-sdk-message-state";
+import { readClaudeSdkSessionId } from "./agent-sdk-message-state";
 import { isToolUseBlock, toToolCallId, toToolCallName, toToolResultText } from "./agent-sdk-tools";
 interface ClaudeMessageTranslatorOptions {
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
@@ -27,24 +26,31 @@ interface ClaudeAssistantFinalCandidate {
   readonly ordinal: number;
 }
 
+export class ClaudeTerminalWriteError extends Error {
+  override readonly name = "ClaudeTerminalWriteError";
+
+  constructor(cause: unknown) {
+    super("Claude terminal delivery failed.", { cause });
+  }
+}
+
 function toClaudeThoughtId(messageId: string): string {
   return `${messageId}:thought`;
 }
 
 export class ClaudeAgentSdkMessageTranslator {
   readonly #activeAssistantMessageIds = new Map<RunId, MessageId>();
-  #activeThoughtId: string | null = null;
+  readonly #activeThoughtIds = new Map<string, string>();
   readonly #authoritativeAssistantMessageIds = new Set<MessageId>();
   readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #assistantMessageOrdinals = new Map<MessageId, number>();
   readonly #assistantMessageRunIds = new Map<MessageId, RunId>();
   readonly #assistantMessageSequences = new Map<RunId, number>();
-  readonly #blockIndexToToolCallId = new Map<number, string>();
+  readonly #blockToolCallIds = new Map<string, Map<number, string>>();
   readonly #events: ClaudeAgentSdkEventWriter;
   readonly #lastCompletedAssistantMessages = new Map<RunId, ClaudeAssistantFinalCandidate>();
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #streamedTextMessages = new Set<string>();
-  readonly #streamedTextByMessageId = new Map<string, string>();
   readonly #streamingNativeMessageIds = new Map<string, string>();
   readonly #textByAssistantMessageId = new Map<MessageId, string>();
 
@@ -55,30 +61,49 @@ export class ClaudeAgentSdkMessageTranslator {
 
   resetTurnMessageState(): void {
     this.#activeAssistantMessageIds.clear();
-    this.#activeThoughtId = null;
+    this.#activeThoughtIds.clear();
     this.#authoritativeAssistantMessageIds.clear();
     this.#assistantMessageIds.reset();
     this.#assistantMessageOrdinals.clear();
     this.#assistantMessageRunIds.clear();
     this.#assistantMessageSequences.clear();
-    this.#blockIndexToToolCallId.clear();
+    this.#blockToolCallIds.clear();
     this.#events.resetTurnState();
     this.#lastCompletedAssistantMessages.clear();
-    this.#streamedTextByMessageId.clear();
     this.#streamedTextMessages.clear();
     this.#streamingNativeMessageIds.clear();
     this.#textByAssistantMessageId.clear();
   }
 
   async endActiveThought(context: AgentDriverContext): Promise<void> {
-    const thoughtId = this.#activeThoughtId;
+    const thoughtIds = [...this.#activeThoughtIds.values()];
+    this.#activeThoughtIds.clear();
 
-    if (thoughtId === null) {
-      return;
+    for (const thoughtId of thoughtIds) {
+      await this.#events.endThought(context, thoughtId);
+    }
+  }
+
+  async finishTurn(
+    context: AgentDriverContext,
+    toolStatus: "completed" | "failed",
+  ): Promise<void> {
+    await this.endActiveThought(context);
+
+    for (const [messageId, runId] of this.#assistantMessageRunIds) {
+      await this.#endAssistantMessage(context, runId, messageId);
     }
 
-    this.#activeThoughtId = null;
-    await this.#events.endThought(context, thoughtId);
+    await this.#events.finishTools(context, toolStatus);
+  }
+
+  async #endThought(context: AgentDriverContext, messageId: string): Promise<void> {
+    const thoughtId = this.#activeThoughtIds.get(messageId);
+    this.#activeThoughtIds.delete(messageId);
+
+    if (thoughtId !== undefined) {
+      await this.#events.endThought(context, thoughtId);
+    }
   }
 
   async handleSdkMessage(
@@ -88,7 +113,7 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<boolean> {
     const sessionId = readClaudeSdkSessionId(message);
 
-    if (isTruthy(sessionId)) {
+    if (sessionId) {
       await this.#options.recordNativeSessionId(context, sessionId);
     }
 
@@ -152,12 +177,9 @@ export class ClaudeAgentSdkMessageTranslator {
           authoritativeText.push(text);
         }
         const isDuplicateStreamedText =
-          text === null ||
-          this.#streamedTextMessages.has(messageId) ||
-          isDuplicateClaudeFinalText(this.#streamedTextByMessageId, messageId, text) ||
-          this.#textByAssistantMessageId.get(messageId) === text;
+          text === null || this.#streamedTextMessages.has(messageId);
 
-        if (isTruthy(text) && !isDuplicateStreamedText) {
+        if (text && !isDuplicateStreamedText) {
           this.#appendAssistantText(messageId, text);
           // Claude content blocks are protocol-ordered; push each derived event before reading the next block.
           await this.#events.pushTextDelta({
@@ -172,32 +194,27 @@ export class ClaudeAgentSdkMessageTranslator {
 
       if (isToolUseBlock(block)) {
         const toolCallId = toToolCallId(block, messageId, index);
-        if (this.#events.hasToolStarted(toolCallId)) {
-          continue;
-        }
-
-        // Claude content blocks are protocol-ordered; keep tool start/args/end in wire order.
-        await this.#events.ensureToolStarted({
-          context,
-          parentMessageId: messageId,
-          toolCallId,
-          toolCallName: toToolCallName(block),
-        });
-        const { input } = block;
-        if (isTruthy(input)) {
-          await this.#events.pushToolArguments({
+        if (!this.#events.hasToolStarted(toolCallId)) {
+          // Claude content blocks are protocol-ordered; keep tool start/args/end in wire order.
+          await this.#events.ensureToolStarted({
             context,
-            delta: stringifyForDisplay(input),
-            reason: "driver.claude.tool.args",
+            parentMessageId: messageId,
             toolCallId,
+            toolCallName: toToolCallName(block),
           });
+        }
+        const { input } = block;
+        if (input !== undefined) {
+          await this.#events.pushToolSnapshot(context, toolCallId, stringifyForDisplay(input));
         }
       }
     }
 
     if (authoritativeText.length > 0) {
+      const text = authoritativeText.join("");
       this.#authoritativeAssistantMessageIds.add(messageId);
-      this.#textByAssistantMessageId.set(messageId, authoritativeText.join(""));
+      this.#textByAssistantMessageId.set(messageId, text);
+      await this.#events.pushMessageSnapshot(context, messageId, text);
     }
 
     await this.#endAssistantMessage(context, runId, messageId);
@@ -210,9 +227,6 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const event = isRecord(message.event) ? message.event : null;
     const eventType = readString(event, "type");
-    // Each stream_event envelope carries its own uuid, so per-event envelope ids
-    // cannot identify the message. The API message id from message_start is the
-    // stable identity for every chunk until the matching message_stop.
     const streamScopeKey = this.#streamScopeKey(runId, message);
 
     if (eventType === "message_start") {
@@ -231,7 +245,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
     const messageId = this.#assistantMessageId(
       runId,
-      this.#streamingNativeMessageIds.get(streamScopeKey) ?? null,
+      this.#streamingNativeMessageIds.get(streamScopeKey) ?? this.#readNativeMessageId(message),
     );
 
     if (eventType === "content_block_start") {
@@ -248,16 +262,16 @@ export class ClaudeAgentSdkMessageTranslator {
       const index = readNumber(event, "index");
 
       if (index !== null) {
-        this.#blockIndexToToolCallId.delete(index);
+        this.#blockToolCallIds.get(messageId)?.delete(index);
       }
       return;
     }
 
     if (eventType === "message_stop") {
-      await this.endActiveThought(context);
+      await this.#endThought(context, messageId);
       await this.#endAssistantMessage(context, runId, messageId);
       this.#streamingNativeMessageIds.delete(streamScopeKey);
-      this.#blockIndexToToolCallId.clear();
+      this.#blockToolCallIds.delete(messageId);
       return;
     }
 
@@ -269,8 +283,6 @@ export class ClaudeAgentSdkMessageTranslator {
   }
 
   #streamScopeKey(runId: RunId, message: SDKMessage): string {
-    // Subagent stream events (parent_tool_use_id set) interleave with the main
-    // thread; scope the in-flight message pointer so they never cross-merge.
     const parentToolUseId = isRecord(message)
       ? readString(message, "parent_tool_use_id")
       : null;
@@ -279,10 +291,6 @@ export class ClaudeAgentSdkMessageTranslator {
 
   #appendStreamedText(messageId: string, text: string): void {
     this.#streamedTextMessages.add(messageId);
-    this.#streamedTextByMessageId.set(
-      messageId,
-      `${this.#streamedTextByMessageId.get(messageId) ?? ""}${text}`,
-    );
     this.#appendAssistantText(messageId as MessageId, text);
   }
 
@@ -309,7 +317,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (blockType === "text") {
       const text = readString(block, "text");
-      if (isTruthy(text)) {
+      if (text) {
         this.#appendStreamedText(messageId, text);
         await this.#events.pushTextDelta({
           context,
@@ -322,8 +330,8 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     if (blockType === "thinking") {
-      const thoughtId = this.#activeThoughtId ?? toClaudeThoughtId(messageId);
-      this.#activeThoughtId = thoughtId;
+      const thoughtId = this.#activeThoughtIds.get(messageId) ?? toClaudeThoughtId(messageId);
+      this.#activeThoughtIds.set(messageId, thoughtId);
       await this.#events.ensureThoughtStarted(context, thoughtId);
       return;
     }
@@ -332,7 +340,8 @@ export class ClaudeAgentSdkMessageTranslator {
       return;
     }
 
-    const toolCallId = toToolCallId(block, messageId, index ?? this.#blockIndexToToolCallId.size);
+    const toolCallIds = this.#blockToolCallIds.get(messageId) ?? new Map<number, string>();
+    const toolCallId = toToolCallId(block, messageId, index ?? toolCallIds.size);
     await this.#events.ensureToolStarted({
       context,
       parentMessageId: messageId,
@@ -341,11 +350,12 @@ export class ClaudeAgentSdkMessageTranslator {
     });
 
     if (index !== null) {
-      this.#blockIndexToToolCallId.set(index, toolCallId);
+      toolCallIds.set(index, toolCallId);
+      this.#blockToolCallIds.set(messageId, toolCallIds);
     }
 
     const { input } = block;
-    if (isTruthy(input)) {
+    if (input) {
       await this.#events.pushToolArguments({
         context,
         delta: stringifyForDisplay(input),
@@ -366,7 +376,7 @@ export class ClaudeAgentSdkMessageTranslator {
     if (deltaType === "text_delta") {
       const text = readString(delta, "text");
 
-      if (!isTruthy(text)) {
+      if (!text) {
         return;
       }
 
@@ -383,9 +393,9 @@ export class ClaudeAgentSdkMessageTranslator {
     if (deltaType === "input_json_delta") {
       const index = readNumber(event, "index");
       const partialJson = readString(delta, "partial_json");
-      const toolCallId = index === null ? null : this.#blockIndexToToolCallId.get(index);
+      const toolCallId = index === null ? null : this.#blockToolCallIds.get(messageId)?.get(index);
 
-      if (isTruthy(partialJson) && isTruthy(toolCallId)) {
+      if (partialJson && toolCallId) {
         await this.#events.pushToolArguments({
           context,
           delta: partialJson,
@@ -399,12 +409,12 @@ export class ClaudeAgentSdkMessageTranslator {
     if (deltaType === "thinking_delta") {
       const thinkingText = readString(delta, "thinking");
 
-      if (!isTruthy(thinkingText)) {
+      if (!thinkingText) {
         return;
       }
 
-      const thoughtId = this.#activeThoughtId ?? toClaudeThoughtId(messageId);
-      this.#activeThoughtId = thoughtId;
+      const thoughtId = this.#activeThoughtIds.get(messageId) ?? toClaudeThoughtId(messageId);
+      this.#activeThoughtIds.set(messageId, thoughtId);
 
       await this.#events.pushThoughtDelta({
         context,
@@ -430,7 +440,7 @@ export class ClaudeAgentSdkMessageTranslator {
       const toolCallId = readString(block, "tool_use_id");
       const resultText = toToolResultText(block);
 
-      if (!isTruthy(toolCallId) || !isTruthy(resultText)) {
+      if (!toolCallId || !resultText) {
         continue;
       }
 
@@ -549,9 +559,6 @@ export class ClaudeAgentSdkMessageTranslator {
       return null;
     }
 
-    // The envelope uuid is unique per emitted SDK message, including the
-    // complete-assistant replays of an already-streamed message. Prefer the API
-    // message id so stream chunks and completion snapshots share one identity.
     return readString(readRecord(message, "message"), "id") ?? readString(message, "uuid");
   }
 
@@ -592,6 +599,7 @@ export class ClaudeAgentSdkMessageTranslator {
     message: Extract<SDKMessage, { type: "result" }>,
     runId: RunId,
   ): Promise<void> {
+    await this.finishTurn(context, message.subtype === "success" ? "completed" : "failed");
     await this.#events.pushUsage(
       context,
       isRecord(message.usage) ? message.usage : null,
@@ -606,14 +614,23 @@ export class ClaudeAgentSdkMessageTranslator {
       const finalMessage =
         resultText === null ? null : this.#resolveFinalAssistantSnapshot(runId, resultText);
 
-      await this.#events.pushRunFinished(context, runId, finalMessage);
+      try {
+        await this.#events.pushRunFinished(context, runId, finalMessage);
+      } catch (error) {
+        throw new ClaudeTerminalWriteError(error);
+      }
       return;
     }
 
-    await this.#events.pushRunError(
-      context,
-      `claude.${message.subtype}`,
-      message.errors.join("\n") || "Claude Agent SDK turn failed.",
-    );
+    try {
+      await this.#events.pushRunError(
+        context,
+        runId,
+        `claude.${message.subtype}`,
+        message.errors.join("\n") || "Claude Agent SDK turn failed.",
+      );
+    } catch (error) {
+      throw new ClaudeTerminalWriteError(error);
+    }
   }
 }

@@ -58,12 +58,24 @@
       }
     },
     {
-      "delivery": "best_effort",
       "kind": "tool.call.updated",
       "payload": {
         "rawInput": "{\"file\":\"src/a.ts\"}",
         "status": "running",
         "toolCallId": "tool-2"
+      }
+    },
+    {
+      "kind": "message.added",
+      "payload": {
+        "content": [
+          {
+            "text": "pong",
+            "type": "text"
+          }
+        ],
+        "messageId": "<driver-id>",
+        "role": "agent"
       }
     },
     {

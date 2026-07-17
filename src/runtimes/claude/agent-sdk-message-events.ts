@@ -1,7 +1,13 @@
 import type { SDKFilesPersistedEvent, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
-import { isRecord, readNumber, readString } from "./agent-sdk-json";
+import {
+  isRecord,
+  readString,
+  sumTokenCounts,
+  toCostAmount,
+  toTokenCount,
+} from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 
 export function toClaudeFilesPersistedEvents(message: SDKFilesPersistedEvent): DriverEventInput[] {
@@ -50,16 +56,22 @@ export function toClaudeUsageUpdatedEvents(
   usage: JsonObject | null,
   costAmount: number | null,
 ): DriverEventInput[] {
-  if (!usage && costAmount === null) {
+  const inputTokens = toTokenCount(usage?.["input_tokens"]);
+  const outputTokens = toTokenCount(usage?.["output_tokens"]);
+  const cacheReadTokens = toTokenCount(usage?.["cache_read_input_tokens"]);
+  const cacheCreationTokens = toTokenCount(usage?.["cache_creation_input_tokens"]);
+  const totalTokens = sumTokenCounts(inputTokens, outputTokens);
+  const cost = toCostAmount(costAmount);
+
+  if (
+    inputTokens === null &&
+    outputTokens === null &&
+    cacheReadTokens === null &&
+    cacheCreationTokens === null &&
+    cost === null
+  ) {
     return [];
   }
-
-  const inputTokens = readNumber(usage, "input_tokens");
-  const outputTokens = readNumber(usage, "output_tokens");
-  const cacheReadTokens = readNumber(usage, "cache_read_input_tokens");
-  const cacheCreationTokens = readNumber(usage, "cache_creation_input_tokens");
-  const totalTokens =
-    inputTokens === null && outputTokens === null ? null : (inputTokens ?? 0) + (outputTokens ?? 0);
 
   return [
     {
@@ -67,8 +79,8 @@ export function toClaudeUsageUpdatedEvents(
       payload: {
         cachedReadTokens: cacheReadTokens,
         cachedWriteTokens: cacheCreationTokens,
-        costAmount,
-        costCurrency: costAmount === null ? null : "USD",
+        costAmount: cost,
+        costCurrency: cost === null ? null : "USD",
         inputTokens,
         outputTokens,
         size: null,
