@@ -361,6 +361,179 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(payload?.["finalMessageText"]).toBe("相同文本");
   });
 
+  test("keeps chunked stream deltas and the complete assistant snapshot on one message", async () => {
+    // Real SDK wire shape: every envelope (each stream chunk and the complete
+    // assistant replay) carries a distinct uuid; only the API message id inside
+    // message_start / assistant.message is stable across the whole message.
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          message: { id: "msg-api-1" },
+          type: "message_start",
+        },
+        type: "stream_event",
+        uuid: "envelope-1",
+      },
+      {
+        event: {
+          content_block: { text: "", type: "text" },
+          index: 0,
+          type: "content_block_start",
+        },
+        type: "stream_event",
+        uuid: "envelope-2",
+      },
+      {
+        event: {
+          delta: { text: "Got it —", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "envelope-3",
+      },
+      {
+        event: {
+          delta: { text: " I'm here.", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "envelope-4",
+      },
+      {
+        message: {
+          content: [{ text: "Got it — I'm here.", type: "text" }],
+          id: "msg-api-1",
+        },
+        type: "assistant",
+        uuid: "envelope-5",
+      },
+      {
+        event: {
+          index: 0,
+          type: "content_block_stop",
+        },
+        type: "stream_event",
+        uuid: "envelope-6",
+      },
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "envelope-7",
+      },
+      {
+        result: "Got it — I'm here.",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "envelope-8",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const startedEvents = events().filter((event) => event.kind === "message.started");
+    const completedEvents = events().filter((event) => event.kind === "message.completed");
+    const textMessages = events().flatMap((event) => {
+      if (event.kind !== "message.delta" || !isRecord(event.payload)) {
+        return [];
+      }
+
+      const contentDelta = event.payload["contentDelta"];
+      const messageId = event.payload["messageId"];
+      return typeof contentDelta === "string" && typeof messageId === "string"
+        ? [{ contentDelta, messageId }]
+        : [];
+    });
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+    const payload =
+      runCompleted === undefined || !isRecord(runCompleted.payload) ? null : runCompleted.payload;
+
+    expect(startedEvents).toHaveLength(1);
+    expect(completedEvents).toHaveLength(1);
+    expect(textMessages.map((entry) => entry.contentDelta)).toEqual(["Got it —", " I'm here."]);
+    expect(new Set(textMessages.map((entry) => entry.messageId)).size).toBe(1);
+    expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
+    expect(payload?.["finalMessageText"]).toBe("Got it — I'm here.");
+  });
+
+  test("scopes interleaved subagent stream chunks away from the main message", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          message: { id: "msg-main" },
+          type: "message_start",
+        },
+        parent_tool_use_id: null,
+        type: "stream_event",
+        uuid: "envelope-1",
+      },
+      {
+        event: {
+          message: { id: "msg-subagent" },
+          type: "message_start",
+        },
+        parent_tool_use_id: "tool-task-1",
+        type: "stream_event",
+        uuid: "envelope-2",
+      },
+      {
+        event: {
+          delta: { text: "主线程回答", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        parent_tool_use_id: null,
+        type: "stream_event",
+        uuid: "envelope-3",
+      },
+      {
+        event: {
+          delta: { text: "子代理输出", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        parent_tool_use_id: "tool-task-1",
+        type: "stream_event",
+        uuid: "envelope-4",
+      },
+      {
+        event: {
+          delta: { text: "，继续。", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        parent_tool_use_id: null,
+        type: "stream_event",
+        uuid: "envelope-5",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const textByMessageId = new Map<string, string>();
+
+    for (const event of events()) {
+      if (event.kind !== "message.delta" || !isRecord(event.payload)) {
+        continue;
+      }
+
+      const contentDelta = event.payload["contentDelta"];
+      const messageId = event.payload["messageId"];
+
+      if (typeof contentDelta === "string" && typeof messageId === "string") {
+        textByMessageId.set(messageId, (textByMessageId.get(messageId) ?? "") + contentDelta);
+      }
+    }
+
+    expect([...textByMessageId.values()].toSorted()).toEqual(["主线程回答，继续。", "子代理输出"]);
+  });
+
   test("does not promote a replayed stream-only message stop to canonical final", async () => {
     const { context, events, logger, translator } = createHarness();
     const messages = [
