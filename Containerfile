@@ -1,4 +1,4 @@
-FROM cloudflare/sandbox:0.12.3@sha256:23f67e16131b780865a5fa5aa3c8607408a730105c248836409f4e02bb6bf042
+FROM cloudflare/sandbox:0.12.3
 
 # Keep the default base image version in sync with apps/api/package.json -> @cloudflare/sandbox.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.211

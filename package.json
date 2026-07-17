@@ -18,9 +18,7 @@
   "files": [
     "dist",
     "src",
-    "assets",
-    "environment-package-managers.json",
-    "scripts/environment-package-manager-check.mjs"
+    "assets"
   ],
   "type": "module",
   "types": "./dist/types/index.d.ts",
