@@ -45,6 +45,7 @@ export class ClaudeAgentSdkMessageTranslator {
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #streamedTextMessages = new Set<string>();
   readonly #streamedTextByMessageId = new Map<string, string>();
+  readonly #streamingNativeMessageIds = new Map<string, string>();
   readonly #textByAssistantMessageId = new Map<MessageId, string>();
 
   constructor(options: ClaudeMessageTranslatorOptions) {
@@ -65,6 +66,7 @@ export class ClaudeAgentSdkMessageTranslator {
     this.#lastCompletedAssistantMessages.clear();
     this.#streamedTextByMessageId.clear();
     this.#streamedTextMessages.clear();
+    this.#streamingNativeMessageIds.clear();
     this.#textByAssistantMessageId.clear();
   }
 
@@ -152,7 +154,8 @@ export class ClaudeAgentSdkMessageTranslator {
         const isDuplicateStreamedText =
           text === null ||
           this.#streamedTextMessages.has(messageId) ||
-          isDuplicateClaudeFinalText(this.#streamedTextByMessageId, messageId, text);
+          isDuplicateClaudeFinalText(this.#streamedTextByMessageId, messageId, text) ||
+          this.#textByAssistantMessageId.get(messageId) === text;
 
         if (isTruthy(text) && !isDuplicateStreamedText) {
           this.#appendAssistantText(messageId, text);
@@ -207,16 +210,29 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const event = isRecord(message.event) ? message.event : null;
     const eventType = readString(event, "type");
+    // Each stream_event envelope carries its own uuid, so per-event envelope ids
+    // cannot identify the message. The API message id from message_start is the
+    // stable identity for every chunk until the matching message_stop.
+    const streamScopeKey = this.#streamScopeKey(runId, message);
 
     if (eventType === "message_start") {
+      const nativeMessageId = readString(readRecord(event, "message"), "id");
+
+      if (nativeMessageId !== null) {
+        this.#streamingNativeMessageIds.set(streamScopeKey, nativeMessageId);
+      }
+
       await this.#events.ensureMessageStarted(
         context,
-        this.#assistantMessageId(runId, this.#readNativeMessageId(message)),
+        this.#assistantMessageId(runId, nativeMessageId),
       );
       return;
     }
 
-    const messageId = this.#assistantMessageId(runId, this.#readNativeMessageId(message));
+    const messageId = this.#assistantMessageId(
+      runId,
+      this.#streamingNativeMessageIds.get(streamScopeKey) ?? null,
+    );
 
     if (eventType === "content_block_start") {
       await this.#handleContentBlockStart(context, messageId, event);
@@ -240,6 +256,7 @@ export class ClaudeAgentSdkMessageTranslator {
     if (eventType === "message_stop") {
       await this.endActiveThought(context);
       await this.#endAssistantMessage(context, runId, messageId);
+      this.#streamingNativeMessageIds.delete(streamScopeKey);
       this.#blockIndexToToolCallId.clear();
       return;
     }
@@ -249,6 +266,15 @@ export class ClaudeAgentSdkMessageTranslator {
       const usage = readRecord(event, "usage");
       await this.#events.pushUsage(context, usage ?? delta, null);
     }
+  }
+
+  #streamScopeKey(runId: RunId, message: SDKMessage): string {
+    // Subagent stream events (parent_tool_use_id set) interleave with the main
+    // thread; scope the in-flight message pointer so they never cross-merge.
+    const parentToolUseId = isRecord(message)
+      ? readString(message, "parent_tool_use_id")
+      : null;
+    return `${runId}:${parentToolUseId ?? "main"}`;
   }
 
   #appendStreamedText(messageId: string, text: string): void {
@@ -519,7 +545,14 @@ export class ClaudeAgentSdkMessageTranslator {
   }
 
   #readNativeMessageId(message: SDKMessage): string | null {
-    return isRecord(message) ? readString(message, "uuid") : null;
+    if (!isRecord(message)) {
+      return null;
+    }
+
+    // The envelope uuid is unique per emitted SDK message, including the
+    // complete-assistant replays of an already-streamed message. Prefer the API
+    // message id so stream chunks and completion snapshots share one identity.
+    return readString(readRecord(message, "message"), "id") ?? readString(message, "uuid");
   }
 
   async #handleSystemMessage(
