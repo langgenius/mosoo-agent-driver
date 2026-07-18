@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
@@ -62,6 +63,7 @@ function createLiveStartInput(input: {
   cwd: string;
   homePath: string;
   sharedRootPath: string;
+  systemPrompt?: string;
 }): DriverStartInput {
   return {
     ...bootPayload,
@@ -86,7 +88,9 @@ function createLiveStartInput(input: {
       },
       skillCatalog: [],
       skills: [],
-      systemPrompt: "Reply to the user with exactly one lowercase word: pong. Do not call tools.",
+      systemPrompt:
+        input.systemPrompt ??
+        "Reply to the user with exactly one lowercase word: pong. Do not call tools.",
     },
     runtime: "claude-agent-sdk",
     runtimeTransport: "claude-agent-sdk",
@@ -96,21 +100,56 @@ function createLiveStartInput(input: {
 const liveApiKey = readLiveApiKey();
 const liveTest = liveApiKey ? test : test.skip;
 
+function createLiveKernel(): AgentDriverKernelCore {
+  return new AgentDriverKernelCore({
+    backendFactory: (input) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(input),
+    hostPorts: {
+      skill: {
+        materialize: async () => [],
+      },
+    },
+  });
+}
+
+function hasPayloadValue(event: DriverEventInput, key: string, value: string): boolean {
+  return (
+    typeof event.payload === "object" &&
+    event.payload !== null &&
+    !Array.isArray(event.payload) &&
+    (event.payload as Record<string, unknown>)[key] === value
+  );
+}
+
+async function sendTurn(
+  kernel: AgentDriverKernelCore,
+  suffix: string,
+  text: string,
+  runId = DRIVER_TEST_IDS.runId,
+): Promise<DriverEventInput[]> {
+  const requestId = `live-claude-request-${suffix}`;
+  const dispatch = kernel.dispatch({
+    commandId: `live-claude-input-${suffix}`,
+    input: { text },
+    kind: "input.start",
+    requestId,
+    runId,
+  });
+  const events = await waitForTerminalTurnEvent({
+    events: kernel.events(),
+    timeoutMs: LIVE_TURN_TIMEOUT_MS,
+  });
+
+  await expect(dispatch).resolves.toEqual({ requestId });
+  return events;
+}
+
 describe("Claude Agent SDK live provider", () => {
   liveTest(
     "sends ping through the driver and receives pong from Anthropic",
     async () => {
       expect(liveApiKey).toBeString();
       const paths = await createLiveDriverPaths();
-      const kernel = new AgentDriverKernelCore({
-        backendFactory: (input) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(input),
-        hostPorts: {
-          skill: {
-            materialize: async () => [],
-          },
-        },
-      });
-      const events = kernel.events();
+      const kernel = createLiveKernel();
 
       try {
         await kernel.start(
@@ -122,25 +161,49 @@ describe("Claude Agent SDK live provider", () => {
           }),
         );
 
-        const dispatch = kernel.dispatch({
-          commandId: "live-input-1",
-          input: {
-            text: "ping",
-          },
-          kind: "input.start",
-          requestId: "live-request-1",
-          runId: DRIVER_TEST_IDS.runId,
-        });
-        const turnEvents = await waitForTerminalTurnEvent({
-          events,
-          timeoutMs: LIVE_TURN_TIMEOUT_MS,
-        });
+        const turnEvents = await sendTurn(kernel, "smoke", "ping");
         const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
 
-        await expect(dispatch).resolves.toEqual({
-          requestId: "live-request-1",
-        });
         expect(outputText).toContain("pong");
+      } finally {
+        await kernel.stop("test.stop").catch(() => {});
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "reads and writes workspace files through SDK tools",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const inputName = "source file-λ.txt";
+      const outputName = "claude-output.txt";
+      const contents = "claude-live-token-6241";
+      await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          "workspace-tools",
+          `Use Read to read ${JSON.stringify(inputName)}. Use Write to create ${JSON.stringify(outputName)} with exactly the text you read. Do not use Bash. Reply with exactly files-done.`,
+        );
+
+        expect(events.some((event) => hasPayloadValue(event, "title", "Read"))).toBe(true);
+        expect(events.some((event) => hasPayloadValue(event, "title", "Write"))).toBe(true);
+        expect(events.map(textDeltaFrom).join("")).toContain("files-done");
+        expect(await readFile(join(paths.cwd, inputName), "utf8")).toBe(`${contents}\n`);
+        expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
       } finally {
         await kernel.stop("test.stop").catch(() => {});
       }
