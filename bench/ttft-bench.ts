@@ -16,7 +16,7 @@
  * tool-requiring task, without needing the eventual code changes in place.
  *
  * Run (from apps/driver):
- *   ANTHROPIC_API_KEY=... OPENAI_API_KEY=... bun bench/ttft-bench.ts
+ *   ANTHROPIC_API_KEY=... OPENAI_API_KEY=... vp run bench
  * Flags (env):
  *   TTFT_TRIALS=5            trials per cell (default 5) + 1 discarded warmup
  *   TTFT_RUNTIMES=claude,openai,opencode   subset to run

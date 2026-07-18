@@ -118,7 +118,7 @@ describe("driver artifact contract", () => {
     expect(dockerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
     expect(dockerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
     expect(dockerignore).toContain("!dist/driver.mjs");
-    expect(dockerBuildScript).toBe("bun run build && docker build -t agent-driver:local .");
+    expect(dockerBuildScript).toBe("vp run build && docker build -t agent-driver:local .");
   });
 
   test("pins the OpenAI runtime, SDK, and app-server schema to one stable version", () => {

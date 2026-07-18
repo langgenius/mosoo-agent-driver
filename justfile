@@ -1,37 +1,32 @@
 default:
-    just --list
+    @just --list
 
 fmt:
     vp fmt .
 
 lint: fmt
-    bun run lint
+    vp run lint
 
 tc: lint
-    bun run tc
+    vp run tc
 
 test: lint
-    bun run test
+    vp run test
 
 build: test
-    bun run build
-
-ci: lint
-    bun run tc
-    bun run test
-    bun run build
+    vp run build
 
 docker-build:
-    bun run docker:build
+    vp run docker:build
 
 live-anthropic:
-    bun run test:live:anthropic
+    vp run test:live:anthropic
 
 live-openai:
-    bun run test:live:openai
+    vp run test:live:openai
 
 live-opencode:
-    bun run test:live:opencode
+    vp run test:live:opencode
 
 clean:
     fd -u -t d -F node_modules . -X rm -rf

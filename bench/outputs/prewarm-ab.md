@@ -7,8 +7,8 @@ same machine/session, live Anthropic API.
 Reproduce (from `apps/driver`):
 
 ```sh
-AGENT_DRIVER_CLAUDE_PREWARM=0 TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=no_tool bun bench/ttft-bench.ts
-TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=no_tool bun bench/ttft-bench.ts
+AGENT_DRIVER_CLAUDE_PREWARM=0 TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=no_tool vp run bench
+TTFT_TRIALS=5 TTFT_RUNTIMES=claude TTFT_SCENARIOS=no_tool vp run bench
 ```
 
 | config          | TTFT p50 | TTFT p95 | boot p50 | per-trial TTFT (ms)          |
