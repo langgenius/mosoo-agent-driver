@@ -19,7 +19,7 @@ concurrency:
 jobs:
   validate-pr-title:
     name: Validate PR title
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       pull-requests: read
     steps:
@@ -43,7 +43,7 @@ jobs:
 
   check:
     name: Check
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -77,7 +77,7 @@ jobs:
   docker:
     name: Docker
     needs: check
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
