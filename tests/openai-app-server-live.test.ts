@@ -3,12 +3,33 @@ import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:f
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { applyCommittedMutation, validateSessionSnapshot } from "../src/contract";
+import type {
+  AuthorityOperation,
+  CommittedMutation,
+  Run,
+  SessionSnapshot,
+} from "../src/contract";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { OPENAI_DEFAULT_MODEL_ID } from "../src/models";
+import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
+import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
+import { createTurnParams } from "../src/runtimes/openai/app-server-driver-backend";
+import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "../src/runtimes/openai/app-server-env";
+import {
+  OPENAI_APP_SERVER_MCP_ELICITATION_EXTENSION,
+  OpenAiContractAdapter,
+  type OpenAiAuthorityUpdate,
+} from "../src/runtimes/openai/contract-adapter";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
-import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
+import {
+  DRIVER_TEST_IDS,
+  FakeDriverRuntimeIo,
+  bootPayload,
+} from "./driver-runtime-boundary-fixtures";
 import {
   textDeltaFrom,
   waitForTerminalTurnEvent,
@@ -23,6 +44,7 @@ const OPENAI_RUNTIME_HOME_ENV = "CODEX_HOME";
 const OPENAI_RUNTIME_HOME_DIR = ".codex";
 const LIVE_OPERATION_TIMEOUT_MS = 15_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
+const CONTRACT_COMMAND_ID = "00000000000000000000009001";
 
 const tempRoots: string[] = [];
 
@@ -147,6 +169,77 @@ function createLiveKernel(): AgentDriverKernelCore {
       },
     },
   });
+}
+
+function createLiveContractSnapshot(run: Run, capturedAt: string): SessionSnapshot {
+  return validateSessionSnapshot({
+    capturedAt,
+    interactions: [],
+    items: [],
+    protocolVersion: 2,
+    revision: 0,
+    runs: [run],
+    session: {
+      capabilities: {
+        [OPENAI_APP_SERVER_MCP_ELICITATION_EXTENSION]: {},
+        "interaction.input": {},
+        "interaction.permission": {},
+        "interaction.tool": {},
+        "item.change": {},
+        "item.plan": {},
+        "item.reasoning": {},
+        "item.terminal": {},
+        "openai.app-server/thread-item": {},
+      },
+      config: [],
+      createdAt: capturedAt,
+      id: DRIVER_TEST_IDS.sessionId,
+      status: "open",
+      updatedAt: capturedAt,
+    },
+  });
+}
+
+function createLiveContractAdapter(run: Run) {
+  let nextId = 9_100;
+  let snapshot = createLiveContractSnapshot(run, run.startedAt);
+  const authority: OpenAiAuthorityUpdate[] = [];
+  const committedMutationIds = new Set<string>();
+  const terminal = Promise.withResolvers<void>();
+  const adapter = new OpenAiContractAdapter({
+    authority: async (update) => {
+      authority.push(update);
+
+      if (!committedMutationIds.has(update.mutationId)) {
+        const mutation: CommittedMutation = {
+          baseRevision: snapshot.revision,
+          cause: update.cause,
+          committedAt: new Date().toISOString(),
+          mutationId: update.mutationId,
+          operations: [...update.operations] as AuthorityOperation[],
+          revision: snapshot.revision + 1,
+          sessionId: DRIVER_TEST_IDS.sessionId,
+        };
+        snapshot = applyCommittedMutation(snapshot, mutation);
+        committedMutationIds.add(update.mutationId);
+      }
+
+      if (snapshot.runs.find((entry) => entry.id === run.id)?.status !== "active") {
+        terminal.resolve();
+      }
+    },
+    createId: () => String(nextId++).padStart(26, "0"),
+    now: () => new Date(),
+    preview: () => {},
+    sessionId: DRIVER_TEST_IDS.sessionId,
+  });
+
+  return {
+    adapter,
+    authority,
+    snapshot: () => snapshot,
+    terminal: terminal.promise,
+  };
 }
 
 async function stopLiveKernel(kernel: AgentDriverKernelCore, reason: string): Promise<void> {
@@ -573,5 +666,146 @@ describe("OpenAI app-server live provider", () => {
       }
     },
     LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+});
+
+describe("OpenAI Contract adapter live provider", () => {
+  liveTest(
+    "projects real file tools into Contract Authority",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const inputName = "contract-input.txt";
+      const outputName = "contract-output.txt";
+      const contents = "live-contract-token-9537";
+      const prompt = `Use a shell command to read ${inputName}. Then use the file patch tool to create ${outputName} with exactly the text you read. Reply with exactly contract-done.`;
+      const startedAt = new Date().toISOString();
+      const run = {
+        id: DRIVER_TEST_IDS.runId,
+        input: [{ text: prompt, type: "text" }],
+        origin: "user",
+        startedAt,
+        status: "active",
+      } satisfies Run;
+      const contract = createLiveContractAdapter(run);
+      const payload = createLiveStartInput({
+        apiKey: liveApiKey,
+        cwd: paths.cwd,
+        homePath: paths.homePath,
+        sharedRootPath: paths.sharedRootPath,
+        systemPrompt:
+          "Perform requested workspace operations with tools, then answer exactly as requested.",
+      });
+      const logger = createBufferedSinkLogger({
+        level: "debug",
+        service: "openai-contract-live-test",
+        sink: async () => {},
+      });
+      const protocolFailure = Promise.withResolvers<void>();
+      let protocolError: Error | null = null;
+      const context = createAgentDriverContext({
+        eventSink: new FakeDriverRuntimeIo([]),
+        logger,
+        payload,
+        permission: { request: async () => "reject_once" },
+      });
+      const client = new OpenAiAppServerClient(payload, {
+        ...context,
+        handleNotification: async (method, params) => {
+          await contract.adapter.handleNotification(method, params);
+        },
+        handleProtocolError: async (error) => {
+          protocolError = error;
+          protocolFailure.resolve();
+        },
+      });
+      await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
+
+      try {
+        await client.start();
+        const threadResult = await client.request("thread/start", {
+          approvalPolicy: "never",
+          cwd: paths.cwd,
+          developerInstructions: payload.execution.systemPrompt,
+          model: readLiveModel(),
+          modelProvider: "openai",
+          sandbox: MOSOO_OPENAI_RUNTIME_SANDBOX_MODE,
+          sessionStartSource: "startup",
+        });
+        const turnResult = await client.request(
+          "turn/start",
+          createTurnParams({
+            approvalPolicy: "never",
+            cwd: paths.cwd,
+            model: readLiveModel(),
+            text: prompt,
+            threadId: threadResult.thread.id,
+          }),
+        );
+        await contract.adapter.attachTurn({
+          cause: { commandId: CONTRACT_COMMAND_ID, type: "command" },
+          run,
+          threadId: threadResult.thread.id,
+          turnId: turnResult.turn.id,
+        });
+
+        if (
+          turnResult.turn.status === "completed" ||
+          turnResult.turn.status === "failed" ||
+          turnResult.turn.status === "interrupted"
+        ) {
+          await contract.adapter.handleNotification("turn/completed", {
+            threadId: threadResult.thread.id,
+            turn: turnResult.turn,
+          });
+        }
+
+        await withLiveTimeout({
+          details: { turnId: turnResult.turn.id },
+          label: "Contract terminal Authority mutation",
+          logStatus: logLiveStatus,
+          task: async () => {
+            await Promise.race([contract.terminal, protocolFailure.promise]);
+
+            if (protocolError !== null) {
+              throw protocolError;
+            }
+          },
+          timeoutMs: LIVE_TURN_TIMEOUT_MS,
+        });
+        await client.drainServerMessages();
+
+        const snapshot = contract.snapshot();
+        const completedRun = snapshot.runs.find((entry) => entry.id === run.id);
+        const terminalItem = snapshot.items.find(
+          (item) => item.kind === "terminal" && JSON.stringify(item).includes(contents),
+        );
+        const changeItem = snapshot.items.find(
+          (item) =>
+            item.kind === "change" &&
+            item.changes.some((change) => change.path.endsWith(outputName)),
+        );
+        const messageItem = snapshot.items.find(
+          (item) => item.kind === "message" && JSON.stringify(item).includes("contract-done"),
+        );
+
+        expect(completedRun?.status).toBe("completed");
+        expect(completedRun?.usage?.total).toBeGreaterThan(0);
+        expect(terminalItem).toMatchObject({ status: "completed" });
+        expect(changeItem).toMatchObject({ status: "completed" });
+        expect(messageItem).toMatchObject({ status: "completed" });
+        expect(contract.authority.every((update) => update.turnId === turnResult.turn.id)).toBe(
+          true,
+        );
+        expect(snapshot.interactions.every((interaction) => interaction.status !== "open")).toBe(
+          true,
+        );
+        expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        contract.adapter.dispose();
+        await client.stop();
+        await logger.destroy();
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 10_000,
   );
 });
