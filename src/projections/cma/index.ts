@@ -7,6 +7,13 @@ type CmaInboundType =
   | "user.message"
   | "user.tool_confirmation";
 
+export class CmaInvalidEventError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CmaInvalidEventError";
+  }
+}
+
 export class CmaUnsupportedFieldError extends Error {
   readonly field: string;
 
@@ -54,10 +61,9 @@ export type CmaInboundEvent =
   | CmaUserMessageEvent
   | CmaUserToolConfirmationEvent;
 
-export type CmaSessionStatus = "idle" | "running" | "terminated";
+export type CmaSessionStatus = "idle" | "rescheduling" | "running" | "terminated";
 
 export interface CmaOutboundEvent {
-  readonly debug?: unknown;
   readonly error?: unknown;
   readonly message?: unknown;
   readonly metadata?: Record<string, unknown>;
@@ -72,6 +78,7 @@ export interface CmaOutboundEvent {
     | "agent.tool_use"
     | "session.error"
     | "session.status_idle"
+    | "session.status_rescheduling"
     | "session.status_running"
     | "session.status_terminated"
     | "session.usage";
@@ -100,7 +107,7 @@ function readString(record: Record<string, unknown>, field: string): string {
   const value = record[field];
 
   if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`CMA field ${field} must be a non-empty string.`);
+    throw new CmaInvalidEventError(`CMA field ${field} must be a non-empty string.`);
   }
 
   return value;
@@ -114,7 +121,7 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
   }
 
   if (typeof value !== "string") {
-    throw new Error(`CMA field ${field} must be a string.`);
+    throw new CmaInvalidEventError(`CMA field ${field} must be a string.`);
   }
 
   return value;
@@ -131,7 +138,7 @@ function readOptionalStringArray(
   }
 
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new Error(`CMA field ${field} must be a string array.`);
+    throw new CmaInvalidEventError(`CMA field ${field} must be a string array.`);
   }
 
   return value;
@@ -139,7 +146,7 @@ function readOptionalStringArray(
 
 function readInboundType(input: unknown): CmaInboundType {
   if (!isRecord(input)) {
-    throw new Error("CMA inbound event must be an object.");
+    throw new CmaInvalidEventError("CMA inbound event must be an object.");
   }
 
   const type = input["type"];
@@ -150,7 +157,7 @@ function readInboundType(input: unknown): CmaInboundType {
     type !== "user.message" &&
     type !== "user.tool_confirmation"
   ) {
-    throw new Error(`Unsupported CMA event type: ${String(type)}.`);
+    throw new CmaInvalidEventError(`Unsupported CMA event type: ${String(type)}.`);
   }
 
   return type;
@@ -197,7 +204,7 @@ export function parseCmaInboundEvent(input: unknown): CmaInboundEvent {
       const decision = readString(record, "decision");
 
       if (decision !== "allow_once" && decision !== "reject_once") {
-        throw new Error("CMA field decision must be allow_once or reject_once.");
+        throw new CmaInvalidEventError("CMA field decision must be allow_once or reject_once.");
       }
 
       return {
@@ -283,6 +290,15 @@ function readToolEventType(payload: Record<string, unknown>): CmaOutboundEvent["
   return "agent.tool_use";
 }
 
+function isRecoverableFailure(payload: Record<string, unknown>): boolean {
+  if (payload["recoverable"] === true) {
+    return true;
+  }
+
+  const error = payload["error"];
+  return isRecord(error) && error["retryable"] === true;
+}
+
 export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEvent[] {
   const payload = readPayloadRecord(event);
 
@@ -347,14 +363,23 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
         },
       ];
     }
-    case "run.started":
-    case "run.waiting": {
+    case "run.started": {
       return [
         {
           metadata: payload,
           sessionStatus: "running",
           sourceEventKind: event.kind,
           type: "session.status_running",
+        },
+      ];
+    }
+    case "run.waiting": {
+      return [
+        {
+          metadata: payload,
+          sessionStatus: "idle",
+          sourceEventKind: event.kind,
+          type: "session.status_idle",
         },
       ];
     }
@@ -370,21 +395,14 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
       ];
     }
     case "run.failed": {
+      const recoverable = isRecoverableFailure(payload);
+
       return [
         {
           error: payload,
-          sessionStatus: "terminated",
+          sessionStatus: recoverable ? "rescheduling" : "terminated",
           sourceEventKind: event.kind,
-          type: "session.error",
-        },
-      ];
-    }
-    case "diagnostic.reported": {
-      return [
-        {
-          debug: payload,
-          sourceEventKind: event.kind,
-          type: "session.status_idle",
+          type: recoverable ? "session.status_rescheduling" : "session.error",
         },
       ];
     }
