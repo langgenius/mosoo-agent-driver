@@ -1,16 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import type { StopReason } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
 
 import type { DriverEventInput } from "../src/protocol/events";
 import {
   AcpTurnEventState,
-  toAcpSessionReadyEvents,
+  toSessionReadyEvents,
 } from "../src/runtimes/acp/acp-event-translator";
 import type { AcpTurnEventStateInput } from "../src/runtimes/acp/acp-event-translator";
-import type { AcpPromptStopReason } from "../src/runtimes/acp/acp-types";
 
 interface CompletePromptFixture {
-  readonly stopReason: AcpPromptStopReason;
+  readonly stopReason: StopReason;
   readonly usage: unknown;
 }
 
@@ -288,7 +288,7 @@ function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   }
 
   if (fixture.sessionReady !== undefined) {
-    events.push(...toAcpSessionReadyEvents(fixture.sessionReady));
+    events.push(...toSessionReadyEvents(fixture.sessionReady));
   }
 
   for (const update of fixture.updates) {
@@ -296,7 +296,7 @@ function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   }
 
   if (fixture.permissionRequest !== undefined) {
-    events.push(...state.translatePermissionRequest(fixture.permissionRequest).events);
+    events.push(...state.translatePermission(fixture.permissionRequest).events);
   }
 
   if (fixture.failPrompt !== undefined) {

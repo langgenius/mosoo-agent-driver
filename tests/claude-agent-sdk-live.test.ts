@@ -1,18 +1,42 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+import { applyCommittedMutation, validateSessionSnapshot } from "../src/contract";
+import type {
+  AuthorityOperation,
+  CommittedMutation,
+  Run,
+  SessionSnapshot,
+} from "../src/contract";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import { createBufferedSinkLogger } from "../src/observability";
+import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
+import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { ClaudeContractAdapter } from "../src/runtimes/claude/contract-adapter";
+import { createClaudeQueryOptions } from "../src/runtimes/claude/agent-sdk-query-options";
+import type { ContractAuthorityUpdate } from "../src/runtimes/contract-projection";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
-import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
-import { textDeltaFrom, waitForTerminalTurnEvent } from "./live-driver-events";
+import {
+  DRIVER_TEST_IDS,
+  FakeDriverRuntimeIo,
+  bootPayload,
+} from "./driver-runtime-boundary-fixtures";
+import {
+  textDeltaFrom,
+  waitForTerminalTurnEvent,
+  withLiveTimeout,
+} from "./live-driver-events";
 
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
 const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_MODEL";
 const DEFAULT_LIVE_MODEL = "claude-sonnet-5";
+const LIVE_OPERATION_TIMEOUT_MS = 15_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 
 const tempRoots: string[] = [];
@@ -62,6 +86,7 @@ function createLiveStartInput(input: {
   cwd: string;
   homePath: string;
   sharedRootPath: string;
+  systemPrompt?: string;
 }): DriverStartInput {
   return {
     ...bootPayload,
@@ -86,7 +111,9 @@ function createLiveStartInput(input: {
       },
       skillCatalog: [],
       skills: [],
-      systemPrompt: "Reply to the user with exactly one lowercase word: pong. Do not call tools.",
+      systemPrompt:
+        input.systemPrompt ??
+        "Reply to the user with exactly one lowercase word: pong. Do not call tools.",
     },
     runtime: "claude-agent-sdk",
     runtimeTransport: "claude-agent-sdk",
@@ -96,21 +123,230 @@ function createLiveStartInput(input: {
 const liveApiKey = readLiveApiKey();
 const liveTest = liveApiKey ? test : test.skip;
 
+function createLiveKernel(): AgentDriverKernelCore {
+  return new AgentDriverKernelCore({
+    backendFactory: (input) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(input),
+    hostPorts: {
+      skill: {
+        materialize: async () => [],
+      },
+    },
+  });
+}
+
+function createLiveContractSnapshot(run: Run): SessionSnapshot {
+  return validateSessionSnapshot({
+    capturedAt: run.startedAt,
+    interactions: [],
+    items: [],
+    protocolVersion: 2,
+    revision: 0,
+    runs: [run],
+    session: {
+      capabilities: {
+        "interaction.permission": {},
+        "item.artifact": {},
+        "item.change": {},
+        "item.plan": {},
+        "item.reasoning": {},
+        "item.terminal": {},
+      },
+      config: [],
+      createdAt: run.startedAt,
+      id: DRIVER_TEST_IDS.sessionId,
+      status: "open",
+      updatedAt: run.startedAt,
+    },
+  });
+}
+
+function createLiveContractAdapter(run: Run) {
+  let nextId = 9_200;
+  let snapshot = createLiveContractSnapshot(run);
+  const authority: ContractAuthorityUpdate[] = [];
+  const committedMutationIds = new Set<string>();
+  const adapter = new ClaudeContractAdapter({
+    authority: async (update) => {
+      authority.push(update);
+
+      if (committedMutationIds.has(update.mutationId)) {
+        return;
+      }
+
+      const mutation: CommittedMutation = {
+        baseRevision: snapshot.revision,
+        cause: update.cause,
+        committedAt: new Date().toISOString(),
+        mutationId: update.mutationId,
+        operations: [...update.operations] as AuthorityOperation[],
+        revision: snapshot.revision + 1,
+        sessionId: DRIVER_TEST_IDS.sessionId,
+      };
+      snapshot = applyCommittedMutation(snapshot, mutation);
+      committedMutationIds.add(update.mutationId);
+    },
+    createId: () => String(nextId++).padStart(26, "0"),
+    now: () => new Date(),
+    preview: () => {},
+    sessionId: DRIVER_TEST_IDS.sessionId,
+  });
+  adapter.attachRun(run);
+
+  return {
+    adapter,
+    authority,
+    snapshot: () => snapshot,
+  };
+}
+
+function hasPayloadValue(event: DriverEventInput, key: string, value: string): boolean {
+  return (
+    typeof event.payload === "object" &&
+    event.payload !== null &&
+    !Array.isArray(event.payload) &&
+    (event.payload as Record<string, unknown>)[key] === value
+  );
+}
+
+function hasPayloadText(event: DriverEventInput, key: string, text: string): boolean {
+  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+    return false;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.includes(text);
+}
+
+function payloadString(event: DriverEventInput | undefined, key: string): string | null {
+  if (
+    event === undefined ||
+    typeof event.payload !== "object" ||
+    event.payload === null ||
+    Array.isArray(event.payload)
+  ) {
+    return null;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
+function toolCallId(events: readonly DriverEventInput[], title: string): string | null {
+  return payloadString(
+    events.find(
+      (event) => event.kind === "item.started" && hasPayloadValue(event, "title", title),
+    ),
+    "itemId",
+  );
+}
+
+function hasToolStatus(
+  events: readonly DriverEventInput[],
+  id: string | null,
+  status: "completed" | "failed",
+): boolean {
+  return (
+    id !== null &&
+    events.some(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        payloadString(event, "toolCallId") === id &&
+        hasPayloadValue(event, "status", status),
+    )
+  );
+}
+
+function fromIterator(iterator: AsyncIterator<DriverEventInput>): AsyncIterable<DriverEventInput> {
+  return { [Symbol.asyncIterator]: () => iterator };
+}
+
+async function waitForLiveEvent(
+  iterator: AsyncIterator<DriverEventInput>,
+  predicate: (event: DriverEventInput) => boolean,
+  label: string,
+): Promise<DriverEventInput> {
+  return withLiveTimeout({
+    details: { label },
+    label,
+    logStatus: () => {},
+    task: async () => {
+      while (true) {
+        const next = await iterator.next();
+
+        if (next.done) {
+          throw new Error(`Driver event stream closed before ${label}.`);
+        }
+
+        if (predicate(next.value)) {
+          return next.value;
+        }
+
+        if (
+          next.value.kind === "run.completed" ||
+          next.value.kind === "run.failed" ||
+          next.value.kind === "run.cancelled"
+        ) {
+          throw new Error(`Driver turn ended with ${next.value.kind} before ${label}.`);
+        }
+      }
+    },
+    timeoutMs: LIVE_TURN_TIMEOUT_MS,
+  });
+}
+
+async function stopLiveKernel(kernel: AgentDriverKernelCore, reason: string): Promise<void> {
+  await withLiveTimeout({
+    details: { reason },
+    label: "live kernel shutdown",
+    logStatus: () => {},
+    task: () => kernel.stop(reason),
+    timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+  });
+}
+
+async function sendTurn(
+  kernel: AgentDriverKernelCore,
+  events: AsyncIterable<DriverEventInput>,
+  suffix: string,
+  text: string,
+  runId = DRIVER_TEST_IDS.runId,
+): Promise<DriverEventInput[]> {
+  const requestId = `live-claude-request-${suffix}`;
+  const dispatch = kernel.dispatch({
+    commandId: `live-claude-input-${suffix}`,
+    input: { text },
+    kind: "input.start",
+    requestId,
+    runId,
+  });
+  const turnEvents = await waitForTerminalTurnEvent({
+    events,
+    timeoutMs: LIVE_TURN_TIMEOUT_MS,
+  });
+
+  await expect(dispatch).resolves.toEqual({ requestId });
+  return turnEvents;
+}
+
+async function sendPing(
+  kernel: AgentDriverKernelCore,
+  events: AsyncIterable<DriverEventInput>,
+  suffix: string,
+  runId = DRIVER_TEST_IDS.runId,
+): Promise<void> {
+  const turnEvents = await sendTurn(kernel, events, suffix, "ping", runId);
+  const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
+
+  expect(outputText).toContain("pong");
+}
+
 describe("Claude Agent SDK live provider", () => {
   liveTest(
     "sends ping through the driver and receives pong from Anthropic",
     async () => {
       expect(liveApiKey).toBeString();
       const paths = await createLiveDriverPaths();
-      const kernel = new AgentDriverKernelCore({
-        backendFactory: (input) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(input),
-        hostPorts: {
-          skill: {
-            materialize: async () => [],
-          },
-        },
-      });
-      const events = kernel.events();
+      const kernel = createLiveKernel();
 
       try {
         await kernel.start(
@@ -122,29 +358,519 @@ describe("Claude Agent SDK live provider", () => {
           }),
         );
 
-        const dispatch = kernel.dispatch({
-          commandId: "live-input-1",
-          input: {
-            text: "ping",
-          },
-          kind: "input.start",
-          requestId: "live-request-1",
-          runId: DRIVER_TEST_IDS.runId,
-        });
-        const turnEvents = await waitForTerminalTurnEvent({
-          events,
-          timeoutMs: LIVE_TURN_TIMEOUT_MS,
-        });
-        const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
-
-        await expect(dispatch).resolves.toEqual({
-          requestId: "live-request-1",
-        });
-        expect(outputText).toContain("pong");
+        await sendPing(kernel, kernel.events(), "smoke");
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "reads a workspace file through the Read tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const inputName = "source file-λ.txt";
+      const contents = "claude-read-token-6241";
+      await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "read-file",
+          `Use Read to read ${JSON.stringify(inputName)}. Do not use Bash. Reply with exactly its contents and nothing else.`,
+        );
+
+        const readToolId = toolCallId(events, "Read");
+
+        expect(readToolId).not.toBeNull();
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              payloadString(event, "toolCallId") === readToolId &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", contents),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("")).toContain(contents);
+        expect(await readFile(join(paths.cwd, inputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "creates a workspace file through the Write tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const outputName = "claude-output.txt";
+      const contents = "claude-write-token-7352";
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "write-file",
+          `Use Write to create ${JSON.stringify(outputName)} with exactly one line: ${contents}. Do not use Bash. Reply with exactly written.`,
+        );
+
+        const writeToolId = toolCallId(events, "Write");
+
+        expect(writeToolId).not.toBeNull();
+        expect(hasToolStatus(events, writeToolId, "completed")).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("written");
+        expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "recovers after a failed Bash command",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Run every requested Bash command in order even when one fails, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "failed-command",
+          "Run `sh -c 'printf claude-stdout; printf claude-stderr >&2; exit 7'`. After it fails, run `printf claude-recovered`. Then reply with exactly recovered.",
+        );
+        const bashStarts = events.filter(
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+        );
+
+        expect(bashStarts.length).toBeGreaterThanOrEqual(2);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" && hasPayloadValue(event, "status", "failed"),
+          ),
+        ).toBe(true);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", "claude-recovered"),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("recovered");
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "edits and deletes workspace files through SDK tools",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const editName = "edit target.txt";
+      const deleteName = "delete target-λ.txt";
+      await Promise.all([
+        writeFile(join(paths.cwd, editName), "before\n", "utf8"),
+        writeFile(join(paths.cwd, deleteName), "remove me\n", "utf8"),
+      ]);
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "edit-delete-files",
+          `Use Edit to replace before with after in ${JSON.stringify(editName)}. Then use Bash to delete ${JSON.stringify(deleteName)}. Reply with exactly mutated.`,
+        );
+
+        const editToolId = toolCallId(events, "Edit");
+        const bashToolId = toolCallId(events, "Bash");
+
+        expect(editToolId).not.toBeNull();
+        expect(bashToolId).not.toBeNull();
+        expect(hasToolStatus(events, editToolId, "completed")).toBe(true);
+        expect(hasToolStatus(events, bashToolId, "completed")).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("mutated");
+        expect(await readFile(join(paths.cwd, editName), "utf8")).toBe("after\n");
+        await expect(readFile(join(paths.cwd, deleteName), "utf8")).rejects.toThrow();
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "resumes the native session in a fresh process",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const firstKernel = createLiveKernel();
+      const memoryToken = "claude-resume-memory-5183";
+      let firstStopped = false;
+
+      try {
+        await firstKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+          }),
+        );
+        const firstEvents = await sendTurn(
+          firstKernel,
+          firstKernel.events(),
+          "resume-store",
+          `Remember the token ${memoryToken}. Reply with exactly stored.`,
+        );
+        const resumePointer = payloadString(
+          firstEvents.find((event) => event.kind === "runtime.resume.updated"),
+          "resumePointer",
+        );
+        expect(resumePointer).not.toBeNull();
+        await stopLiveKernel(firstKernel, "live.resume-restart");
+        firstStopped = true;
+
+        const baseInput = createLiveStartInput({
+          apiKey: liveApiKey,
+          cwd: paths.cwd,
+          homePath: paths.homePath,
+          sharedRootPath: paths.sharedRootPath,
+          systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+        });
+        const resumedKernel = createLiveKernel();
+
+        try {
+          await resumedKernel.start({
+            ...baseInput,
+            execution: {
+              ...baseInput.execution,
+              session: {
+                ...baseInput.execution.session,
+                nativeResumeRef: {
+                  kind: "claude_session_id",
+                  runtimeId: "claude-agent-sdk",
+                  value: resumePointer!,
+                },
+              },
+            },
+          });
+          const events = await sendTurn(
+            resumedKernel,
+            resumedKernel.events(),
+            "resume-recall",
+            "Reply with exactly the token I asked you to remember in the previous turn.",
+            DRIVER_TEST_IDS.secondRunId,
+          );
+
+          expect(events.map(textDeltaFrom).join("")).toContain(memoryToken);
+        } finally {
+          await stopLiveKernel(resumedKernel, "test.stop");
+        }
+      } finally {
+        if (!firstStopped) {
+          await stopLiveKernel(firstKernel, "test.stop");
+        }
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+
+  liveTest(
+    "cancels a running tool and accepts the next turn",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const iterator = kernel.events()[Symbol.asyncIterator]();
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "When asked to wait, run the requested Bash command. For every other request, reply with exactly pong.",
+          }),
+        );
+        const runningInput = kernel.dispatch({
+          commandId: "live-claude-input-cancelled",
+          input: { text: "Run the Bash command `sleep 30`, then reply pong." },
+          kind: "input.start",
+          requestId: "live-claude-request-cancelled",
+          runId: DRIVER_TEST_IDS.runId,
+        });
+        const runningTool = await waitForLiveEvent(
+          iterator,
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          "running Bash tool",
+        );
+        const toolCallId = payloadString(runningTool, "itemId");
+        expect(toolCallId).not.toBeNull();
+        await withLiveTimeout({
+          details: {},
+          label: "active turn cancellation",
+          logStatus: () => {},
+          task: () => kernel.cancel("live.cancel"),
+          timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+        });
+
+        await expect(runningInput).resolves.toBeUndefined();
+        await waitForLiveEvent(
+          iterator,
+          (event) =>
+            event.kind === "tool.call.updated" &&
+            hasPayloadValue(event, "status", "failed") &&
+            payloadString(event, "toolCallId") === toolCallId,
+          "cancelled Bash terminal event",
+        );
+        await waitForLiveEvent(
+          iterator,
+          (event) => event.kind === "run.cancelled",
+          "cancelled run terminal event",
+        );
+        await sendPing(
+          kernel,
+          fromIterator(iterator),
+          "after-cancel",
+          DRIVER_TEST_IDS.secondRunId,
+        );
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+
+  liveTest(
+    "stops during a running tool and starts a fresh process",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const firstKernel = createLiveKernel();
+      const firstEvents = firstKernel.events()[Symbol.asyncIterator]();
+      let firstStopped = false;
+
+      try {
+        await firstKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "When asked to wait, run the requested Bash command. For every other request, reply with exactly pong.",
+          }),
+        );
+        const runningInput = firstKernel.dispatch({
+          commandId: "live-claude-input-stop",
+          input: { text: "Run the Bash command `sleep 30`, then reply pong." },
+          kind: "input.start",
+          requestId: "live-claude-request-stop",
+          runId: DRIVER_TEST_IDS.runId,
+        });
+        const runningTool = await waitForLiveEvent(
+          firstEvents,
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          "running Bash tool before shutdown",
+        );
+        const toolCallId = payloadString(runningTool, "itemId");
+        expect(toolCallId).not.toBeNull();
+        await stopLiveKernel(firstKernel, "live.active-stop");
+        firstStopped = true;
+
+        await expect(runningInput).resolves.toBeUndefined();
+        const shutdownEvents = await withLiveTimeout({
+          details: {},
+          label: "shutdown event stream closure",
+          logStatus: () => {},
+          task: () => Array.fromAsync(fromIterator(firstEvents)),
+          timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+        });
+        expect(
+          shutdownEvents.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "failed") &&
+              payloadString(event, "toolCallId") === toolCallId,
+          ),
+        ).toBe(true);
+        expect(shutdownEvents.some((event) => event.kind === "run.cancelled")).toBe(true);
+      } finally {
+        if (!firstStopped) {
+          await stopLiveKernel(firstKernel, "test.stop");
+        }
+      }
+
+      const restartedKernel = createLiveKernel();
+
+      try {
+        await restartedKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+          }),
+        );
+        await sendPing(
+          restartedKernel,
+          restartedKernel.events(),
+          "after-restart",
+          DRIVER_TEST_IDS.secondRunId,
+        );
+      } finally {
+        await stopLiveKernel(restartedKernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+});
+
+describe("Claude Contract adapter live provider", () => {
+  liveTest(
+    "projects real SDK file tools into Contract Authority",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const inputName = "contract-input.txt";
+      const outputName = "contract-output.txt";
+      const contents = "claude-contract-token-7326";
+      const prompt = `Use Read to read ${inputName}. Use Write to create ${outputName} with exactly the text you read. Do not use Bash. Reply with exactly contract-done.`;
+      const run = {
+        id: DRIVER_TEST_IDS.runId,
+        input: [{ text: prompt, type: "text" }],
+        origin: "user",
+        startedAt: new Date().toISOString(),
+        status: "active",
+      } satisfies Run;
+      const contract = createLiveContractAdapter(run);
+      const payload = createLiveStartInput({
+        apiKey: liveApiKey,
+        cwd: paths.cwd,
+        homePath: paths.homePath,
+        sharedRootPath: paths.sharedRootPath,
+        systemPrompt:
+          "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+      });
+      const logger = createBufferedSinkLogger({
+        level: "debug",
+        service: "claude-contract-live-test",
+        sink: async () => {},
+      });
+      const context = createAgentDriverContext({
+        eventSink: new FakeDriverRuntimeIo([]),
+        logger,
+        payload,
+        permission: { request: async () => "allow_once" },
+      });
+      const abortController = new AbortController();
+      let sdkQuery: ReturnType<typeof query> | null = null;
+      await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
+
+      try {
+        const options = await createClaudeQueryOptions({
+          abortController,
+          context,
+          nativeSessionId: null,
+          payload,
+        });
+        sdkQuery = query({ options, prompt });
+        await withLiveTimeout({
+          details: {},
+          label: "Claude Contract terminal Authority mutation",
+          logStatus: () => {},
+          task: async () => {
+            for await (const message of sdkQuery!) {
+              if (await contract.adapter.handleMessage(message, run.id)) {
+                return;
+              }
+            }
+
+            throw new Error("Claude SDK query ended before its Contract Run became terminal.");
+          },
+          timeoutMs: LIVE_TURN_TIMEOUT_MS,
+        });
+
+        const snapshot = contract.snapshot();
+        const completedRun = snapshot.runs.find((entry) => entry.id === run.id);
+        const readTool = snapshot.items.find(
+          (item) => item.kind === "tool" && item.name === "Read",
+        );
+        const writeTool = snapshot.items.find(
+          (item) => item.kind === "tool" && item.name === "Write",
+        );
+        const message = snapshot.items.find(
+          (item) => item.kind === "message" && JSON.stringify(item).includes("contract-done"),
+        );
+
+        expect(completedRun?.status).toBe("completed");
+        expect(completedRun?.usage?.total).toBeGreaterThan(0);
+        expect(readTool).toMatchObject({ category: "read", status: "completed" });
+        expect(writeTool).toMatchObject({ category: "edit", status: "completed" });
+        expect(message).toMatchObject({ status: "completed" });
+        expect(contract.authority.length).toBeGreaterThan(0);
+        expect(snapshot.interactions).toHaveLength(0);
+        expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        abortController.abort("test.stop");
+        sdkQuery?.close();
+        contract.adapter.dispose();
+        await logger.destroy();
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 10_000,
   );
 });

@@ -1,32 +1,23 @@
-import { formatLogValue } from "../../observability";
+import type { JsonObject } from "../provider-json";
 
-export type JsonObject = Record<string, unknown>;
-
-export function isRecord(value: unknown): value is JsonObject {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function readString(value: JsonObject | null, key: string): string | null {
-  const entry = value?.[key];
-  return typeof entry === "string" ? entry : null;
-}
+export { isRecord, readRecord, readString, stringifyForDisplay } from "../provider-json";
+export type { JsonObject } from "../provider-json";
 
 export function readNumber(value: JsonObject | null, key: string): number | null {
   const entry = value?.[key];
-  return typeof entry === "number" ? entry : null;
+  return typeof entry === "number" && Number.isFinite(entry) ? entry : null;
 }
 
-export function readRecord(value: JsonObject | null, key: string): JsonObject | null {
-  const entry = value?.[key];
-  return isRecord(entry) ? entry : null;
+export function toTokenCount(value: unknown): number | null {
+  return typeof value === "number" && value >= 0 && Number.isSafeInteger(value) ? value : null;
 }
 
-export function stringifyForDisplay(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "";
-  }
+export function sumTokenCounts(input: number | null, output: number | null): number | null {
+  return input === null && output === null ? null : toTokenCount((input ?? 0) + (output ?? 0));
+}
 
-  return formatLogValue(value);
+export function toCostAmount(value: unknown): number | null {
+  return typeof value === "number" && value >= 0 && Number.isFinite(value) ? value : null;
 }
 
 export function toErrorMessage(error: unknown, defaultMessage: string): string {

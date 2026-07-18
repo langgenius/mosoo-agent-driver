@@ -64,7 +64,7 @@
         "content": "hello",
         "messageId": "<driver-id>",
         "rawOutput": "hello",
-        "status": "completed",
+        "status": "running",
         "toolCallId": "cmd-1"
       }
     },
@@ -75,7 +75,7 @@
         "content": " world",
         "messageId": "<driver-id>",
         "rawOutput": " world",
-        "status": "completed",
+        "status": "running",
         "toolCallId": "cmd-1"
       }
     }

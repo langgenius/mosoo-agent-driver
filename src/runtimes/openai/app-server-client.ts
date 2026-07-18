@@ -1,14 +1,18 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
 import { mkdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { Interface as ReadlineInterface } from "node:readline";
+import { Transform } from "node:stream";
+import type { TransformCallback } from "node:stream";
 
-import { toDriverDurationMs } from "../../core/driver-runtime-timing";
+import { toDurationMs } from "../../core/driver-runtime-timing";
 import type { DriverStartInput } from "../../protocol/start";
-import { createPromiseDeferred } from "../../utils/async";
+import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
 import type { AgentDriverContext } from "../agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
+import { killProcessGroup } from "../child-process";
 import { summarizeOpenAiProxyEnv } from "./app-server-env";
 import {
   isRecord,
@@ -28,6 +32,7 @@ import type {
   ClientRequestParams,
   ClientRequestResult,
   CommandExecutionRequestApprovalResponse,
+  CurrentTimeReadResponse,
   FileChangeRequestApprovalResponse,
   PermissionsRequestApprovalResponse,
   RequestId,
@@ -49,12 +54,12 @@ interface PendingJsonRpcRequest {
   resolve(value: unknown): void;
 }
 
-export interface OpenAiAppServerClientStartPhase {
+interface OpenAiAppServerClientStartPhase {
   readonly durationMs: number;
   readonly name: string;
 }
 
-export interface OpenAiAppServerClientStartResult {
+interface OpenAiAppServerClientStartResult {
   readonly phases: readonly OpenAiAppServerClientStartPhase[];
 }
 
@@ -66,7 +71,7 @@ interface OpenAiClientContext extends AgentDriverContext {
   handleProtocolError(error: Error): Promise<void>;
 }
 
-function toOpenAiApprovalDecision(
+function toApprovalDecision(
   decision: "allow_once" | "reject_once",
 ): CommandExecutionRequestApprovalResponse["decision"] {
   return decision === "allow_once" ? "accept" : "decline";
@@ -127,8 +132,42 @@ function summarizeJsonRpcErrorData(value: unknown): JsonObject | null {
 
 const OPENAI_RUNTIME_HOME_ENV_NAME = ["CODE", "X_HOME"].join("");
 const DEFAULT_OPENAI_RUNTIME_EXECUTABLE = ["co", "dex"].join("");
+const APP_SERVER_TERMINATE_TIMEOUT_MS = 2_000;
+const APP_SERVER_KILL_TIMEOUT_MS = 1_000;
+const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_APP_SERVER_MESSAGE_BYTES = 8 * 1_024 * 1_024;
+const MAX_PENDING_SERVER_MESSAGES = 1_024;
+const MAX_PENDING_SERVER_MESSAGE_BYTES = 32 * 1_024 * 1_024;
 
-function readOpenAiRuntimeExecutable(): string {
+export function limitNdjsonLines(maxMessageBytes = MAX_APP_SERVER_MESSAGE_BYTES): Transform {
+  if (!Number.isSafeInteger(maxMessageBytes) || maxMessageBytes < 1) {
+    throw new RangeError("App-server message byte limit must be a positive safe integer.");
+  }
+
+  let pendingBytes = 0;
+
+  return new Transform({
+    transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
+      for (const byte of chunk) {
+        if (byte === 0x0a) {
+          pendingBytes = 0;
+          continue;
+        }
+
+        pendingBytes += 1;
+
+        if (pendingBytes > maxMessageBytes) {
+          callback(new Error(`App-server message exceeds ${maxMessageBytes} bytes.`));
+          return;
+        }
+      }
+
+      callback(null, chunk);
+    },
+  });
+}
+
+function readRuntimeExecutable(): string {
   const executable = process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"]?.trim();
   return executable && executable.length > 0 ? executable : DEFAULT_OPENAI_RUNTIME_EXECUTABLE;
 }
@@ -136,27 +175,51 @@ function readOpenAiRuntimeExecutable(): string {
 export class OpenAiAppServerClient {
   readonly #context: OpenAiClientContext;
   readonly #pendingRequests = new Map<RequestId, PendingJsonRpcRequest>();
+  readonly #pendingServerRequests = new Map<RequestId, AbortController>();
   readonly #payload: DriverStartInput;
   #nextId = 1;
+  #pendingServerMessageBytes = 0;
+  #pendingServerMessages = 0;
   #process: ChildProcessWithoutNullStreams | null = null;
+  #processClosed: Promise<void> | null = null;
   #readline: ReadlineInterface | null = null;
   #serverMessageQueue: Promise<void> = Promise.resolve();
+  #startRequested = false;
+  #stopRequested = false;
+  #stopTask: Promise<void> | null = null;
 
   constructor(payload: DriverStartInput, context: OpenAiClientContext) {
     this.#payload = payload;
     this.#context = context;
   }
 
-  async start(): Promise<OpenAiAppServerClientStartResult> {
+  async start(signal?: AbortSignal): Promise<OpenAiAppServerClientStartResult> {
+    signal?.throwIfAborted();
+    if (this.#startRequested || this.#stopRequested) {
+      throw new Error("OpenAi app-server client cannot be started more than once.");
+    }
+    this.#startRequested = true;
+
+    const onAbort = () => {
+      this.#stopRequested = true;
+      const child = this.#process;
+
+      if (child !== null && child.exitCode === null && child.signalCode === null) {
+        killProcessGroup(child, "SIGKILL");
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     const phases: OpenAiAppServerClientStartPhase[] = [];
     const measure = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
       const startedAtMs = Date.now();
 
       try {
-        return await task();
+        signal?.throwIfAborted();
+        return await raceWithAbort(task(), signal);
       } finally {
         phases.push({
-          durationMs: toDriverDurationMs(startedAtMs),
+          durationMs: toDurationMs(startedAtMs),
           name,
         });
       }
@@ -202,19 +265,35 @@ export class OpenAiAppServerClient {
       proxyEnv: summarizeOpenAiProxyEnv(env),
     });
 
+    if (this.#stopRequested) {
+      signal?.throwIfAborted();
+      throw new Error("OpenAi app-server client stopped during startup.");
+    }
+
     await measure("app_server.spawn", async () => {
-      const executable = readOpenAiRuntimeExecutable();
+      const executable = readRuntimeExecutable();
       const child = spawn(executable, ["app-server"], {
         cwd: this.#payload.execution.session.cwd,
+        detached: true,
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
 
       this.#process = child;
-      this.#readline = createInterface({ input: child.stdout });
+      const processClosed = Promise.withResolvers<void>();
+      this.#processClosed = processClosed.promise;
+      const limitedStdout = child.stdout.pipe(limitNdjsonLines());
+      const reader = createInterface({ input: limitedStdout });
+      this.#readline = reader;
 
-      this.#readline.on("line", (line) => {
-        this.#handleLine(line);
+      reader.on("line", (line) => {
+        this.#onLine(line);
+      });
+      limitedStdout.once("error", (error) => {
+        this.#failProtocol(error);
+      });
+      child.stdin.on("error", (error) => {
+        this.#failProtocol(error);
       });
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (chunk: string) => {
@@ -222,29 +301,55 @@ export class OpenAiAppServerClient {
           chunk,
         });
       });
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, exitSignal) => {
+        signal?.removeEventListener("abort", onAbort);
+        killProcessGroup(child, "SIGKILL");
+        processClosed.resolve();
+        reader.close();
+
+        if (this.#process === child) {
+          this.#process = null;
+          this.#processClosed = null;
+          this.#readline = null;
+        }
+
+        if (this.#stopRequested) {
+          return;
+        }
+
         const error = new Error(
-          `OpenAi app-server exited with ${code === null ? `signal ${signal ?? "unknown"}` : `code ${code}`}.`,
+          `OpenAi app-server exited with ${code === null ? `signal ${exitSignal ?? "unknown"}` : `code ${code}`}.`,
         );
-        this.#rejectPending(error);
-        this.#serverMessageQueue = this.#notifyProtocolErrorAfterQueuedMessages(
-          this.#serverMessageQueue,
-          error,
-        );
+        void this.#failAfterDrain(error);
+      });
+
+      await once(child, "spawn");
+      child.on("error", (error) => {
+        this.#failProtocol(error);
       });
     });
 
+    if (this.#stopRequested) {
+      signal?.throwIfAborted();
+      throw new Error("OpenAi app-server client stopped during startup.");
+    }
+
     await measure("app_server.initialize", async () => {
-      await this.request("initialize", {
-        capabilities: {
-          experimentalApi: true,
+      await this.request(
+        "initialize",
+        {
+          capabilities: {
+            experimentalApi: false,
+            requestAttestation: false,
+          },
+          clientInfo: {
+            name: "mosoo_driver",
+            title: "Mosoo Driver",
+            version: "0.1.0",
+          },
         },
-        clientInfo: {
-          name: "mosoo_driver",
-          title: "Mosoo Driver",
-          version: "0.1.0",
-        },
-      });
+        signal,
+      );
       this.notify("initialized", {});
     });
 
@@ -254,11 +359,13 @@ export class OpenAiAppServerClient {
   async request<M extends ClientRequestMethod>(
     method: M,
     params: ClientRequestParams[M],
+    signal?: AbortSignal,
   ): Promise<ClientRequestResult[M]> {
+    signal?.throwIfAborted();
     const id = this.#nextId;
     this.#nextId += 1;
 
-    const response = createPromiseDeferred<ClientRequestResult[M]>();
+    const response = Promise.withResolvers<ClientRequestResult[M]>();
     const parseResult = CLIENT_REQUEST_RESULT_PARSERS[method];
     this.#pendingRequests.set(id, {
       method,
@@ -268,13 +375,36 @@ export class OpenAiAppServerClient {
       },
     });
 
-    this.#send({
-      id,
-      method,
-      ...(params === undefined ? {} : { params }),
-    });
+    try {
+      this.#send({
+        id,
+        method,
+        ...(params === undefined ? {} : { params }),
+      });
+    } catch (error) {
+      this.#pendingRequests.delete(id);
+      throw error;
+    }
 
-    return response.promise;
+    try {
+      const result = await settlePromiseWithTimeout(response.promise, {
+        label: `App-server ${method} request`,
+        ...(signal === undefined ? {} : { signal }),
+        timeoutMs: APP_SERVER_REQUEST_TIMEOUT_MS,
+      });
+
+      if (result.status === "completed") {
+        return result.value;
+      }
+
+      if (result.status === "timed_out") {
+        this.#failProtocol(result.error);
+      }
+
+      throw result.error;
+    } finally {
+      this.#pendingRequests.delete(id);
+    }
   }
 
   notify(method: string, params: JsonObject | undefined): void {
@@ -282,6 +412,18 @@ export class OpenAiAppServerClient {
       method,
       ...(params === undefined ? {} : { params }),
     });
+  }
+
+  async drainServerMessages(): Promise<void> {
+    for (;;) {
+      const tail = this.#serverMessageQueue;
+      await tail;
+      await Promise.resolve();
+
+      if (tail === this.#serverMessageQueue) {
+        return;
+      }
+    }
   }
 
   respond(id: RequestId, result: unknown): void {
@@ -301,15 +443,88 @@ export class OpenAiAppServerClient {
     });
   }
 
-  stop(): void {
-    this.#readline?.close();
-    this.#readline = null;
-    this.#process?.kill("SIGTERM");
-    this.#process = null;
-    this.#rejectPending(new Error("OpenAi app-server stopped."));
+  abortServerRequests(reason: Error): void {
+    for (const request of this.#pendingServerRequests.values()) {
+      request.abort(reason);
+    }
+    this.#pendingServerRequests.clear();
+  }
+
+  stop(signal?: AbortSignal): Promise<void> {
+    this.#stopRequested = true;
+    if (this.#stopTask !== null) {
+      return this.#stopTask;
+    }
+
+    const task = this.#performStop(signal).finally(() => {
+      if (this.#stopTask === task) {
+        this.#stopTask = null;
+      }
+    });
+    this.#stopTask = task;
+    return task;
+  }
+
+  async #performStop(signal?: AbortSignal): Promise<void> {
+    const child = this.#process;
+    const processClosed = this.#processClosed;
+    const onAbort = () => {
+      if (child !== null && child.exitCode === null && child.signalCode === null) {
+        killProcessGroup(child, "SIGKILL");
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+    }
+
+    try {
+      this.#readline?.close();
+      this.#rejectPending(new Error("OpenAi app-server stopped."));
+      this.abortServerRequests(new Error("OpenAi app-server stopped."));
+
+      if (child === null || processClosed === null) {
+        signal?.throwIfAborted();
+        return;
+      }
+
+      if (!signal?.aborted && child.exitCode === null && child.signalCode === null) {
+        killProcessGroup(child, "SIGTERM");
+      }
+
+      const terminated = await settlePromiseWithTimeout(processClosed, {
+        label: "OpenAi app-server termination",
+        ...(signal === undefined ? {} : { signal }),
+        timeoutMs: APP_SERVER_TERMINATE_TIMEOUT_MS,
+      });
+
+      if (terminated.status === "completed") {
+        return;
+      }
+
+      if (child.exitCode === null && child.signalCode === null) {
+        killProcessGroup(child, "SIGKILL");
+      }
+
+      const killed = await settlePromiseWithTimeout(processClosed, {
+        label: "OpenAi app-server forced termination",
+        ...(signal === undefined ? {} : { signal }),
+        timeoutMs: APP_SERVER_KILL_TIMEOUT_MS,
+      });
+
+      if (killed.status !== "completed") {
+        throw killed.error;
+      }
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   #send(message: Record<string, unknown>): void {
+    if (this.#stopRequested) {
+      throw new Error("OpenAi app-server client is stopping.");
+    }
+
     const child = this.#process;
 
     if (child === null || child.stdin.destroyed) {
@@ -319,7 +534,11 @@ export class OpenAiAppServerClient {
     child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  #handleLine(line: string): void {
+  #onLine(line: string): void {
+    if (this.#stopRequested) {
+      return;
+    }
+
     const trimmed = line.trim();
 
     if (trimmed.length === 0) {
@@ -345,21 +564,66 @@ export class OpenAiAppServerClient {
     const id = toJsonRpcId(parsed["id"]);
 
     if (method !== null) {
-      this.#serverMessageQueue = this.#handleQueuedServerMessage(
+      const bytes = Buffer.byteLength(trimmed, "utf8");
+
+      if (
+        this.#pendingServerMessages >= MAX_PENDING_SERVER_MESSAGES ||
+        bytes > MAX_PENDING_SERVER_MESSAGE_BYTES - this.#pendingServerMessageBytes
+      ) {
+        this.#failProtocol(new Error("App-server message queue limit exceeded."));
+        return;
+      }
+
+      this.#pendingServerMessages += 1;
+      this.#pendingServerMessageBytes += bytes;
+      this.#serverMessageQueue = this.#processMessage(
         this.#serverMessageQueue,
         method,
         id,
         parsed["params"],
-      );
+      ).finally(() => {
+        this.#pendingServerMessages -= 1;
+        this.#pendingServerMessageBytes -= bytes;
+      });
       return;
     }
 
     if (id !== null) {
-      this.#handleClientResponse(id, parsed);
+      this.#onResponse(id, parsed);
     }
   }
 
-  async #handleQueuedServerMessage(
+  #failProtocol(error: Error): void {
+    if (this.#stopRequested) {
+      return;
+    }
+
+    this.#rejectPending(error);
+    void this.#notifyProtocolError(error);
+    void this.stop().catch(() => {});
+  }
+
+  async #failAfterDrain(error: Error): Promise<void> {
+    await this.drainServerMessages();
+
+    if (!this.#stopRequested) {
+      this.#failProtocol(error);
+    }
+  }
+
+  async #notifyProtocolError(error: Error): Promise<void> {
+    try {
+      await this.#context.handleProtocolError(error);
+    } catch (protocolError) {
+      this.#context.logger.error(
+        "driver.openai.protocol_failure_handler.failed",
+        protocolError,
+        {},
+      );
+    }
+  }
+
+  async #processMessage(
     previousMessage: Promise<void>,
     method: string,
     id: RequestId | null,
@@ -367,30 +631,33 @@ export class OpenAiAppServerClient {
   ): Promise<void> {
     try {
       await previousMessage;
-      await this.#handleServerMessage(method, id, params);
+
+      if (this.#stopRequested) {
+        return;
+      }
+
+      await this.#onServerMessage(method, id, params);
     } catch (error) {
       this.#context.logger.error("driver.openai.server_message.failed", error, {
         method,
       });
-      await this.#context.handleProtocolError(
+      await this.#notifyProtocolError(
         error instanceof Error ? error : new Error("OpenAi app-server protocol message failed."),
       );
 
-      if (id !== null) {
-        this.respondError(id, error instanceof Error ? error.message : "Server request failed.");
+      if (id !== null && !this.#stopRequested) {
+        try {
+          this.respondError(id, error instanceof Error ? error.message : "Server request failed.");
+        } catch (responseError) {
+          this.#context.logger.error("driver.openai.server_error_response.failed", responseError, {
+            method,
+          });
+        }
       }
     }
   }
 
-  async #notifyProtocolErrorAfterQueuedMessages(
-    previousMessage: Promise<void>,
-    error: Error,
-  ): Promise<void> {
-    await previousMessage;
-    await this.#context.handleProtocolError(error);
-  }
-
-  #handleClientResponse(id: RequestId, message: JsonObject): void {
+  #onResponse(id: RequestId, message: JsonObject): void {
     const pending = this.#pendingRequests.get(id);
 
     if (pending === undefined) {
@@ -428,12 +695,22 @@ export class OpenAiAppServerClient {
     }
   }
 
-  async #handleServerMessage(method: string, id: RequestId | null, params: unknown): Promise<void> {
+  async #onServerMessage(method: string, id: RequestId | null, params: unknown): Promise<void> {
     if (id === null) {
       if (!isServerNotificationMethod(method)) {
         this.#context.logger.debug("driver.openai.server_notification.ignored", {
           method,
         });
+        return;
+      }
+
+      if (method === "serverRequest/resolved") {
+        const parsed = parseServerNotificationParams(method, params);
+        this.#pendingServerRequests
+          .get(parsed.requestId)
+          ?.abort(new Error("OpenAi app-server request was resolved elsewhere."));
+        this.#pendingServerRequests.delete(parsed.requestId);
+        await this.#context.handleNotification(method, parsed);
         return;
       }
 
@@ -446,48 +723,79 @@ export class OpenAiAppServerClient {
       return;
     }
 
-    await this.#handleServerRequest(method, id, params);
+    if (this.#pendingServerRequests.has(id)) {
+      throw new Error(`OpenAi app-server request ${String(id)} is already pending.`);
+    }
+
+    const controller = new AbortController();
+    this.#pendingServerRequests.set(id, controller);
+    void this.#onRequest(method, id, params, controller.signal).catch(async (error: unknown) => {
+      if (controller.signal.aborted) {
+        return;
+      }
+
+      this.#context.logger.error("driver.openai.server_request.failed", error, { method });
+      await this.#notifyProtocolError(
+        error instanceof Error ? error : new Error("OpenAi app-server request failed."),
+      );
+      this.#replyError(id, error instanceof Error ? error.message : "Server request failed.");
+    });
   }
 
-  async #handleServerRequest(
+  async #onRequest(
     method: ServerRequestMethod,
     id: RequestId,
     params: unknown,
+    signal: AbortSignal,
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
     const requestId = `${method}:${String(id)}`;
+
+    if (method === "currentTime/read") {
+      const response: CurrentTimeReadResponse = {
+        currentTimeAt: Math.floor(Date.now() / 1_000),
+      };
+      this.#reply(id, response);
+      return;
+    }
 
     if (
       method === "item/commandExecution/requestApproval" ||
       method === "item/fileChange/requestApproval"
     ) {
-      const decision = await this.#context.ports.permission.request({
-        rawInput: stringifyForDisplay(payload["command"] ?? payload["reason"] ?? payload),
-        requestId,
-        title:
-          method === "item/fileChange/requestApproval"
-            ? "Approve file changes"
-            : "Approve command execution",
-        toolCallId: readString(payload, "itemId"),
-        toolKind: method,
-      });
+      const decision = await this.#context.ports.permission.request(
+        {
+          rawInput: stringifyForDisplay(payload["command"] ?? payload["reason"] ?? payload),
+          requestId,
+          title:
+            method === "item/fileChange/requestApproval"
+              ? "Approve file changes"
+              : "Approve command execution",
+          toolCallId: readString(payload, "itemId"),
+          toolKind: method,
+        },
+        signal,
+      );
       const response: CommandExecutionRequestApprovalResponse | FileChangeRequestApprovalResponse =
         {
-          decision: toOpenAiApprovalDecision(decision),
+          decision: toApprovalDecision(decision),
         };
-      this.respond(id, response);
+      this.#reply(id, response);
       return;
     }
 
     if (method === "item/permissions/requestApproval") {
-      const decision = await this.#context.ports.permission.request({
-        rawInput: stringifyForDisplay(payload["permissions"] ?? payload),
-        requestId,
-        title: "Approve runtime permissions",
-        toolCallId: readString(payload, "itemId"),
-        toolKind: method,
-      });
-      this.respond(
+      const decision = await this.#context.ports.permission.request(
+        {
+          rawInput: stringifyForDisplay(payload["permissions"] ?? payload),
+          requestId,
+          title: "Approve runtime permissions",
+          toolCallId: readString(payload, "itemId"),
+          toolKind: method,
+        },
+        signal,
+      );
+      this.#reply(
         id,
         decision === "allow_once"
           ? toPermissionProfileGrant(payload)
@@ -499,7 +807,19 @@ export class OpenAiAppServerClient {
       return;
     }
 
-    this.respondError(id, "Unsupported OpenAi app-server request.");
+    this.#replyError(id, "Unsupported OpenAi app-server request.");
+  }
+
+  #reply(id: RequestId, result: unknown): void {
+    if (this.#pendingServerRequests.delete(id) && !this.#stopRequested) {
+      this.respond(id, result);
+    }
+  }
+
+  #replyError(id: RequestId, message: string): void {
+    if (this.#pendingServerRequests.delete(id) && !this.#stopRequested) {
+      this.respondError(id, message);
+    }
   }
 
   #rejectPending(error: Error): void {

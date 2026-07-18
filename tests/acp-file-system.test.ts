@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createBufferedSinkLogger } from "../src/observability";
 import type { Logger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
+import { isDriverId } from "../src/protocol/id";
 import { AcpFileSystem } from "../src/runtimes/acp/acp-file-system";
 import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
@@ -33,6 +34,12 @@ function createContext(events: DriverEventInput[]): {
       eventSink: {
         pushEvents: async (input) => {
           events.push(...input.events);
+          return {
+            accepted: input.events.map((event, index) => ({
+              seq: index + 1,
+              type: event.kind,
+            })),
+          };
         },
       },
       logger,
@@ -79,18 +86,33 @@ describe("ACP file system bridge", () => {
       ).resolves.toEqual({});
 
       expect(await readFile(path, "utf8")).toBe("hello");
-      expect(events).toEqual([
-        {
-          kind: "file.changed",
-          payload: {
-            change: "upsert",
-            path,
-            source: "acp.fs",
-          },
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        kind: "file.changed",
+        payload: {
+          change: "upsert",
+          path,
+          source: "acp.fs",
         },
-      ]);
+      });
+      expect(isDriverId(events[0]?.sourceEventId)).toBe(true);
     } finally {
       await logger.destroy();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects files above the deployment byte limit before reading them", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-limit-"));
+    const path = join(root, "large.txt");
+
+    try {
+      await writeFile(path, "");
+      await truncate(path, 8 * 1_024 * 1_024 + 1);
+      await expect(createFileSystem(root).readTextFile({ path })).rejects.toThrow(
+        "file exceeds 8388608 bytes",
+      );
+    } finally {
       await rm(root, { force: true, recursive: true });
     }
   });

@@ -111,9 +111,8 @@ export function createDriverLogger(
 ): DriverLoggerHandle {
   let nextSeq = 0;
   let openUplink: () => void = () => undefined;
-  // The API rejects pushLogs until the hello handshake commits, and the DO
-  // round-trip for hello can take arbitrarily long in production. Hold every
-  // batch behind this event gate (never a timer) until the boot flow opens it;
+  // The API rejects pushLogs until the hello handshake commits. Hold every
+  // batch behind this event gate until the boot flow opens it;
   // the transport's ring buffer bounds what accumulates while gated. Shutdown
   // paths must also open the gate so a pending flush can never hang teardown.
   const uplinkOpened = new Promise<void>((resolve) => {

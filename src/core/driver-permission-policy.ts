@@ -4,12 +4,8 @@ import type { DriverPermissionRequest, PermissionDecision } from "./driver-permi
 
 export type { DriverPermissionPolicy };
 
-export function resolveDriverPermissionPolicy(payload: DriverStartInput): DriverPermissionPolicy {
-  return payload.execution.permissionPolicy;
-}
-
 export function isDriverFullAccess(payload: DriverStartInput): boolean {
-  return resolveDriverPermissionPolicy(payload) === "full_access";
+  return payload.execution.permissionPolicy === "full_access";
 }
 
 /**
@@ -26,8 +22,11 @@ export function isDriverFullAccess(payload: DriverStartInput): boolean {
  */
 export function createDriverPermissionRequestHandler(input: {
   payload: DriverStartInput;
-  supervised: (request: DriverPermissionRequest) => Promise<PermissionDecision>;
-}): (request: DriverPermissionRequest) => Promise<PermissionDecision> {
+  supervised: (
+    request: DriverPermissionRequest,
+    signal?: AbortSignal,
+  ) => Promise<PermissionDecision>;
+}): (request: DriverPermissionRequest, signal?: AbortSignal) => Promise<PermissionDecision> {
   if (isDriverFullAccess(input.payload)) {
     return async () => "allow_once";
   }

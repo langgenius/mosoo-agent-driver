@@ -1,8 +1,8 @@
 import type { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { RunId } from "../../protocol/id";
-import { createPromiseDeferred } from "../../utils/async";
 
 interface ActiveOpenAiTurn {
+  promise: Promise<void>;
   reject(error: Error): void;
   resolve(): void;
   runId: RunId;
@@ -12,11 +12,26 @@ type TerminalOpenAiTurn =
   | { kind: "completed" }
   | { error: DriverTurnCancelledError | Error; kind: "failed" };
 
+const MAX_RETAINED_TURNS = 1_024;
+
+function rememberBounded<T>(map: Map<string, T>, turnId: string, value: T): void {
+  map.delete(turnId);
+  map.set(turnId, value);
+
+  if (map.size > MAX_RETAINED_TURNS) {
+    const oldest = map.keys().next().value;
+
+    if (oldest !== undefined) {
+      map.delete(oldest);
+    }
+  }
+}
+
 export class OpenAiTurnTracker {
   readonly #activeTurns = new Map<string, ActiveOpenAiTurn>();
-  readonly #cancelledTurns = new Map<string, string>();
+  readonly #settlingTurnIds = new Set<string>();
   readonly #terminalTurns = new Map<string, TerminalOpenAiTurn>();
-  readonly #startedTurnIds = new Set<string>();
+  readonly #startedTurnIds = new Map<string, true>();
 
   activeRunId(turnId: string): RunId | null {
     return this.#activeTurns.get(turnId)?.runId ?? null;
@@ -28,29 +43,26 @@ export class OpenAiTurnTracker {
 
   clearActiveTurns(): void {
     this.#activeTurns.clear();
+    this.#settlingTurnIds.clear();
+    this.#startedTurnIds.clear();
+    this.#terminalTurns.clear();
   }
 
   hasTerminal(turnId: string): boolean {
-    return this.#terminalTurns.has(turnId);
-  }
-
-  markCancelled(turnId: string, reason: string): void {
-    this.#cancelledTurns.set(turnId, reason);
+    return this.#settlingTurnIds.has(turnId) || this.#terminalTurns.has(turnId);
   }
 
   markTurnStarted(turnId: string): boolean {
-    if (this.#startedTurnIds.has(turnId)) {
+    if (this.#startedTurnIds.has(turnId) || this.hasTerminal(turnId)) {
       return false;
     }
 
-    this.#startedTurnIds.add(turnId);
+    rememberBounded(this.#startedTurnIds, turnId, true);
     return true;
   }
 
-  rejectTurn(turnId: string, error: Error): void {
-    const activeTurn = this.#activeTurns.get(turnId);
-    activeTurn?.reject(error);
-    this.#activeTurns.delete(turnId);
+  rejectTurn(turnId: string, error: Error): boolean {
+    return this.settle(turnId, { error, kind: "failed" });
   }
 
   rejectActiveTurns(error: Error): void {
@@ -59,8 +71,40 @@ export class OpenAiTurnTracker {
     }
   }
 
-  settle(turnId: string, terminalTurn: TerminalOpenAiTurn): void {
-    this.#terminalTurns.set(turnId, terminalTurn);
+  beginSettlement(turnId: string): boolean {
+    if (this.hasTerminal(turnId)) {
+      return false;
+    }
+
+    this.#settlingTurnIds.add(turnId);
+    return true;
+  }
+
+  cancelSettlement(turnId: string): void {
+    this.#settlingTurnIds.delete(turnId);
+  }
+
+  finishSettlement(turnId: string, terminalTurn: TerminalOpenAiTurn): boolean {
+    if (!this.#settlingTurnIds.delete(turnId) || this.#terminalTurns.has(turnId)) {
+      return false;
+    }
+
+    this.#recordTerminal(turnId, terminalTurn);
+    return true;
+  }
+
+  settle(turnId: string, terminalTurn: TerminalOpenAiTurn): boolean {
+    if (this.hasTerminal(turnId)) {
+      return false;
+    }
+
+    this.#recordTerminal(turnId, terminalTurn);
+    return true;
+  }
+
+  #recordTerminal(turnId: string, terminalTurn: TerminalOpenAiTurn): void {
+    this.#startedTurnIds.delete(turnId);
+    rememberBounded(this.#terminalTurns, turnId, terminalTurn);
     const activeTurn = this.#activeTurns.get(turnId);
 
     if (activeTurn === undefined) {
@@ -76,12 +120,6 @@ export class OpenAiTurnTracker {
     this.#activeTurns.delete(turnId);
   }
 
-  takeCancellationReason(turnId: string): string | null {
-    const reason = this.#cancelledTurns.get(turnId) ?? null;
-    this.#cancelledTurns.delete(turnId);
-    return reason;
-  }
-
   async track(turnId: string, runId: RunId): Promise<void> {
     const terminalTurn = this.#terminalTurns.get(turnId);
 
@@ -93,8 +131,19 @@ export class OpenAiTurnTracker {
       throw terminalTurn.error;
     }
 
-    const turn = createPromiseDeferred<void>();
+    const activeTurn = this.#activeTurns.get(turnId);
+
+    if (activeTurn !== undefined) {
+      if (activeTurn.runId !== runId) {
+        throw new Error(`Turn ${turnId} is already tracked by another run.`);
+      }
+
+      return activeTurn.promise;
+    }
+
+    const turn = Promise.withResolvers<void>();
     this.#activeTurns.set(turnId, {
+      promise: turn.promise,
       reject: turn.reject,
       resolve: () => {
         turn.resolve();

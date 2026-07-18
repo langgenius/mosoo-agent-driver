@@ -1,7 +1,8 @@
+import { timestampSchema } from "../contract/common";
 import type { DriverInstanceId, DriverId, EventId, SessionId, RunId } from "../protocol/id";
 import { parseDriverId } from "../protocol/id";
 
-export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-05-26" as const;
+export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-05-26";
 
 export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
@@ -186,14 +187,14 @@ export interface RuntimeTimingPhase {
 }
 
 export interface RuntimeTimingPayload {
-  readonly completedAtMs: number;
+  readonly completedAt: string;
   readonly path: RuntimeTimingPath;
   readonly phases: readonly RuntimeTimingPhase[];
   readonly runId: RunId | null;
   readonly sessionId: SessionId;
   readonly source: RuntimeTimingSource;
   readonly stage: RuntimeTimingStage;
-  readonly startedAtMs: number;
+  readonly startedAt: string;
   readonly totalMs: number;
   readonly traceId: string | null;
 }
@@ -318,7 +319,7 @@ export function createRuntimeEvent<TPayload>(
     sessionId: draft.sessionId,
     ...(draft.sourceEventId === undefined ? {} : { sourceEventId: draft.sourceEventId }),
     ...(draft.traceId === undefined ? {} : { traceId: draft.traceId }),
-    visibility: draft.visibility ?? getRuntimeEventDefaultVisibility(draft.kind),
+    visibility: draft.visibility ?? defaultVisibility(draft.kind),
   };
 }
 
@@ -371,6 +372,7 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
     throw new Error("Runtime event payload is required.");
   }
 
+  const correlationId = readOptionalString(value, "correlationId", "Runtime event");
   const driverInstanceId = readOptionalDriverId(value, "driverInstanceId") as
     | DriverInstanceId
     | undefined;
@@ -397,6 +399,7 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
 
   return {
     actor,
+    ...(correlationId === undefined ? {} : { correlationId }),
     delivery,
     ...(driverInstanceId === undefined ? {} : { driverInstanceId }),
     id,
@@ -451,12 +454,12 @@ export function ingestRuntimeEventInput(
     }
 
     return {
-      event: parseRuntimeEventEnvelope(createRuntimeEnvelopeFromDraft(context, input)),
+      event: parseRuntimeEventEnvelope(eventFromDraft(context, input)),
       status: "accepted",
     };
   } catch (error) {
     return {
-      rejection: classifyRuntimeEventIngressError(input, error),
+      rejection: classifyIngressError(input, error),
       status: "rejected",
     };
   }
@@ -475,7 +478,7 @@ export function toRuntimeEventInput(
   throw new Error(outcome.rejection.message);
 }
 
-function createRuntimeEnvelopeFromDraft(
+function eventFromDraft(
   context: RuntimeEventBuildContext,
   draft: RuntimeEventInputDraft,
 ): RuntimeEventEnvelope {
@@ -502,7 +505,7 @@ function createRuntimeEnvelopeFromDraft(
   });
 }
 
-function getRuntimeEventDefaultVisibility(kind: RuntimeEventKind): RuntimeEventVisibility {
+function defaultVisibility(kind: RuntimeEventKind): RuntimeEventVisibility {
   if (ownerDiagnosticRuntimeEventKinds.has(kind)) {
     return "owner_debug";
   }
@@ -692,8 +695,8 @@ function readRunPayload(
   requireOptionalString(record, "targetRunId", context.kind);
   requireOptionalString(record, "userMessageId", context.kind);
   requireOptionalStringArray(record, "inputItemIds", context.kind);
-  requireOptionalTimestampString(record, "completedAt", context.kind);
-  requireOptionalTimestampString(record, "startedAt", context.kind);
+  requireOptionalTimestamp(record, "completedAt", context.kind);
+  requireOptionalTimestamp(record, "startedAt", context.kind);
 
   const admitted = omitPayloadIdentity(record);
 
@@ -728,7 +731,7 @@ function readRunView(
   requireEnumValue(record, "status", runStatuses, context.kind);
 
   return {
-    completedAt: requireNullableTimestampString(
+    completedAt: requireNullableTimestamp(
       record,
       "completedAt",
       context.kind,
@@ -737,7 +740,7 @@ function readRunView(
     error:
       record["error"] === null ? null : readRunError(context.kind, record["error"], "run.error"),
     id: context.runId ?? null,
-    startedAt: requireNullableTimestampString(record, "startedAt", context.kind, "run.startedAt"),
+    startedAt: requireNullableTimestamp(record, "startedAt", context.kind, "run.startedAt"),
     status: record["status"],
     traceId: context.traceId ?? null,
   };
@@ -779,7 +782,7 @@ function readTimingPayload(
   payload: unknown,
 ): RuntimeTimingPayload {
   const record = requirePayloadRecord("runtime.timing.recorded", payload);
-  const completedAtMs = requireNonNegativeNumber(record, "completedAtMs");
+  const completedAt = requireTimestamp(record, "completedAt", "runtime.timing.recorded");
   const path = requireEnumValue(record, "path", runtimeTimingPaths, "runtime.timing.recorded");
   const source = requireEnumValue(
     record,
@@ -788,25 +791,25 @@ function readTimingPayload(
     "runtime.timing.recorded",
   );
   const stage = requireEnumValue(record, "stage", runtimeTimingStages, "runtime.timing.recorded");
-  const startedAtMs = requireNonNegativeNumber(record, "startedAtMs");
-  const totalMs = requireNonNegativeNumber(record, "totalMs");
+  const startedAt = requireTimestamp(record, "startedAt", "runtime.timing.recorded");
+  const totalMs = requireNonNegativeInt(record, "totalMs");
   const phases = readTimingPhases(record["phases"]);
 
-  if (completedAtMs < startedAtMs) {
+  if (Date.parse(completedAt) < Date.parse(startedAt)) {
     throw new Error(
-      "Runtime event runtime.timing.recorded payload completedAtMs must not precede startedAtMs.",
+      "Runtime event runtime.timing.recorded payload completedAt must not precede startedAt.",
     );
   }
 
   return {
-    completedAtMs,
+    completedAt,
     path: path as RuntimeTimingPath,
     phases,
     runId: context.runId ?? null,
     sessionId: context.sessionId,
     source: source as RuntimeTimingSource,
     stage: stage as RuntimeTimingStage,
-    startedAtMs,
+    startedAt,
     totalMs,
     traceId: context.traceId ?? null,
   };
@@ -821,13 +824,13 @@ function readTimingPhases(value: unknown): RuntimeTimingPhase[] {
     const record = requirePayloadRecord("runtime.timing.recorded", phase, "phase");
 
     return {
-      durationMs: requireNonNegativeNumber(record, "durationMs"),
+      durationMs: requireNonNegativeInt(record, "durationMs"),
       name: requireString(record, "name", "runtime.timing.recorded"),
     };
   });
 }
 
-function classifyRuntimeEventIngressError(
+function classifyIngressError(
   input: unknown,
   error: unknown,
 ): RuntimeEventIngressRejection {
@@ -1061,7 +1064,7 @@ function requireOptionalStringArray(
   }
 }
 
-function requireOptionalTimestampString(
+function requireOptionalTimestamp(
   value: RuntimeEventRecord,
   field: string,
   label: RuntimeEventKind | string,
@@ -1070,11 +1073,20 @@ function requireOptionalTimestampString(
     return;
   }
 
-  const timestamp = requireString(value, field, label);
-  assertTimestamp(timestamp, `${label} ${field}`);
+  requireTimestamp(value, field, label);
 }
 
-function requireNullableTimestampString(
+function requireTimestamp(
+  value: RuntimeEventRecord,
+  field: string,
+  label: RuntimeEventKind | string,
+): string {
+  const timestamp = requireString(value, field, label);
+  assertTimestamp(timestamp, `${label} ${field}`);
+  return timestamp;
+}
+
+function requireNullableTimestamp(
   value: RuntimeEventRecord,
   field: string,
   label: RuntimeEventKind | string,
@@ -1084,17 +1096,15 @@ function requireNullableTimestampString(
     return null;
   }
 
-  const timestamp = requireString(value, field, `${label} ${nullableLabel}`);
-  assertTimestamp(timestamp, `${label} ${nullableLabel}`);
-  return timestamp;
+  return requireTimestamp(value, field, `${label} ${nullableLabel}`);
 }
 
-function requireNonNegativeNumber(value: RuntimeEventRecord, field: string): number {
+function requireNonNegativeInt(value: RuntimeEventRecord, field: string): number {
   const entry = value[field];
 
-  if (typeof entry !== "number" || !Number.isFinite(entry) || entry < 0) {
+  if (typeof entry !== "number" || !Number.isSafeInteger(entry) || entry < 0) {
     throw new Error(
-      `Runtime event runtime.timing.recorded ${field} must be a non-negative number.`,
+      `Runtime event runtime.timing.recorded ${field} must be a non-negative safe integer.`,
     );
   }
 
@@ -1144,8 +1154,8 @@ function readOptionalDriverId(value: RuntimeEventRecord, field: string): DriverI
 }
 
 function assertTimestamp(value: string, label: string): void {
-  if (!Number.isFinite(Date.parse(value))) {
-    throw new Error(`${label} must be a valid timestamp.`);
+  if (!timestampSchema.safeParse(value).success) {
+    throw new Error(`${label} must be an ISO 8601 timestamp with a timezone offset.`);
   }
 }
 

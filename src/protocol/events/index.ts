@@ -1,3 +1,4 @@
+import { timestampSchema } from "../../contract/common";
 import { parseRuntimeEventEnvelope } from "../../runtime-events";
 import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "../../runtime-events";
 
@@ -7,7 +8,7 @@ export type DriverEventInput = RuntimeEventEnvelope | RuntimeEventInputDraft;
 export interface DriverEventEnvelope {
   readonly event: DriverEvent;
   readonly eventId: string;
-  readonly occurredAt?: number | null | undefined;
+  readonly occurredAt?: string | null | undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -26,8 +27,14 @@ export function parseDriverEventEnvelope(input: unknown): DriverEventEnvelope {
     throw new TypeError("Driver event envelope eventId must be a non-empty string.");
   }
 
-  if (occurredAt !== undefined && occurredAt !== null && typeof occurredAt !== "number") {
-    throw new TypeError("Driver event envelope occurredAt must be a number, null, or undefined.");
+  if (
+    occurredAt !== undefined &&
+    occurredAt !== null &&
+    (typeof occurredAt !== "string" || !timestampSchema.safeParse(occurredAt).success)
+  ) {
+    throw new TypeError(
+      "Driver event envelope occurredAt must be an ISO 8601 string with a timezone offset, null, or undefined.",
+    );
   }
 
   return {

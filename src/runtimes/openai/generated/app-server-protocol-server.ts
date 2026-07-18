@@ -14,6 +14,7 @@ import {
   parseTurnPlan,
   readOptionalNullableString,
   readRequiredBoolean,
+  readRequiredNumber,
   readRequiredString,
 } from "./app-server-protocol-common";
 import type {
@@ -23,12 +24,14 @@ import type {
   FileChangePatchUpdatedNotification,
   ItemNotificationBase,
   JsonObject,
+  McpToolCallProgressNotification,
   PlanDeltaNotification,
   ReasoningSummaryPartAddedNotification,
   ReasoningSummaryTextDeltaNotification,
   ReasoningTextDeltaNotification,
   RemoteControlConnectionStatus,
   RemoteControlStatusChangedNotification,
+  ServerRequestResolvedNotification,
   ServerNotificationMethod,
   ServerNotificationParams,
   ThreadSettingsUpdatedNotification,
@@ -174,6 +177,7 @@ function parseReasoningTextDeltaNotification(value: unknown): ReasoningTextDelta
   const record = readParams(value, "item/reasoning/textDelta");
 
   return {
+    contentIndex: readRequiredNumber(record, "contentIndex", label),
     delta: readRequiredString(record, "delta", label),
     itemId: readRequiredString(record, "itemId", label),
     threadId: readRequiredString(record, "threadId", label),
@@ -189,7 +193,7 @@ function parseReasoningSummaryPartAddedNotification(
 
   return {
     itemId: readRequiredString(record, "itemId", label),
-    part: readRequiredString(record, "part", label),
+    summaryIndex: readRequiredNumber(record, "summaryIndex", label),
     threadId: readRequiredString(record, "threadId", label),
     turnId: readRequiredString(record, "turnId", label),
   };
@@ -204,8 +208,36 @@ function parseReasoningSummaryTextDeltaNotification(
   return {
     delta: readRequiredString(record, "delta", label),
     itemId: readRequiredString(record, "itemId", label),
+    summaryIndex: readRequiredNumber(record, "summaryIndex", label),
     threadId: readRequiredString(record, "threadId", label),
     turnId: readRequiredString(record, "turnId", label),
+  };
+}
+
+function parseMcpToolCallProgressNotification(value: unknown): McpToolCallProgressNotification {
+  const label = "item/mcpToolCall/progress params";
+  const record = readParams(value, "item/mcpToolCall/progress");
+
+  return {
+    itemId: readRequiredString(record, "itemId", label),
+    message: readRequiredString(record, "message", label),
+    threadId: readRequiredString(record, "threadId", label),
+    turnId: readRequiredString(record, "turnId", label),
+  };
+}
+
+function parseServerRequestResolvedNotification(value: unknown): ServerRequestResolvedNotification {
+  const label = "serverRequest/resolved params";
+  const record = readParams(value, "serverRequest/resolved");
+  const requestId = record["requestId"];
+
+  if (typeof requestId !== "number" && typeof requestId !== "string") {
+    throw new Error(`${label}.requestId must be a string or number.`);
+  }
+
+  return {
+    requestId,
+    threadId: readRequiredString(record, "threadId", label),
   };
 }
 
@@ -248,10 +280,20 @@ function parseTurnNotification(
 ): ServerNotificationParams[typeof method] {
   const label = `${method} params`;
   const record = readParams(value, method);
+  const turn = parseTurn(record["turn"], `${label}.turn`);
+
+  if (
+    method === "turn/completed" &&
+    turn.status !== "completed" &&
+    turn.status !== "failed" &&
+    turn.status !== "interrupted"
+  ) {
+    throw new Error(`${label}.turn.status must be terminal.`);
+  }
 
   return {
     threadId: readRequiredString(record, "threadId", label),
-    turn: parseTurn(record["turn"], `${label}.turn`),
+    turn,
   };
 }
 
@@ -299,12 +341,14 @@ const SERVER_NOTIFICATION_PARAM_PARSERS: {
   "item/fileChange/outputDelta": (value) =>
     parseOptionalToolDeltaNotification(value, "item/fileChange/outputDelta"),
   "item/fileChange/patchUpdated": parseFileChangePatchUpdated,
+  "item/mcpToolCall/progress": parseMcpToolCallProgressNotification,
   "item/plan/delta": parsePlanDeltaNotification,
   "item/reasoning/summaryPartAdded": parseReasoningSummaryPartAddedNotification,
   "item/reasoning/summaryTextDelta": parseReasoningSummaryTextDeltaNotification,
   "item/reasoning/textDelta": parseReasoningTextDeltaNotification,
   "item/started": (value) => parseItemNotificationBase(value, "item/started"),
   "remoteControl/status/changed": parseRemoteControlStatusChangedNotification,
+  "serverRequest/resolved": parseServerRequestResolvedNotification,
   "thread/settings/updated": parseThreadSettingsUpdatedNotification,
   "thread/started": parseThreadStarted,
   "thread/status/changed": parseThreadStatusChanged,

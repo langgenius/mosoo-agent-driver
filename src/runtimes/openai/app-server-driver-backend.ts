@@ -1,11 +1,11 @@
 import { isDriverFullAccess } from "../../core/driver-permission-policy";
+import { pushLosslessEvents } from "../../core/driver-runtime-io";
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
-  createDriverRuntimeTimingEvent,
-  createDriverRuntimeTimingPhase,
-  toDriverDurationMs,
+  createTimingEvent,
+  createTimingPhase,
+  toDurationMs,
 } from "../../core/driver-runtime-timing";
-import type { AgentDriverMaterializedSkill } from "../../host-ports";
 import {
   summarizePath,
   summarizeRuntimeCommandInput,
@@ -13,7 +13,8 @@ import {
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
-import type { McpExecuteCommand, RuntimeCommandInput } from "../../runtime-command";
+import type { RuntimeCommandInput } from "../../runtime-command";
+import { raceWithAbort } from "../../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "../agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
@@ -36,15 +37,15 @@ import type {
 } from "./generated/app-server-protocol";
 
 /**
- * Codex app-server approval policy per driver permission policy.
+ * App-server approval policy derived from the driver permission policy.
  *
  * `never` = "Never ask the user to approve commands" (== the CLI
  * `--dangerously-bypass-approvals-and-sandbox` posture). The runtime sandbox is
  * already `danger-full-access` (see MOSOO_OPENAI_RUNTIME_SANDBOX_MODE), so under
- * full_access this makes Codex fully autonomous. Supervised keeps `on-request`
+ * `full_access` makes the runtime fully autonomous. `supervised` keeps `on-request`
  * so exec/patch approvals surface to the control plane.
  */
-function resolveOpenAiApprovalPolicy(payload: DriverStartInput): ApprovalPolicy {
+function resolveApprovalPolicy(payload: DriverStartInput): ApprovalPolicy {
   return isDriverFullAccess(payload) ? "never" : "on-request";
 }
 
@@ -56,7 +57,7 @@ interface OpenAiTurnStartInput {
   readonly threadId: string;
 }
 
-function readOpenAiNativeResumeThreadId(payload: DriverStartInput): string | null {
+function readResumeThreadId(payload: DriverStartInput): string | null {
   const { nativeResumeRef } = payload.execution.session;
 
   if (nativeResumeRef === null) {
@@ -77,15 +78,15 @@ function readOpenAiNativeResumeThreadId(payload: DriverStartInput): string | nul
   return nativeResumeRef.value;
 }
 
-function isTerminalOpenAiTurnStatus(status: TurnStatus | undefined): boolean {
+function isTerminalTurn(status: TurnStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
 }
 
-function isMissingOpenAiRollout(error: unknown, threadId: string): boolean {
+function isMissingRollout(error: unknown, threadId: string): boolean {
   return error instanceof Error && error.message === `no rollout found for thread id ${threadId}`;
 }
 
-function toOpenAiRecoveryItems(
+function toRecoveryItems(
   messages: DriverStartInput["execution"]["session"]["recoveryMessages"],
 ): JsonObject[] {
   return messages.map((message) => ({
@@ -100,7 +101,7 @@ function toOpenAiRecoveryItems(
   }));
 }
 
-export function createOpenAiTurnStartParams(input: OpenAiTurnStartInput): TurnStartParams {
+export function createTurnParams(input: OpenAiTurnStartInput): TurnStartParams {
   return {
     approvalPolicy: input.approvalPolicy,
     cwd: input.cwd,
@@ -140,10 +141,8 @@ async function interruptOpenAiTurn(input: {
 export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "openai-runtime";
   readonly #payload: DriverStartInput;
-  readonly #runtimeBootstrapDigest: string | null;
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#threadId);
   #client: OpenAiAppServerClient | null = null;
-  #materializedSkills: readonly AgentDriverMaterializedSkill[] = [];
   #pendingTurnStartCancellationReason: string | null = null;
   #threadId: string | null = null;
   #turnStartInFlight = false;
@@ -154,19 +153,20 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
   constructor(payload: DriverStartInput) {
     this.#payload = payload;
-    this.#runtimeBootstrapDigest = computeRuntimeBootstrapDigest(payload.execution);
   }
 
-  async start(context: AgentDriverContext): Promise<void> {
-    const startupStartedAtMs = Date.now();
-    const startupPhases: ReturnType<typeof createDriverRuntimeTimingPhase>[] = [];
+  async start(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const startupStartedAt = new Date().toISOString();
+    const startupPhases: ReturnType<typeof createTimingPhase>[] = [];
     const measureStartupPhase = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
       const startedAtMs = Date.now();
 
       try {
-        return await task();
+        signal.throwIfAborted();
+        return await raceWithAbort(task(), signal);
       } finally {
-        startupPhases.push(createDriverRuntimeTimingPhase(name, toDriverDurationMs(startedAtMs)));
+        startupPhases.push(createTimingPhase(name, toDurationMs(startedAtMs)));
       }
     };
 
@@ -176,40 +176,46 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         this.#events.handleNotification(context, method, params),
       handleProtocolError: async (error) => {
         this.#events.rejectActiveTurns(error);
+        context.lifecycle.fail(error);
       },
     });
     this.#client = client;
     const clientStartPromise = (async () => {
       const startedAtMs = Date.now();
-      const result = await client.start();
+      const result = await client.start(signal);
       startupPhases.push(
-        createDriverRuntimeTimingPhase("app_server.start", toDriverDurationMs(startedAtMs)),
-        ...result.phases.map((phase) =>
-          createDriverRuntimeTimingPhase(phase.name, phase.durationMs),
-        ),
+        createTimingPhase("app_server.start", toDurationMs(startedAtMs)),
+        ...result.phases.map((phase) => createTimingPhase(phase.name, phase.durationMs)),
       );
     })();
     const skillBootstrapPromise = (async () => {
-      this.#materializedSkills = await measureStartupPhase("skills.materialize", () =>
+      const materializedSkills = await measureStartupPhase("skills.materialize", () =>
         context.ports.skill.materialize(this.#payload.execution),
       );
-      return measureStartupPhase("skills.bootstrap", () =>
+      const artifacts = await measureStartupPhase("skills.bootstrap", () =>
         writeSkillBootstrapArtifacts(this.#payload.execution),
       );
+      return { artifacts, count: materializedSkills.length };
     })();
     let bootstrapArtifacts: Awaited<typeof skillBootstrapPromise>;
 
     try {
       [, bootstrapArtifacts] = await Promise.all([clientStartPromise, skillBootstrapPromise]);
     } catch (error) {
-      client.stop();
+      signal.throwIfAborted();
+      await client.stop();
       throw error;
     }
 
+    signal.throwIfAborted();
+    if (this.#client !== client) {
+      throw new Error("OpenAi app-server backend stopped during startup.");
+    }
+
     const developerInstructions = buildNativeRuntimeSystemPrompt(this.#payload.execution);
-    const nativeResumeThreadId = readOpenAiNativeResumeThreadId(this.#payload);
+    const nativeResumeThreadId = readResumeThreadId(this.#payload);
     const baseThreadParams = {
-      approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
+      approvalPolicy: resolveApprovalPolicy(this.#payload),
       cwd: this.#payload.execution.session.cwd,
       model: this.#payload.execution.model,
       modelProvider: this.#payload.execution.provider,
@@ -224,19 +230,23 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
     if (nativeResumeThreadId === null) {
       threadResult = await measureStartupPhase("thread.start", () =>
-        client.request("thread/start", threadStartParams),
+        client.request("thread/start", threadStartParams, signal),
       );
     } else {
       try {
         threadResult = await measureStartupPhase("thread.resume", () =>
-          client.request("thread/resume", {
-            ...baseThreadParams,
-            ...(developerInstructions === null ? {} : { developerInstructions }),
-            threadId: nativeResumeThreadId,
-          } satisfies ThreadResumeParams),
+          client.request(
+            "thread/resume",
+            {
+              ...baseThreadParams,
+              ...(developerInstructions === null ? {} : { developerInstructions }),
+              threadId: nativeResumeThreadId,
+            } satisfies ThreadResumeParams,
+            signal,
+          ),
         );
       } catch (error) {
-        if (!isMissingOpenAiRollout(error, nativeResumeThreadId)) {
+        if (!isMissingRollout(error, nativeResumeThreadId)) {
           throw error;
         }
 
@@ -244,18 +254,20 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           nativeResumeRefPresent: true,
         });
         threadResult = await measureStartupPhase("thread.start_after_missing_rollout", () =>
-          client.request("thread/start", threadStartParams),
+          client.request("thread/start", threadStartParams, signal),
         );
-        const recoveryItems = toOpenAiRecoveryItems(
-          this.#payload.execution.session.recoveryMessages,
-        );
+        const recoveryItems = toRecoveryItems(this.#payload.execution.session.recoveryMessages);
 
         if (recoveryItems.length > 0) {
           await measureStartupPhase("thread.inject_recovery_items", () =>
-            client.request("thread/inject_items", {
-              items: recoveryItems,
-              threadId: threadResult.thread.id,
-            }),
+            client.request(
+              "thread/inject_items",
+              {
+                items: recoveryItems,
+                threadId: threadResult.thread.id,
+              },
+              signal,
+            ),
           );
         }
 
@@ -264,41 +276,40 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         });
       }
     }
+    signal.throwIfAborted();
     this.#threadId = threadResult.thread.id;
-    void this.#emitStartupTimingEvent(context, startupStartedAtMs, startupPhases);
+    void this.#emitStartupTiming(context, startupStartedAt, startupPhases);
 
     context.logger.info("driver.openai.runtime.started", {
-      bootstrapArtifacts,
-      bootstrapDigest: this.#runtimeBootstrapDigest,
+      bootstrapArtifacts: bootstrapArtifacts.artifacts,
+      bootstrapDigest: computeRuntimeBootstrapDigest(this.#payload.execution),
       execution: {
         cwd: summarizePath(this.#payload.execution.session.cwd),
         homePath: summarizePath(this.#payload.execution.session.homePath),
         sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
       },
       nativeResumeRefPresent: Boolean(nativeResumeThreadId),
-      skillCount: this.#materializedSkills.length,
+      skillCount: bootstrapArtifacts.count,
       threadIdPresent: Boolean(this.#threadId),
     });
   }
 
-  async #emitStartupTimingEvent(
+  async #emitStartupTiming(
     context: AgentDriverContext,
-    startedAtMs: number,
-    phases: readonly ReturnType<typeof createDriverRuntimeTimingPhase>[],
+    startedAt: string,
+    phases: readonly ReturnType<typeof createTimingPhase>[],
   ): Promise<void> {
     try {
-      await context.ports.eventSink.pushEvents({
-        events: [
-          createDriverRuntimeTimingEvent({
-            path: this.#payload.execution.run.runId === null ? "prewarm" : "cold",
-            phases,
-            runId: this.#payload.execution.run.runId,
-            sessionId: this.#payload.execution.run.sessionId,
-            stage: "driver_backend",
-            startedAtMs,
-          }),
-        ],
-      });
+      await pushLosslessEvents(context.ports.eventSink, [
+        createTimingEvent({
+          path: this.#payload.execution.run.runId === null ? "prewarm" : "cold",
+          phases,
+          runId: this.#payload.execution.run.runId,
+          sessionId: this.#payload.execution.run.sessionId,
+          stage: "driver_backend",
+          startedAt,
+        }),
+      ]);
     } catch (error) {
       context.logger.error("driver.openai.startup_timing.failed", error, {
         driverInstanceId: this.#payload.driverInstanceId,
@@ -332,8 +343,8 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     try {
       turnResult = await client.request(
         "turn/start",
-        createOpenAiTurnStartParams({
-          approvalPolicy: resolveOpenAiApprovalPolicy(this.#payload),
+        createTurnParams({
+          approvalPolicy: resolveApprovalPolicy(this.#payload),
           cwd: this.#payload.execution.session.cwd,
           model: this.#payload.execution.model,
           text: input.text,
@@ -341,6 +352,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         }),
       );
     } catch (error) {
+      this.#turnStartInFlight = false;
       const pendingCancellationReason = this.#pendingTurnStartCancellationReason;
       this.#pendingTurnStartCancellationReason = null;
 
@@ -349,28 +361,50 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       }
 
       throw error;
-    } finally {
-      this.#turnStartInFlight = false;
     }
 
     const turnId = turnResult.turn.id;
+    const completion = this.#events.trackTurn(turnId, runId);
+    void completion.catch(() => {});
+    this.#turnStartInFlight = false;
+    const pendingCancellationReason = this.#pendingTurnStartCancellationReason;
+    this.#pendingTurnStartCancellationReason = null;
+
+    if (pendingCancellationReason !== null) {
+      await Promise.all([
+        this.#events.cancelTurn(context, turnId, pendingCancellationReason, () =>
+          client.drainServerMessages(),
+        ),
+        interruptOpenAiTurn({
+          client,
+          context,
+          reason: pendingCancellationReason,
+          threadId,
+          turnId,
+        }),
+      ]);
+      await client.drainServerMessages();
+      this.#events.releaseTurnState();
+      throw new DriverTurnCancelledError(pendingCancellationReason);
+    }
+
     const turnStartedAtMs = Date.now();
 
     await this.#eventPublisher.push(context, "driver.openai.provider.turn_start", [
-      createDriverRuntimeTimingEvent({
-        completedAtMs: turnStartedAtMs,
+      createTimingEvent({
+        completedAt: new Date(turnStartedAtMs).toISOString(),
         path: "unknown",
         phases: [
-          createDriverRuntimeTimingPhase(
+          createTimingPhase(
             "provider.turn_start",
-            toDriverDurationMs(turnStartRequestedAtMs, turnStartedAtMs),
+            toDurationMs(turnStartRequestedAtMs, turnStartedAtMs),
           ),
         ],
         runId,
         sessionId: context.payload.execution.run.sessionId,
         sourceEventId: `openai.provider.turn_start:${turnId}`,
         stage: "driver_turn",
-        startedAtMs: turnStartRequestedAtMs,
+        startedAt: new Date(turnStartRequestedAtMs).toISOString(),
         native: {
           eventName: "provider.turn_start",
           provider: "openai",
@@ -378,24 +412,8 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         },
       }),
     ]);
-    const pendingCancellationReason = this.#pendingTurnStartCancellationReason;
-    this.#pendingTurnStartCancellationReason = null;
 
-    if (pendingCancellationReason !== null) {
-      this.#events.markTurnCancelled(turnId, pendingCancellationReason);
-      void interruptOpenAiTurn({
-        client,
-        context,
-        reason: pendingCancellationReason,
-        threadId,
-        turnId,
-      });
-      throw new DriverTurnCancelledError(pendingCancellationReason);
-    }
-
-    const completion = this.#events.trackTurn(turnId, runId);
-
-    if (isTerminalOpenAiTurnStatus(turnResult.turn.status)) {
+    if (isTerminalTurn(turnResult.turn.status)) {
       await this.#events.handleNotification(context, "turn/completed", {
         threadId,
         turn: turnResult.turn,
@@ -414,44 +432,38 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       return;
     }
 
+    client.abortServerRequests(new DriverTurnCancelledError(reason));
+
     if (this.#turnStartInFlight) {
       this.#pendingTurnStartCancellationReason = reason;
     }
 
-    for (const turnId of this.#events.activeTurnIds()) {
-      this.#events.markTurnCancelled(turnId, reason);
-      this.#events.rejectTurn(turnId, new DriverTurnCancelledError(reason));
-      void interruptOpenAiTurn({ client, context, reason, threadId, turnId });
-    }
+    const activeTurnIds = this.#events.activeTurnIds();
+
+    await Promise.all(
+      activeTurnIds.flatMap((turnId) => [
+        this.#events.cancelTurn(context, turnId, reason, () => client.drainServerMessages()),
+        interruptOpenAiTurn({ client, context, reason, threadId, turnId }),
+      ]),
+    );
+    await client.drainServerMessages();
+    this.#events.releaseTurnState();
   }
 
-  async handleMcpExecute(
+  async stop(
     context: AgentDriverContext,
-    command: McpExecuteCommand,
-  ): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }> {
-    context.logger.info("driver.openai.mcp.execute.started", {
-      serverId: command.serverId,
-      toolName: command.toolName,
-    });
-
-    const result = await context.ports.mcp.execute(command);
-
-    context.logger.info("driver.openai.mcp.execute.completed", {
-      outputLength: result.outputText.length,
-      serverId: command.serverId,
-      toolName: command.toolName,
-    });
-
-    return result;
-  }
-
-  async stop(context: AgentDriverContext, reason: string): Promise<void> {
+    reason: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     const client = this.#client;
+    const cancellation = raceWithAbort(this.cancelActiveTurn(context, reason), signal);
 
-    await this.cancelActiveTurn(context, reason);
+    await Promise.all([cancellation, client?.stop(signal)]);
     this.#events.clearActiveTurns();
-    client?.stop();
-    this.#client = null;
+
+    if (this.#client === client) {
+      this.#client = null;
+    }
   }
 
   #requireClient(): OpenAiAppServerClient {

@@ -1,3 +1,5 @@
+import type { InitializeResponse } from "@agentclientprotocol/sdk";
+
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import {
@@ -9,11 +11,11 @@ import {
   readString,
   stringifyForDisplay,
 } from "./acp-types";
-import type { AcpInitializeResult, JsonObject } from "./acp-types";
+import type { JsonObject } from "./acp-types";
 
 const ACP_USAGE_CONTRACT = "openai_total_with_cached_breakdown";
 
-export function toAcpInitializeEvents(result: AcpInitializeResult): DriverEventInput[] {
+export function toInitializeEvents(result: InitializeResponse): DriverEventInput[] {
   const events: DriverEventInput[] = [
     {
       kind: "runtime.capabilities.updated",
@@ -25,7 +27,7 @@ export function toAcpInitializeEvents(result: AcpInitializeResult): DriverEventI
     },
   ];
 
-  if (result.authMethods.length > 0) {
+  if (result.authMethods !== undefined && result.authMethods.length > 0) {
     events.push({
       kind: "auth.methods.updated",
       payload: {
@@ -38,7 +40,7 @@ export function toAcpInitializeEvents(result: AcpInitializeResult): DriverEventI
   return events;
 }
 
-export function toAcpPromptStartEvents(input: {
+export function toPromptStartEvents(input: {
   messageId: string;
   runId: RunId;
   text: string;
@@ -81,7 +83,7 @@ export function toAcpPromptStartEvents(input: {
   ];
 }
 
-export function toAcpSessionReadyEvents(input: {
+export function toSessionReadyEvents(input: {
   mode: "created" | "loaded" | "resumed";
   nativeSessionId: string;
   setup: JsonObject;
@@ -107,14 +109,14 @@ export function toAcpSessionReadyEvents(input: {
       },
       visibility: "owner_debug",
     },
-    ...toSessionModeEvents(input.setup),
-    ...toSessionModelsEvents(input.setup),
-    ...toSessionConfigEvents(input.setup),
-    ...toSessionCapabilitiesEvents(input.setup),
+    ...toModeEvents(input.setup),
+    ...toModelEvents(input.setup),
+    ...toConfigEvents(input.setup),
+    ...toCapabilityEvents(input.setup),
   ];
 }
 
-export function toAcpAuthSessionEvent(input: {
+export function toAuthEvent(input: {
   methodId: string;
   status: "authenticated" | "failed";
 }): DriverEventInput {
@@ -128,7 +130,7 @@ export function toAcpAuthSessionEvent(input: {
   };
 }
 
-export function shouldIgnoreAcpReplayUpdate(params: unknown): boolean {
+export function shouldIgnoreReplay(params: unknown): boolean {
   const record = isRecord(params) ? params : {};
   const update = readRecord(record, "update");
 
@@ -152,20 +154,26 @@ export function normalizePromptUsage(raw: unknown): JsonObject | null {
     return null;
   }
 
-  const totalTokens = readNumber(raw, "totalTokens") ?? readNumber(raw, "total_tokens");
-  const inputTokens = readNumber(raw, "inputTokens") ?? readNumber(raw, "input_tokens");
-  const outputTokens = readNumber(raw, "outputTokens") ?? readNumber(raw, "output_tokens");
+  const rawTotal = readNumber(raw, "totalTokens") ?? readNumber(raw, "total_tokens");
+  const rawInput = readNumber(raw, "inputTokens") ?? readNumber(raw, "input_tokens");
+  const rawOutput = readNumber(raw, "outputTokens") ?? readNumber(raw, "output_tokens");
+  const totalTokens =
+    rawTotal !== null && Number.isSafeInteger(rawTotal) && rawTotal >= 0 ? rawTotal : null;
+  const inputTokens =
+    rawInput !== null && Number.isSafeInteger(rawInput) && rawInput >= 0 ? rawInput : null;
+  const outputTokens =
+    rawOutput !== null && Number.isSafeInteger(rawOutput) && rawOutput >= 0 ? rawOutput : null;
 
   if (totalTokens === null && inputTokens === null && outputTokens === null) {
     return null;
   }
 
   return {
-    inputTokens,
-    outputTokens,
+    ...(inputTokens === null ? {} : { inputTokens }),
+    ...(outputTokens === null ? {} : { outputTokens }),
     raw,
     source: "prompt_response",
-    totalTokens,
+    ...(totalTokens === null ? {} : { totalTokens }),
     usageContract: ACP_USAGE_CONTRACT,
   };
 }
@@ -201,7 +209,7 @@ function summarizeLabel(label: string, record: JsonObject): string {
   return title === null ? `[${label}]` : `[${label}: ${title}]`;
 }
 
-function normalizeAvailableCommands(raw: unknown): JsonObject[] | null {
+function normalizeCommands(raw: unknown): JsonObject[] | null {
   if (!Array.isArray(raw)) {
     return null;
   }
@@ -229,7 +237,7 @@ function normalizeAvailableCommands(raw: unknown): JsonObject[] | null {
   return commands;
 }
 
-function normalizeConfigValueOptions(raw: unknown): JsonObject[] {
+function normalizeChoices(raw: unknown, group?: { id: string; name: string }): JsonObject[] {
   if (!Array.isArray(raw)) {
     return [];
   }
@@ -239,6 +247,16 @@ function normalizeConfigValueOptions(raw: unknown): JsonObject[] {
       return [];
     }
 
+    const nestedOptions = entry["options"];
+    const groupId = readNonEmptyString(entry, "group");
+
+    if (Array.isArray(nestedOptions) && groupId !== null) {
+      return normalizeChoices(nestedOptions, {
+        id: groupId,
+        name: readNonEmptyString(entry, "name") ?? groupId,
+      });
+    }
+
     const value = readNonEmptyString(entry, "value");
 
     if (value === null) {
@@ -246,14 +264,10 @@ function normalizeConfigValueOptions(raw: unknown): JsonObject[] {
     }
 
     const description = readNullableString(entry, "description");
-    const group = readNullableString(entry, "group");
-    const groupName = readNullableString(entry, "groupName");
-
     return [
       {
         ...(description === undefined ? {} : { description }),
-        ...(group === undefined ? {} : { group }),
-        ...(groupName === undefined ? {} : { groupName }),
+        ...(group === undefined ? {} : { group: group.id, groupName: group.name }),
         name: readNonEmptyString(entry, "name") ?? value,
         value,
       },
@@ -267,12 +281,11 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
   }
 
   return raw.flatMap((entry): JsonObject[] => {
-    if (!isRecord(entry) || entry["type"] !== "select") {
+    if (!isRecord(entry) || (entry["type"] !== "select" && entry["type"] !== "boolean")) {
       return [];
     }
 
     const id = readNonEmptyString(entry, "id");
-    const currentValue = readString(entry, "currentValue");
 
     if (id === null) {
       return [];
@@ -281,8 +294,29 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
     const category = readNullableString(entry, "category");
     const description = readNullableString(entry, "description");
     const name = readNonEmptyString(entry, "name");
-    const rawValues = entry["values"] ?? entry["options"];
-    const values = Array.isArray(rawValues) ? normalizeConfigValueOptions(rawValues) : null;
+
+    if (entry["type"] === "boolean") {
+      const currentValue = entry["currentValue"];
+
+      if (typeof currentValue !== "boolean") {
+        return [];
+      }
+
+      return [
+        {
+          ...(category === undefined ? {} : { category }),
+          currentValue,
+          ...(description === undefined ? {} : { description }),
+          id,
+          ...(name === null ? {} : { name }),
+          type: "boolean",
+        },
+      ];
+    }
+
+    const currentValue = readString(entry, "currentValue");
+    const rawOptions = entry["options"];
+    const values = normalizeChoices(rawOptions);
 
     return [
       {
@@ -292,13 +326,13 @@ function normalizeConfigOptions(raw: unknown): JsonObject[] | null {
         id,
         ...(name === null ? {} : { name }),
         type: "select",
-        ...(values === null ? {} : { values }),
+        ...(Array.isArray(rawOptions) ? { values } : {}),
       },
     ];
   });
 }
 
-function normalizePlanEntries(raw: unknown): JsonObject[] {
+function normalizePlan(raw: unknown): JsonObject[] {
   if (!Array.isArray(raw)) {
     return [];
   }
@@ -325,10 +359,8 @@ function normalizePlanEntries(raw: unknown): JsonObject[] {
   });
 }
 
-export function toAvailableCommandsEvents(update: JsonObject | null): DriverEventInput[] {
-  const commands = normalizeAvailableCommands(
-    update?.["availableCommands"] ?? update?.["commands"],
-  );
+export function toCommandEvents(update: JsonObject | null): DriverEventInput[] {
+  const commands = normalizeCommands(update?.["availableCommands"] ?? update?.["commands"]);
 
   if (commands === null) {
     return [];
@@ -345,9 +377,10 @@ export function toAvailableCommandsEvents(update: JsonObject | null): DriverEven
 }
 
 export function toPlanEvents(update: JsonObject | null): DriverEventInput[] {
-  const entries = normalizePlanEntries(update?.["entries"]);
+  const rawEntries = update?.["entries"];
+  const entries = normalizePlan(rawEntries);
 
-  if (entries.length === 0) {
+  if (!Array.isArray(rawEntries) || (rawEntries.length > 0 && entries.length === 0)) {
     return [];
   }
 
@@ -362,7 +395,7 @@ export function toPlanEvents(update: JsonObject | null): DriverEventInput[] {
   ];
 }
 
-function toSessionCapabilitiesEvents(setup: JsonObject | null): DriverEventInput[] {
+function toCapabilityEvents(setup: JsonObject | null): DriverEventInput[] {
   const capabilities =
     readRecord(setup, "capabilities") ?? readRecord(setup, "sessionCapabilities");
 
@@ -381,7 +414,7 @@ function toSessionCapabilitiesEvents(setup: JsonObject | null): DriverEventInput
   ];
 }
 
-export function toSessionConfigEvents(update: JsonObject | null): DriverEventInput[] {
+export function toConfigEvents(update: JsonObject | null): DriverEventInput[] {
   const options = normalizeConfigOptions(update?.["configOptions"] ?? update?.["options"]);
 
   if (options === null) {
@@ -398,7 +431,7 @@ export function toSessionConfigEvents(update: JsonObject | null): DriverEventInp
   ];
 }
 
-export function toSessionInfoEvents(update: JsonObject | null): DriverEventInput[] {
+export function toInfoEvents(update: JsonObject | null): DriverEventInput[] {
   const title = readNullableString(update, "title");
   const goal = readNullableString(update, "goal");
   const workspace = update?.["workspace"];
@@ -419,7 +452,7 @@ export function toSessionInfoEvents(update: JsonObject | null): DriverEventInput
   ];
 }
 
-export function toSessionModeEvents(update: JsonObject | null): DriverEventInput[] {
+export function toModeEvents(update: JsonObject | null): DriverEventInput[] {
   const currentMode =
     readNullableString(update, "currentModeId") ??
     readNullableString(update, "currentMode") ??
@@ -442,7 +475,7 @@ export function toSessionModeEvents(update: JsonObject | null): DriverEventInput
   ];
 }
 
-function toSessionModelsEvents(setup: JsonObject | null): DriverEventInput[] {
+function toModelEvents(setup: JsonObject | null): DriverEventInput[] {
   const currentModel = readNullableString(setup, "currentModel") ?? undefined;
   const availableModels = setup?.["availableModels"] ?? setup?.["models"];
   const providers = setup?.["providers"];
@@ -463,14 +496,19 @@ function toSessionModelsEvents(setup: JsonObject | null): DriverEventInput[] {
   ];
 }
 
-export function toUsageUpdateEvents(update: JsonObject | null): DriverEventInput[] {
-  const used = readNumber(update, "used");
-  const size = readNumber(update, "size");
+export function toUsageEvents(update: JsonObject | null): DriverEventInput[] {
+  const rawUsed = readNumber(update, "used");
+  const rawSize = readNumber(update, "size");
   const cost = readRecord(update, "cost");
-  const costAmount = readNumber(cost, "amount");
+  const rawCostAmount = readNumber(cost, "amount");
+  const used =
+    rawUsed !== null && Number.isSafeInteger(rawUsed) && rawUsed >= 0 ? rawUsed : null;
+  const size =
+    rawSize !== null && Number.isSafeInteger(rawSize) && rawSize >= 0 ? rawSize : null;
+  const costAmount = rawCostAmount !== null && rawCostAmount >= 0 ? rawCostAmount : null;
   const costCurrency = readNullableString(cost, "currency");
 
-  if (used === null && size === null && cost === null) {
+  if (used === null && size === null && costAmount === null) {
     return [];
   }
 
@@ -478,12 +516,12 @@ export function toUsageUpdateEvents(update: JsonObject | null): DriverEventInput
     {
       kind: "usage.updated",
       payload: {
-        costAmount,
-        ...(costCurrency === undefined ? {} : { costCurrency }),
-        size,
+        ...(costAmount === null ? {} : { costAmount }),
+        ...(costAmount === null || costCurrency === undefined ? {} : { costCurrency }),
+        ...(size === null ? {} : { size }),
         source: "session_update",
         usageContract: ACP_USAGE_CONTRACT,
-        used,
+        ...(used === null ? {} : { used }),
       },
     },
   ];

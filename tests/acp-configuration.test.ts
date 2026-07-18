@@ -3,16 +3,19 @@ import { describe, expect, test } from "bun:test";
 import { createBufferedSinkLogger } from "../src/observability";
 import {
   ACP_PROTOCOL_VERSION,
-  buildAcpChildProcessEnv,
-  enforceAcpProtocolVersion,
-  resolveAcpAuthMethodId,
+  buildChildEnv,
+  buildClientCapabilities,
+  assertProtocolVersion,
+  resolveAuthMethod,
+  supportsAdditionalDirs,
+  supportsSessionClose,
+  supportsSessionResume,
 } from "../src/runtimes/acp/acp-configuration";
-import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
-import type { AcpInitializeResult } from "../src/runtimes/acp/acp-types";
+import { AcpDriverBackend, limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
 import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { bootPayload } from "./driver-runtime-boundary-fixtures";
 
-function createInitializeResult(protocolVersion: number | string | null): AcpInitializeResult {
+function createInitializeResult(protocolVersion: number | string | null) {
   return {
     agentCapabilities: {},
     agentInfo: null,
@@ -24,45 +27,88 @@ function createInitializeResult(protocolVersion: number | string | null): AcpIni
 describe("ACP runtime configuration", () => {
   test("accepts the configured ACP protocol version only", () => {
     expect(() =>
-      enforceAcpProtocolVersion(createInitializeResult(ACP_PROTOCOL_VERSION)),
+      assertProtocolVersion(createInitializeResult(ACP_PROTOCOL_VERSION)),
     ).not.toThrow();
     expect(() =>
-      enforceAcpProtocolVersion(createInitializeResult(String(ACP_PROTOCOL_VERSION))),
-    ).not.toThrow();
+      assertProtocolVersion(createInitializeResult(String(ACP_PROTOCOL_VERSION))),
+    ).toThrow();
 
-    expect(() => enforceAcpProtocolVersion(createInitializeResult(2))).toThrow();
-    expect(() => enforceAcpProtocolVersion(createInitializeResult(null))).toThrow();
+    expect(() => assertProtocolVersion(createInitializeResult(2))).toThrow();
+    expect(() => assertProtocolVersion(createInitializeResult(null))).toThrow();
+  });
+
+  test("bounds each official transport message before JSON decoding", async () => {
+    const encoder = new TextEncoder();
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("abc"));
+        controller.enqueue(encoder.encode("d\nok\n"));
+        controller.close();
+      },
+    });
+
+    await expect(new Response(limitAcpInput(input, 3)).text()).rejects.toThrow(
+      "message exceeds 3 bytes",
+    );
+  });
+
+  test("advertises stable boolean configuration support", () => {
+    expect(buildClientCapabilities()).toEqual({
+      fs: {
+        readTextFile: true,
+        writeTextFile: true,
+      },
+      session: {
+        configOptions: {
+          boolean: {},
+        },
+      },
+      terminal: true,
+    });
+  });
+
+  test("treats null session capabilities as unsupported", () => {
+    expect(
+      supportsAdditionalDirs({
+        sessionCapabilities: { additionalDirectories: null },
+      }),
+    ).toBe(false);
+    expect(supportsSessionClose({ sessionCapabilities: { close: null } })).toBe(false);
+    expect(supportsSessionResume({ sessionCapabilities: { resume: null } })).toBe(false);
+    expect(supportsSessionClose({ sessionCapabilities: { close: {} } })).toBe(true);
+    expect(supportsSessionResume({ sessionCapabilities: { resume: {} } })).toBe(true);
+    expect(
+      supportsAdditionalDirs({
+        sessionCapabilities: { additionalDirectories: {} },
+      }),
+    ).toBe(true);
   });
 
   test("fails fast when a configured auth method is not advertised", () => {
     expect(
-      resolveAcpAuthMethodId([{ id: "browser-login", name: "Browser Login" }], {
+      resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "browser-login",
       }),
     ).toBe("browser-login");
 
-    expect(resolveAcpAuthMethodId([{ id: "browser-login", name: "Browser Login" }], {})).toBeNull();
+    expect(resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {})).toBeNull();
 
     expect(() =>
-      resolveAcpAuthMethodId([{ id: "browser-login", name: "Browser Login" }], {
+      resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "device-login",
       }),
     ).toThrow();
   });
 
   test("inherits only runtime proxy env and prepends artifact paths", () => {
-    const env = buildAcpChildProcessEnv(
+    const env = buildChildEnv(
       {
         ...bootPayload,
         execution: {
           ...bootPayload.execution,
           environment: {
-            paths: {
-              executable: ["/artifact/bin"],
-              node: [],
-              python: [],
-            },
-            variables: {},
+            paths: { executable: ["/artifact/bin"], node: [], python: [] },
+            variables: bootPayload.execution.environment.variables,
           },
         },
       },
@@ -85,7 +131,7 @@ describe("ACP runtime configuration", () => {
   });
 
   test("keeps explicit ACP execution proxy env above inherited process env", () => {
-    const env = buildAcpChildProcessEnv(
+    const env = buildChildEnv(
       {
         ...bootPayload,
         execution: {
@@ -130,7 +176,7 @@ describe("ACP runtime configuration", () => {
     });
 
     try {
-      await expect(backend.start(context)).rejects.toThrow(
+      await expect(backend.start(context, new AbortController().signal)).rejects.toThrow(
         "ACP fallback requires a host integration snapshot.",
       );
     } finally {

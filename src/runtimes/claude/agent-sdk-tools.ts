@@ -1,4 +1,3 @@
-import { isTruthy } from "../../core/truthiness";
 import { readString, stringifyForDisplay } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 export function isToolUseBlock(block: JsonObject): boolean {
@@ -16,7 +15,7 @@ export function toToolCallName(block: JsonObject): string {
 
   if (type === "mcp_tool_use") {
     const serverName = readString(block, "server_name");
-    return isTruthy(serverName) ? `${serverName}.${name}` : name;
+    return serverName ? `${serverName}.${name}` : name;
   }
 
   return name;

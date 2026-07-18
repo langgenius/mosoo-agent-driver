@@ -43,21 +43,15 @@
     {
       "kind": "item.completed",
       "payload": {
-        "error": "Turn failed after the maximum turn request limit.",
         "itemId": "tool-1",
         "itemType": "tool_call",
-        "status": "failed"
+        "status": "completed"
       },
       "runId": "run-1"
     },
     {
-      "kind": "run.failed",
+      "kind": "run.completed",
       "payload": {
-        "error": {
-          "code": "acp.max_turn_requests",
-          "message": "ACP prompt stopped after the maximum turn request limit."
-        },
-        "recoverable": false,
         "stopReason": "max_turn_requests"
       },
       "runId": "run-1"

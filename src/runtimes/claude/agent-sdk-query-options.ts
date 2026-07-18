@@ -7,7 +7,6 @@ import type {
   PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import { isTruthy } from "../../core/truthiness";
 import type { DriverBootMcpServer } from "../../protocol/boot";
 import type { DriverBuiltInToolName } from "../../protocol/boot";
 import type { JsonObject } from "../../protocol/json";
@@ -32,6 +31,25 @@ const CLAUDE_BUILT_IN_TOOL_NAMES = {
   write: "Write",
 } as const satisfies Record<DriverBuiltInToolName, string>;
 
+const CLAUDE_PROVIDER_OPTION_KEYS = new Set<string>(
+  [
+    "agentProgressSummaries",
+    "betas",
+    "effort",
+    "enableFileCheckpointing",
+    "fallbackModel",
+    "forwardSubagentText",
+    "includeHookEvents",
+    "maxBudgetUsd",
+    "maxThinkingTokens",
+    "maxTurns",
+    "outputFormat",
+    "taskBudget",
+    "thinking",
+    "title",
+  ] satisfies readonly (keyof ClaudeQueryOptions)[],
+);
+
 function createCanUseTool(context: AgentDriverContext): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {
     if (options.signal.aborted) {
@@ -43,13 +61,25 @@ function createCanUseTool(context: AgentDriverContext): CanUseTool {
       };
     }
 
-    const decision = await context.ports.permission.request({
-      rawInput: stringifyForDisplay(input),
-      requestId: options.toolUseID,
-      title: options.title ?? options.displayName ?? `Approve ${toolName}`,
-      toolCallId: options.toolUseID,
-      toolKind: toolName,
-    });
+    const decision = await context.ports.permission.request(
+      {
+        rawInput: stringifyForDisplay(input),
+        requestId: options.requestId,
+        title: options.title ?? options.displayName ?? `Approve ${toolName}`,
+        toolCallId: options.toolUseID,
+        toolKind: toolName,
+      },
+      options.signal,
+    );
+
+    if (options.signal.aborted) {
+      return {
+        behavior: "deny",
+        interrupt: true,
+        message: "Permission request was aborted.",
+        toolUseID: options.toolUseID,
+      };
+    }
 
     if (decision === "allow_once") {
       return {
@@ -113,7 +143,12 @@ export function mergeClaudeQueryOptions<T extends object>(
   options: T,
   providerOptions: JsonObject,
 ): T {
-  return mergeProviderOptions(options, providerOptions);
+  return mergeProviderOptions(
+    options,
+    Object.fromEntries(
+      Object.entries(providerOptions).filter(([key]) => CLAUDE_PROVIDER_OPTION_KEYS.has(key)),
+    ),
+  );
 }
 
 export async function createClaudeQueryOptions(input: {
@@ -147,7 +182,7 @@ export async function createClaudeQueryOptions(input: {
   options.tools = builtInTools;
 
   const claudeCodeExecutable = readProcessEnvString(CLAUDE_CODE_EXECUTABLE_ENV);
-  if (isTruthy(claudeCodeExecutable)) {
+  if (claudeCodeExecutable) {
     options.pathToClaudeCodeExecutable = claudeCodeExecutable;
   }
 
@@ -156,7 +191,7 @@ export async function createClaudeQueryOptions(input: {
     options.mcpServers = mcpServers;
   }
 
-  if (isTruthy(appendSystemPrompt)) {
+  if (appendSystemPrompt) {
     options.systemPrompt = {
       append: appendSystemPrompt,
       preset: "claude_code",
@@ -164,7 +199,7 @@ export async function createClaudeQueryOptions(input: {
     };
   }
 
-  if (isTruthy(input.nativeSessionId)) {
+  if (input.nativeSessionId) {
     options.resume = input.nativeSessionId;
   }
 
@@ -173,6 +208,5 @@ export async function createClaudeQueryOptions(input: {
     input.payload.execution.environment.paths,
     mergedOptions.env ?? {},
   );
-  mergedOptions.tools = builtInTools;
   return mergedOptions;
 }

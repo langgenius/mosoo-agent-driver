@@ -8,7 +8,10 @@ import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import {
+  isServerRequestMethod,
   isServerNotificationMethod,
+  OPENAI_APP_SERVER_SCHEMA_VERSION,
+  parseClientRequestResult,
   parseServerNotificationParams,
 } from "../src/runtimes/openai/generated/app-server-protocol";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/generated/app-server-protocol";
@@ -232,6 +235,84 @@ async function assertTrackTurnFixture(
 }
 
 describe("OpenAI app-server provider fixtures", () => {
+  test("matches the 0.144.5 reasoning, MCP progress, and interactive request surface", () => {
+    expect(OPENAI_APP_SERVER_SCHEMA_VERSION).toBe("0.144.5");
+    expect(
+      parseServerNotificationParams("item/reasoning/summaryPartAdded", {
+        itemId: "reasoning-1",
+        summaryIndex: 1,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toEqual({
+      itemId: "reasoning-1",
+      summaryIndex: 1,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(
+      parseServerNotificationParams("item/mcpToolCall/progress", {
+        itemId: "tool-1",
+        message: "Working",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).toEqual({
+      itemId: "tool-1",
+      message: "Working",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    expect(isServerRequestMethod("item/tool/requestUserInput")).toBe(true);
+    expect(isServerRequestMethod("item/tool/call")).toBe(true);
+    expect(isServerRequestMethod("mcpServer/elicitation/request")).toBe(true);
+    expect(isServerRequestMethod("account/chatgptAuthTokens/refresh")).toBe(true);
+    expect(isServerRequestMethod("attestation/generate")).toBe(true);
+    expect(isServerRequestMethod("currentTime/read")).toBe(true);
+    expect(
+      parseServerNotificationParams("serverRequest/resolved", {
+        requestId: 7,
+        threadId: "thread-1",
+      }),
+    ).toEqual({ requestId: 7, threadId: "thread-1" });
+  });
+
+  test.each([undefined, "inProgress", "unknown"])(
+    "rejects non-terminal turn/completed status %p",
+    (status) => {
+      expect(() =>
+        parseServerNotificationParams("turn/completed", {
+          threadId: "thread-1",
+          turn: { id: "turn-1", ...(status === undefined ? {} : { status }) },
+        }),
+      ).toThrow();
+    },
+  );
+
+  test.each([
+    "completedAt",
+    "durationMs",
+    "error",
+    "items",
+    "itemsView",
+    "startedAt",
+    "status",
+  ] as const)("rejects turn/start without required Turn field %s", (missing) => {
+    const turn: Record<string, unknown> = {
+      completedAt: null,
+      durationMs: null,
+      error: null,
+      id: "turn-1",
+      items: [],
+      itemsView: "notLoaded",
+      startedAt: null,
+      status: "inProgress",
+    };
+    delete turn[missing];
+
+    expect(() => parseClientRequestResult("turn/start", { turn })).toThrow(missing);
+  });
+
   test("preserves the assistant item identity on text deltas", () => {
     expect(
       parseServerNotificationParams("item/agentMessage/delta", {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { CmaUnsupportedFieldError } from "../src/projections/cma";
+import { CmaInvalidEventError, CmaUnsupportedFieldError } from "../src/projections/cma";
 import { projectCmaInboundToDriverCommand, projectDriverEventToCma } from "../src/projections/cma";
 
 describe("CMA projection", () => {
@@ -88,6 +88,24 @@ describe("CMA projection", () => {
     ).toThrow(CmaUnsupportedFieldError);
   });
 
+  test.each([
+    [null, "must be an object"],
+    [{ type: "unknown" }, "Unsupported CMA event type"],
+    [{ type: "user.message" }, "commandId"],
+    [
+      {
+        commandId: "command-1",
+        decision: "always",
+        requestId: "request-1",
+        type: "user.tool_confirmation",
+      },
+      "decision",
+    ],
+  ])("classifies malformed inbound events as request errors", (input, message) => {
+    expect(() => projectCmaInboundToDriverCommand(input)).toThrow(CmaInvalidEventError);
+    expect(() => projectCmaInboundToDriverCommand(input)).toThrow(message);
+  });
+
   test("projects permission requests to requires_action idle status", () => {
     expect(
       projectDriverEventToCma({
@@ -120,6 +138,23 @@ describe("CMA projection", () => {
         type: "session.status_idle",
       },
     ]);
+    expect(
+      projectDriverEventToCma({
+        kind: "run.waiting",
+        payload: { status: "waiting_input" },
+      }),
+    ).toMatchObject([
+      {
+        sessionStatus: "idle",
+        type: "session.status_idle",
+      },
+    ]);
+    expect(
+      projectDriverEventToCma({
+        kind: "diagnostic.reported",
+        payload: { message: "private" },
+      }),
+    ).toEqual([]);
   });
 
   test("projects driver event families to CMA outbound events", () => {
@@ -166,6 +201,30 @@ describe("CMA projection", () => {
       {
         sourceEventKind: "usage.updated",
         type: "session.usage",
+      },
+    ]);
+  });
+
+  test.each([
+    [true, "rescheduling", "session.status_rescheduling"],
+    [false, "terminated", "session.error"],
+  ] as const)("maps recoverable=%s run failures to %s", (recoverable, sessionStatus, type) => {
+    expect(
+      projectDriverEventToCma({
+        kind: "run.failed",
+        payload: {
+          error: {
+            code: "driver.failed",
+            message: "failed",
+          },
+          recoverable,
+        },
+      }),
+    ).toMatchObject([
+      {
+        sessionStatus,
+        sourceEventKind: "run.failed",
+        type,
       },
     ]);
   });

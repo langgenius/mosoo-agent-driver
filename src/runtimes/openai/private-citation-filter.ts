@@ -1,6 +1,7 @@
 const OPENAI_PRIVATE_MARKUP_START = "\uE200";
 const OPENAI_PRIVATE_MARKUP_END = "\uE201";
 const OPENAI_PRIVATE_CITATION_PREFIX = `${OPENAI_PRIVATE_MARKUP_START}cite\uE202`;
+const MAX_PENDING_PRIVATE_CITATION_CHARS = 4_096;
 
 export interface OpenAiPrivateCitationFilterResult {
   readonly privateCitationCount: number;
@@ -8,7 +9,7 @@ export interface OpenAiPrivateCitationFilterResult {
 }
 
 interface OpenAiPrivateCitationScanResult extends OpenAiPrivateCitationFilterResult {
-  readonly hasPendingMarkup: boolean;
+  readonly pendingMarkup: string;
 }
 
 function scanOpenAiPrivateCitations(
@@ -35,7 +36,7 @@ function scanOpenAiPrivateCitations(
       OPENAI_PRIVATE_CITATION_PREFIX.startsWith(remainingText)
     ) {
       return {
-        hasPendingMarkup: true,
+        pendingMarkup: remainingText,
         privateCitationCount,
         text: sanitizedText,
       };
@@ -55,7 +56,7 @@ function scanOpenAiPrivateCitations(
     if (markupEnd === -1) {
       if (options.preserveIncompleteMarkup) {
         return {
-          hasPendingMarkup: true,
+          pendingMarkup: remainingText,
           privateCitationCount,
           text: sanitizedText,
         };
@@ -70,7 +71,7 @@ function scanOpenAiPrivateCitations(
   }
 
   return {
-    hasPendingMarkup: false,
+    pendingMarkup: "",
     privateCitationCount,
     text: sanitizedText,
   };
@@ -86,40 +87,55 @@ export function filterOpenAiPrivateCitations(text: string): OpenAiPrivateCitatio
 }
 
 export class OpenAiPrivateCitationStreamFilter {
-  #emittedTextLength = 0;
-  #privateCitationCount = 0;
-  #rawText = "";
+  #discardUntilEnd = false;
+  #pendingMarkup = "";
 
   push(delta: string): OpenAiPrivateCitationFilterResult {
-    this.#rawText += delta;
-    const result = scanOpenAiPrivateCitations(this.#rawText, {
+    let input = delta;
+    let discardedCitationCount = 0;
+
+    if (this.#discardUntilEnd) {
+      const markupEnd = input.indexOf(OPENAI_PRIVATE_MARKUP_END);
+
+      if (markupEnd === -1) {
+        return { privateCitationCount: 0, text: "" };
+      }
+
+      this.#discardUntilEnd = false;
+      discardedCitationCount = 1;
+      input = input.slice(markupEnd + OPENAI_PRIVATE_MARKUP_END.length);
+    }
+
+    const result = scanOpenAiPrivateCitations(this.#pendingMarkup + input, {
       preserveIncompleteMarkup: true,
     });
-    const emittedText = result.text.slice(this.#emittedTextLength);
-    const newlyDetectedCitations = result.privateCitationCount - this.#privateCitationCount;
+    this.#pendingMarkup = result.pendingMarkup;
 
-    this.#emittedTextLength = result.text.length;
-    this.#privateCitationCount = result.privateCitationCount;
+    if (this.#pendingMarkup.length > MAX_PENDING_PRIVATE_CITATION_CHARS) {
+      this.#pendingMarkup = "";
+      this.#discardUntilEnd = true;
+    }
 
     return {
-      privateCitationCount: newlyDetectedCitations,
-      text: emittedText,
+      privateCitationCount: discardedCitationCount + result.privateCitationCount,
+      text: result.text,
     };
   }
 
   finish(): OpenAiPrivateCitationFilterResult {
-    const result = scanOpenAiPrivateCitations(this.#rawText, {
+    if (this.#discardUntilEnd) {
+      this.#discardUntilEnd = false;
+      return { privateCitationCount: 0, text: "" };
+    }
+
+    const result = scanOpenAiPrivateCitations(this.#pendingMarkup, {
       preserveIncompleteMarkup: false,
     });
-    const emittedText = result.text.slice(this.#emittedTextLength);
-    const newlyDetectedCitations = result.privateCitationCount - this.#privateCitationCount;
-
-    this.#emittedTextLength = result.text.length;
-    this.#privateCitationCount = result.privateCitationCount;
+    this.#pendingMarkup = "";
 
     return {
-      privateCitationCount: newlyDetectedCitations,
-      text: emittedText,
+      privateCitationCount: result.privateCitationCount,
+      text: result.text,
     };
   }
 }

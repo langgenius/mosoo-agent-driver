@@ -26,7 +26,7 @@ export interface AcpPermissionOption {
   readonly optionId: string;
 }
 
-export function toAcpPermissionRequest(input: {
+export function toPermissionRequest(input: {
   params: unknown;
   requestId: string;
   runId: RunId | null;
@@ -78,7 +78,7 @@ export function toAcpPermissionRequest(input: {
   };
 }
 
-export function toAcpPermissionResolvedEvent(input: {
+export function toPermissionResolvedEvent(input: {
   option: AcpPermissionOption | null;
   requestId: string;
   runId: RunId | null;

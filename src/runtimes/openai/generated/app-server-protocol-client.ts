@@ -27,9 +27,29 @@ function parseThreadResponse(value: unknown, method: string): ThreadStartRespons
 
 function parseTurnStartResponse(value: unknown): TurnStartResponse {
   const record = expectRecord(value, "turn/start result");
+  const turn = expectRecord(record["turn"], "turn/start result.turn");
+
+  for (const field of [
+    "completedAt",
+    "durationMs",
+    "error",
+    "items",
+    "itemsView",
+    "startedAt",
+    "status",
+  ]) {
+    if (!Object.hasOwn(turn, field)) {
+      throw new Error(`turn/start result.turn.${field} is required.`);
+    }
+  }
+
+  const parsed = parseTurn(turn, "turn/start result.turn");
 
   return {
-    turn: parseTurn(record["turn"], "turn/start result.turn"),
+    turn: {
+      ...parsed,
+      error: parsed.error ?? null,
+    } as Required<typeof parsed>,
   };
 }
 

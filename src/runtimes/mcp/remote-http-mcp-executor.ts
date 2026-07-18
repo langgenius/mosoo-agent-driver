@@ -10,10 +10,13 @@ import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client"
 
 import type { DriverStartInput } from "../../protocol/start";
 import type { McpExecuteCommand } from "../../runtime-command";
-import { ignorePromiseRejection } from "../../utils/async";
+import { settlePromiseWithTimeout } from "../../utils/async";
 
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
 type ActiveMcpServer = Extract<SessionMcpServer, { authorizationState: "active" }>;
+
+const MCP_REQUEST_TIMEOUT_MS = 60_000;
+const MCP_CLEANUP_TIMEOUT_MS = 2_000;
 
 function parseToolArguments(command: McpExecuteCommand): Record<string, unknown> {
   try {
@@ -46,27 +49,22 @@ function resolveActiveMcpServer(
     throw new Error(`MCP server ${command.serverId} is not configured for this session.`);
   }
 
-  if (server.authorizationState === "authorization_required") {
-    throw new Error(
-      `MCP server ${server.name} requires authorization before tools can be executed.`,
-    );
+  switch (server.authorizationState) {
+    case "active":
+      return server;
+    case "authorization_required":
+      throw new Error(
+        `MCP server ${server.name} requires authorization before tools can be executed.`,
+      );
+    case "expired":
+      throw new Error(
+        `MCP authorization for ${server.name} has expired and must be refreshed before use.`,
+      );
+    case "revoked":
+      throw new Error(`MCP authorization for ${server.name} was revoked and must be reconnected.`);
+    case "disabled":
+      throw new Error(`MCP server ${server.name} is disabled for this session.`);
   }
-
-  if (server.authorizationState === "expired") {
-    throw new Error(
-      `MCP authorization for ${server.name} has expired and must be refreshed before use.`,
-    );
-  }
-
-  if (server.authorizationState === "revoked") {
-    throw new Error(`MCP authorization for ${server.name} was revoked and must be reconnected.`);
-  }
-
-  if (server.authorizationState === "disabled") {
-    throw new Error(`MCP server ${server.name} is disabled for this session.`);
-  }
-
-  return server as ActiveMcpServer;
 }
 
 function normalizeCallToolResult(
@@ -183,7 +181,9 @@ function mapMcpExecutionError(
 export async function executeRemoteHttpMcpCommand(
   payload: DriverStartInput,
   command: McpExecuteCommand,
+  signal: AbortSignal,
 ): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }> {
+  signal.throwIfAborted();
   const server = resolveActiveMcpServer(payload, command);
   const argumentsObject = parseToolArguments(command);
   const authProvider: AuthProvider = {
@@ -196,16 +196,21 @@ export async function executeRemoteHttpMcpCommand(
   const transport = new StreamableHTTPClientTransport(new URL(server.proxyUrl), {
     authProvider,
   });
+  const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
 
   try {
-    await client.connect(transport);
+    await client.connect(transport, {
+      signal: requestSignal,
+      timeout: MCP_REQUEST_TIMEOUT_MS,
+    });
     const result = await client.callTool(
       {
         arguments: argumentsObject,
         name: command.toolName,
       },
       {
-        timeout: 60_000,
+        signal: requestSignal,
+        timeout: MCP_REQUEST_TIMEOUT_MS,
       },
     );
 
@@ -213,12 +218,16 @@ export async function executeRemoteHttpMcpCommand(
   } catch (error) {
     throw mapMcpExecutionError(command, server, error);
   } finally {
-    try {
-      await transport.terminateSession();
-    } catch {
-      await transport.close().catch(ignorePromiseRejection);
+    if (!requestSignal.aborted) {
+      await settlePromiseWithTimeout(transport.terminateSession(), {
+        label: "MCP session termination",
+        timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+      });
     }
 
-    await client.close().catch(ignorePromiseRejection);
+    await settlePromiseWithTimeout(client.close(), {
+      label: "MCP client close",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    });
   }
 }

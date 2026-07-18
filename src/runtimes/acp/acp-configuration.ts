@@ -1,10 +1,14 @@
+import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
+import type { AgentCapabilities, ClientCapabilities, McpServer } from "@agentclientprotocol/sdk";
+
 import type { DriverExecutionSessionContext } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
-import type { AcpAuthMethod, AcpInitializeResult, AcpMcpServer, JsonObject } from "./acp-types";
-import { isRecord, readRecord } from "./acp-types";
+import type { JsonObject } from "./acp-types";
 
-export const ACP_PROTOCOL_VERSION = 1 as const;
+type AcpHttpMcpServer = Extract<McpServer, { type: "http" }>;
+
+export const ACP_PROTOCOL_VERSION = PROTOCOL_VERSION;
 const ACP_RUNTIME_HOME_DIR = "acp-fallback";
 const ACP_DEFAULT_COMMAND = "acp-agent";
 const ACP_INHERITED_PROCESS_ENV_KEYS = [
@@ -19,14 +23,14 @@ const ACP_INHERITED_PROCESS_ENV_KEYS = [
   "no_proxy",
 ] as const;
 
-export function readAcpFallbackCommand(): string {
+export function readFallbackCommand(): string {
   const command = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
   return typeof command === "string" && command.trim().length > 0
     ? command.trim()
     : ACP_DEFAULT_COMMAND;
 }
 
-export function readAcpFallbackArgs(): string[] {
+export function readFallbackArgs(): string[] {
   const rawArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
 
   if (typeof rawArgs !== "string" || rawArgs.trim().length === 0) {
@@ -42,7 +46,7 @@ export function readAcpFallbackArgs(): string[] {
   return parsed;
 }
 
-function buildAcpInheritedProcessEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+function buildInheritedEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   const inherited: Record<string, string> = {};
 
   for (const key of ACP_INHERITED_PROCESS_ENV_KEYS) {
@@ -56,14 +60,14 @@ function buildAcpInheritedProcessEnv(env: NodeJS.ProcessEnv): Record<string, str
   return inherited;
 }
 
-export function buildAcpChildProcessEnv(
+export function buildChildEnv(
   payload: DriverStartInput,
   processEnv: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   const { homePath } = payload.execution.session;
 
   return buildRuntimeChildProcessEnv(payload.execution.environment.paths, {
-    ...buildAcpInheritedProcessEnv(processEnv),
+    ...buildInheritedEnv(processEnv),
     ...payload.execution.environment.variables,
     DISABLE_AUTOUPDATER: "1",
     DISABLE_ERROR_REPORTING: "1",
@@ -76,18 +80,23 @@ export function buildAcpChildProcessEnv(
   });
 }
 
-export function buildAcpClientCapabilities(): JsonObject {
+export function buildClientCapabilities(): ClientCapabilities {
   return {
     fs: {
       readTextFile: true,
       writeTextFile: true,
     },
+    session: {
+      configOptions: {
+        boolean: {},
+      },
+    },
     terminal: true,
   };
 }
 
-export function buildAcpMcpServers(payload: DriverStartInput): AcpMcpServer[] {
-  return payload.execution.session.mcpServers.flatMap((server): AcpMcpServer[] => {
+export function buildMcpServers(payload: DriverStartInput): AcpHttpMcpServer[] {
+  return payload.execution.session.mcpServers.flatMap((server): AcpHttpMcpServer[] => {
     if (server.authorizationState !== "active") {
       return [];
     }
@@ -113,28 +122,23 @@ export function buildAcpMcpServers(payload: DriverStartInput): AcpMcpServer[] {
   });
 }
 
-export function enforceAcpMcpSupport(
-  agentCapabilities: JsonObject | null,
-  servers: AcpMcpServer[],
+export function assertMcpSupport(
+  agentCapabilities: AgentCapabilities | null,
+  servers: AcpHttpMcpServer[],
 ): void {
   if (servers.length === 0) {
     return;
   }
 
-  const mcpCapabilities = readRecord(agentCapabilities, "mcpCapabilities");
-
-  if (mcpCapabilities?.["http"] === true) {
+  if (agentCapabilities?.mcpCapabilities?.http === true) {
     return;
   }
 
   throw new Error("ACP agent does not advertise HTTP MCP support.");
 }
 
-export function enforceAcpProtocolVersion(result: AcpInitializeResult): void {
-  if (
-    result.protocolVersion === ACP_PROTOCOL_VERSION ||
-    result.protocolVersion === String(ACP_PROTOCOL_VERSION)
-  ) {
+export function assertProtocolVersion(result: { readonly protocolVersion: unknown }): void {
+  if (result.protocolVersion === ACP_PROTOCOL_VERSION) {
     return;
   }
 
@@ -143,7 +147,7 @@ export function enforceAcpProtocolVersion(result: AcpInitializeResult): void {
   );
 }
 
-export function readAcpNativeResumeSessionId(payload: DriverStartInput): string | null {
+export function readResumeId(payload: DriverStartInput): string | null {
   const ref = payload.execution.session.nativeResumeRef;
 
   if (ref === null) {
@@ -154,11 +158,15 @@ export function readAcpNativeResumeSessionId(payload: DriverStartInput): string 
     throw new Error("ACP fallback received an incompatible native resume ref.");
   }
 
+  if (ref.value.trim().length === 0) {
+    throw new Error("ACP fallback received an empty native session ID.");
+  }
+
   return ref.value;
 }
 
-export function resolveAcpAuthMethodId(
-  authMethods: readonly AcpAuthMethod[],
+export function resolveAuthMethod(
+  authMethods: readonly { readonly id: string }[],
   env: Record<string, string>,
 ): string | null {
   const requestedMethodId = env["MOSOO_ACP_AUTH_METHOD_ID"]?.trim();
@@ -174,7 +182,7 @@ export function resolveAcpAuthMethodId(
   throw new Error(`Configured ACP auth method is not advertised: ${requestedMethodId}.`);
 }
 
-export function toAcpRequestMeta(input: {
+export function toRequestMeta(input: {
   sessionContext: DriverExecutionSessionContext;
 }): JsonObject {
   const context = input.sessionContext;
@@ -185,14 +193,20 @@ export function toAcpRequestMeta(input: {
   };
 }
 
-export function supportsAcpSessionClose(agentCapabilities: JsonObject | null): boolean {
-  return isRecord(readRecord(agentCapabilities, "sessionCapabilities")?.["close"]);
+export function supportsSessionClose(agentCapabilities: AgentCapabilities | null): boolean {
+  return agentCapabilities?.sessionCapabilities?.close != null;
 }
 
-export function supportsAcpSessionLoad(agentCapabilities: JsonObject | null): boolean {
-  return agentCapabilities?.["loadSession"] === true;
+export function supportsAdditionalDirs(
+  agentCapabilities: AgentCapabilities | null,
+): boolean {
+  return agentCapabilities?.sessionCapabilities?.additionalDirectories != null;
 }
 
-export function supportsAcpSessionResume(agentCapabilities: JsonObject | null): boolean {
-  return isRecord(readRecord(agentCapabilities, "sessionCapabilities")?.["resume"]);
+export function supportsSessionLoad(agentCapabilities: AgentCapabilities | null): boolean {
+  return agentCapabilities?.loadSession === true;
+}
+
+export function supportsSessionResume(agentCapabilities: AgentCapabilities | null): boolean {
+  return agentCapabilities?.sessionCapabilities?.resume != null;
 }

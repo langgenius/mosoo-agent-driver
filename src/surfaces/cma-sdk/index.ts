@@ -9,6 +9,7 @@ import type {
   CmaSessionEventRecord,
   CmaSessionRecord,
 } from "../../stores/cma-store";
+import { CMA_MAX_EVENT_BYTES } from "../../stores/cma-store";
 import { CMA_DEFAULT_BETA_HEADER_NAME, CMA_DEFAULT_BETA_HEADER_VALUE } from "../cma-http";
 
 export type CmaSdkFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -48,7 +49,10 @@ export interface CmaSdkClient {
     sessionId: string,
     event: CmaInboundEvent,
   ): Promise<CmaSessionEventDispatchRecord>;
-  streamSessionEvents(sessionId: string): AsyncIterable<CmaSessionEventRecord>;
+  streamSessionEvents(
+    sessionId: string,
+    afterCursor?: string,
+  ): AsyncIterable<CmaSessionEventRecord>;
 }
 
 export class CmaSdkError extends Error {
@@ -63,10 +67,6 @@ export class CmaSdkError extends Error {
     this.code = code;
     this.body = body;
   }
-}
-
-function defaultFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  return fetch(input, init);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -111,14 +111,10 @@ function readData(body: unknown): unknown {
   return body["data"];
 }
 
-function encodePathSegment(value: string): string {
-  return encodeURIComponent(value);
-}
-
 function parseSseRecord(frame: string): CmaSessionEventRecord | null {
   const dataLines: string[] = [];
 
-  for (const line of frame.split("\n")) {
+  for (const line of frame.split(/\r\n|\r|\n/u)) {
     if (line.startsWith("data:")) {
       dataLines.push(line.slice(5).trimStart());
     }
@@ -131,30 +127,55 @@ function parseSseRecord(frame: string): CmaSessionEventRecord | null {
   return JSON.parse(dataLines.join("\n")) as CmaSessionEventRecord;
 }
 
-function extractSseRecords(buffer: string): {
-  readonly records: readonly CmaSessionEventRecord[];
-  readonly rest: string;
-} {
-  const records: CmaSessionEventRecord[] = [];
-  let rest = buffer;
-  let separatorIndex = rest.indexOf("\n\n");
-
-  while (separatorIndex >= 0) {
-    const frame = rest.slice(0, separatorIndex);
-    const record = parseSseRecord(frame);
-
-    if (record) {
-      records.push(record);
+function findSseSeparator(
+  value: Uint8Array,
+  length: number,
+  start: number,
+  atEof = false,
+): { readonly index: number; readonly length: number } | null {
+  const lineBreakLength = (index: number): number => {
+    if (index >= length) {
+      return 0;
     }
 
-    rest = rest.slice(separatorIndex + 2);
-    separatorIndex = rest.indexOf("\n\n");
+    if (value[index] === 13) {
+      if (index + 1 >= length) {
+        return atEof ? 1 : 0;
+      }
+
+      return value[index + 1] === 10 ? 2 : 1;
+    }
+
+    return value[index] === 10 ? 1 : 0;
+  };
+
+  for (let index = start; index < length; ) {
+    const first = lineBreakLength(index);
+
+    if (first === 0) {
+      index += 1;
+      continue;
+    }
+
+    const second = lineBreakLength(index + first);
+
+    if (second > 0) {
+      return { index, length: first + second };
+    }
+
+    index += first;
   }
 
-  return {
-    records,
-    rest,
-  };
+  return null;
+}
+
+function sseFrameLimitError(): CmaSdkError {
+  return new CmaSdkError(
+    500,
+    "CMA_SDK_FRAME_TOO_LARGE",
+    `CMA SSE frame exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
+    null,
+  );
 }
 
 export function createCmaSdkClient(options: CmaSdkClientOptions): CmaSdkClient {
@@ -168,7 +189,7 @@ class CmaSdkClientCore implements CmaSdkClient {
 
   constructor(options: CmaSdkClientOptions) {
     this.#baseUrl = new URL(options.baseUrl);
-    this.#fetch = options.fetch ?? defaultFetch;
+    this.#fetch = options.fetch ?? fetch;
     this.#headers = new Headers(options.headers);
 
     if (options.betaHeader !== false) {
@@ -181,7 +202,7 @@ class CmaSdkClientCore implements CmaSdkClient {
 
   async archiveEnvironment(id: string): Promise<CmaEnvironmentRecord> {
     return this.#requestData<CmaEnvironmentRecord>(
-      `/v1/environments/${encodePathSegment(id)}/archive`,
+      `/v1/environments/${encodeURIComponent(id)}/archive`,
       {
         method: "POST",
       },
@@ -210,21 +231,21 @@ class CmaSdkClientCore implements CmaSdkClient {
   }
 
   async deleteEnvironment(id: string): Promise<void> {
-    await this.#request(`/v1/environments/${encodePathSegment(id)}`, {
+    await this.#request(`/v1/environments/${encodeURIComponent(id)}`, {
       method: "DELETE",
     });
   }
 
   async getAgent(id: string): Promise<CmaAgentRecord> {
-    return this.#requestData<CmaAgentRecord>(`/v1/agents/${encodePathSegment(id)}`);
+    return this.#requestData<CmaAgentRecord>(`/v1/agents/${encodeURIComponent(id)}`);
   }
 
   async getEnvironment(id: string): Promise<CmaEnvironmentRecord> {
-    return this.#requestData<CmaEnvironmentRecord>(`/v1/environments/${encodePathSegment(id)}`);
+    return this.#requestData<CmaEnvironmentRecord>(`/v1/environments/${encodeURIComponent(id)}`);
   }
 
   async getSession(id: string): Promise<CmaSessionRecord> {
-    return this.#requestData<CmaSessionRecord>(`/v1/sessions/${encodePathSegment(id)}`);
+    return this.#requestData<CmaSessionRecord>(`/v1/sessions/${encodeURIComponent(id)}`);
   }
 
   async listAgents(): Promise<readonly CmaAgentRecord[]> {
@@ -237,7 +258,7 @@ class CmaSdkClientCore implements CmaSdkClient {
 
   async listSessionEvents(sessionId: string): Promise<readonly CmaSessionEventRecord[]> {
     return this.#requestData<readonly CmaSessionEventRecord[]>(
-      `/v1/sessions/${encodePathSegment(sessionId)}/events`,
+      `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
     );
   }
 
@@ -246,7 +267,7 @@ class CmaSdkClientCore implements CmaSdkClient {
     event: CmaInboundEvent,
   ): Promise<CmaSessionEventDispatchRecord> {
     return this.#requestData<CmaSessionEventDispatchRecord>(
-      `/v1/sessions/${encodePathSegment(sessionId)}/events`,
+      `/v1/sessions/${encodeURIComponent(sessionId)}/events`,
       {
         body: JSON.stringify(event),
         method: "POST",
@@ -254,10 +275,14 @@ class CmaSdkClientCore implements CmaSdkClient {
     );
   }
 
-  async *streamSessionEvents(sessionId: string): AsyncIterable<CmaSessionEventRecord> {
-    const response = await this.#request(`/v1/sessions/${encodePathSegment(sessionId)}/events`, {
+  async *streamSessionEvents(
+    sessionId: string,
+    afterCursor?: string,
+  ): AsyncIterable<CmaSessionEventRecord> {
+    const response = await this.#request(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
       headers: {
         accept: "text/event-stream",
+        ...(afterCursor === undefined ? {} : { "last-event-id": afterCursor }),
       },
     });
 
@@ -272,8 +297,59 @@ class CmaSdkClientCore implements CmaSdkClient {
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "";
+    const frame = new Uint8Array(CMA_MAX_EVENT_BYTES + 1);
     let completed = false;
+    let frameLength = 0;
+    let scanFrom = 0;
+
+    const consume = (separator: {
+      readonly index: number;
+      readonly length: number;
+    }): CmaSessionEventRecord | null => {
+      const consumed = separator.index + separator.length;
+
+      if (consumed > CMA_MAX_EVENT_BYTES) {
+        throw sseFrameLimitError();
+      }
+
+      const record = parseSseRecord(decoder.decode(frame.subarray(0, separator.index)));
+      frame.copyWithin(0, consumed, frameLength);
+      frameLength -= consumed;
+      scanFrom = 0;
+      return record;
+    };
+
+    const append = (bytes: Uint8Array): CmaSessionEventRecord[] => {
+      const records: CmaSessionEventRecord[] = [];
+
+      for (const byte of bytes) {
+        if (frameLength >= frame.length) {
+          throw sseFrameLimitError();
+        }
+
+        frame[frameLength] = byte;
+        frameLength += 1;
+        const separator = findSseSeparator(frame, frameLength, scanFrom);
+
+        if (!separator) {
+          scanFrom = Math.max(0, frameLength - 3);
+
+          if (frameLength > CMA_MAX_EVENT_BYTES) {
+            throw sseFrameLimitError();
+          }
+
+          continue;
+        }
+
+        const record = consume(separator);
+
+        if (record) {
+          records.push(record);
+        }
+      }
+
+      return records;
+    };
 
     try {
       while (true) {
@@ -284,21 +360,27 @@ class CmaSdkClientCore implements CmaSdkClient {
           break;
         }
 
-        buffer += decoder.decode(chunk.value, { stream: true });
-        const parsed = extractSseRecords(buffer);
-        buffer = parsed.rest;
-
-        for (const record of parsed.records) {
+        for (const record of append(chunk.value)) {
           yield record;
         }
       }
 
-      buffer += decoder.decode();
+      for (
+        let separator = findSseSeparator(frame, frameLength, 0, true);
+        separator;
+        separator = findSseSeparator(frame, frameLength, 0, true)
+      ) {
+        const record = consume(separator);
 
-      if (buffer.length > 0) {
-        const parsed = extractSseRecords(`${buffer}\n\n`);
+        if (record) {
+          yield record;
+        }
+      }
 
-        for (const record of parsed.records) {
+      if (frameLength > 0) {
+        const record = parseSseRecord(decoder.decode(frame.subarray(0, frameLength)));
+
+        if (record) {
           yield record;
         }
       }
@@ -329,10 +411,7 @@ class CmaSdkClientCore implements CmaSdkClient {
   }
 
   async #requestData<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await this.#request(path, {
-      ...init,
-      headers: this.#createHeaders(init.headers),
-    });
+    const response = await this.#request(path, init);
 
     return readData(await this.#readResponseBody(response)) as T;
   }

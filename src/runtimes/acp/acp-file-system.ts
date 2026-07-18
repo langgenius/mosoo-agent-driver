@@ -1,13 +1,15 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import type { AgentDriverContext } from "../agent-driver-backend";
-import { isRecord, readNonEmptyString, readNumber } from "./acp-types";
+import { isRecord, raceWithAbort, readNonEmptyString, readNumber } from "./acp-types";
 
 interface AcpFileSystemOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
 }
+
+const MAX_ACP_FILE_BYTES = 8 * 1_024 * 1_024;
 
 export class AcpFileSystem {
   readonly #allowedRoots: readonly string[];
@@ -20,7 +22,8 @@ export class AcpFileSystem {
     this.#cwd = resolve(options.cwd);
   }
 
-  async readTextFile(params: unknown): Promise<{ content: string }> {
+  async readTextFile(params: unknown, signal?: AbortSignal): Promise<{ content: string }> {
+    signal?.throwIfAborted();
     const record = isRecord(params) ? params : {};
     const requestedPath = readNonEmptyString(record, "path");
 
@@ -29,7 +32,18 @@ export class AcpFileSystem {
     }
 
     const path = this.#resolveAllowedPath(requestedPath);
-    const raw = await readFile(path, "utf8");
+    const file = await stat(path);
+    signal?.throwIfAborted();
+
+    if (!file.isFile()) {
+      throw new Error("ACP fs/read_text_file requires a regular file.");
+    }
+
+    if (file.size > MAX_ACP_FILE_BYTES) {
+      throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
+    }
+
+    const raw = await readFile(path, { encoding: "utf8", signal });
     const line = readNumber(record, "line");
     const limit = readNumber(record, "limit");
 
@@ -49,7 +63,9 @@ export class AcpFileSystem {
   async writeTextFile(
     context: AgentDriverContext,
     params: unknown,
+    signal?: AbortSignal,
   ): Promise<Record<string, never>> {
+    signal?.throwIfAborted();
     const record = isRecord(params) ? params : {};
     const requestedPath = readNonEmptyString(record, "path");
     const content = typeof record["content"] === "string" ? record["content"] : null;
@@ -58,14 +74,22 @@ export class AcpFileSystem {
       throw new Error("ACP fs/write_text_file requires path and content.");
     }
 
+    if (Buffer.byteLength(content, "utf8") > MAX_ACP_FILE_BYTES) {
+      throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
+    }
+
     const path = this.#resolveAllowedPath(requestedPath);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, content, "utf8");
-    await context.ports.file.reportChanged({
-      change: "upsert",
-      path,
-      reason: "acp.fs",
-    });
+    signal?.throwIfAborted();
+    await writeFile(path, content, { encoding: "utf8", signal });
+    await raceWithAbort(
+      context.ports.file.reportChanged({
+        change: "upsert",
+        path,
+        reason: "acp.fs",
+      }),
+      signal,
+    );
 
     return {};
   }

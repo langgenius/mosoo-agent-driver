@@ -186,6 +186,45 @@ function createHarness() {
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
+  test("marks an SDK tool error as failed", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [{ id: "tool-1", input: { command: "false" }, name: "Bash", type: "tool_use" }],
+        },
+        type: "assistant",
+        uuid: "assistant-1",
+      },
+      {
+        message: {
+          content: [
+            {
+              content: "Command failed",
+              is_error: true,
+              tool_use_id: "tool-1",
+              type: "tool_result",
+            },
+          ],
+        },
+        type: "user",
+        uuid: "user-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "tool.call.updated",
+        payload: expect.objectContaining({ status: "failed", toolCallId: "tool-1" }),
+      }),
+    );
+  });
+
   test("rotates assistant identity across a tool boundary and marks the final message", async () => {
     const { context, events, logger, translator } = createHarness();
     const messages = [
@@ -298,8 +337,197 @@ describe("Claude Agent SDK provider fixtures", () => {
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
       runCompleted === undefined || !isRecord(runCompleted.payload) ? null : runCompleted.payload;
+    const snapshot = events().find(
+      (event) => event.kind === "message.added" && isRecord(event.payload),
+    );
 
     expect(payload?.["finalMessageText"]).toBe("完整最终回答");
+    expect(snapshot).toMatchObject({
+      kind: "message.added",
+      payload: {
+        content: [{ text: "完整最终回答", type: "text" }],
+        role: "agent",
+      },
+    });
+  });
+
+  test("repairs streamed tool input with a lossless assistant snapshot", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          content_block: { id: "tool-1", input: {}, name: "Read", type: "tool_use" },
+          index: 0,
+          type: "content_block_start",
+        },
+        type: "stream_event",
+        uuid: "assistant-1",
+      },
+      {
+        event: {
+          delta: { partial_json: '{"path":"partial', type: "input_json_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-1",
+      },
+      {
+        message: {
+          content: [
+            { id: "tool-1", input: { path: "complete" }, name: "Read", type: "tool_use" },
+          ],
+        },
+        type: "assistant",
+        uuid: "assistant-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    expect(
+      events().filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          event.delivery !== "best_effort" &&
+          isRecord(event.payload) &&
+          event.payload["toolCallId"] === "tool-1",
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ rawInput: '{"path":"complete"}' }),
+      }),
+    );
+  });
+
+  test.each(["success", "error"] as const)(
+    "closes every open item before a %s result terminal",
+    async (outcome) => {
+      const { context, events, logger, translator } = createHarness();
+      const messages = [
+        {
+          event: {
+            delta: { text: "partial", type: "text_delta" },
+            index: 0,
+            type: "content_block_delta",
+          },
+          type: "stream_event",
+          uuid: "assistant-open",
+        },
+        {
+          event: {
+            content_block: { thinking: "", type: "thinking" },
+            index: 1,
+            type: "content_block_start",
+          },
+          type: "stream_event",
+          uuid: "assistant-open",
+        },
+        {
+          event: {
+            content_block: { id: "tool-open", input: {}, name: "Read", type: "tool_use" },
+            index: 2,
+            type: "content_block_start",
+          },
+          type: "stream_event",
+          uuid: "assistant-open",
+        },
+        outcome === "success"
+          ? {
+              result: "partial",
+              subtype: "success",
+              total_cost_usd: 0,
+              type: "result",
+              usage: {},
+              uuid: "result-1",
+            }
+          : {
+              errors: ["failed"],
+              subtype: "error_during_execution",
+              total_cost_usd: 0,
+              type: "result",
+              usage: {},
+              uuid: "result-1",
+            },
+      ] as unknown as SDKMessage[];
+
+      for (const message of messages) {
+        await translator.handleSdkMessage(context, message, "run-1" as RunId);
+      }
+      await logger.destroy();
+
+      const translated = events();
+      const terminalIndex = translated.findIndex((event) =>
+        ["run.completed", "run.failed"].includes(event.kind),
+      );
+      expect(terminalIndex).toBeGreaterThan(-1);
+      for (const kind of ["message.completed", "thought.completed", "item.completed"] as const) {
+        expect(translated.findIndex((event) => event.kind === kind)).toBeGreaterThan(-1);
+        expect(translated.findIndex((event) => event.kind === kind)).toBeLessThan(terminalIndex);
+      }
+      expect(translated.slice(0, terminalIndex)).toContainEqual(
+        expect.objectContaining({
+          kind: "tool.call.updated",
+          payload: expect.objectContaining({
+            status: outcome === "success" ? "completed" : "failed",
+            toolCallId: "tool-open",
+          }),
+        }),
+      );
+    },
+  );
+
+  test("closes every interleaved assistant message before the Run terminal", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          delta: { text: "A", type: "text_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-open-a",
+      },
+      {
+        event: {
+          delta: { text: "B", type: "text_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-open-b",
+      },
+      {
+        result: "B",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-interleaved",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const translated = events();
+    const started = translated
+      .filter((event) => event.kind === "message.started" && isRecord(event.payload))
+      .map((event) => (event.payload as Record<string, unknown>)["messageId"]);
+    const terminalIndex = translated.findIndex((event) => event.kind === "run.completed");
+    const completed = translated
+      .slice(0, terminalIndex)
+      .filter((event) => event.kind === "message.completed" && isRecord(event.payload))
+      .map((event) => (event.payload as Record<string, unknown>)["messageId"]);
+
+    expect(started).toHaveLength(2);
+    expect(completed).toEqual(started);
   });
 
   test("keeps duplicate text scoped to its native assistant message", async () => {
@@ -724,6 +952,99 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(payload).not.toBeNull();
     expect(payload).not.toHaveProperty("finalMessageId");
     expect(payload).not.toHaveProperty("finalMessageText");
+  });
+
+  test("isolates interleaved tool and thought streams by message UUID", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const stream = (uuid: string, event: Record<string, unknown>) =>
+      ({ event, type: "stream_event", uuid }) as SDKMessage;
+    const messages = [
+      stream("tool-message-a", {
+        content_block: { id: "tool-a", name: "Bash", type: "tool_use" },
+        index: 0,
+        type: "content_block_start",
+      }),
+      stream("tool-message-b", {
+        content_block: { id: "tool-b", name: "Bash", type: "tool_use" },
+        index: 0,
+        type: "content_block_start",
+      }),
+      stream("tool-message-a", {
+        delta: { partial_json: '{"a":', type: "input_json_delta" },
+        index: 0,
+        type: "content_block_delta",
+      }),
+      stream("tool-message-b", { type: "message_stop" }),
+      stream("tool-message-a", {
+        delta: { partial_json: "1}", type: "input_json_delta" },
+        index: 0,
+        type: "content_block_delta",
+      }),
+      stream("thought-message-a", {
+        content_block: { thinking: "", type: "thinking" },
+        index: 0,
+        type: "content_block_start",
+      }),
+      stream("thought-message-b", {
+        content_block: { thinking: "", type: "thinking" },
+        index: 0,
+        type: "content_block_start",
+      }),
+      stream("thought-message-a", {
+        delta: { thinking: "A1", type: "thinking_delta" },
+        index: 0,
+        type: "content_block_delta",
+      }),
+      stream("thought-message-b", {
+        delta: { thinking: "B1", type: "thinking_delta" },
+        index: 0,
+        type: "content_block_delta",
+      }),
+      stream("thought-message-b", { type: "message_stop" }),
+      stream("thought-message-a", {
+        delta: { thinking: "A2", type: "thinking_delta" },
+        index: 0,
+        type: "content_block_delta",
+      }),
+    ];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const toolArguments = events().flatMap((event) => {
+      if (event.kind !== "tool.call.updated" || !isRecord(event.payload)) {
+        return [];
+      }
+
+      const rawInput = event.payload["rawInput"];
+      const toolCallId = event.payload["toolCallId"];
+      return typeof rawInput === "string" && typeof toolCallId === "string"
+        ? [{ rawInput, toolCallId }]
+        : [];
+    });
+    const thoughtDeltas = events().flatMap((event) => {
+      if (event.kind !== "thought.delta" || !isRecord(event.payload)) {
+        return [];
+      }
+
+      const contentDelta = event.payload["contentDelta"];
+      const thoughtId = event.payload["thoughtId"];
+      return typeof contentDelta === "string" && typeof thoughtId === "string"
+        ? [{ contentDelta, thoughtId }]
+        : [];
+    });
+    const thoughts = Object.fromEntries(
+      thoughtDeltas.map(({ contentDelta, thoughtId }) => [contentDelta, thoughtId]),
+    );
+
+    expect(toolArguments).toEqual([
+      { rawInput: '{"a":', toolCallId: "tool-a" },
+      { rawInput: "1}", toolCallId: "tool-a" },
+    ]);
+    expect(thoughts["A1"]).toBe(thoughts["A2"]);
+    expect(thoughts["A1"]).not.toBe(thoughts["B1"]);
   });
 
   test.each(claudeFixtureNames)("apps provider-native fixture %s", async (name) => {

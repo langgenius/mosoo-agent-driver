@@ -1,5 +1,5 @@
 import type { DriverBootPayload } from "../../protocol/boot";
-import { createPromiseDeferred, settlePromiseWithTimeout, sleepPromise } from "../../utils/async";
+import { settlePromiseWithTimeout, sleepPromise } from "../../utils/async";
 
 export type DriverWireSocket = Pick<
   WebSocket,
@@ -27,9 +27,15 @@ function toDriverControlSocketUrl(payload: DriverBootPayload): URL {
   return url;
 }
 
-async function dialOnce(url: URL): Promise<WebSocket> {
-  const opened = createPromiseDeferred<WebSocket>();
+async function dialOnce(url: URL, signal?: AbortSignal): Promise<WebSocket> {
+  signal?.throwIfAborted();
+  const opened = Promise.withResolvers<WebSocket>();
   const socket = new WebSocket(url);
+  const onAbort = () => {
+    opened.reject(signal?.reason);
+    socket.close(1000, "runtime.dial.cancelled");
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   socket.addEventListener(
     "open",
@@ -60,27 +66,32 @@ async function dialOnce(url: URL): Promise<WebSocket> {
   const result = await settlePromiseWithTimeout(opened.promise, {
     label: "runtime driver control socket dial",
     timeoutMs: DRIVER_CONTROL_DIAL_ATTEMPT_TIMEOUT_MS,
-  });
+  }).finally(() => signal?.removeEventListener("abort", onAbort));
 
   if (result.status === "completed") {
     return result.value;
   }
 
-  socket.close(1000, "runtime.dial.abandoned");
+  if (!signal?.aborted) {
+    socket.close(1000, "runtime.dial.abandoned");
+  }
   throw result.error;
 }
 
 export async function dialDriverControlSocket(
   payload: DriverBootPayload,
+  signal?: AbortSignal,
 ): Promise<DriverWireSocket> {
+  signal?.throwIfAborted();
   const url = toDriverControlSocketUrl(payload);
   const deadlineMs = Date.now() + DRIVER_CONTROL_DIAL_DEADLINE_MS;
   let lastError: unknown = null;
 
   while (true) {
     try {
-      return await dialOnce(url);
+      return await dialOnce(url, signal);
     } catch (error) {
+      signal?.throwIfAborted();
       lastError = error;
     }
 
@@ -88,7 +99,7 @@ export async function dialDriverControlSocket(
       break;
     }
 
-    await sleepPromise(DRIVER_CONTROL_DIAL_RETRY_MS);
+    await sleepPromise(DRIVER_CONTROL_DIAL_RETRY_MS, signal);
   }
 
   throw lastError instanceof Error ? lastError : new Error("Driver control socket dial timed out.");

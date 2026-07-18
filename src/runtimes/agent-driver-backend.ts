@@ -1,3 +1,4 @@
+import { pushLosslessEvents } from "../core/driver-runtime-io";
 import type { DriverRuntimeEventPort } from "../core/driver-runtime-io";
 import type {
   AgentDriverCommandSource,
@@ -14,12 +15,17 @@ import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type { DriverRuntime } from "../protocol/runtime";
 import type { DriverStartInput } from "../protocol/start";
-import type { McpExecuteCommand, RuntimeCommandInput } from "../runtime-command";
+import type { RuntimeCommandInput } from "../runtime-command";
 
 export interface AgentDriverContext {
+  lifecycle: AgentDriverLifecycle;
   logger: Logger;
   payload: DriverStartInput;
   ports: AgentDriverHostPorts;
+}
+
+export interface AgentDriverLifecycle {
+  fail(error: Error): void;
 }
 
 export type AgentDriverContextPortOverrides = Partial<{
@@ -35,6 +41,7 @@ export type AgentDriverContextPortOverrides = Partial<{
 export interface AgentDriverContextInput {
   commandSource?: AgentDriverCommandSource;
   eventSink: DriverRuntimeEventPort | AgentDriverEventSink;
+  lifecycle?: AgentDriverLifecycle;
   logger: Logger;
   payload: DriverStartInput;
   permission: AgentDriverPermissionPort;
@@ -58,8 +65,11 @@ function toAgentDriverEventSink(
     return eventSink;
   }
 
+  const currentRunId = eventSink.currentRunId?.bind(eventSink);
+
   return {
     commandUpdate: async () => {},
+    ...(currentRunId === undefined ? {} : { currentRunId }),
     pushEvents: (input) => eventSink.pushEvents(input),
   };
 }
@@ -87,7 +97,7 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
           },
         } satisfies DriverEventInput;
 
-        await eventSink.pushEvents({ events: [event] });
+        await pushLosslessEvents(eventSink, [event]);
       },
     },
     hostIntegration: {
@@ -115,6 +125,11 @@ export function createAgentDriverContext(input: AgentDriverContextInput): AgentD
   };
 
   return {
+    lifecycle:
+      input.lifecycle ??
+      ({
+        fail: (error) => input.logger.error("driver.backend.unsupervised_failure", error, {}),
+      } satisfies AgentDriverLifecycle),
     logger: input.logger,
     payload: input.payload,
     ports,
@@ -125,14 +140,8 @@ export interface AgentDriverBackend {
   readonly runtime: DriverRuntime;
   cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void>;
   handleInput(context: AgentDriverContext, input: RuntimeCommandInput, runId: RunId): Promise<void>;
-  handleMcpExecute(
-    context: AgentDriverContext,
-    command: McpExecuteCommand,
-  ): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }>;
-  start(context: AgentDriverContext): Promise<void>;
-  stop(context: AgentDriverContext, reason: string): Promise<void>;
+  start(context: AgentDriverContext, signal: AbortSignal): Promise<void>;
+  stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void>;
 }
 
-export type AgentDriverBackendFactory = (
-  input: DriverStartInput,
-) => AgentDriverBackend | Promise<AgentDriverBackend>;
+export type AgentDriverBackendFactory = (input: DriverStartInput) => AgentDriverBackend;

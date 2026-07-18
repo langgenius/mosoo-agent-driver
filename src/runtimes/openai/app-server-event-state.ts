@@ -20,20 +20,21 @@ export class OpenAiMessageState {
       turnId: string;
     }
   >();
-  readonly #ended = new Set<string>();
+  readonly #ended = new Set<MessageId>();
   readonly #itemSequences = new Map<string, number>();
   readonly #itemByMessageId = new Map<MessageId, string>();
   readonly #itemMessageIds = new Map<string, MessageId>();
+  readonly #reasoningEnded = new Set<string>();
   readonly #reasoningStarted = new Set<string>();
-  readonly #started = new Set<string>();
-  readonly #textById = new Map<string, string>();
+  readonly #started = new Set<MessageId>();
+  readonly #textById = new Map<MessageId, string>();
   readonly #turnByMessageId = new Map<MessageId, string>();
   readonly #turnMessages = new RuntimeAssistantMessageIdIndex<string>();
   readonly #turnMessageIds = new Map<string, MessageId>();
   readonly #turnMessageSequences = new Map<string, number>();
   readonly #turnNextItemSequences = new Map<string, number>();
 
-  appendText(messageId: string, delta: string): void {
+  appendText(messageId: MessageId, delta: string): void {
     if (delta.length === 0 || this.#ended.has(messageId)) {
       return;
     }
@@ -41,16 +42,16 @@ export class OpenAiMessageState {
     this.#textById.set(messageId, `${this.#textById.get(messageId) ?? ""}${delta}`);
   }
 
-  currentText(messageId: string): string {
+  currentText(messageId: MessageId): string {
     return this.#textById.get(messageId) ?? "";
   }
 
-  setText(messageId: string, text: string): void {
+  setText(messageId: MessageId, text: string): void {
     this.#textById.set(messageId, text);
   }
 
-  ensureReasoningStarted(messageId: string, events: DriverEventInput[]): void {
-    if (this.#reasoningStarted.has(messageId)) {
+  ensureReasoning(messageId: string, events: DriverEventInput[]): void {
+    if (this.#reasoningEnded.has(messageId) || this.#reasoningStarted.has(messageId)) {
       return;
     }
 
@@ -64,6 +65,35 @@ export class OpenAiMessageState {
     });
   }
 
+  finishOpen(): DriverEventInput[] {
+    const events: DriverEventInput[] = [];
+
+    for (const messageId of this.#started) {
+      this.markEnded(messageId);
+      events.push({
+        kind: "message.completed",
+        payload: {
+          messageId,
+          role: "agent",
+        },
+      });
+    }
+
+    for (const thoughtId of this.#reasoningStarted) {
+      if (this.markReasoningEnded(thoughtId)) {
+        events.push({
+          kind: "thought.completed",
+          payload: {
+            channel: "summary",
+            thoughtId,
+          },
+        });
+      }
+    }
+
+    return events;
+  }
+
   async ensureTurnMessage(
     context: AgentDriverContext,
     turnId: string,
@@ -72,7 +102,7 @@ export class OpenAiMessageState {
     const existing = this.#turnMessageIds.get(turnId);
 
     if (existing !== undefined) {
-      await this.ensureMessageStarted(context, existing, push);
+      await this.ensureStarted(context, existing, push);
       return existing;
     }
 
@@ -81,7 +111,7 @@ export class OpenAiMessageState {
     const generated = this.#turnMessages.getOrCreate(`${turnId}:${nextSequence}`);
     this.#turnMessageIds.set(turnId, generated);
     this.#turnByMessageId.set(generated, turnId);
-    await this.ensureMessageStarted(context, generated, push);
+    await this.ensureStarted(context, generated, push);
     return generated;
   }
 
@@ -98,7 +128,7 @@ export class OpenAiMessageState {
       if (!this.#ended.has(existing)) {
         this.#turnMessageIds.set(input.turnId, existing);
       }
-      await this.ensureMessageStarted(context, existing, push);
+      await this.ensureStarted(context, existing, push);
       return existing;
     }
 
@@ -114,11 +144,11 @@ export class OpenAiMessageState {
     this.#itemByMessageId.set(messageId, itemKey);
     this.#turnMessageIds.set(input.turnId, messageId);
     this.#turnByMessageId.set(messageId, input.turnId);
-    await this.ensureMessageStarted(context, messageId, push);
+    await this.ensureStarted(context, messageId, push);
     return messageId;
   }
 
-  recordCompletedSnapshot(input: {
+  recordSnapshot(input: {
     itemId: string;
     messageId: MessageId;
     text: string;
@@ -130,7 +160,7 @@ export class OpenAiMessageState {
     this.#completedSnapshots.set(itemKey, { ...input, sequence });
   }
 
-  finalCompletedSnapshotForTurn(turnId: string): { id: MessageId; text: string } | null {
+  finalSnapshot(turnId: string): { id: MessageId; text: string } | null {
     let finalSnapshot:
       | {
           itemId: string;
@@ -155,12 +185,12 @@ export class OpenAiMessageState {
       : { id: finalSnapshot.messageId, text: finalSnapshot.text };
   }
 
-  async ensureMessageStarted(
+  async ensureStarted(
     context: AgentDriverContext,
-    messageId: string,
+    messageId: MessageId,
     push: OpenAiEventPush,
   ): Promise<void> {
-    if (this.#started.has(messageId)) {
+    if (this.#ended.has(messageId) || this.#started.has(messageId)) {
       return;
     }
 
@@ -182,6 +212,7 @@ export class OpenAiMessageState {
     }
 
     this.#ended.add(messageId);
+    this.#started.delete(messageId);
     const turnId = this.#turnByMessageId.get(messageId);
 
     if (turnId !== undefined) {
@@ -199,8 +230,39 @@ export class OpenAiMessageState {
     return this.#ended.has(messageId);
   }
 
+  isReasoningEnded(messageId: string): boolean {
+    return this.#reasoningEnded.has(messageId);
+  }
+
+  markReasoningEnded(messageId: string): boolean {
+    if (this.#reasoningEnded.has(messageId)) {
+      return false;
+    }
+
+    this.#reasoningEnded.add(messageId);
+    this.#reasoningStarted.delete(messageId);
+    return true;
+  }
+
   messageForTurn(turnId: string): MessageId | null {
     return this.#turnMessageIds.get(turnId) ?? null;
+  }
+
+  reset(): void {
+    this.#completedSnapshots.clear();
+    this.#ended.clear();
+    this.#itemSequences.clear();
+    this.#itemByMessageId.clear();
+    this.#itemMessageIds.clear();
+    this.#reasoningEnded.clear();
+    this.#reasoningStarted.clear();
+    this.#started.clear();
+    this.#textById.clear();
+    this.#turnByMessageId.clear();
+    this.#turnMessages.reset();
+    this.#turnMessageIds.clear();
+    this.#turnMessageSequences.clear();
+    this.#turnNextItemSequences.clear();
   }
 
   #observeItem(itemKey: string, turnId: string): number {
@@ -228,13 +290,16 @@ export class OpenAiItemState {
     this.#completed.add(itemId);
     return true;
   }
+
+  reset(): void {
+    this.#completed.clear();
+  }
 }
 
 export class OpenAiToolState {
-  readonly #parentMessages = new Map<string, string>();
-  readonly #started = new Set<string>();
+  readonly #parentMessages = new Map<string, MessageId>();
 
-  parentMessage(toolCallId: string): string | null {
+  parentMessage(toolCallId: string): MessageId | null {
     return this.#parentMessages.get(toolCallId) ?? null;
   }
 
@@ -242,19 +307,19 @@ export class OpenAiToolState {
     context: AgentDriverContext,
     push: OpenAiEventPush,
     input: {
-      parentMessageId: string;
+      parentMessageId: MessageId;
       reason: string;
       toolCallId: string;
       toolCallName: string;
     },
   ): Promise<void> {
+    const started = this.#parentMessages.has(input.toolCallId);
     this.#parentMessages.set(input.toolCallId, input.parentMessageId);
 
-    if (this.#started.has(input.toolCallId)) {
+    if (started) {
       return;
     }
 
-    this.#started.add(input.toolCallId);
     await push(context, input.reason, [
       {
         kind: "item.started",
@@ -276,6 +341,36 @@ export class OpenAiToolState {
         },
       },
     ]);
+  }
+
+  failOpen(): DriverEventInput[] {
+    const events = [...this.#parentMessages.keys()].flatMap<DriverEventInput>((toolCallId) => [
+      {
+        kind: "tool.call.updated",
+        payload: {
+          status: "failed",
+          toolCallId,
+        },
+      },
+      {
+        kind: "item.completed",
+        payload: {
+          itemId: toolCallId,
+          itemType: "tool_call",
+          status: "failed",
+        },
+      },
+    ]);
+    this.#parentMessages.clear();
+    return events;
+  }
+
+  markEnded(toolCallId: string): void {
+    this.#parentMessages.delete(toolCallId);
+  }
+
+  reset(): void {
+    this.#parentMessages.clear();
   }
 }
 
@@ -311,5 +406,9 @@ export class OpenAiPlanState {
       content,
       status: "completed",
     });
+  }
+
+  reset(): void {
+    this.#plans.clear();
   }
 }

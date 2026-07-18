@@ -1,4 +1,4 @@
-export const OPENAI_APP_SERVER_SCHEMA_VERSION = "0.144.0" as const;
+export const OPENAI_APP_SERVER_SCHEMA_VERSION = "0.144.5" as const;
 
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -18,10 +18,11 @@ export type UserInput =
   | { type: "mention"; name: string; path: string };
 
 export interface InitializeParams {
-  capabilities?: {
-    experimentalApi?: boolean;
-  };
-  clientInfo?: {
+  capabilities: {
+    experimentalApi: boolean;
+    requestAttestation: boolean;
+  } | null;
+  clientInfo: {
     name: string;
     title?: string;
     version: string;
@@ -135,7 +136,7 @@ export interface Turn {
 }
 
 export interface TurnStartResponse {
-  turn: Turn;
+  turn: Required<Turn>;
 }
 
 export interface TurnInterruptParams {
@@ -198,6 +199,7 @@ export interface FileChangePatchUpdatedNotification {
 }
 
 export interface ReasoningTextDeltaNotification {
+  contentIndex: number;
   delta: string;
   itemId: string;
   threadId: string;
@@ -206,7 +208,7 @@ export interface ReasoningTextDeltaNotification {
 
 export interface ReasoningSummaryPartAddedNotification {
   itemId: string;
-  part: string;
+  summaryIndex: number;
   threadId: string;
   turnId: string;
 }
@@ -214,8 +216,21 @@ export interface ReasoningSummaryPartAddedNotification {
 export interface ReasoningSummaryTextDeltaNotification {
   delta: string;
   itemId: string;
+  summaryIndex: number;
   threadId: string;
   turnId: string;
+}
+
+export interface McpToolCallProgressNotification {
+  itemId: string;
+  message: string;
+  threadId: string;
+  turnId: string;
+}
+
+export interface ServerRequestResolvedNotification {
+  requestId: RequestId;
+  threadId: string;
 }
 
 export interface TextPosition {
@@ -291,12 +306,14 @@ export interface ServerNotificationParams {
     turnId?: string;
   };
   "item/fileChange/patchUpdated": FileChangePatchUpdatedNotification;
+  "item/mcpToolCall/progress": McpToolCallProgressNotification;
   "item/plan/delta": PlanDeltaNotification;
   "item/reasoning/summaryPartAdded": ReasoningSummaryPartAddedNotification;
   "item/reasoning/summaryTextDelta": ReasoningSummaryTextDeltaNotification;
   "item/reasoning/textDelta": ReasoningTextDeltaNotification;
   "item/started": ItemNotificationBase;
   "remoteControl/status/changed": RemoteControlStatusChangedNotification;
+  "serverRequest/resolved": ServerRequestResolvedNotification;
   "thread/settings/updated": ThreadSettingsUpdatedNotification;
   "thread/started": { thread: Thread };
   "thread/status/changed": { status: ThreadStatus; threadId: string };
@@ -331,29 +348,72 @@ export interface ClientRequestResult {
 export type ClientRequestMethod = keyof ClientRequestParams;
 
 export interface CommandExecutionRequestApprovalResponse {
-  decision: "accept" | "decline" | "cancel";
+  decision: "accept" | "acceptForSession" | "decline" | "cancel" | JsonObject;
 }
 
 export interface FileChangeRequestApprovalResponse {
-  decision: "accept" | "decline" | "cancel";
+  decision: "accept" | "acceptForSession" | "decline" | "cancel";
 }
 
 export interface PermissionsRequestApprovalResponse {
   permissions: JsonObject;
-  scope: "turn";
+  scope: "turn" | "session";
   strictAutoReview?: boolean;
 }
 
+export interface ToolRequestUserInputResponse {
+  answers: Record<string, { answers: string[] }>;
+}
+
+export interface DynamicToolCallResponse {
+  contentItems: Array<
+    { type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }
+  >;
+  success: boolean;
+}
+
+export interface ChatgptAuthTokensRefreshResponse {
+  accessToken: string;
+  chatgptAccountId: string;
+  chatgptPlanType: string | null;
+}
+
+export interface AttestationGenerateResponse {
+  token: string;
+}
+
+export interface CurrentTimeReadResponse {
+  currentTimeAt: number;
+}
+
+export interface McpServerElicitationRequestResponse {
+  _meta: JsonValue | null;
+  action: "accept" | "decline" | "cancel";
+  content: JsonValue | null;
+}
+
 export interface ServerRequestParams {
+  "account/chatgptAuthTokens/refresh": JsonObject;
+  "attestation/generate": JsonObject;
+  "currentTime/read": JsonObject;
   "item/commandExecution/requestApproval": JsonObject;
   "item/fileChange/requestApproval": JsonObject;
   "item/permissions/requestApproval": JsonObject;
+  "item/tool/call": JsonObject;
+  "item/tool/requestUserInput": JsonObject;
+  "mcpServer/elicitation/request": JsonObject;
 }
 
 export interface ServerRequestResult {
+  "account/chatgptAuthTokens/refresh": ChatgptAuthTokensRefreshResponse;
+  "attestation/generate": AttestationGenerateResponse;
+  "currentTime/read": CurrentTimeReadResponse;
   "item/commandExecution/requestApproval": CommandExecutionRequestApprovalResponse;
   "item/fileChange/requestApproval": FileChangeRequestApprovalResponse;
   "item/permissions/requestApproval": PermissionsRequestApprovalResponse;
+  "item/tool/call": DynamicToolCallResponse;
+  "item/tool/requestUserInput": ToolRequestUserInputResponse;
+  "mcpServer/elicitation/request": McpServerElicitationRequestResponse;
 }
 
 export type ServerRequestMethod = keyof ServerRequestParams;
@@ -366,12 +426,14 @@ const SERVER_NOTIFICATION_METHODS = new Set<string>([
   "item/completed",
   "item/fileChange/outputDelta",
   "item/fileChange/patchUpdated",
+  "item/mcpToolCall/progress",
   "item/plan/delta",
   "item/reasoning/summaryPartAdded",
   "item/reasoning/summaryTextDelta",
   "item/reasoning/textDelta",
   "item/started",
   "remoteControl/status/changed",
+  "serverRequest/resolved",
   "thread/settings/updated",
   "thread/started",
   "thread/status/changed",
@@ -384,9 +446,15 @@ const SERVER_NOTIFICATION_METHODS = new Set<string>([
 ]);
 
 const SERVER_REQUEST_METHODS = new Set<string>([
+  "account/chatgptAuthTokens/refresh",
+  "attestation/generate",
+  "currentTime/read",
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
   "item/permissions/requestApproval",
+  "item/tool/call",
+  "item/tool/requestUserInput",
+  "mcpServer/elicitation/request",
 ]);
 
 export function isServerNotificationMethod(method: string): method is ServerNotificationMethod {

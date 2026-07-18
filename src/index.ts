@@ -12,6 +12,7 @@ export type {
   DriverDiagnosticSeverity,
 } from "./core/driver-diagnostics";
 export {
+  CmaInvalidEventError,
   CmaUnsupportedFieldError,
   parseCmaInboundEvent,
   projectCmaInboundToDriverCommand,
@@ -48,12 +49,17 @@ export type {
   CmaSdkFetch,
   CmaSessionEventDispatchRecord,
 } from "./surfaces/cma-sdk";
-export { CmaMemoryStore, createCmaMemoryStore } from "./stores/memory";
+export { createCmaMemoryStore } from "./stores/memory";
 export type { CmaMemoryStoreIdFactory, CmaMemoryStoreOptions } from "./stores/memory";
-export { CmaStoreConflictError, CmaStoreNotFoundError } from "./stores/cma-store";
+export {
+  CmaSessionTerminatedError,
+  CmaStoreConflictError,
+  CmaStoreNotFoundError,
+} from "./stores/cma-store";
 export type {
   CmaAgentRecord,
-  CmaAppendInboundEventInput,
+  CmaClaimInboundEventInput,
+  CmaClaimInboundEventResult,
   CmaCreateAgentInput,
   CmaCreateEnvironmentInput,
   CmaCreateSessionInput,
@@ -64,8 +70,11 @@ export type {
   CmaEnvironmentPackageManager,
   CmaEnvironmentPackages,
   CmaEnvironmentUnrestrictedNetworking,
+  CmaInboundEventLease,
+  CmaRenewInboundEventClaimInput,
   CmaSessionEventRecord,
   CmaSessionRecord,
+  CmaSettleInboundEventInput,
   CmaStore,
   CmaStoreResourceKind,
 } from "./stores/cma-store";
@@ -89,7 +98,6 @@ export type {
   AgentDriverContextPortOverrides,
 } from "./runtimes/agent-driver-backend";
 export { createAgentDriverContext } from "./runtimes/agent-driver-backend";
-export { createAgentDriverBackend } from "./runtimes/create-agent-driver-backend";
 export { OPENAI_DEFAULT_MODEL_ID } from "./models";
 export {
   isSupportedDriverRuntime,

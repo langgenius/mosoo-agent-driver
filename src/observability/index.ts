@@ -1,13 +1,11 @@
 import {
   createLogger,
-  createTraceparent,
   createWideEvent,
   generateRequestId,
   generateSpanId,
   generateTraceId,
   getContext,
   parseTraceparent,
-  withContext,
   withContextAsync,
 } from "vestig";
 import type {
@@ -97,15 +95,15 @@ const DEFAULT_MAX_BUFFER_SIZE = 512;
 const FUNCTION_VALUE_LABEL = "[Function]";
 const SERIALIZATION_FAILURE_LABEL = "[Unserializable]";
 
-const ignoreBufferedSinkError: BufferedSinkTransportConfig["onError"] = (error, entries) => {
-  Object.is(error, entries);
-};
+const ignoreBufferedSinkError: BufferedSinkTransportConfig["onError"] = () => {};
 
 class BufferedSinkTransport implements Transport {
   readonly config: TransportConfig;
   readonly name: string;
 
   #buffer: LogEntry[] = [];
+  #destroyPromise: Promise<void> | null = null;
+  #destroyed = false;
   #flushPromise: Promise<void> | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   private readonly options: BufferedSinkTransportConfig;
@@ -120,6 +118,10 @@ class BufferedSinkTransport implements Transport {
   }
 
   log(entry: LogEntry): void {
+    if (this.#destroyed) {
+      return;
+    }
+
     if (this.#buffer.length >= this.options.maxBufferSize) {
       this.#buffer.shift();
     }
@@ -134,7 +136,7 @@ class BufferedSinkTransport implements Transport {
     this.#scheduleFlush();
   }
 
-  async flush(): Promise<void> {
+  flush(): Promise<void> {
     if (this.#flushPromise !== null) {
       return this.#flushPromise;
     }
@@ -142,21 +144,26 @@ class BufferedSinkTransport implements Transport {
     this.#clearTimer();
 
     if (this.#buffer.length === 0) {
-      return;
+      return Promise.resolve();
     }
 
-    this.#flushPromise = this.#flushBatchesWithCleanup();
-
-    return this.#flushPromise;
+    return (this.#flushPromise = this.#flushBatches().finally(() => {
+      this.#flushPromise = null;
+    }));
   }
 
-  async destroy(): Promise<void> {
-    this.#clearTimer();
-    await this.flush();
+  destroy(): Promise<void> {
+    if (this.#destroyPromise === null) {
+      this.#destroyed = true;
+      this.#clearTimer();
+      this.#destroyPromise = this.flush();
+    }
+
+    return this.#destroyPromise;
   }
 
   #scheduleFlush(): void {
-    if (this.#timer !== null) {
+    if (this.#destroyed || this.#timer !== null) {
       return;
     }
 
@@ -173,14 +180,6 @@ class BufferedSinkTransport implements Transport {
 
     clearTimeout(this.#timer);
     this.#timer = null;
-  }
-
-  async #flushBatchesWithCleanup(): Promise<void> {
-    try {
-      await this.#flushBatches();
-    } finally {
-      this.#flushPromise = null;
-    }
   }
 
   async #flushBatches(): Promise<void> {
@@ -332,11 +331,6 @@ function isNonEmptyString(value: string | null | undefined): value is string {
   return value !== null && value !== undefined && value.length > 0;
 }
 
-function readContextString(context: Partial<LogContext> | null | undefined, key: string): string {
-  const value = context?.[key];
-  return typeof value === "string" && value.length > 0 ? value : "";
-}
-
 function createBaseLogger(options: BaseLoggerOptions): Logger {
   const config: LoggerConfig = {
     context: normalizeLogContext({
@@ -352,10 +346,6 @@ function createBaseLogger(options: BaseLoggerOptions): Logger {
   };
 
   return createLogger(config);
-}
-
-export function createConsoleLogger(options: BaseLoggerOptions): Logger {
-  return createBaseLogger(options);
 }
 
 export function createBufferedSinkLogger(options: CreateBufferedSinkLoggerOptions): Logger {
@@ -376,31 +366,6 @@ export function createBufferedSinkLogger(options: CreateBufferedSinkLoggerOption
   );
 
   return logger;
-}
-
-export function createErrorLogContext(error: unknown): LogMetadata {
-  if (error instanceof Error) {
-    return {
-      error,
-    };
-  }
-
-  return {
-    error: {
-      message: typeof error === "string" ? error : "Unknown error.",
-      name: "UnknownError",
-    },
-  };
-}
-
-export function createRequestLogMetadata(request: Request): LogMetadata {
-  const url = new URL(request.url);
-
-  return {
-    cfRay: request.headers.get("cf-ray"),
-    method: request.method,
-    path: url.pathname,
-  };
 }
 
 export function createScopedWideEvent(config: WideEventConfig): WideEventBuilder {
@@ -434,38 +399,6 @@ export function createTraceLogContext(input: CreateTraceLogContextInput): TraceL
     traceId,
     ...(isNonEmptyString(parentSpanId) ? { parentSpanId } : {}),
   };
-}
-
-export function createRequestTraceLogContext(
-  request: Request,
-  input: {
-    context?: Record<string, unknown>;
-    service: string;
-  },
-): TraceLogContext {
-  const requestUrl = new URL(request.url);
-  const requestId = request.headers.get("x-request-id");
-  const traceparent =
-    request.headers.get("traceparent") ?? requestUrl.searchParams.get("traceparent");
-
-  return createTraceLogContext({
-    service: input.service,
-    ...(input.context === undefined ? {} : { context: input.context }),
-    ...(isNonEmptyString(requestId) ? { requestId } : {}),
-    ...(isNonEmptyString(traceparent) ? { traceparent } : {}),
-  });
-}
-
-export function createTraceparentFromContext(context?: Partial<LogContext> | null): string {
-  const activeContext = context ?? getContext();
-
-  const traceId = readContextString(activeContext, "traceId");
-  const spanId = readContextString(activeContext, "spanId");
-
-  return createTraceparent(
-    traceId.length > 0 ? traceId : generateTraceId(),
-    spanId.length > 0 ? spanId : generateSpanId(),
-  );
 }
 
 export function emitWideEvent(
@@ -506,25 +439,21 @@ export function formatLogValue(value: unknown): string {
   }
 }
 
-export function getActiveLogContext(): LogContext | undefined {
+function getActiveLogContext(): LogContext | undefined {
   return getContext();
 }
 
-export function normalizeLogContext(context: Record<string, unknown> = {}): LogContext {
+function normalizeLogContext(context: Record<string, unknown> = {}): LogContext {
   return normalizeLogMetadata(context) as LogContext;
 }
 
-export function normalizeLogMetadata(metadata: Record<string, unknown> = {}): LogMetadata {
+function normalizeLogMetadata(metadata: Record<string, unknown> = {}): LogMetadata {
   return Object.fromEntries(
     Object.entries(metadata).flatMap(([key, value]) => {
       const normalized = normalizeValue(value);
       return normalized === undefined ? [] : [[key, normalized]];
     }),
   );
-}
-
-export function runWithLogContext<T>(context: Record<string, unknown>, fn: () => T): T {
-  return withContext(normalizeLogContext(context), fn);
 }
 
 export async function runWithLogContextAsync<T>(

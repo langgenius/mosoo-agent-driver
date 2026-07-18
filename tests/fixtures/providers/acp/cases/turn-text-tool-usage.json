@@ -103,10 +103,11 @@
       "delivery": "lossless",
       "kind": "tool.call.updated",
       "payload": {
-        "kind": "tool",
+        "kind": "shell",
+        "rawInput": "{\"command\":\"pwd\"}",
         "rawOutput": "{\"text\":\"/workspace\"}",
         "status": "completed",
-        "title": null,
+        "title": "Run command",
         "toolCallId": "tool-1"
       },
       "runId": "run-1",
@@ -125,19 +126,6 @@
       "runId": "run-1"
     },
     {
-      "delivery": "lossless",
-      "kind": "tool.call.updated",
-      "payload": {
-        "kind": "tool",
-        "rawOutput": "{\"text\":\"/workspace\"}",
-        "status": "completed",
-        "title": null,
-        "toolCallId": "tool-1"
-      },
-      "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:tool-call-update:4"
-    },
-    {
       "kind": "message.completed",
       "payload": {
         "messageId": "assistant-message-1",
@@ -148,8 +136,6 @@
     {
       "kind": "usage.updated",
       "payload": {
-        "inputTokens": null,
-        "outputTokens": null,
         "raw": {
           "totalTokens": 12
         },

@@ -1,18 +1,34 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { projectDriverEventToCma } from "../../projections/cma";
-import type { DriverEventInput } from "../../protocol/events";
+import { createDriverId } from "../../protocol/id";
+import { parseRuntimeEventEnvelope } from "../../runtime-events";
+import type { RuntimeEventEnvelope } from "../../runtime-events";
 import type {
   CmaAgentRecord,
-  CmaAppendInboundEventInput,
+  CmaClaimInboundEventInput,
+  CmaClaimInboundEventResult,
   CmaCreateAgentInput,
   CmaCreateEnvironmentInput,
   CmaCreateSessionInput,
   CmaEnvironmentConfig,
   CmaEnvironmentRecord,
+  CmaInboundEventLease,
+  CmaRenewInboundEventClaimInput,
   CmaSessionEventRecord,
   CmaSessionRecord,
+  CmaSettleInboundEventInput,
   CmaStore,
 } from "../cma-store";
-import { CmaStoreConflictError, CmaStoreNotFoundError } from "../cma-store";
+import {
+  CMA_MAX_EVENT_BYTES,
+  CMA_MAX_REPLAY_BYTES,
+  CMA_MAX_STREAMS,
+  CmaSessionTerminatedError,
+  CmaStoreConflictError,
+  CmaStoreNotFoundError,
+  encodeCmaSseRecord,
+} from "../cma-store";
 
 export type CmaMemoryStoreIdFactory = (
   resource: "agent" | "environment" | "event" | "session",
@@ -26,62 +42,48 @@ export interface CmaMemoryStoreOptions {
   readonly sessions?: readonly CmaCreateSessionInput[];
 }
 
-function createDefaultId(resource: "agent" | "environment" | "event" | "session"): string {
-  return `${resource}-${globalThis.crypto.randomUUID()}`;
+const createDefaultId: CmaMemoryStoreIdFactory = () => createDriverId();
+const CLAIM_LEASE_MS = 30_000;
+const CLAIM_RENEW_MS = 10_000;
+const MAX_PENDING_SUBSCRIBER_EVENTS = 64;
+const UTF8 = new TextEncoder();
+
+interface CmaInboundClaim {
+  lease: CmaInboundEventLease;
+  record: CmaSessionEventRecord;
 }
 
-function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
-  return { ...value };
+interface CmaMemorySubscriber {
+  push(record: CmaSessionEventRecord): void;
+}
+
+interface CmaSourceEventRecord {
+  readonly event: RuntimeEventEnvelope;
+  readonly records: readonly CmaSessionEventRecord[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function eventKey(sessionId: string, id: string): string {
+  return `${sessionId}\u0000${id}`;
+}
+
+function isTerminalEvent(record: CmaSessionEventRecord): boolean {
+  return "sessionStatus" in record.event && record.event.sessionStatus === "terminated";
+}
+
+function jsonBytes(value: unknown): number {
+  return UTF8.encode(JSON.stringify(value)).byteLength;
+}
+
+function eventFrameBytes(record: CmaSessionEventRecord): number {
+  return encodeCmaSseRecord(record).byteLength;
 }
 
 function sortById<T extends { readonly id: string }>(records: Iterable<T>): T[] {
   return [...records].toSorted((left, right) => left.id.localeCompare(right.id));
-}
-
-function cloneAgent(record: CmaAgentRecord): CmaAgentRecord {
-  return {
-    ...record,
-    metadata: cloneRecord(record.metadata),
-  };
-}
-
-function cloneEnvironmentConfig(config: CmaEnvironmentConfig): CmaEnvironmentConfig {
-  return {
-    networking:
-      config.networking.type === "limited"
-        ? {
-            allow_mcp_servers: config.networking.allow_mcp_servers,
-            allow_package_managers: config.networking.allow_package_managers,
-            allowed_hosts: [...config.networking.allowed_hosts],
-            type: "limited",
-          }
-        : {
-            type: "unrestricted",
-          },
-    packages: Object.fromEntries(
-      Object.entries(config.packages).map(([manager, packages]) => [manager, [...packages]]),
-    ),
-    type: "cloud",
-  };
-}
-
-function cloneEnvironment(record: CmaEnvironmentRecord): CmaEnvironmentRecord {
-  return {
-    ...record,
-    config: cloneEnvironmentConfig(record.config),
-    metadata: cloneRecord(record.metadata),
-  };
-}
-
-function cloneSession(record: CmaSessionRecord): CmaSessionRecord {
-  return {
-    ...record,
-    metadata: cloneRecord(record.metadata),
-  };
-}
-
-function cloneEvent(record: CmaSessionEventRecord): CmaSessionEventRecord {
-  return { ...record };
 }
 
 function createDefaultEnvironmentConfig(): CmaEnvironmentConfig {
@@ -94,92 +96,22 @@ function createDefaultEnvironmentConfig(): CmaEnvironmentConfig {
   };
 }
 
-class CmaMemoryEventSubscriber {
-  readonly #values: CmaSessionEventRecord[] = [];
-  readonly #waiters: ((result: IteratorResult<CmaSessionEventRecord>) => void)[] = [];
-  #closed = false;
-
-  close(): void {
-    if (this.#closed) {
-      return;
-    }
-
-    this.#closed = true;
-
-    for (const waiter of this.#waiters.splice(0)) {
-      waiter({
-        done: true,
-        value: undefined,
-      });
-    }
-  }
-
-  next(): Promise<IteratorResult<CmaSessionEventRecord>> {
-    const value = this.#values.shift();
-
-    if (value) {
-      return Promise.resolve({
-        done: false,
-        value,
-      });
-    }
-
-    if (this.#closed) {
-      return Promise.resolve({
-        done: true,
-        value: undefined,
-      });
-    }
-
-    return new Promise((resolve) => {
-      this.#waiters.push(resolve);
-    });
-  }
-
-  push(record: CmaSessionEventRecord): void {
-    if (this.#closed) {
-      return;
-    }
-
-    const value = cloneEvent(record);
-    const waiter = this.#waiters.shift();
-
-    if (waiter) {
-      waiter({
-        done: false,
-        value,
-      });
-      return;
-    }
-
-    this.#values.push(value);
-  }
-
-  async *values(): AsyncIterable<CmaSessionEventRecord> {
-    while (true) {
-      const result = await this.next();
-
-      if (result.done) {
-        return;
-      }
-
-      yield result.value;
-    }
-  }
-}
-
-export function createCmaMemoryStore(options: CmaMemoryStoreOptions = {}): CmaMemoryStore {
+export function createCmaMemoryStore(options: CmaMemoryStoreOptions = {}): CmaStore {
   return new CmaMemoryStore(options);
 }
 
-export class CmaMemoryStore implements CmaStore {
+class CmaMemoryStore implements CmaStore {
   readonly #agents = new Map<string, CmaAgentRecord>();
   readonly #environments = new Map<string, CmaEnvironmentRecord>();
   readonly #eventsBySessionId = new Map<string, CmaSessionEventRecord[]>();
   readonly #idFactory: CmaMemoryStoreIdFactory;
+  readonly #inboundClaims = new Map<string, CmaInboundClaim>();
   readonly #now: () => Date;
+  readonly #pendingPermissionsBySessionId = new Map<string, Map<string, unknown>>();
   readonly #sessions = new Map<string, CmaSessionRecord>();
-  readonly #subscribersBySessionId = new Map<string, Set<CmaMemoryEventSubscriber>>();
+  readonly #sourceEvents = new Map<string, CmaSourceEventRecord>();
+  readonly #subscribersBySessionId = new Map<string, Set<CmaMemorySubscriber>>();
+  #subscriberCount = 0;
 
   constructor(options: CmaMemoryStoreOptions = {}) {
     this.#idFactory = options.idFactory ?? createDefaultId;
@@ -200,37 +132,255 @@ export class CmaMemoryStore implements CmaStore {
 
   async appendDriverEvent(
     sessionId: string,
-    driverEvent: DriverEventInput,
+    driverEvent: RuntimeEventEnvelope,
   ): Promise<readonly CmaSessionEventRecord[]> {
-    this.#requireSession(sessionId);
+    const session = this.#requireSession(sessionId);
+    const admittedEvent = parseRuntimeEventEnvelope(driverEvent);
 
-    const events = projectDriverEventToCma(driverEvent).map((event) =>
-      this.#appendEvent({
-        command: null,
-        commandResult: null,
-        direction: "outbound",
-        driverEvent,
-        event,
-        sessionId,
-      }),
-    );
+    if (admittedEvent.sessionId !== sessionId) {
+      throw new TypeError(
+        `Driver event sessionId ${admittedEvent.sessionId} does not match CMA session ${sessionId}.`,
+      );
+    }
 
-    return events.map(cloneEvent);
+    if (jsonBytes(admittedEvent) > CMA_MAX_EVENT_BYTES) {
+      throw new RangeError(`CMA event exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`);
+    }
+
+    const projectedEvents = projectDriverEventToCma(admittedEvent);
+
+    if (
+      admittedEvent.delivery !== "lossless" &&
+      projectedEvents.some((event) => event.sessionStatus !== undefined)
+    ) {
+      throw new TypeError(`CMA authoritative event ${admittedEvent.kind} must be lossless.`);
+    }
+
+    const persistent = admittedEvent.delivery === "lossless";
+    const sourceEventId = admittedEvent.sourceEventId ?? admittedEvent.id;
+    const sourceKey = persistent ? eventKey(sessionId, sourceEventId) : null;
+    const existing = sourceKey === null ? undefined : this.#sourceEvents.get(sourceKey);
+
+    if (existing) {
+      if (
+        !isDeepStrictEqual(
+          {
+            ...existing.event,
+            id: admittedEvent.id,
+            occurredAt: admittedEvent.occurredAt,
+          },
+          admittedEvent,
+        )
+      ) {
+        throw new CmaStoreConflictError("event", sourceEventId);
+      }
+
+      return existing.records.map((record) => structuredClone(record));
+    }
+
+    if (
+      session.status === "terminated" ||
+      (admittedEvent.visibility !== "participant" && admittedEvent.visibility !== "public")
+    ) {
+      if (sourceKey !== null) {
+        this.#sourceEvents.set(sourceKey, {
+          event: structuredClone(admittedEvent),
+          records: [],
+        });
+      }
+
+      return [];
+    }
+
+    const pendingPermissions = new Map(this.#pendingPermissionsBySessionId.get(sessionId) ?? []);
+    let currentStatus: CmaSessionRecord["status"] = session.status;
+    const transitions = projectedEvents.map((projected) => {
+      const status = this.#nextSessionStatus(
+        currentStatus,
+        admittedEvent,
+        projected.sessionStatus,
+        projected.requiresAction,
+        pendingPermissions,
+      );
+      currentStatus = status ?? currentStatus;
+      const pendingAction =
+        status === "idle" ? pendingPermissions.values().next().value : undefined;
+      const statusEvent =
+        status === undefined ||
+        projected.sessionStatus === undefined ||
+        projected.sessionStatus === status
+          ? projected
+          : {
+              ...projected,
+              sessionStatus: status,
+              type: `session.status_${status}` as const,
+            };
+      const event =
+        pendingAction === undefined || statusEvent.requiresAction !== undefined
+          ? statusEvent
+          : { ...statusEvent, requiresAction: pendingAction };
+      return {
+        record: this.#createEvent({
+          command: null,
+          commandResult: null,
+          commandStatus: null,
+          direction: "outbound",
+          event,
+          sessionId,
+        }),
+        status,
+      };
+    });
+
+    if (pendingPermissions.size === 0) {
+      this.#pendingPermissionsBySessionId.delete(sessionId);
+    } else {
+      this.#pendingPermissionsBySessionId.set(sessionId, pendingPermissions);
+    }
+
+    for (const { record, status } of transitions) {
+      if (persistent) {
+        this.#persistEvent(record);
+      }
+      this.#updateSessionStatus(sessionId, status, record.createdAt);
+      this.#publishEvent(record);
+    }
+
+    const records = transitions.map(({ record }) => record);
+
+    if (sourceKey !== null) {
+      this.#sourceEvents.set(sourceKey, {
+        event: structuredClone(admittedEvent),
+        records,
+      });
+    }
+
+    return records.map((record) => structuredClone(record));
   }
 
-  async appendInboundEvent(input: CmaAppendInboundEventInput): Promise<CmaSessionEventRecord> {
-    this.#requireSession(input.sessionId);
+  async claimInboundEvent(input: CmaClaimInboundEventInput): Promise<CmaClaimInboundEventResult> {
+    const session = this.#requireSession(input.sessionId);
+    const key = eventKey(input.sessionId, input.command.commandId);
+    const existing = this.#inboundClaims.get(key);
 
-    return cloneEvent(
-      this.#appendEvent({
-        command: input.command,
-        commandResult: input.commandResult,
-        direction: "inbound",
-        driverEvent: null,
-        event: input.event,
-        sessionId: input.sessionId,
-      }),
-    );
+    if (existing) {
+      if (
+        !isDeepStrictEqual(existing.record.command, input.command) ||
+        !isDeepStrictEqual(existing.record.event, input.event)
+      ) {
+        throw new CmaStoreConflictError("event", input.command.commandId);
+      }
+
+      if (existing.record.commandStatus === "accepted") {
+        if (session.status === "terminated") {
+          throw new CmaSessionTerminatedError(input.sessionId);
+        }
+
+        if (existing.lease.expiresAt <= this.#nowIso()) {
+          existing.lease = this.#createLease();
+          return {
+            claimed: true,
+            event: structuredClone(existing.record),
+            lease: structuredClone(existing.lease),
+          };
+        }
+      }
+
+      return {
+        claimed: false,
+        event: structuredClone(existing.record),
+      };
+    }
+
+    if (session.status === "terminated") {
+      throw new CmaSessionTerminatedError(input.sessionId);
+    }
+
+    const record = this.#createEvent({
+      command: input.command,
+      commandResult: null,
+      commandStatus: "accepted",
+      direction: "inbound",
+      event: input.event,
+      sessionId: input.sessionId,
+    });
+    this.#persistEvent(record);
+    const lease = this.#createLease();
+    this.#inboundClaims.set(key, { lease, record });
+    this.#publishEvent(record);
+
+    return {
+      claimed: true,
+      event: structuredClone(record),
+      lease: structuredClone(lease),
+    };
+  }
+
+  async renewInboundEventClaim(
+    input: CmaRenewInboundEventClaimInput,
+  ): Promise<CmaInboundEventLease> {
+    const claim = this.#requireClaim(input.sessionId, input.commandId);
+
+    if (
+      claim.record.commandStatus !== "accepted" ||
+      claim.lease.id !== input.leaseId ||
+      claim.lease.expiresAt <= this.#nowIso()
+    ) {
+      throw new CmaStoreConflictError("event", input.commandId);
+    }
+
+    if (this.#requireSession(input.sessionId).status === "terminated") {
+      throw new CmaSessionTerminatedError(input.sessionId);
+    }
+
+    claim.lease = this.#createLease(input.leaseId);
+    return structuredClone(claim.lease);
+  }
+
+  async settleInboundEvent(input: CmaSettleInboundEventInput): Promise<CmaSessionEventRecord> {
+    const claim = this.#requireClaim(input.sessionId, input.commandId);
+
+    if (claim.lease.id !== input.leaseId) {
+      throw new CmaStoreConflictError("event", input.commandId);
+    }
+
+    const commandResult = input.status === "failed" ? null : structuredClone(input.commandResult);
+
+    if (claim.record.commandStatus !== "accepted") {
+      if (
+        claim.record.commandStatus !== input.status ||
+        !isDeepStrictEqual(claim.record.commandResult, commandResult)
+      ) {
+        throw new CmaStoreConflictError("event", input.commandId);
+      }
+
+      return structuredClone(claim.record);
+    }
+
+    if (claim.lease.expiresAt <= this.#nowIso()) {
+      throw new CmaStoreConflictError("event", input.commandId);
+    }
+
+    const updated = {
+      ...claim.record,
+      commandResult,
+      commandStatus: input.status,
+      cursor: createDriverId(),
+      updatedAt: this.#nowIso(),
+    } satisfies CmaSessionEventRecord;
+    eventFrameBytes(updated);
+    const events = this.#eventsBySessionId.get(input.sessionId) ?? [];
+    const index = events.findIndex((event) => event.id === claim.record.id);
+
+    if (index < 0) {
+      throw new CmaStoreNotFoundError("event", claim.record.id);
+    }
+
+    events.splice(index, 1);
+    events.push(updated);
+    claim.record = updated;
+    this.#publishEvent(updated);
+    return structuredClone(updated);
   }
 
   async archiveEnvironment(id: string): Promise<CmaEnvironmentRecord> {
@@ -242,19 +392,19 @@ export class CmaMemoryStore implements CmaStore {
       updatedAt: this.#nowIso(),
     } satisfies CmaEnvironmentRecord;
     this.#environments.set(id, updated);
-    return cloneEnvironment(updated);
+    return structuredClone(updated);
   }
 
   async createAgent(input: CmaCreateAgentInput): Promise<CmaAgentRecord> {
-    return cloneAgent(this.#putAgent(input));
+    return structuredClone(this.#putAgent(input));
   }
 
   async createEnvironment(input: CmaCreateEnvironmentInput): Promise<CmaEnvironmentRecord> {
-    return cloneEnvironment(this.#putEnvironment(input));
+    return structuredClone(this.#putEnvironment(input));
   }
 
   async createSession(input: CmaCreateSessionInput): Promise<CmaSessionRecord> {
-    return cloneSession(this.#putSession(input));
+    return structuredClone(this.#putSession(input));
   }
 
   async deleteEnvironment(id: string): Promise<boolean> {
@@ -263,73 +413,238 @@ export class CmaMemoryStore implements CmaStore {
 
   async getAgent(id: string): Promise<CmaAgentRecord | null> {
     const agent = this.#agents.get(id);
-    return agent ? cloneAgent(agent) : null;
+    return agent ? structuredClone(agent) : null;
   }
 
   async getEnvironment(id: string): Promise<CmaEnvironmentRecord | null> {
     const environment = this.#environments.get(id);
-    return environment ? cloneEnvironment(environment) : null;
+    return environment ? structuredClone(environment) : null;
   }
 
   async getSession(id: string): Promise<CmaSessionRecord | null> {
     const session = this.#sessions.get(id);
-    return session ? cloneSession(session) : null;
+    return session ? structuredClone(session) : null;
   }
 
   async listAgents(): Promise<readonly CmaAgentRecord[]> {
-    return sortById(this.#agents.values()).map(cloneAgent);
+    return sortById(this.#agents.values()).map((agent) => structuredClone(agent));
   }
 
   async listEnvironments(): Promise<readonly CmaEnvironmentRecord[]> {
-    return sortById(this.#environments.values()).map(cloneEnvironment);
+    return sortById(this.#environments.values()).map((environment) => structuredClone(environment));
   }
 
   async listSessionEvents(sessionId: string): Promise<readonly CmaSessionEventRecord[]> {
     this.#requireSession(sessionId);
-    return (this.#eventsBySessionId.get(sessionId) ?? []).map(cloneEvent);
+    return this.#readReplay(sessionId).map((event) => structuredClone(event));
   }
 
-  watchSessionEvents(sessionId: string): AsyncIterable<CmaSessionEventRecord> {
+  streamSessionEvents(
+    sessionId: string,
+    afterCursor?: string,
+  ): AsyncIterable<CmaSessionEventRecord> {
     this.#requireSession(sessionId);
-    const subscriber = new CmaMemoryEventSubscriber();
-    const subscribers = this.#subscribersBySessionId.get(sessionId) ?? new Set();
-    subscribers.add(subscriber);
-    this.#subscribersBySessionId.set(sessionId, subscribers);
-    return this.#createSubscription(sessionId, subscriber);
+    return {
+      [Symbol.asyncIterator]: () => {
+        const session = this.#requireSession(sessionId);
+        const replay = this.#readReplay(sessionId, afterCursor);
+        const replayCount = replay.length;
+        const pending: { readonly bytes: number; readonly record: CmaSessionEventRecord }[] = [];
+        const subscribers = this.#subscribersBySessionId.get(sessionId) ?? new Set();
+        let accepting = session.status !== "terminated";
+        let closed = false;
+        let controller: ReadableStreamDefaultController<CmaSessionEventRecord>;
+        let demanded = false;
+        let pendingBytes = 0;
+        let replayIndex = 0;
+        let registered = true;
+        let subscribed = false;
+
+        if (this.#subscriberCount >= CMA_MAX_STREAMS) {
+          throw new RangeError(`CMA subscription limit of ${CMA_MAX_STREAMS} was exceeded.`);
+        }
+        this.#subscriberCount += 1;
+
+        const unsubscribe = () => {
+          if (!subscribed) {
+            return;
+          }
+
+          subscribed = false;
+          subscribers.delete(subscriber);
+
+          if (subscribers.size === 0) {
+            this.#subscribersBySessionId.delete(sessionId);
+          }
+        };
+        const release = () => {
+          if (!registered) {
+            return;
+          }
+
+          registered = false;
+          unsubscribe();
+          this.#subscriberCount -= 1;
+        };
+        const drain = () => {
+          if (closed || !demanded) {
+            return;
+          }
+
+          let record: CmaSessionEventRecord | undefined;
+
+          if (replayIndex < replayCount) {
+            record = replay[replayIndex++];
+          } else {
+            const next = pending.shift();
+
+            if (next) {
+              pendingBytes -= next.bytes;
+              record = next.record;
+            }
+          }
+
+          if (record) {
+            demanded = false;
+            controller.enqueue(structuredClone(record));
+          }
+
+          if (!closed && replayIndex >= replayCount && pending.length === 0 && !accepting) {
+            closed = true;
+            controller.close();
+            release();
+          }
+        };
+        const subscriber: CmaMemorySubscriber = {
+          push: (record) => {
+            if (!accepting) {
+              return;
+            }
+
+            const bytes = eventFrameBytes(record);
+
+            if (
+              pending.length >= MAX_PENDING_SUBSCRIBER_EVENTS ||
+              bytes > CMA_MAX_EVENT_BYTES - pendingBytes
+            ) {
+              accepting = false;
+              closed = true;
+              release();
+              controller.error(
+                new Error(
+                  bytes > CMA_MAX_EVENT_BYTES - pendingBytes
+                    ? "CMA subscriber byte limit exceeded."
+                    : "CMA event stream slow consumer limit exceeded.",
+                ),
+              );
+              return;
+            }
+
+            pending.push({ bytes, record });
+            pendingBytes += bytes;
+
+            if (isTerminalEvent(record)) {
+              accepting = false;
+              unsubscribe();
+            }
+
+            drain();
+          },
+        };
+        const stream = new ReadableStream<CmaSessionEventRecord>(
+          {
+            start: (value) => {
+              controller = value;
+
+              if (accepting) {
+                subscribers.add(subscriber);
+                this.#subscribersBySessionId.set(sessionId, subscribers);
+                subscribed = true;
+              }
+            },
+            pull() {
+              demanded = true;
+              drain();
+            },
+            cancel() {
+              accepting = false;
+              closed = true;
+              release();
+            },
+          },
+          { highWaterMark: 0 },
+        );
+        const reader = stream.getReader();
+
+        return {
+          next: () => reader.read(),
+          async return() {
+            await reader.cancel();
+            return { done: true, value: undefined };
+          },
+          async throw(error?: unknown) {
+            await reader.cancel(error);
+            throw error;
+          },
+        };
+      },
+    };
   }
 
-  #appendEvent(input: Omit<CmaSessionEventRecord, "createdAt" | "id">): CmaSessionEventRecord {
+  #createEvent(
+    input: Omit<CmaSessionEventRecord, "createdAt" | "cursor" | "id" | "updatedAt">,
+  ): CmaSessionEventRecord {
+    const now = this.#nowIso();
     const record = {
-      ...input,
-      createdAt: this.#nowIso(),
+      ...structuredClone(input),
+      createdAt: now,
+      cursor: createDriverId(),
       id: this.#idFactory("event"),
+      updatedAt: now,
     } satisfies CmaSessionEventRecord;
-    const events = this.#eventsBySessionId.get(input.sessionId) ?? [];
-    events.push(record);
-    this.#eventsBySessionId.set(input.sessionId, events);
-    this.#publishEvent(record);
+    eventFrameBytes(record);
     return record;
   }
 
-  async *#createSubscription(
-    sessionId: string,
-    subscriber: CmaMemoryEventSubscriber,
-  ): AsyncIterable<CmaSessionEventRecord> {
-    try {
-      yield* subscriber.values();
-    } finally {
-      subscriber.close();
-      const subscribers = this.#subscribersBySessionId.get(sessionId);
-      subscribers?.delete(subscriber);
+  #persistEvent(record: CmaSessionEventRecord): void {
+    const events = this.#eventsBySessionId.get(record.sessionId) ?? [];
+    events.push(record);
+    this.#eventsBySessionId.set(record.sessionId, events);
+  }
 
-      if (subscribers?.size === 0) {
-        this.#subscribersBySessionId.delete(sessionId);
+  #readReplay(sessionId: string, afterCursor?: string): CmaSessionEventRecord[] {
+    const replay: CmaSessionEventRecord[] = [];
+    let bytes = 0;
+
+    for (const event of this.#eventsBySessionId.get(sessionId) ?? []) {
+      if (afterCursor !== undefined && event.cursor <= afterCursor) {
+        continue;
       }
+
+      const eventBytes = eventFrameBytes(event);
+
+      if (eventBytes > CMA_MAX_REPLAY_BYTES - bytes) {
+        throw new RangeError(`CMA replay exceeds ${CMA_MAX_REPLAY_BYTES} UTF-8 bytes.`);
+      }
+
+      bytes += eventBytes;
+      replay.push(event);
     }
+
+    return replay;
   }
 
   #nowIso(): string {
     return this.#now().toISOString();
+  }
+
+  #createLease(id: string = createDriverId()): CmaInboundEventLease {
+    const now = this.#now().getTime();
+    return {
+      expiresAt: new Date(now + CLAIM_LEASE_MS).toISOString(),
+      id,
+      renewAfter: new Date(now + CLAIM_RENEW_MS).toISOString(),
+    };
   }
 
   #putAgent(input: CmaCreateAgentInput): CmaAgentRecord {
@@ -343,7 +658,7 @@ export class CmaMemoryStore implements CmaStore {
     const record = {
       createdAt: now,
       id,
-      metadata: cloneRecord(input.metadata ?? {}),
+      metadata: structuredClone(input.metadata ?? {}),
       name: input.name,
       updatedAt: now,
     } satisfies CmaAgentRecord;
@@ -361,10 +676,10 @@ export class CmaMemoryStore implements CmaStore {
     const now = this.#nowIso();
     const record = {
       archivedAt: null,
-      config: cloneEnvironmentConfig(input.config ?? createDefaultEnvironmentConfig()),
+      config: structuredClone(input.config ?? createDefaultEnvironmentConfig()),
       createdAt: now,
       id,
-      metadata: cloneRecord(input.metadata ?? {}),
+      metadata: structuredClone(input.metadata ?? {}),
       name: input.name,
       updatedAt: now,
     } satisfies CmaEnvironmentRecord;
@@ -393,7 +708,7 @@ export class CmaMemoryStore implements CmaStore {
       createdAt: now,
       environmentId: input.environmentId ?? null,
       id,
-      metadata: cloneRecord(input.metadata ?? {}),
+      metadata: structuredClone(input.metadata ?? {}),
       status: "idle",
       updatedAt: now,
     } satisfies CmaSessionRecord;
@@ -407,6 +722,64 @@ export class CmaMemoryStore implements CmaStore {
     }
   }
 
+  #nextSessionStatus(
+    current: CmaSessionRecord["status"],
+    event: RuntimeEventEnvelope,
+    proposed: CmaSessionRecord["status"] | undefined,
+    requiresAction: unknown,
+    pendingPermissions: Map<string, unknown>,
+  ): CmaSessionRecord["status"] | undefined {
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const requestId = typeof payload["requestId"] === "string" ? payload["requestId"] : null;
+
+    switch (event.kind) {
+      case "permission.requested":
+        if (requestId !== null && requiresAction !== undefined) {
+          pendingPermissions.set(requestId, structuredClone(requiresAction));
+        }
+        return current === "rescheduling" ? current : "idle";
+      case "permission.resolved":
+        if (requestId === null || !pendingPermissions.delete(requestId)) {
+          return current;
+        }
+        if (current === "rescheduling") {
+          return current;
+        }
+        return pendingPermissions.size > 0 ? "idle" : "running";
+      case "run.started":
+        pendingPermissions.clear();
+        return "running";
+      case "run.waiting":
+        return current === "rescheduling" ? current : "idle";
+      case "run.cancelled":
+      case "run.completed":
+        pendingPermissions.clear();
+        return "idle";
+      case "run.failed":
+        pendingPermissions.clear();
+        return proposed;
+      default:
+        return proposed;
+    }
+  }
+
+  #updateSessionStatus(
+    sessionId: string,
+    status: CmaSessionRecord["status"] | undefined,
+    updatedAt: string,
+  ): void {
+    if (status === undefined) {
+      return;
+    }
+
+    const session = this.#requireSession(sessionId);
+    this.#sessions.set(sessionId, {
+      ...session,
+      status,
+      updatedAt,
+    });
+  }
+
   #requireEnvironment(id: string): CmaEnvironmentRecord {
     const environment = this.#environments.get(id);
 
@@ -415,6 +788,16 @@ export class CmaMemoryStore implements CmaStore {
     }
 
     return environment;
+  }
+
+  #requireClaim(sessionId: string, commandId: string): CmaInboundClaim {
+    const claim = this.#inboundClaims.get(eventKey(sessionId, commandId));
+
+    if (!claim) {
+      throw new CmaStoreNotFoundError("event", commandId);
+    }
+
+    return claim;
   }
 
   #requireSession(id: string): CmaSessionRecord {
