@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { createOpenAiTurnStartParams } from "../src/runtimes/openai/app-server-driver-backend";
+import { createTurnParams } from "../src/runtimes/openai/app-server-driver-backend";
 
 describe("OpenAI app-server turn start params", () => {
   test("carries the resolved approval policy with every user turn", () => {
     expect(
-      createOpenAiTurnStartParams({
+      createTurnParams({
         approvalPolicy: "never",
         cwd: "/workspace",
         model: "gpt-5.4",
@@ -29,7 +29,7 @@ describe("OpenAI app-server turn start params", () => {
 
   test("propagates the supervised approval policy unchanged", () => {
     expect(
-      createOpenAiTurnStartParams({
+      createTurnParams({
         approvalPolicy: "on-request",
         cwd: "/workspace",
         model: "gpt-5.4",
