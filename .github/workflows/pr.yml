@@ -59,20 +59,11 @@ jobs:
           run-install: |
             - args: ['--frozen-lockfile']
 
-      - name: Lint
-        run: vp run lint
+      - name: Setup just
+        uses: extractions/setup-just@v3
 
-      - name: Typecheck
-        run: vp run tc
-
-      - name: Test
-        run: vp run test
-
-      - name: Build
-        run: vp run build
-
-      - name: Verify driver artifact
-        run: test -f dist/driver.mjs
+      - name: Check
+        run: just check
 
   image:
     name: Container image

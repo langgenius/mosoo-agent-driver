@@ -16,6 +16,13 @@ test: lint
 build: test
     vp run build
 
+check:
+    vp run lint
+    vp run tc
+    vp run test
+    vp run build
+    test -f dist/driver.mjs
+
 image-build:
     vp run image:build
 
