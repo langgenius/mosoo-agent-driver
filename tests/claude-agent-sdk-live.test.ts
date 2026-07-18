@@ -439,6 +439,7 @@ describe("Claude Agent SDK live provider", () => {
           "write-file",
           `Use Write to create ${JSON.stringify(outputName)} with exactly one line: ${contents}. Do not use Bash. Reply with exactly written.`,
         );
+
         const writeToolId = toolCallId(events, "Write");
 
         expect(writeToolId).not.toBeNull();
@@ -531,6 +532,7 @@ describe("Claude Agent SDK live provider", () => {
           "edit-delete-files",
           `Use Edit to replace before with after in ${JSON.stringify(editName)}. Then use Bash to delete ${JSON.stringify(deleteName)}. Reply with exactly mutated.`,
         );
+
         const editToolId = toolCallId(events, "Edit");
         const bashToolId = toolCallId(events, "Bash");
 
@@ -688,6 +690,90 @@ describe("Claude Agent SDK live provider", () => {
         );
       } finally {
         await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+
+  liveTest(
+    "stops during a running tool and starts a fresh process",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const firstKernel = createLiveKernel();
+      const firstEvents = firstKernel.events()[Symbol.asyncIterator]();
+      let firstStopped = false;
+
+      try {
+        await firstKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "When asked to wait, run the requested Bash command. For every other request, reply with exactly pong.",
+          }),
+        );
+        const runningInput = firstKernel.dispatch({
+          commandId: "live-claude-input-stop",
+          input: { text: "Run the Bash command `sleep 30`, then reply pong." },
+          kind: "input.start",
+          requestId: "live-claude-request-stop",
+          runId: DRIVER_TEST_IDS.runId,
+        });
+        const runningTool = await waitForLiveEvent(
+          firstEvents,
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          "running Bash tool before shutdown",
+        );
+        const toolCallId = payloadString(runningTool, "itemId");
+        expect(toolCallId).not.toBeNull();
+        await stopLiveKernel(firstKernel, "live.active-stop");
+        firstStopped = true;
+
+        await expect(runningInput).resolves.toBeUndefined();
+        const shutdownEvents = await withLiveTimeout({
+          details: {},
+          label: "shutdown event stream closure",
+          logStatus: () => {},
+          task: () => Array.fromAsync(fromIterator(firstEvents)),
+          timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+        });
+        expect(
+          shutdownEvents.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "failed") &&
+              payloadString(event, "toolCallId") === toolCallId,
+          ),
+        ).toBe(true);
+        expect(shutdownEvents.some((event) => event.kind === "run.cancelled")).toBe(true);
+      } finally {
+        if (!firstStopped) {
+          await stopLiveKernel(firstKernel, "test.stop");
+        }
+      }
+
+      const restartedKernel = createLiveKernel();
+
+      try {
+        await restartedKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+          }),
+        );
+        await sendPing(
+          restartedKernel,
+          restartedKernel.events(),
+          "after-restart",
+          DRIVER_TEST_IDS.secondRunId,
+        );
+      } finally {
+        await stopLiveKernel(restartedKernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
