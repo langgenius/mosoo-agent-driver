@@ -1071,6 +1071,59 @@ describe("OpenAI Contract adapter", () => {
     });
   });
 
+  test.each([
+    {
+      error: { message: "command failed explicitly" },
+      expectedError: "command failed explicitly",
+      expectedStatus: "failed",
+      label: "explicit failure",
+      nativeStatus: "failed",
+    },
+    {
+      error: null,
+      expectedError: "commandExecution failed.",
+      expectedStatus: "failed",
+      label: "fallback failure",
+      nativeStatus: "failed",
+    },
+    {
+      error: null,
+      expectedError: null,
+      expectedStatus: "cancelled",
+      label: "declined command",
+      nativeStatus: "declined",
+    },
+  ] as const)(
+    "projects $label as $expectedStatus",
+    async ({ error, expectedError, expectedStatus, nativeStatus }) => {
+      const harness = createHarness();
+      await registerTurn(harness.adapter);
+      await harness.adapter.handleNotification("item/completed", {
+        completedAtMs: Date.parse("2026-07-16T08:00:00.100Z"),
+        item: {
+          aggregatedOutput: "command output",
+          command: "false",
+          error,
+          exitCode: nativeStatus === "failed" ? 1 : null,
+          id: `command-${nativeStatus}-${expectedError ?? "none"}`,
+          status: nativeStatus,
+          type: "commandExecution",
+        },
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+      });
+
+      const item = harness.snapshot().items[0];
+      expect(item).toMatchObject({ kind: "terminal", status: expectedStatus });
+
+      if (expectedError === null) {
+        expect(item).not.toHaveProperty("error");
+      } else {
+        expect(item).toMatchObject({ error: { message: expectedError, retryable: false } });
+      }
+    },
+  );
+
   test("uses an empty file-change snapshot to clear prior active changes", async () => {
     const harness = createHarness();
     await registerTurn(harness.adapter);
