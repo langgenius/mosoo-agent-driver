@@ -430,6 +430,77 @@ describe("Claude Agent SDK live provider", () => {
   );
 
   liveTest(
+    "edits and deletes workspace files through SDK tools",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const editName = "edit target.txt";
+      const deleteName = "delete target-λ.txt";
+      await Promise.all([
+        writeFile(join(paths.cwd, editName), "before\n", "utf8"),
+        writeFile(join(paths.cwd, deleteName), "remove me\n", "utf8"),
+      ]);
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          "edit-delete-files",
+          `Use Edit to replace before with after in ${JSON.stringify(editName)}. Then use Bash to delete ${JSON.stringify(deleteName)}. Reply with exactly mutated.`,
+        );
+        const editToolId = payloadString(
+          events.find(
+            (event) =>
+              event.kind === "item.started" && hasPayloadValue(event, "title", "Edit"),
+          )!,
+          "itemId",
+        );
+        const bashToolId = payloadString(
+          events.find(
+            (event) =>
+              event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          )!,
+          "itemId",
+        );
+
+        expect(editToolId).not.toBeNull();
+        expect(bashToolId).not.toBeNull();
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              payloadString(event, "toolCallId") === editToolId &&
+              hasPayloadValue(event, "status", "completed"),
+          ),
+        ).toBe(true);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              payloadString(event, "toolCallId") === bashToolId &&
+              hasPayloadValue(event, "status", "completed"),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("mutated");
+        expect(await readFile(join(paths.cwd, editName), "utf8")).toBe("after\n");
+        await expect(readFile(join(paths.cwd, deleteName), "utf8")).rejects.toThrow();
+      } finally {
+        await kernel.stop("test.stop").catch(() => {});
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
     "resumes the native session in a fresh process",
     async () => {
       const paths = await createLiveDriverPaths();
