@@ -186,6 +186,45 @@ function createHarness() {
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
+  test("marks an SDK tool error as failed", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [{ id: "tool-1", input: { command: "false" }, name: "Bash", type: "tool_use" }],
+        },
+        type: "assistant",
+        uuid: "assistant-1",
+      },
+      {
+        message: {
+          content: [
+            {
+              content: "Command failed",
+              is_error: true,
+              tool_use_id: "tool-1",
+              type: "tool_result",
+            },
+          ],
+        },
+        type: "user",
+        uuid: "user-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "tool.call.updated",
+        payload: expect.objectContaining({ status: "failed", toolCallId: "tool-1" }),
+      }),
+    );
+  });
+
   test("rotates assistant identity across a tool boundary and marks the final message", async () => {
     const { context, events, logger, translator } = createHarness();
     const messages = [

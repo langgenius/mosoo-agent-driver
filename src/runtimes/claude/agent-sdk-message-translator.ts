@@ -453,6 +453,7 @@ export class ClaudeAgentSdkMessageTranslator {
           this.#activeAssistantMessageIds.get(runId) ??
           this.#lastCompletedAssistantMessages.get(runId)?.id ??
           this.#assistantMessageId(runId, null),
+        status: block["is_error"] === true ? "failed" : "completed",
         toolCallId,
       });
     }

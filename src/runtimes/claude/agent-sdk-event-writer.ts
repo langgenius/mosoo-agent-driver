@@ -41,6 +41,7 @@ export interface ClaudeToolResultEvent {
   content: string;
   context: AgentDriverContext;
   messageId: string;
+  status: "completed" | "failed";
   toolCallId: string;
 }
 
@@ -371,6 +372,7 @@ export class ClaudeAgentSdkEventWriter {
     content,
     context,
     messageId,
+    status,
     toolCallId,
   }: ClaudeToolResultEvent): Promise<void> {
     const events: DriverEventInput[] = [
@@ -380,7 +382,7 @@ export class ClaudeAgentSdkEventWriter {
           content,
           messageId,
           rawOutput: content,
-          status: "completed",
+          status,
           toolCallId,
         },
       },
@@ -393,7 +395,7 @@ export class ClaudeAgentSdkEventWriter {
         payload: {
           itemId: toolCallId,
           itemType: "tool_call",
-          status: "completed",
+          status,
         },
       });
     }
