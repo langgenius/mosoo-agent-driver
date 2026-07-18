@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, copyFile, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
@@ -19,6 +19,8 @@ const LIVE_ENABLED_ENV = "AGENT_DRIVER_LIVE_OPENAI";
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_OPENAI_API_KEY";
 const PROVIDER_API_KEY_ENV = "OPENAI_API_KEY";
 const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_OPENAI_MODEL";
+const OPENAI_RUNTIME_HOME_ENV = "CODEX_HOME";
+const OPENAI_RUNTIME_HOME_DIR = ".codex";
 const LIVE_OPERATION_TIMEOUT_MS = 15_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 
@@ -54,6 +56,19 @@ function readLiveModel(): string {
   return readEnvString(LIVE_MODEL_ENV) ?? OPENAI_DEFAULT_MODEL_ID;
 }
 
+async function copyLocalAuth(homePath: string): Promise<void> {
+  if (readLiveApiKey() !== null) {
+    return;
+  }
+
+  const sourceHome = readEnvString(OPENAI_RUNTIME_HOME_ENV) ??
+    join(homedir(), OPENAI_RUNTIME_HOME_DIR);
+  const target = join(homePath, "auth.json");
+
+  await copyFile(join(sourceHome, "auth.json"), target);
+  await chmod(target, 0o600);
+}
+
 async function createLiveDriverPaths(): Promise<{
   cwd: string;
   homePath: string;
@@ -66,6 +81,7 @@ async function createLiveDriverPaths(): Promise<{
     mkdir(homePath, { recursive: true }),
     mkdir(sharedRootPath, { recursive: true }),
   ]);
+  await copyLocalAuth(homePath);
   tempRoots.push(root);
 
   return {
