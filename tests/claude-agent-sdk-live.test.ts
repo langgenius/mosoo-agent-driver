@@ -36,6 +36,7 @@ const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
 const LIVE_MODEL_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_MODEL";
 const DEFAULT_LIVE_MODEL = "claude-sonnet-5";
+const LIVE_OPERATION_TIMEOUT_MS = 15_000;
 const LIVE_TURN_TIMEOUT_MS = 120_000;
 
 const tempRoots: string[] = [];
@@ -216,8 +217,13 @@ function hasPayloadText(event: DriverEventInput, key: string, text: string): boo
   return typeof value === "string" && value.includes(text);
 }
 
-function payloadString(event: DriverEventInput, key: string): string | null {
-  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+function payloadString(event: DriverEventInput | undefined, key: string): string | null {
+  if (
+    event === undefined ||
+    typeof event.payload !== "object" ||
+    event.payload === null ||
+    Array.isArray(event.payload)
+  ) {
     return null;
   }
 
@@ -225,8 +231,82 @@ function payloadString(event: DriverEventInput, key: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function toolCallId(events: readonly DriverEventInput[], title: string): string | null {
+  return payloadString(
+    events.find(
+      (event) => event.kind === "item.started" && hasPayloadValue(event, "title", title),
+    ),
+    "itemId",
+  );
+}
+
+function hasToolStatus(
+  events: readonly DriverEventInput[],
+  id: string | null,
+  status: "completed" | "failed",
+): boolean {
+  return (
+    id !== null &&
+    events.some(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        payloadString(event, "toolCallId") === id &&
+        hasPayloadValue(event, "status", status),
+    )
+  );
+}
+
+function fromIterator(iterator: AsyncIterator<DriverEventInput>): AsyncIterable<DriverEventInput> {
+  return { [Symbol.asyncIterator]: () => iterator };
+}
+
+async function waitForLiveEvent(
+  iterator: AsyncIterator<DriverEventInput>,
+  predicate: (event: DriverEventInput) => boolean,
+  label: string,
+): Promise<DriverEventInput> {
+  return withLiveTimeout({
+    details: { label },
+    label,
+    logStatus: () => {},
+    task: async () => {
+      while (true) {
+        const next = await iterator.next();
+
+        if (next.done) {
+          throw new Error(`Driver event stream closed before ${label}.`);
+        }
+
+        if (predicate(next.value)) {
+          return next.value;
+        }
+
+        if (
+          next.value.kind === "run.completed" ||
+          next.value.kind === "run.failed" ||
+          next.value.kind === "run.cancelled"
+        ) {
+          throw new Error(`Driver turn ended with ${next.value.kind} before ${label}.`);
+        }
+      }
+    },
+    timeoutMs: LIVE_TURN_TIMEOUT_MS,
+  });
+}
+
+async function stopLiveKernel(kernel: AgentDriverKernelCore, reason: string): Promise<void> {
+  await withLiveTimeout({
+    details: { reason },
+    label: "live kernel shutdown",
+    logStatus: () => {},
+    task: () => kernel.stop(reason),
+    timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+  });
+}
+
 async function sendTurn(
   kernel: AgentDriverKernelCore,
+  events: AsyncIterable<DriverEventInput>,
   suffix: string,
   text: string,
   runId = DRIVER_TEST_IDS.runId,
@@ -239,13 +319,25 @@ async function sendTurn(
     requestId,
     runId,
   });
-  const events = await waitForTerminalTurnEvent({
-    events: kernel.events(),
+  const turnEvents = await waitForTerminalTurnEvent({
+    events,
     timeoutMs: LIVE_TURN_TIMEOUT_MS,
   });
 
   await expect(dispatch).resolves.toEqual({ requestId });
-  return events;
+  return turnEvents;
+}
+
+async function sendPing(
+  kernel: AgentDriverKernelCore,
+  events: AsyncIterable<DriverEventInput>,
+  suffix: string,
+  runId = DRIVER_TEST_IDS.runId,
+): Promise<void> {
+  const turnEvents = await sendTurn(kernel, events, suffix, "ping", runId);
+  const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
+
+  expect(outputText).toContain("pong");
 }
 
 describe("Claude Agent SDK live provider", () => {
@@ -266,12 +358,9 @@ describe("Claude Agent SDK live provider", () => {
           }),
         );
 
-        const turnEvents = await sendTurn(kernel, "smoke", "ping");
-        const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
-
-        expect(outputText).toContain("pong");
+        await sendPing(kernel, kernel.events(), "smoke");
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
@@ -299,17 +388,12 @@ describe("Claude Agent SDK live provider", () => {
         );
         const events = await sendTurn(
           kernel,
+          kernel.events(),
           "read-file",
           `Use Read to read ${JSON.stringify(inputName)}. Do not use Bash. Reply with exactly its contents and nothing else.`,
         );
 
-        const readToolId = payloadString(
-          events.find(
-            (event) =>
-              event.kind === "item.started" && hasPayloadValue(event, "title", "Read"),
-          )!,
-          "itemId",
-        );
+        const readToolId = toolCallId(events, "Read");
 
         expect(readToolId).not.toBeNull();
         expect(
@@ -324,7 +408,7 @@ describe("Claude Agent SDK live provider", () => {
         expect(events.map(textDeltaFrom).join("")).toContain(contents);
         expect(await readFile(join(paths.cwd, inputName), "utf8")).toBe(`${contents}\n`);
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
@@ -351,30 +435,18 @@ describe("Claude Agent SDK live provider", () => {
         );
         const events = await sendTurn(
           kernel,
+          kernel.events(),
           "write-file",
           `Use Write to create ${JSON.stringify(outputName)} with exactly one line: ${contents}. Do not use Bash. Reply with exactly written.`,
         );
-        const writeToolId = payloadString(
-          events.find(
-            (event) =>
-              event.kind === "item.started" && hasPayloadValue(event, "title", "Write"),
-          )!,
-          "itemId",
-        );
+        const writeToolId = toolCallId(events, "Write");
 
         expect(writeToolId).not.toBeNull();
-        expect(
-          events.some(
-            (event) =>
-              event.kind === "tool.call.updated" &&
-              payloadString(event, "toolCallId") === writeToolId &&
-              hasPayloadValue(event, "status", "completed"),
-          ),
-        ).toBe(true);
+        expect(hasToolStatus(events, writeToolId, "completed")).toBe(true);
         expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("written");
         expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
@@ -399,6 +471,7 @@ describe("Claude Agent SDK live provider", () => {
         );
         const events = await sendTurn(
           kernel,
+          kernel.events(),
           "failed-command",
           "Run `sh -c 'printf claude-stdout; printf claude-stderr >&2; exit 7'`. After it fails, run `printf claude-recovered`. Then reply with exactly recovered.",
         );
@@ -423,7 +496,7 @@ describe("Claude Agent SDK live provider", () => {
         ).toBe(true);
         expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("recovered");
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
@@ -454,47 +527,22 @@ describe("Claude Agent SDK live provider", () => {
         );
         const events = await sendTurn(
           kernel,
+          kernel.events(),
           "edit-delete-files",
           `Use Edit to replace before with after in ${JSON.stringify(editName)}. Then use Bash to delete ${JSON.stringify(deleteName)}. Reply with exactly mutated.`,
         );
-        const editToolId = payloadString(
-          events.find(
-            (event) =>
-              event.kind === "item.started" && hasPayloadValue(event, "title", "Edit"),
-          )!,
-          "itemId",
-        );
-        const bashToolId = payloadString(
-          events.find(
-            (event) =>
-              event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
-          )!,
-          "itemId",
-        );
+        const editToolId = toolCallId(events, "Edit");
+        const bashToolId = toolCallId(events, "Bash");
 
         expect(editToolId).not.toBeNull();
         expect(bashToolId).not.toBeNull();
-        expect(
-          events.some(
-            (event) =>
-              event.kind === "tool.call.updated" &&
-              payloadString(event, "toolCallId") === editToolId &&
-              hasPayloadValue(event, "status", "completed"),
-          ),
-        ).toBe(true);
-        expect(
-          events.some(
-            (event) =>
-              event.kind === "tool.call.updated" &&
-              payloadString(event, "toolCallId") === bashToolId &&
-              hasPayloadValue(event, "status", "completed"),
-          ),
-        ).toBe(true);
+        expect(hasToolStatus(events, editToolId, "completed")).toBe(true);
+        expect(hasToolStatus(events, bashToolId, "completed")).toBe(true);
         expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("mutated");
         expect(await readFile(join(paths.cwd, editName), "utf8")).toBe("after\n");
         await expect(readFile(join(paths.cwd, deleteName), "utf8")).rejects.toThrow();
       } finally {
-        await kernel.stop("test.stop").catch(() => {});
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
@@ -520,15 +568,16 @@ describe("Claude Agent SDK live provider", () => {
         );
         const firstEvents = await sendTurn(
           firstKernel,
+          firstKernel.events(),
           "resume-store",
           `Remember the token ${memoryToken}. Reply with exactly stored.`,
         );
         const resumePointer = payloadString(
-          firstEvents.find((event) => event.kind === "runtime.resume.updated")!,
+          firstEvents.find((event) => event.kind === "runtime.resume.updated"),
           "resumePointer",
         );
         expect(resumePointer).not.toBeNull();
-        await firstKernel.stop("live.resume-restart");
+        await stopLiveKernel(firstKernel, "live.resume-restart");
         firstStopped = true;
 
         const baseInput = createLiveStartInput({
@@ -557,6 +606,7 @@ describe("Claude Agent SDK live provider", () => {
           });
           const events = await sendTurn(
             resumedKernel,
+            resumedKernel.events(),
             "resume-recall",
             "Reply with exactly the token I asked you to remember in the previous turn.",
             DRIVER_TEST_IDS.secondRunId,
@@ -564,12 +614,80 @@ describe("Claude Agent SDK live provider", () => {
 
           expect(events.map(textDeltaFrom).join("")).toContain(memoryToken);
         } finally {
-          await resumedKernel.stop("test.stop").catch(() => {});
+          await stopLiveKernel(resumedKernel, "test.stop");
         }
       } finally {
         if (!firstStopped) {
-          await firstKernel.stop("test.stop").catch(() => {});
+          await stopLiveKernel(firstKernel, "test.stop");
         }
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+
+  liveTest(
+    "cancels a running tool and accepts the next turn",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const iterator = kernel.events()[Symbol.asyncIterator]();
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "When asked to wait, run the requested Bash command. For every other request, reply with exactly pong.",
+          }),
+        );
+        const runningInput = kernel.dispatch({
+          commandId: "live-claude-input-cancelled",
+          input: { text: "Run the Bash command `sleep 30`, then reply pong." },
+          kind: "input.start",
+          requestId: "live-claude-request-cancelled",
+          runId: DRIVER_TEST_IDS.runId,
+        });
+        const runningTool = await waitForLiveEvent(
+          iterator,
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          "running Bash tool",
+        );
+        const toolCallId = payloadString(runningTool, "itemId");
+        expect(toolCallId).not.toBeNull();
+        await withLiveTimeout({
+          details: {},
+          label: "active turn cancellation",
+          logStatus: () => {},
+          task: () => kernel.cancel("live.cancel"),
+          timeoutMs: LIVE_OPERATION_TIMEOUT_MS,
+        });
+
+        await expect(runningInput).resolves.toBeUndefined();
+        await waitForLiveEvent(
+          iterator,
+          (event) =>
+            event.kind === "tool.call.updated" &&
+            hasPayloadValue(event, "status", "failed") &&
+            payloadString(event, "toolCallId") === toolCallId,
+          "cancelled Bash terminal event",
+        );
+        await waitForLiveEvent(
+          iterator,
+          (event) => event.kind === "run.cancelled",
+          "cancelled run terminal event",
+        );
+        await sendPing(
+          kernel,
+          fromIterator(iterator),
+          "after-cancel",
+          DRIVER_TEST_IDS.secondRunId,
+        );
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
       }
     },
     LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
