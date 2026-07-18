@@ -30,7 +30,7 @@ honest success signal.
 
 ```sh
 # from apps/driver
-ANTHROPIC_API_KEY=... OPENAI_API_KEY=... bun bench/ttft-bench.ts
+ANTHROPIC_API_KEY=... OPENAI_API_KEY=... vp run bench
 ```
 
 Env knobs:

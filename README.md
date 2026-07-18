@@ -90,14 +90,16 @@ Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qual
 
 ## Quick Start
 
-`agent-driver` targets [Bun](https://bun.sh). It is not currently available from npm; work from this repository checkout, install dependencies, and run the test suite:
+`agent-driver` targets [Bun](https://bun.sh), with [Vite+](https://viteplus.dev) as the development toolchain and command entry point.
+Vite+ provisions the Bun version declared by `packageManager`; Bun remains the runtime, package manager, test runner, and binary bundler underneath it.
+The package is not currently available from npm, so work from this repository checkout, install dependencies, and run the test suite:
 
 ```sh
-bun install --frozen-lockfile
-bun test
+vp install --frozen-lockfile
+vp run test
 ```
 
-The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required. Drop the following into `tests/quickstart.test.ts` and run `bun test tests/quickstart.test.ts`:
+The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required. Drop the following into `tests/quickstart.test.ts` and run `vp run test tests/quickstart.test.ts`:
 
 ```ts
 import { expect, test } from "bun:test";
@@ -149,15 +151,15 @@ This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessio
 ## Commands
 
 ```sh
-bun install --frozen-lockfile
-bun run lint
-bun run tc
-bun run test
-bun run build
-bun run docker:build
+vp install --frozen-lockfile
+vp run lint
+vp run tc
+vp run test
+vp run build
+vp run docker:build
 ```
 
-`bun run docker:build` produces a local `agent-driver:local` image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
+`vp run docker:build` produces a local `agent-driver:local` image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
 ## Boundaries
 
@@ -171,11 +173,11 @@ bun run docker:build
 
 ## Checks
 
-- `bun run lint`
-- `bun run tc`
-- `bun run test`
-- `bun run build`
-- `bun run docker:build`
+- `vp run lint`
+- `vp run tc`
+- `vp run test`
+- `vp run build`
+- `vp run docker:build`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live provider smoke tests are gated by environment credentials
