@@ -99,8 +99,9 @@ jobs:
 
       - name: Verify packaged binaries
         run: |
-          buildah from --name agent-driver-ci-container agent-driver:ci
-          buildah run agent-driver-ci-container -- /bin/sh -c '
+          container="$(buildah from agent-driver:ci)"
+          trap 'buildah rm "$container"' EXIT
+          buildah run "$container" -- /bin/sh -c '
             test -x /usr/local/bin/agent-driver
             test -x /usr/local/bin/mosoo-claude-code
             codex --version
