@@ -67,4 +67,17 @@ describe("OpenAI private citation filter", () => {
       text: "\uE200cite\uE202turn7search12",
     });
   });
+
+  test("bounds an unclosed private citation without exposing its payload", () => {
+    const filter = new OpenAiPrivateCitationStreamFilter();
+
+    expect(filter.push(`before\uE200cite\uE202${"x".repeat(5_000)}`)).toEqual({
+      privateCitationCount: 0,
+      text: "before",
+    });
+    expect(filter.push("\uE201after")).toEqual({
+      privateCitationCount: 1,
+      text: "after",
+    });
+  });
 });
