@@ -278,13 +278,12 @@ describe("Claude Agent SDK live provider", () => {
   );
 
   liveTest(
-    "reads and writes workspace files through SDK tools",
+    "reads a workspace file through the Read tool",
     async () => {
       const paths = await createLiveDriverPaths();
       const kernel = createLiveKernel();
       const inputName = "source file-λ.txt";
-      const outputName = "claude-output.txt";
-      const contents = "claude-live-token-6241";
+      const contents = "claude-read-token-6241";
       await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
 
       try {
@@ -300,14 +299,79 @@ describe("Claude Agent SDK live provider", () => {
         );
         const events = await sendTurn(
           kernel,
-          "workspace-tools",
-          `Use Read to read ${JSON.stringify(inputName)}. Use Write to create ${JSON.stringify(outputName)} with exactly the text you read. Do not use Bash. Reply with exactly files-done.`,
+          "read-file",
+          `Use Read to read ${JSON.stringify(inputName)}. Do not use Bash. Reply with exactly its contents and nothing else.`,
         );
 
-        expect(events.some((event) => hasPayloadValue(event, "title", "Read"))).toBe(true);
-        expect(events.some((event) => hasPayloadValue(event, "title", "Write"))).toBe(true);
-        expect(events.map(textDeltaFrom).join("")).toContain("files-done");
+        const readToolId = payloadString(
+          events.find(
+            (event) =>
+              event.kind === "item.started" && hasPayloadValue(event, "title", "Read"),
+          )!,
+          "itemId",
+        );
+
+        expect(readToolId).not.toBeNull();
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              payloadString(event, "toolCallId") === readToolId &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", contents),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("")).toContain(contents);
         expect(await readFile(join(paths.cwd, inputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        await kernel.stop("test.stop").catch(() => {});
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "creates a workspace file through the Write tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const outputName = "claude-output.txt";
+      const contents = "claude-write-token-7352";
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          "write-file",
+          `Use Write to create ${JSON.stringify(outputName)} with exactly one line: ${contents}. Do not use Bash. Reply with exactly written.`,
+        );
+        const writeToolId = payloadString(
+          events.find(
+            (event) =>
+              event.kind === "item.started" && hasPayloadValue(event, "title", "Write"),
+          )!,
+          "itemId",
+        );
+
+        expect(writeToolId).not.toBeNull();
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              payloadString(event, "toolCallId") === writeToolId &&
+              hasPayloadValue(event, "status", "completed"),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("written");
         expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
       } finally {
         await kernel.stop("test.stop").catch(() => {});
