@@ -43,7 +43,20 @@ export class OpenAiAppServerItemEventBridge {
     this.#tools = input.tools;
   }
 
-  async handleAgentMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  reset(): void {
+    this.#citationDiagnosticsEmitted.clear();
+    this.#citationFilters.clear();
+    this.#items.reset();
+    this.#messages.reset();
+    this.#plans.reset();
+    this.#tools.reset();
+  }
+
+  finishOpen(): DriverEventInput[] {
+    return [...this.#messages.finishOpen(), ...this.#tools.failOpen()];
+  }
+
+  async onMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turnId = readNonEmptyString(params, "turnId");
     const itemId = readNonEmptyString(params, "itemId");
     const delta = readNonEmptyString(params, "delta");
@@ -82,7 +95,7 @@ export class OpenAiAppServerItemEventBridge {
     ]);
   }
 
-  async handleFileChangePatchUpdated(
+  async onFilePatch(
     context: AgentDriverContext,
     params: JsonObject,
   ): Promise<void> {
@@ -120,7 +133,7 @@ export class OpenAiAppServerItemEventBridge {
           content: resultText,
           messageId: parentMessageId,
           rawOutput: resultText,
-          status: "completed",
+          status: "running",
           toolCallId: itemId,
         },
       });
@@ -133,7 +146,7 @@ export class OpenAiAppServerItemEventBridge {
     }
   }
 
-  async handleItemCompleted(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async onItemCompleted(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const item = readRecord(params, "item");
     const itemId = item === null ? null : readNonEmptyString(item, "id");
     const turnId = readNonEmptyString(params, "turnId");
@@ -147,10 +160,10 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     const events: DriverEventInput[] = [];
-    await this.#appendCompletedMessageEvents(context, events, item, itemId, turnId);
-    this.#appendCompletedPlanEvents(events, item, itemId);
-    this.#appendCompletedReasoningEvents(events, item, itemId);
-    await this.#appendCompletedToolEvents(context, events, item, itemId, turnId);
+    await this.#appendMessageEnd(context, events, item, itemId, turnId);
+    this.#appendPlanEnd(events, item, itemId);
+    this.#appendReasoningEnd(events, item, itemId);
+    await this.#appendToolEnd(context, events, item, itemId, turnId);
 
     events.push(...toOpenAiFileChangeEvents(item));
 
@@ -159,7 +172,7 @@ export class OpenAiAppServerItemEventBridge {
     }
   }
 
-  async handleItemStarted(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async onItemStarted(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const item = readRecord(params, "item");
     const turnId = readNonEmptyString(params, "turnId");
 
@@ -182,7 +195,7 @@ export class OpenAiAppServerItemEventBridge {
     });
   }
 
-  async handlePlanDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async onPlanDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const itemId = readNonEmptyString(params, "itemId");
     const delta = readString(params, "delta");
 
@@ -194,7 +207,7 @@ export class OpenAiAppServerItemEventBridge {
     await this.#push(context, "driver.openai.plan.delta", [this.#plans.createUpdatedEvent()]);
   }
 
-  async handleReasoningSummaryDelta(
+  async onReasoningDelta(
     context: AgentDriverContext,
     params: JsonObject,
   ): Promise<void> {
@@ -208,7 +221,11 @@ export class OpenAiAppServerItemEventBridge {
     const messageId = `reasoning:${itemId}`;
     const events: DriverEventInput[] = [];
 
-    this.#messages.ensureReasoningStarted(messageId, events);
+    if (this.#messages.isReasoningEnded(messageId)) {
+      return;
+    }
+
+    this.#messages.ensureReasoning(messageId, events);
     events.push({
       delivery: "best_effort",
       kind: "thought.delta",
@@ -222,7 +239,20 @@ export class OpenAiAppServerItemEventBridge {
     await this.#push(context, "driver.openai.reasoning.summary", events);
   }
 
-  async handleToolOutputDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async onReasoningPart(
+    context: AgentDriverContext,
+    params: JsonObject,
+  ): Promise<void> {
+    const summaryIndex = params["summaryIndex"];
+
+    if (typeof summaryIndex !== "number" || !Number.isInteger(summaryIndex) || summaryIndex < 1) {
+      return;
+    }
+
+    await this.onReasoningDelta(context, { ...params, delta: "\n\n" });
+  }
+
+  async onToolOutput(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const itemId = readNonEmptyString(params, "itemId");
     const delta = readNonEmptyString(params, "delta");
 
@@ -244,14 +274,14 @@ export class OpenAiAppServerItemEventBridge {
           content: delta,
           messageId: parentMessageId,
           rawOutput: delta,
-          status: "completed",
+          status: "running",
           toolCallId: itemId,
         },
       },
     ]);
   }
 
-  async handleTurnCompletedItems(
+  async onTurnItems(
     context: AgentDriverContext,
     params: JsonObject,
     turnId: string,
@@ -263,7 +293,7 @@ export class OpenAiAppServerItemEventBridge {
         continue;
       }
 
-      await this.handleItemCompleted(context, {
+      await this.onItemCompleted(context, {
         item,
         threadId: readString(params, "threadId"),
         turnId,
@@ -271,7 +301,7 @@ export class OpenAiAppServerItemEventBridge {
     }
   }
 
-  async resolveTurnFinalAssistantSnapshot(
+  async resolveFinalMessage(
     context: AgentDriverContext,
     params: JsonObject,
     turnId: string,
@@ -293,12 +323,12 @@ export class OpenAiAppServerItemEventBridge {
       // Terminal notifications commonly use `itemsView: "notLoaded"` with an
       // empty items list. The provider's item/completed frames are complete
       // snapshots; first-seen item order remains stable when older completion
-      // frames arrive late. A full or legacy non-empty list stays authoritative.
+      // frames arrive late. A full or non-empty list stays authoritative.
       if (itemsView === "full" || (itemsView === null && items.length > 0)) {
         return null;
       }
 
-      const completedSnapshot = this.#messages.finalCompletedSnapshotForTurn(turnId);
+      const completedSnapshot = this.#messages.finalSnapshot(turnId);
 
       if (completedSnapshot !== null) {
         this.#releaseCitationState(completedSnapshot.id);
@@ -323,13 +353,13 @@ export class OpenAiAppServerItemEventBridge {
       this.#push,
     );
     const filteredText = filterOpenAiPrivateCitations(text);
-    await this.#reportPrivateCitations(context, messageId, filteredText.privateCitationCount);
+    await this.#reportCitations(context, messageId, filteredText.privateCitationCount);
     this.#messages.setText(messageId, filteredText.text);
     this.#releaseCitationState(messageId);
     return { id: messageId, text: filteredText.text };
   }
 
-  async handleTurnPlanUpdated(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async onTurnPlan(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const plan = readArray(params, "plan").flatMap((entry) => {
       if (!isRecord(entry)) {
         return [];
@@ -361,7 +391,7 @@ export class OpenAiAppServerItemEventBridge {
     ]);
   }
 
-  async #appendCompletedMessageEvents(
+  async #appendMessageEnd(
     context: AgentDriverContext,
     events: DriverEventInput[],
     item: JsonObject,
@@ -399,7 +429,7 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     if (filteredFinalText !== null) {
-      this.#appendPrivateCitationDiagnostic(
+      this.#appendCitationDiag(
         events,
         messageId,
         filteredFinalText.privateCitationCount,
@@ -444,7 +474,7 @@ export class OpenAiAppServerItemEventBridge {
       // deltas may be missing or replayed, so canonical completion must not
       // inherit a corrupted accumulator even when live deltas cannot be undone.
       this.#messages.setText(messageId, filteredFinalText.text);
-      this.#messages.recordCompletedSnapshot({
+      this.#messages.recordSnapshot({
         itemId,
         messageId,
         text: filteredFinalText.text,
@@ -465,7 +495,7 @@ export class OpenAiAppServerItemEventBridge {
     }
   }
 
-  #appendPrivateCitationDiagnostic(
+  #appendCitationDiag(
     events: DriverEventInput[],
     messageId: string,
     privateCitationCount: number,
@@ -501,13 +531,13 @@ export class OpenAiAppServerItemEventBridge {
     return filter.push(delta).text;
   }
 
-  async #reportPrivateCitations(
+  async #reportCitations(
     context: AgentDriverContext,
     messageId: string,
     privateCitationCount: number,
   ): Promise<void> {
     const events: DriverEventInput[] = [];
-    this.#appendPrivateCitationDiagnostic(events, messageId, privateCitationCount);
+    this.#appendCitationDiag(events, messageId, privateCitationCount);
 
     if (events.length > 0) {
       await this.#push(context, "driver.openai.private_citation_markup_removed", events);
@@ -519,7 +549,7 @@ export class OpenAiAppServerItemEventBridge {
     this.#citationFilters.delete(messageId);
   }
 
-  #appendCompletedPlanEvents(events: DriverEventInput[], item: JsonObject, itemId: string): void {
+  #appendPlanEnd(events: DriverEventInput[], item: JsonObject, itemId: string): void {
     if (readString(item, "type") !== "plan") {
       return;
     }
@@ -534,7 +564,7 @@ export class OpenAiAppServerItemEventBridge {
     events.push(this.#plans.createUpdatedEvent());
   }
 
-  #appendCompletedReasoningEvents(
+  #appendReasoningEnd(
     events: DriverEventInput[],
     item: JsonObject,
     itemId: string,
@@ -549,28 +579,30 @@ export class OpenAiAppServerItemEventBridge {
     const messageId = `reasoning:${itemId}`;
 
     if (summary.length > 0) {
-      this.#messages.ensureReasoningStarted(messageId, events);
+      this.#messages.ensureReasoning(messageId, events);
       events.push({
         delivery: "best_effort",
         kind: "thought.delta",
         payload: {
           channel: "summary",
-          contentDelta: summary.join("\n"),
+          contentDelta: summary.join("\n\n"),
           thoughtId: messageId,
         },
       });
     }
 
-    events.push({
-      kind: "thought.completed",
-      payload: {
-        channel: "summary",
-        thoughtId: messageId,
-      },
-    });
+    if (this.#messages.markReasoningEnded(messageId)) {
+      events.push({
+        kind: "thought.completed",
+        payload: {
+          channel: "summary",
+          thoughtId: messageId,
+        },
+      });
+    }
   }
 
-  async #appendCompletedToolEvents(
+  async #appendToolEnd(
     context: AgentDriverContext,
     events: DriverEventInput[],
     item: JsonObject,
@@ -596,10 +628,22 @@ export class OpenAiAppServerItemEventBridge {
       toolCallName: toolName,
     });
 
+    const nativeStatus = readString(item, "status");
+    const status =
+      nativeStatus === "failed" || nativeStatus === "declined" ? "failed" : "completed";
+    const toolResult = toOpenAiToolResultText(item);
+
     events.push({
       kind: "tool.call.updated",
       payload: {
-        status: "completed",
+        ...(toolResult === null || toolResult.length === 0
+          ? {}
+          : {
+              content: toolResult,
+              messageId: parentMessageId,
+              rawOutput: toolResult,
+            }),
+        status,
         toolCallId: itemId,
       },
     });
@@ -608,23 +652,10 @@ export class OpenAiAppServerItemEventBridge {
       payload: {
         itemId,
         itemType: "tool_call",
-        status: "completed",
+        status,
       },
     });
 
-    const toolResult = toOpenAiToolResultText(item);
-
-    if (toolResult !== null && toolResult.length > 0) {
-      events.push({
-        kind: "tool.call.updated",
-        payload: {
-          content: toolResult,
-          messageId: parentMessageId,
-          rawOutput: toolResult,
-          status: "completed",
-          toolCallId: itemId,
-        },
-      });
-    }
+    this.#tools.markEnded(itemId);
   }
 }

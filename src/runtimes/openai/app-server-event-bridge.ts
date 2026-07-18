@@ -23,15 +23,11 @@ interface OpenAiAppServerEventBridgeOptions {
   requireThreadId(): string;
 }
 
-function createOpenAiTurnSourceEventId(eventName: string, turnId: string): string {
+function turnEventId(eventName: string, turnId: string): string {
   return `openai.${eventName}:${turnId}`;
 }
 
-function createOpenAiTurnEventFields(input: {
-  eventName: string;
-  runId?: RunId | undefined;
-  turnId: string;
-}): {
+function turnEventFields(input: { eventName: string; runId?: RunId | undefined; turnId: string }): {
   native: { eventName: string; provider: string; turnId: string };
   runId?: RunId | undefined;
   sourceEventId: string;
@@ -43,7 +39,7 @@ function createOpenAiTurnEventFields(input: {
       turnId: input.turnId,
     },
     ...(input.runId === undefined ? {} : { runId: input.runId }),
-    sourceEventId: createOpenAiTurnSourceEventId(input.eventName, input.turnId),
+    sourceEventId: turnEventId(input.eventName, input.turnId),
   };
 }
 
@@ -73,6 +69,45 @@ export class OpenAiAppServerEventBridge {
 
   clearActiveTurns(): void {
     this.#turns.clearActiveTurns();
+    this.#itemEvents.reset();
+  }
+
+  async cancelTurn(
+    context: AgentDriverContext,
+    turnId: string,
+    reason: string,
+    drainUpdates?: () => Promise<void>,
+  ): Promise<void> {
+    const runId = this.#turns.activeRunId(turnId);
+
+    if (runId === null) {
+      return;
+    }
+
+    if (!this.#turns.rejectTurn(turnId, new DriverTurnCancelledError(reason))) {
+      return;
+    }
+    await drainUpdates?.();
+    await this.#push(context, "driver.openai.turn.cancelled", [
+      {
+        ...turnEventFields({ eventName: "turn.cancel.requested", runId, turnId }),
+        kind: "run.cancel.requested",
+        payload: {
+          reason,
+          requestedBy: "user",
+          targetRunId: runId,
+        },
+      },
+      ...this.#itemEvents.finishOpen(),
+      {
+        ...turnEventFields({ eventName: "turn.cancelled", runId, turnId }),
+        kind: "run.cancelled",
+        payload: {
+          requestedBy: "user",
+          stopReason: "cancelled",
+        },
+      },
+    ]);
   }
 
   rejectTurn(turnId: string, error: Error): void {
@@ -81,10 +116,11 @@ export class OpenAiAppServerEventBridge {
 
   rejectActiveTurns(error: Error): void {
     this.#turns.rejectActiveTurns(error);
+    this.#itemEvents.reset();
   }
 
-  markTurnCancelled(turnId: string, reason: string): void {
-    this.#turns.markCancelled(turnId, reason);
+  releaseTurnState(): void {
+    this.#itemEvents.reset();
   }
 
   async trackTurn(turnId: string, runId: RunId): Promise<void> {
@@ -97,87 +133,95 @@ export class OpenAiAppServerEventBridge {
     params: ServerNotificationParams[M],
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
+    const turnId = readNonEmptyString(payload, "turnId");
+
+    if (turnId !== null && this.#turns.hasTerminal(turnId)) {
+      return;
+    }
 
     switch (method) {
       case "configWarning": {
-        this.#handleConfigWarning(context, payload);
+        this.#onConfigWarning(context, payload);
         return;
       }
       case "warning": {
-        this.#handleWarning(context, payload);
+        this.#onWarning(context, payload);
         return;
       }
       case "remoteControl/status/changed": {
-        this.#handleRemoteControlStatusChanged(context, payload);
+        this.#onRemoteControl(context, payload);
         return;
       }
       case "thread/started": {
-        this.#handleThreadStarted(context, payload);
+        this.#onThreadStarted(context, payload);
         return;
       }
       case "thread/status/changed": {
-        this.#handleThreadStatusChanged(context, payload);
+        this.#onThreadStatus(context, payload);
         return;
       }
       case "thread/settings/updated": {
-        this.#handleThreadSettingsUpdated(context, payload);
+        this.#onThreadSettings(context, payload);
         return;
       }
       case "turn/started": {
-        await this.#handleTurnStarted(context, payload);
+        await this.#onTurnStarted(context, payload);
         return;
       }
       case "item/started": {
-        await this.#itemEvents.handleItemStarted(context, payload);
+        await this.#itemEvents.onItemStarted(context, payload);
         return;
       }
       case "item/agentMessage/delta": {
-        await this.#itemEvents.handleAgentMessageDelta(context, payload);
+        await this.#itemEvents.onMessageDelta(context, payload);
         return;
       }
       case "item/plan/delta": {
-        await this.#itemEvents.handlePlanDelta(context, payload);
+        await this.#itemEvents.onPlanDelta(context, payload);
         return;
       }
-      case "item/reasoning/summaryPartAdded":
       case "item/reasoning/summaryTextDelta": {
-        await this.#itemEvents.handleReasoningSummaryDelta(context, payload);
+        await this.#itemEvents.onReasoningDelta(context, payload);
+        return;
+      }
+      case "item/reasoning/summaryPartAdded": {
+        await this.#itemEvents.onReasoningPart(context, payload);
         return;
       }
       case "item/reasoning/textDelta": {
         return;
       }
       case "item/completed": {
-        await this.#itemEvents.handleItemCompleted(context, payload);
+        await this.#itemEvents.onItemCompleted(context, payload);
         return;
       }
       case "item/commandExecution/outputDelta":
       case "item/fileChange/outputDelta": {
-        await this.#itemEvents.handleToolOutputDelta(context, payload);
+        await this.#itemEvents.onToolOutput(context, payload);
         return;
       }
       case "item/fileChange/patchUpdated": {
-        await this.#itemEvents.handleFileChangePatchUpdated(context, payload);
+        await this.#itemEvents.onFilePatch(context, payload);
         return;
       }
       case "thread/tokenUsage/updated": {
-        await this.#handleUsageUpdated(context, payload);
+        await this.#onUsage(context, payload);
         return;
       }
       case "turn/completed": {
-        await this.#handleTurnCompleted(context, payload);
+        await this.#onTurnCompleted(context, payload);
         return;
       }
       case "turn/diff/updated": {
-        await this.#handleTurnDiffUpdated(context, payload);
+        await this.#onTurnDiff(context, payload);
         return;
       }
       case "turn/plan/updated": {
-        await this.#itemEvents.handleTurnPlanUpdated(context, payload);
+        await this.#itemEvents.onTurnPlan(context, payload);
         return;
       }
       case "error": {
-        this.#handleRuntimeError(context, payload);
+        this.#onRuntimeError(context, payload);
         return;
       }
       default: {
@@ -209,7 +253,7 @@ export class OpenAiAppServerEventBridge {
 
     await this.#push(context, "driver.openai.turn.started", [
       {
-        ...createOpenAiTurnEventFields({
+        ...turnEventFields({
           eventName: "turn.started",
           runId: input.runId,
           turnId: input.turnId,
@@ -222,7 +266,7 @@ export class OpenAiAppServerEventBridge {
     ]);
   }
 
-  #handleConfigWarning(context: AgentDriverContext, params: JsonObject): void {
+  #onConfigWarning(context: AgentDriverContext, params: JsonObject): void {
     context.logger.warn("driver.openai.config.warning", {
       details: readString(params, "details"),
       path: readString(params, "path"),
@@ -231,7 +275,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  #handleRemoteControlStatusChanged(context: AgentDriverContext, params: JsonObject): void {
+  #onRemoteControl(context: AgentDriverContext, params: JsonObject): void {
     context.logger.debug("driver.openai.remote_control.status_changed", {
       environmentId: readString(params, "environmentId"),
       installationId: readString(params, "installationId"),
@@ -240,7 +284,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  #handleThreadSettingsUpdated(context: AgentDriverContext, params: JsonObject): void {
+  #onThreadSettings(context: AgentDriverContext, params: JsonObject): void {
     const threadSettings = readRecord(params, "threadSettings");
 
     context.logger.debug("driver.openai.thread.settings_updated", {
@@ -250,7 +294,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  #handleThreadStarted(context: AgentDriverContext, params: JsonObject): void {
+  #onThreadStarted(context: AgentDriverContext, params: JsonObject): void {
     const thread = readRecord(params, "thread");
 
     context.logger.debug("driver.openai.thread.started", {
@@ -258,7 +302,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  #handleThreadStatusChanged(context: AgentDriverContext, params: JsonObject): void {
+  #onThreadStatus(context: AgentDriverContext, params: JsonObject): void {
     const status = readRecord(params, "status");
     const statusType = readString(status, "type");
 
@@ -274,14 +318,14 @@ export class OpenAiAppServerEventBridge {
     }
   }
 
-  #handleWarning(context: AgentDriverContext, params: JsonObject): void {
+  #onWarning(context: AgentDriverContext, params: JsonObject): void {
     context.logger.warn("driver.openai.warning", {
       message: readString(params, "message") ?? "OpenAi app-server warning.",
       threadIdPresent: readString(params, "threadId") !== null,
     });
   }
 
-  #handleRuntimeError(context: AgentDriverContext, params: JsonObject): void {
+  #onRuntimeError(context: AgentDriverContext, params: JsonObject): void {
     const error = readRecord(params, "error");
     const message =
       readString(error, "message") ?? readString(params, "message") ?? "OpenAi app-server error.";
@@ -298,7 +342,7 @@ export class OpenAiAppServerEventBridge {
     });
   }
 
-  async #handleTurnCompleted(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async #onTurnCompleted(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turn = readRecord(params, "turn");
     const turnId = turn === null ? null : readNonEmptyString(turn, "id");
 
@@ -306,93 +350,118 @@ export class OpenAiAppServerEventBridge {
       return;
     }
 
+    const status = turn ? readString(turn, "status") : null;
+
+    if (status !== "completed" && status !== "failed" && status !== "interrupted") {
+      throw new Error("OpenAi turn/completed requires a terminal turn status.");
+    }
+
     const runId = this.#turns.activeRunId(turnId) ?? undefined;
 
     await this.publishRunStarted(context, { runId, turnId });
-    await this.#itemEvents.handleTurnCompletedItems(context, params, turnId);
-    const authoritativeFinalMessage = await this.#itemEvents.resolveTurnFinalAssistantSnapshot(
+    await this.#itemEvents.onTurnItems(context, params, turnId);
+    const authoritativeFinalMessage = await this.#itemEvents.resolveFinalMessage(
       context,
       params,
       turnId,
     );
-    const status = turn ? readString(turn, "status") : null;
-    const error = turn ? readRecord(turn, "error") : null;
-    const cancellationReason = this.#turns.takeCancellationReason(turnId);
-
-    if (cancellationReason !== null || status === "interrupted") {
-      this.#turns.settle(turnId, {
-        error: new DriverTurnCancelledError(cancellationReason ?? "OpenAI turn was interrupted."),
-        kind: "failed",
-      });
+    if (!this.#turns.beginSettlement(turnId)) {
       return;
     }
 
-    if (status === "failed") {
-      const message = toOpenAiErrorMessage(
-        readString(error, "message") ?? "OpenAi turn failed.",
-        readString(error, "additionalDetails"),
-      );
-      await this.#push(context, "driver.openai.turn.failed", [
+    const error = turn ? readRecord(turn, "error") : null;
+    try {
+      if (status === "interrupted") {
+        await this.#push(context, "driver.openai.turn.interrupted", [
+          ...this.#itemEvents.finishOpen(),
+          {
+            ...turnEventFields({ eventName: "turn.interrupted", runId, turnId }),
+            kind: "run.cancelled",
+            payload: {
+              requestedBy: "provider",
+              stopReason: "cancelled",
+            },
+          },
+        ]);
+        this.#finishSettlement(turnId, {
+          error: new DriverTurnCancelledError("OpenAI turn was interrupted."),
+          kind: "failed",
+        });
+        return;
+      }
+
+      if (status === "failed") {
+        const message = toOpenAiErrorMessage(
+          readString(error, "message") ?? "OpenAi turn failed.",
+          readString(error, "additionalDetails"),
+        );
+        await this.#push(context, "driver.openai.turn.failed", [
+          ...this.#itemEvents.finishOpen(),
+          {
+            ...turnEventFields({
+              eventName: "turn.failed",
+              runId,
+              turnId,
+            }),
+            kind: "run.failed",
+            payload: {
+              error: {
+                code: "openai.turn_failed",
+                message,
+              },
+              recoverable: false,
+            },
+          },
+        ]);
+        this.#finishSettlement(turnId, {
+          error: new Error(message),
+          kind: "failed",
+        });
+        return;
+      }
+
+      await this.#push(context, "driver.openai.turn.completed", [
+        ...this.#itemEvents.finishOpen(),
         {
-          ...createOpenAiTurnEventFields({
-            eventName: "turn.failed",
+          ...turnEventFields({
+            eventName: "turn.completed",
             runId,
             turnId,
           }),
-          kind: "run.failed",
+          kind: "run.completed",
           payload: {
-            error: {
-              code: "openai.turn_failed",
-              message,
-            },
-            recoverable: false,
+            ...(authoritativeFinalMessage === null
+              ? {}
+              : {
+                  finalMessageId: authoritativeFinalMessage.id,
+                  finalMessageText: authoritativeFinalMessage.text,
+                }),
+            stopReason: "end_turn",
           },
         },
       ]);
-      this.#turns.settle(turnId, {
-        error: new Error(message),
-        kind: "failed",
-      });
-      return;
-    }
 
-    await this.#push(context, "driver.openai.turn.completed", [
-      {
-        ...createOpenAiTurnEventFields({
-          eventName: "turn.completed",
-          runId,
-          turnId,
-        }),
-        kind: "run.completed",
-        payload: {
-          ...(authoritativeFinalMessage === null
-            ? {}
-            : {
-                finalMessageId: authoritativeFinalMessage.id,
-                finalMessageText: authoritativeFinalMessage.text,
-              }),
-          stopReason: "end_turn",
-        },
-      },
-    ]);
-
-    // A fresh app-server thread may not have a rollout until its first successful
-    // turn is materialized. Resume metadata must never turn that successful turn
-    // into a failure, so publish it only after the canonical completion settles.
-    try {
-      await this.publishNativeResumeRef(context);
-    } catch (publishError) {
-      context.logger.warn("driver.openai.native_resume_ref.publish_failed", {
-        message:
-          publishError instanceof Error
-            ? publishError.message
-            : "Native resume ref publish failed.",
-      });
+      // A fresh app-server thread may not have a rollout until its first successful
+      // turn is materialized. Resume metadata must never turn that successful turn
+      // into a failure, so publish it only after the canonical completion settles.
+      try {
+        await this.publishNativeResumeRef(context);
+      } catch (publishError) {
+        context.logger.warn("driver.openai.native_resume_ref.publish_failed", {
+          message:
+            publishError instanceof Error
+              ? publishError.message
+              : "Native resume ref publish failed.",
+        });
+      }
+      this.#finishSettlement(turnId, { kind: "completed" });
+    } catch (pushError) {
+      this.#turns.cancelSettlement(turnId);
+      throw pushError;
     }
-    this.#turns.settle(turnId, { kind: "completed" });
   }
 
-  async #handleTurnDiffUpdated(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async #onTurnDiff(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turnId = readNonEmptyString(params, "turnId");
     const diff = readString(params, "diff");
 
@@ -414,7 +483,7 @@ export class OpenAiAppServerEventBridge {
     ]);
   }
 
-  async #handleTurnStarted(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async #onTurnStarted(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turn = readRecord(params, "turn");
     const turnId = turn === null ? null : readNonEmptyString(turn, "id");
 
@@ -427,7 +496,7 @@ export class OpenAiAppServerEventBridge {
     await this.publishRunStarted(context, { runId, turnId });
   }
 
-  async #handleUsageUpdated(context: AgentDriverContext, params: JsonObject): Promise<void> {
+  async #onUsage(context: AgentDriverContext, params: JsonObject): Promise<void> {
     await this.#push(context, "driver.openai.usage.updated", [
       {
         kind: "usage.updated",
@@ -446,5 +515,13 @@ export class OpenAiAppServerEventBridge {
     }
 
     await this.#options.push(context, reason, events);
+  }
+
+  #finishSettlement(
+    turnId: string,
+    terminalTurn: Parameters<OpenAiTurnTracker["finishSettlement"]>[1],
+  ): void {
+    this.#turns.finishSettlement(turnId, terminalTurn);
+    this.#itemEvents.reset();
   }
 }
