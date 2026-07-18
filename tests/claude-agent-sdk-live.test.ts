@@ -3,12 +3,34 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+import { applyCommittedMutation, validateSessionSnapshot } from "../src/contract";
+import type {
+  AuthorityOperation,
+  CommittedMutation,
+  Run,
+  SessionSnapshot,
+} from "../src/contract";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
+import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { ClaudeContractAdapter } from "../src/runtimes/claude/contract-adapter";
+import { createClaudeQueryOptions } from "../src/runtimes/claude/agent-sdk-query-options";
+import type { ContractAuthorityUpdate } from "../src/runtimes/contract-projection";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
-import { DRIVER_TEST_IDS, bootPayload } from "./driver-runtime-boundary-fixtures";
-import { textDeltaFrom, waitForTerminalTurnEvent } from "./live-driver-events";
+import {
+  DRIVER_TEST_IDS,
+  FakeDriverRuntimeIo,
+  bootPayload,
+} from "./driver-runtime-boundary-fixtures";
+import {
+  textDeltaFrom,
+  waitForTerminalTurnEvent,
+  withLiveTimeout,
+} from "./live-driver-events";
 
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
@@ -109,6 +131,71 @@ function createLiveKernel(): AgentDriverKernelCore {
       },
     },
   });
+}
+
+function createLiveContractSnapshot(run: Run): SessionSnapshot {
+  return validateSessionSnapshot({
+    capturedAt: run.startedAt,
+    interactions: [],
+    items: [],
+    protocolVersion: 2,
+    revision: 0,
+    runs: [run],
+    session: {
+      capabilities: {
+        "interaction.permission": {},
+        "item.artifact": {},
+        "item.change": {},
+        "item.plan": {},
+        "item.reasoning": {},
+        "item.terminal": {},
+      },
+      config: [],
+      createdAt: run.startedAt,
+      id: DRIVER_TEST_IDS.sessionId,
+      status: "open",
+      updatedAt: run.startedAt,
+    },
+  });
+}
+
+function createLiveContractAdapter(run: Run) {
+  let nextId = 9_200;
+  let snapshot = createLiveContractSnapshot(run);
+  const authority: ContractAuthorityUpdate[] = [];
+  const committedMutationIds = new Set<string>();
+  const adapter = new ClaudeContractAdapter({
+    authority: async (update) => {
+      authority.push(update);
+
+      if (committedMutationIds.has(update.mutationId)) {
+        return;
+      }
+
+      const mutation: CommittedMutation = {
+        baseRevision: snapshot.revision,
+        cause: update.cause,
+        committedAt: new Date().toISOString(),
+        mutationId: update.mutationId,
+        operations: [...update.operations] as AuthorityOperation[],
+        revision: snapshot.revision + 1,
+        sessionId: DRIVER_TEST_IDS.sessionId,
+      };
+      snapshot = applyCommittedMutation(snapshot, mutation);
+      committedMutationIds.add(update.mutationId);
+    },
+    createId: () => String(nextId++).padStart(26, "0"),
+    now: () => new Date(),
+    preview: () => {},
+    sessionId: DRIVER_TEST_IDS.sessionId,
+  });
+  adapter.attachRun(run);
+
+  return {
+    adapter,
+    authority,
+    snapshot: () => snapshot,
+  };
 }
 
 function hasPayloadValue(event: DriverEventInput, key: string, value: string): boolean {
@@ -351,5 +438,100 @@ describe("Claude Agent SDK live provider", () => {
       }
     },
     LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
+  );
+});
+
+describe("Claude Contract adapter live provider", () => {
+  liveTest(
+    "projects real SDK file tools into Contract Authority",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const inputName = "contract-input.txt";
+      const outputName = "contract-output.txt";
+      const contents = "claude-contract-token-7326";
+      const prompt = `Use Read to read ${inputName}. Use Write to create ${outputName} with exactly the text you read. Do not use Bash. Reply with exactly contract-done.`;
+      const run = {
+        id: DRIVER_TEST_IDS.runId,
+        input: [{ text: prompt, type: "text" }],
+        origin: "user",
+        startedAt: new Date().toISOString(),
+        status: "active",
+      } satisfies Run;
+      const contract = createLiveContractAdapter(run);
+      const payload = createLiveStartInput({
+        apiKey: liveApiKey,
+        cwd: paths.cwd,
+        homePath: paths.homePath,
+        sharedRootPath: paths.sharedRootPath,
+        systemPrompt:
+          "Perform requested workspace operations with the named tools, then answer exactly as requested.",
+      });
+      const logger = createBufferedSinkLogger({
+        level: "debug",
+        service: "claude-contract-live-test",
+        sink: async () => {},
+      });
+      const context = createAgentDriverContext({
+        eventSink: new FakeDriverRuntimeIo([]),
+        logger,
+        payload,
+        permission: { request: async () => "allow_once" },
+      });
+      const abortController = new AbortController();
+      let sdkQuery: ReturnType<typeof query> | null = null;
+      await writeFile(join(paths.cwd, inputName), `${contents}\n`, "utf8");
+
+      try {
+        const options = await createClaudeQueryOptions({
+          abortController,
+          context,
+          nativeSessionId: null,
+          payload,
+        });
+        sdkQuery = query({ options, prompt });
+        await withLiveTimeout({
+          details: {},
+          label: "Claude Contract terminal Authority mutation",
+          logStatus: () => {},
+          task: async () => {
+            for await (const message of sdkQuery!) {
+              if (await contract.adapter.handleMessage(message, run.id)) {
+                return;
+              }
+            }
+
+            throw new Error("Claude SDK query ended before its Contract Run became terminal.");
+          },
+          timeoutMs: LIVE_TURN_TIMEOUT_MS,
+        });
+
+        const snapshot = contract.snapshot();
+        const completedRun = snapshot.runs.find((entry) => entry.id === run.id);
+        const readTool = snapshot.items.find(
+          (item) => item.kind === "tool" && item.name === "Read",
+        );
+        const writeTool = snapshot.items.find(
+          (item) => item.kind === "tool" && item.name === "Write",
+        );
+        const message = snapshot.items.find(
+          (item) => item.kind === "message" && JSON.stringify(item).includes("contract-done"),
+        );
+
+        expect(completedRun?.status).toBe("completed");
+        expect(completedRun?.usage?.total).toBeGreaterThan(0);
+        expect(readTool).toMatchObject({ category: "read", status: "completed" });
+        expect(writeTool).toMatchObject({ category: "edit", status: "completed" });
+        expect(message).toMatchObject({ status: "completed" });
+        expect(contract.authority.length).toBeGreaterThan(0);
+        expect(snapshot.interactions).toHaveLength(0);
+        expect(await readFile(join(paths.cwd, outputName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        abortController.abort("test.stop");
+        sdkQuery?.close();
+        contract.adapter.dispose();
+        await logger.destroy();
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 10_000,
   );
 });
