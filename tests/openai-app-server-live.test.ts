@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, copyFile, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -172,6 +172,37 @@ function hasPayloadValue(event: DriverEventInput, key: string, value: string): b
   );
 }
 
+function hasPayloadText(event: DriverEventInput, key: string, text: string): boolean {
+  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+    return false;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.includes(text);
+}
+
+function hasFileChange(event: DriverEventInput, path: string): boolean {
+  if (event.kind !== "file.change.updated" || typeof event.payload !== "object") {
+    return false;
+  }
+
+  const changes =
+    event.payload === null || Array.isArray(event.payload)
+      ? null
+      : (event.payload as Record<string, unknown>)["changes"];
+  return (
+    Array.isArray(changes) &&
+    changes.some(
+      (change) =>
+        typeof change === "object" &&
+        change !== null &&
+        !Array.isArray(change) &&
+        typeof (change as Record<string, unknown>)["path"] === "string" &&
+        ((change as Record<string, unknown>)["path"] as string).endsWith(path),
+    )
+  );
+}
+
 async function waitForLiveEvent(
   iterator: AsyncIterator<DriverEventInput>,
   predicate: (event: DriverEventInput) => boolean,
@@ -198,16 +229,17 @@ async function waitForLiveEvent(
   });
 }
 
-async function sendPing(
+async function sendTurn(
   kernel: AgentDriverKernelCore,
   events: AsyncIterable<DriverEventInput>,
   suffix: string,
+  text: string,
   runId = DRIVER_TEST_IDS.runId,
-): Promise<void> {
+): Promise<DriverEventInput[]> {
   const requestId = `live-openai-request-${suffix}`;
   const dispatch = kernel.dispatch({
     commandId: `live-openai-input-${suffix}`,
-    input: { text: "ping" },
+    input: { text },
     kind: "input.start",
     requestId,
     runId,
@@ -218,9 +250,20 @@ async function sendPing(
     progressMessage: "still waiting for terminal event",
     timeoutMs: LIVE_TURN_TIMEOUT_MS,
   });
-  const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
 
   await expect(dispatch).resolves.toEqual({ requestId });
+  return turnEvents;
+}
+
+async function sendPing(
+  kernel: AgentDriverKernelCore,
+  events: AsyncIterable<DriverEventInput>,
+  suffix: string,
+  runId = DRIVER_TEST_IDS.runId,
+): Promise<void> {
+  const turnEvents = await sendTurn(kernel, events, suffix, "ping", runId);
+  const outputText = turnEvents.map(textDeltaFrom).join("").trim().toLowerCase();
+
   expect(outputText).toContain("pong");
   expect(turnEvents.find((event) => event.kind === "run.completed")?.payload).toMatchObject({
     finalMessageId: expect.any(String),
@@ -257,6 +300,138 @@ describe("OpenAI app-server live provider", () => {
   );
 
   liveTest(
+    "reads a workspace file through a shell tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const fileName = "source file-λ.txt";
+      const contents = "live-read-token-7319";
+      await writeFile(join(paths.cwd, fileName), `${contents}\n`, "utf8");
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Perform requested workspace operations with tools, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "read-file",
+          `Use a shell command to read ${JSON.stringify(fileName)} from the current directory. Reply with exactly its contents and nothing else.`,
+        );
+
+        expect(events.some((event) => hasPayloadValue(event, "title", "Shell"))).toBe(true);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", contents),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("")).toContain(contents);
+        expect(await readFile(join(paths.cwd, fileName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "creates a workspace file through the file-change tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const fileName = "written-by-agent.txt";
+      const contents = "live-write-token-8426";
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Use the file patch tool for requested file changes, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "write-file",
+          `Use the file patch tool to create ${JSON.stringify(fileName)} with exactly one line: ${contents}. Then reply with exactly written.`,
+        );
+
+        expect(events.some((event) => hasPayloadValue(event, "title", "File change"))).toBe(true);
+        expect(events.some((event) => hasFileChange(event, fileName))).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("written");
+        expect(await readFile(join(paths.cwd, fileName), "utf8")).toBe(`${contents}\n`);
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "recovers after a failed shell command",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Run every requested shell command in order even when one fails, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "failed-command",
+          "Run `sh -c 'printf live-stdout; printf live-stderr >&2; exit 7'`. After it fails, run `printf live-recovered`. Then reply with exactly recovered.",
+        );
+        const shellStarts = events.filter(
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
+        );
+
+        expect(shellStarts.length).toBeGreaterThanOrEqual(2);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" && hasPayloadValue(event, "status", "failed"),
+          ),
+        ).toBe(true);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", "live-recovered"),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("recovered");
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
     "cancels a running tool and accepts the next turn",
     async () => {
       const paths = await createLiveDriverPaths();
@@ -283,7 +458,8 @@ describe("OpenAI app-server live provider", () => {
         });
         await waitForLiveEvent(
           iterator,
-          (event) => event.kind === "item.started",
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
           "running tool event",
         );
         await withLiveTimeout({
@@ -347,7 +523,8 @@ describe("OpenAI app-server live provider", () => {
         });
         await waitForLiveEvent(
           firstEvents,
-          (event) => event.kind === "item.started",
+          (event) =>
+            event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
           "running tool before shutdown",
         );
         await stopLiveKernel(firstKernel, "live.active-stop");
