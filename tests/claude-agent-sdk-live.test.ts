@@ -120,6 +120,24 @@ function hasPayloadValue(event: DriverEventInput, key: string, value: string): b
   );
 }
 
+function hasPayloadText(event: DriverEventInput, key: string, text: string): boolean {
+  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+    return false;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.includes(text);
+}
+
+function payloadString(event: DriverEventInput, key: string): string | null {
+  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+    return null;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
 async function sendTurn(
   kernel: AgentDriverKernelCore,
   suffix: string,
@@ -209,5 +227,129 @@ describe("Claude Agent SDK live provider", () => {
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "recovers after a failed Bash command",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Run every requested Bash command in order even when one fails, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          "failed-command",
+          "Run `sh -c 'printf claude-stdout; printf claude-stderr >&2; exit 7'`. After it fails, run `printf claude-recovered`. Then reply with exactly recovered.",
+        );
+        const bashStarts = events.filter(
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+        );
+
+        expect(bashStarts.length).toBeGreaterThanOrEqual(2);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" && hasPayloadValue(event, "status", "failed"),
+          ),
+        ).toBe(true);
+        expect(
+          events.some(
+            (event) =>
+              event.kind === "tool.call.updated" &&
+              hasPayloadValue(event, "status", "completed") &&
+              hasPayloadText(event, "content", "claude-recovered"),
+          ),
+        ).toBe(true);
+        expect(events.map(textDeltaFrom).join("").trim().toLowerCase()).toContain("recovered");
+      } finally {
+        await kernel.stop("test.stop").catch(() => {});
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "resumes the native session in a fresh process",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const firstKernel = createLiveKernel();
+      const memoryToken = "claude-resume-memory-5183";
+      let firstStopped = false;
+
+      try {
+        await firstKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+          }),
+        );
+        const firstEvents = await sendTurn(
+          firstKernel,
+          "resume-store",
+          `Remember the token ${memoryToken}. Reply with exactly stored.`,
+        );
+        const resumePointer = payloadString(
+          firstEvents.find((event) => event.kind === "runtime.resume.updated")!,
+          "resumePointer",
+        );
+        expect(resumePointer).not.toBeNull();
+        await firstKernel.stop("live.resume-restart");
+        firstStopped = true;
+
+        const baseInput = createLiveStartInput({
+          apiKey: liveApiKey,
+          cwd: paths.cwd,
+          homePath: paths.homePath,
+          sharedRootPath: paths.sharedRootPath,
+          systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+        });
+        const resumedKernel = createLiveKernel();
+
+        try {
+          await resumedKernel.start({
+            ...baseInput,
+            execution: {
+              ...baseInput.execution,
+              session: {
+                ...baseInput.execution.session,
+                nativeResumeRef: {
+                  kind: "claude_session_id",
+                  runtimeId: "claude-agent-sdk",
+                  value: resumePointer!,
+                },
+              },
+            },
+          });
+          const events = await sendTurn(
+            resumedKernel,
+            "resume-recall",
+            "Reply with exactly the token I asked you to remember in the previous turn.",
+            DRIVER_TEST_IDS.secondRunId,
+          );
+
+          expect(events.map(textDeltaFrom).join("")).toContain(memoryToken);
+        } finally {
+          await resumedKernel.stop("test.stop").catch(() => {});
+        }
+      } finally {
+        if (!firstStopped) {
+          await firstKernel.stop("test.stop").catch(() => {});
+        }
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
   );
 });
