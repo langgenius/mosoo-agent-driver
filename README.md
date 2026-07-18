@@ -156,10 +156,10 @@ vp run lint
 vp run tc
 vp run test
 vp run build
-vp run docker:build
+vp run image:build
 ```
 
-`vp run docker:build` produces a local `agent-driver:local` image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
+`vp run image:build` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
 ## Boundaries
 
@@ -177,7 +177,7 @@ vp run docker:build
 - `vp run tc`
 - `vp run test`
 - `vp run build`
-- `vp run docker:build`
+- `vp run image:build`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live provider smoke tests are gated by environment credentials

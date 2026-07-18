@@ -59,23 +59,20 @@ jobs:
           run-install: |
             - args: ['--frozen-lockfile']
 
-      - name: Lint
-        run: vp run lint
+      - name: Check
+        run: |
+          set -euo pipefail
+          vp run lint
+          vp run tc
+          vp run test
+          vp run build
+          test -f dist/driver.mjs
+          test -s dist/driver.mjs
+          test -x dist/driver.mjs
+          test "$(head -n 1 dist/driver.mjs)" = '#!/usr/bin/env bun'
 
-      - name: Typecheck
-        run: vp run tc
-
-      - name: Test
-        run: vp run test
-
-      - name: Build
-        run: vp run build
-
-      - name: Verify driver artifact
-        run: test -f dist/driver.mjs
-
-  docker:
-    name: Docker
+  image:
+    name: Container image
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -97,12 +94,13 @@ jobs:
       - name: Build driver artifact
         run: vp run build
 
-      - name: Build Docker image
-        run: docker build --platform linux/amd64 -t agent-driver:ci .
+      - name: Build container image
+        run: buildah build --platform linux/amd64 -t agent-driver:ci .
 
       - name: Verify packaged binaries
         run: |
-          docker run --rm --entrypoint /bin/sh agent-driver:ci -c '
+          buildah from --name agent-driver-ci-container agent-driver:ci
+          buildah run agent-driver-ci-container -- /bin/sh -c '
             test -x /usr/local/bin/agent-driver
             test -x /usr/local/bin/mosoo-claude-code
             codex --version

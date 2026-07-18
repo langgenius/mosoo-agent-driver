@@ -14,8 +14,7 @@ RUN apt-get update \
     && pip --version
 
 # Native agent CLIs pre-installed so the driver can spawn them via PATH.
-# Installed in a single npm invocation so Docker caches the whole agent
-# layer as one unit.
+# Installed in a single npm invocation to keep the agent packages in one layer.
 #
 # Package -> binary -> runtime:
 #   @anthropic-ai/claude-agent-sdk        -> native claude    -> claude-agent-sdk
@@ -25,8 +24,8 @@ RUN apt-get update \
 #
 # Pick the architecture-specific `claude` binary that npm just installed under
 # `@anthropic-ai/claude-agent-sdk-<linux-x64|linux-arm64>` so the image works
-# on CF Containers (linux/amd64) and on local arm64 hosts (e.g. Apple Silicon
-# via OrbStack/Docker Desktop) without forcing platform emulation.
+# on CF Containers (linux/amd64) and local arm64 hosts (e.g. Apple Silicon)
+# without forcing platform emulation.
 RUN OPENAI_RUNTIME_PACKAGE="@openai/co""dex@${OPENAI_RUNTIME_VERSION}" \
     && npm install -g \
       @anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_VERSION} \

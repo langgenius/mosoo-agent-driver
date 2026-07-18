@@ -17,7 +17,7 @@ export const DRIVER_TEST_IDS = {
 
 export const driverBootPayload = {
   bootToken: "boot-token",
-  controlUrl: "http://host.docker.internal:8787/api/driver/socket",
+  controlUrl: "http://host.containers.internal:8787/api/driver/socket",
   driverControlPort: DRIVER_CONTROL_PORT_MIN,
   driverGeneration: 0,
   driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
