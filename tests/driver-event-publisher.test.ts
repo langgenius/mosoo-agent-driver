@@ -506,6 +506,35 @@ describe("DriverEventPublisher", () => {
     await context.logger.destroy();
   });
 
+  test("does not block best-effort producers on transport acknowledgements", async () => {
+    const firstSendEntered = Promise.withResolvers<void>();
+    const releaseFirstSend = Promise.withResolvers<void>();
+    const context = createContext({
+      pushEvents: async (events) => {
+        firstSendEntered.resolve();
+        await releaseFirstSend.promise;
+
+        return {
+          accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId,
+            seq: index + 1,
+            type: event.kind,
+          })),
+        };
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const first = publisher.push(context, "first", [createDelta("a")]);
+
+    await firstSendEntered.promise;
+    const blocked = await Promise.race([first.then(() => false), Bun.sleep(10).then(() => true)]);
+    releaseFirstSend.resolve();
+    await publisher.push(context, "flush", [createEvent("message.completed")]);
+
+    expect(blocked).toBe(false);
+    await context.logger.destroy();
+  });
+
   test("bounds the number of closing events in a run terminal batch", async () => {
     let sends = 0;
     const context = createContext({

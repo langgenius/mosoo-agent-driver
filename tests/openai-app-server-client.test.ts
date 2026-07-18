@@ -123,6 +123,20 @@ setInterval(() => {}, 1000);
     await expect(Array.fromAsync(output)).rejects.toThrow("exceeds 4 bytes");
   });
 
+  test("resets the stdout message limit at newlines across chunk boundaries", async () => {
+    const output = Readable.from([Buffer.from("1234\n12"), Buffer.from("34\n")]).pipe(
+      limitNdjsonLines(4),
+    );
+
+    expect(Buffer.concat(await Array.fromAsync(output)).toString()).toBe("1234\n1234\n");
+  });
+
+  test("rejects an oversized stdout message ending at a newline", async () => {
+    const output = Readable.from([Buffer.from("12345\n")]).pipe(limitNdjsonLines(4));
+
+    await expect(Array.fromAsync(output)).rejects.toThrow("exceeds 4 bytes");
+  });
+
   test("rejects a child process spawn failure without an unhandled error", async () => {
     const harness = await createClientHarness(() => "");
     process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"] = join(harness.directory, "missing");
