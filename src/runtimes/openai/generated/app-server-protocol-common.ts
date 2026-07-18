@@ -55,6 +55,16 @@ export function readRequiredBoolean(value: JsonObject, key: string, label: strin
   return entry;
 }
 
+export function readRequiredNumber(value: JsonObject, key: string, label: string): number {
+  const entry = value[key];
+
+  if (typeof entry !== "number" || !Number.isFinite(entry)) {
+    throw new Error(`${label}.${key} must be a finite number.`);
+  }
+
+  return entry;
+}
+
 function readOptionalString(value: JsonObject, key: string, label: string): string | undefined {
   const entry = value[key];
 
