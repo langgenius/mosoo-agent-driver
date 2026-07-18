@@ -148,18 +148,29 @@ export function limitNdjsonLines(maxMessageBytes = MAX_APP_SERVER_MESSAGE_BYTES)
 
   return new Transform({
     transform(chunk: Buffer, _encoding: BufferEncoding, callback: TransformCallback) {
-      for (const byte of chunk) {
-        if (byte === 0x0a) {
-          pendingBytes = 0;
-          continue;
-        }
+      let lineStart = 0;
 
-        pendingBytes += 1;
+      for (
+        let newline = chunk.indexOf(0x0a);
+        newline >= 0;
+        newline = chunk.indexOf(0x0a, lineStart)
+      ) {
+        pendingBytes += newline - lineStart;
 
         if (pendingBytes > maxMessageBytes) {
           callback(new Error(`App-server message exceeds ${maxMessageBytes} bytes.`));
           return;
         }
+
+        pendingBytes = 0;
+        lineStart = newline + 1;
+      }
+
+      pendingBytes += chunk.length - lineStart;
+
+      if (pendingBytes > maxMessageBytes) {
+        callback(new Error(`App-server message exceeds ${maxMessageBytes} bytes.`));
+        return;
       }
 
       callback(null, chunk);

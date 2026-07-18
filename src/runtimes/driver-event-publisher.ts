@@ -140,7 +140,7 @@ export class DriverEventPublisher {
       }
 
       this.#enqueue(entry);
-      return entry.promise;
+      return entry.losslessCount === 0 && !entry.terminalBatch ? undefined : entry.promise;
     } catch (error) {
       this.#requestPendingDrain(context, reason);
       throw error;
