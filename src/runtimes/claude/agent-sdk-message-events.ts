@@ -1,13 +1,7 @@
 import type { SDKFilesPersistedEvent, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
-import {
-  isRecord,
-  readString,
-  sumTokenCounts,
-  toCostAmount,
-  toTokenCount,
-} from "./agent-sdk-json";
+import { isRecord, readString, sumTokenCounts, toCostAmount, toTokenCount } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 
 export function toClaudeFilesPersistedEvents(message: SDKFilesPersistedEvent): DriverEventInput[] {

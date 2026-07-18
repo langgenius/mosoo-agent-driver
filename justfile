@@ -17,6 +17,7 @@ build: test
     vp run build
 
 check:
+    vp fmt --check
     vp run lint
     vp run tc
     vp run test

@@ -26,9 +26,7 @@ function createInitializeResult(protocolVersion: number | string | null) {
 
 describe("ACP runtime configuration", () => {
   test("accepts the configured ACP protocol version only", () => {
-    expect(() =>
-      assertProtocolVersion(createInitializeResult(ACP_PROTOCOL_VERSION)),
-    ).not.toThrow();
+    expect(() => assertProtocolVersion(createInitializeResult(ACP_PROTOCOL_VERSION))).not.toThrow();
     expect(() =>
       assertProtocolVersion(createInitializeResult(String(ACP_PROTOCOL_VERSION))),
     ).toThrow();

@@ -877,50 +877,53 @@ describe("AgentDriverKernelCore", () => {
   test.each([
     ["successful", null],
     ["failed", new Error("cleanup failed")],
-  ] as const)("joins %s startup cleanup from every concurrent stop", async (_name, cleanupError) => {
-    const backend = createBackend();
-    const cleanupEntered = Promise.withResolvers<void>();
-    const releaseCleanup = Promise.withResolvers<void>();
-    let stopCount = 0;
-    backend.start = async () => {
-      throw new Error("startup failed");
-    };
-    backend.stop = async () => {
-      stopCount += 1;
-      cleanupEntered.resolve();
-      await releaseCleanup.promise;
+  ] as const)(
+    "joins %s startup cleanup from every concurrent stop",
+    async (_name, cleanupError) => {
+      const backend = createBackend();
+      const cleanupEntered = Promise.withResolvers<void>();
+      const releaseCleanup = Promise.withResolvers<void>();
+      let stopCount = 0;
+      backend.start = async () => {
+        throw new Error("startup failed");
+      };
+      backend.stop = async () => {
+        stopCount += 1;
+        cleanupEntered.resolve();
+        await releaseCleanup.promise;
 
-      if (cleanupError !== null) {
-        throw cleanupError;
+        if (cleanupError !== null) {
+          throw cleanupError;
+        }
+      };
+      const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+      const events = kernel.events()[Symbol.asyncIterator]();
+      const startOutcome = kernel.start(bootPayload).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      await cleanupEntered.promise;
+      const stopOutcome = Promise.all([kernel.stop("first stop"), kernel.stop("second stop")]).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(
+        await Promise.race([stopOutcome.then(() => true), Bun.sleep(10).then(() => false)]),
+      ).toBe(false);
+
+      releaseCleanup.resolve();
+      const startupError = await startOutcome;
+      expect(startupError).toMatchObject({ message: "startup failed" });
+      expect(await stopOutcome).toBe(startupError);
+
+      expect(stopCount).toBe(1);
+      if (cleanupError === null) {
+        await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
       }
-    };
-    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
-    const events = kernel.events()[Symbol.asyncIterator]();
-    const startOutcome = kernel.start(bootPayload).then(
-      () => null,
-      (error: unknown) => error,
-    );
-
-    await cleanupEntered.promise;
-    const stopOutcome = Promise.all([kernel.stop("first stop"), kernel.stop("second stop")]).then(
-      () => null,
-      (error: unknown) => error,
-    );
-
-    expect(
-      await Promise.race([stopOutcome.then(() => true), Bun.sleep(10).then(() => false)]),
-    ).toBe(false);
-
-    releaseCleanup.resolve();
-    const startupError = await startOutcome;
-    expect(startupError).toMatchObject({ message: "startup failed" });
-    expect(await stopOutcome).toBe(startupError);
-
-    expect(stopCount).toBe(1);
-    if (cleanupError === null) {
-      await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
-    }
-  });
+    },
+  );
 
   test("serializes concurrent stop calls with an in-flight start", async () => {
     const backend = createBackend();
@@ -1315,45 +1318,41 @@ describe("AgentDriverKernelCore", () => {
     expect(stopCount).toBe(1);
   });
 
-  test(
-    "never reports a successful stop while an owned input task is still running",
-    async () => {
-      const backend = createBackend();
-      const inputEntered = Promise.withResolvers<void>();
-      const releaseInput = Promise.withResolvers<void>();
-      let inputSettled = false;
-      backend.handleInput = async () => {
-        inputEntered.resolve();
-        await releaseInput.promise;
-        inputSettled = true;
-      };
-      backend.cancelActiveTurn = async () => {};
-      const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+  test("never reports a successful stop while an owned input task is still running", async () => {
+    const backend = createBackend();
+    const inputEntered = Promise.withResolvers<void>();
+    const releaseInput = Promise.withResolvers<void>();
+    let inputSettled = false;
+    backend.handleInput = async () => {
+      inputEntered.resolve();
+      await releaseInput.promise;
+      inputSettled = true;
+    };
+    backend.cancelActiveTurn = async () => {};
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
 
-      await kernel.start(bootPayload);
-      const input = kernel
-        .dispatch({
-          commandId: "stuck-input",
-          input: { text: "wait" },
-          kind: "input.start",
-          requestId: "stuck-request",
-          runId: DRIVER_TEST_IDS.runId,
-        })
-        .catch(() => {});
-      await inputEntered.promise;
+    await kernel.start(bootPayload);
+    const input = kernel
+      .dispatch({
+        commandId: "stuck-input",
+        input: { text: "wait" },
+        kind: "input.start",
+        requestId: "stuck-request",
+        runId: DRIVER_TEST_IDS.runId,
+      })
+      .catch(() => {});
+    await inputEntered.promise;
 
-      const first = await Promise.allSettled([kernel.stop("first stop")]);
-      const second = await Promise.allSettled([kernel.stop("second stop")]);
-      const settledBeforeRelease = inputSettled;
-      releaseInput.resolve();
-      await input;
+    const first = await Promise.allSettled([kernel.stop("first stop")]);
+    const second = await Promise.allSettled([kernel.stop("second stop")]);
+    const settledBeforeRelease = inputSettled;
+    releaseInput.resolve();
+    await input;
 
-      expect(first[0]?.status).toBe("rejected");
-      expect(second[0]?.status).toBe("rejected");
-      expect(settledBeforeRelease).toBe(false);
-    },
-    10_000,
-  );
+    expect(first[0]?.status).toBe("rejected");
+    expect(second[0]?.status).toBe("rejected");
+    expect(settledBeforeRelease).toBe(false);
+  }, 10_000);
 
   test("keeps cleanup event delivery available across a transient stop failure", async () => {
     const backend = createBackend();
@@ -1394,10 +1393,7 @@ describe("AgentDriverKernelCore", () => {
     }
 
     expect(stopCount).toBe(2);
-    expect(received.map((event) => event.kind)).toEqual([
-      "run.completed",
-      "diagnostic.reported",
-    ]);
+    expect(received.map((event) => event.kind)).toEqual(["run.completed", "diagnostic.reported"]);
   });
 
   test.each([

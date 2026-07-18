@@ -338,10 +338,7 @@ export class ClaudeAgentSdkEventWriter {
     ]);
   }
 
-  async finishTools(
-    context: AgentDriverContext,
-    status: "completed" | "failed",
-  ): Promise<void> {
+  async finishTools(context: AgentDriverContext, status: "completed" | "failed"): Promise<void> {
     const toolCallIds = [...this.#toolStarted].filter((id) => !this.#toolEnded.has(id));
 
     if (toolCallIds.length === 0) {

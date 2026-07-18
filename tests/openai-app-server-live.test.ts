@@ -4,12 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { applyCommittedMutation, validateSessionSnapshot } from "../src/contract";
-import type {
-  AuthorityOperation,
-  CommittedMutation,
-  Run,
-  SessionSnapshot,
-} from "../src/contract";
+import type { AuthorityOperation, CommittedMutation, Run, SessionSnapshot } from "../src/contract";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { OPENAI_DEFAULT_MODEL_ID } from "../src/models";
 import { createBufferedSinkLogger } from "../src/observability";
@@ -30,11 +25,7 @@ import {
   FakeDriverRuntimeIo,
   bootPayload,
 } from "./driver-runtime-boundary-fixtures";
-import {
-  textDeltaFrom,
-  waitForTerminalTurnEvent,
-  withLiveTimeout,
-} from "./live-driver-events";
+import { textDeltaFrom, waitForTerminalTurnEvent, withLiveTimeout } from "./live-driver-events";
 
 const LIVE_ENABLED_ENV = "AGENT_DRIVER_LIVE_OPENAI";
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_OPENAI_API_KEY";
@@ -83,8 +74,8 @@ async function copyLocalAuth(homePath: string): Promise<void> {
     return;
   }
 
-  const sourceHome = readEnvString(OPENAI_RUNTIME_HOME_ENV) ??
-    join(homedir(), OPENAI_RUNTIME_HOME_DIR);
+  const sourceHome =
+    readEnvString(OPENAI_RUNTIME_HOME_ENV) ?? join(homedir(), OPENAI_RUNTIME_HOME_DIR);
   const target = join(homePath, "auth.json");
 
   await copyFile(join(sourceHome, "auth.json"), target);
@@ -690,8 +681,7 @@ describe("OpenAI app-server live provider", () => {
         });
         await waitForLiveEvent(
           iterator,
-          (event) =>
-            event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
           "running tool event",
         );
         await withLiveTimeout({
@@ -714,12 +704,7 @@ describe("OpenAI app-server live provider", () => {
           (event) => event.kind === "run.cancelled",
           "cancelled run terminal event",
         );
-        await sendPing(
-          kernel,
-          fromIterator(iterator),
-          "after-cancel",
-          DRIVER_TEST_IDS.secondRunId,
-        );
+        await sendPing(kernel, fromIterator(iterator), "after-cancel", DRIVER_TEST_IDS.secondRunId);
       } finally {
         await stopLiveKernel(kernel, "test.stop");
       }
@@ -755,8 +740,7 @@ describe("OpenAI app-server live provider", () => {
         });
         await waitForLiveEvent(
           firstEvents,
-          (event) =>
-            event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Shell"),
           "running tool before shutdown",
         );
         await stopLiveKernel(firstKernel, "live.active-stop");

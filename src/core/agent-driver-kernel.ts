@@ -309,12 +309,15 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     });
   }
 
-  async commandUpdate(input: {
-    commandId: string;
-    error?: RunError;
-    result?: RuntimeCommandResult;
-    status: "accepted" | "cancelled" | "completed" | "failed";
-  }, _signal: AbortSignal): Promise<void> {
+  async commandUpdate(
+    input: {
+      commandId: string;
+      error?: RunError;
+      result?: RuntimeCommandResult;
+      status: "accepted" | "cancelled" | "completed" | "failed";
+    },
+    _signal: AbortSignal,
+  ): Promise<void> {
     const update = structuredClone(input);
     if (update.status === "accepted") {
       return;
@@ -646,16 +649,14 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#rejectPendingCommands(error);
 
     if (this.#activeRunId !== null) {
-      void this
-        .failRun({
-          code: "driver.runtime_failed",
-          details: {},
-          message: error.message,
-          retryable: false,
-        })
-        .catch((eventError: unknown) => {
-          this.#logger.error("driver.kernel.run_failure_event.failed", eventError, {});
-        });
+      void this.failRun({
+        code: "driver.runtime_failed",
+        details: {},
+        message: error.message,
+        retryable: false,
+      }).catch((eventError: unknown) => {
+        this.#logger.error("driver.kernel.run_failure_event.failed", eventError, {});
+      });
     }
 
     void this.#shutdown("driver.backend_failed").catch((shutdownError: unknown) => {
@@ -680,7 +681,11 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#events.pushReserved(structuredClone(event));
   }
 
-  #stopBackend(backend: AgentDriverBackend, payload: DriverStartInput, reason: string): Promise<void> {
+  #stopBackend(
+    backend: AgentDriverBackend,
+    payload: DriverStartInput,
+    reason: string,
+  ): Promise<void> {
     const controller = new AbortController();
     const task = Promise.resolve().then(() =>
       backend.stop(this.#createContext(payload), reason, controller.signal),

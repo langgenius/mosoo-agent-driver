@@ -691,10 +691,15 @@ describe("Claude Contract adapter", () => {
     };
     const first = harness.adapter.openPermission(RUN_ID, "Bash", { command: "pwd" }, options);
     await interactionWriting.promise;
-    const replay = harness.adapter.openPermission(RUN_ID, "Bash", { command: "pwd" }, {
-      ...options,
-      signal: replayController.signal,
-    });
+    const replay = harness.adapter.openPermission(
+      RUN_ID,
+      "Bash",
+      { command: "pwd" },
+      {
+        ...options,
+        signal: replayController.signal,
+      },
+    );
 
     replayController.abort();
     releaseInteraction.resolve();
@@ -719,10 +724,15 @@ describe("Claude Contract adapter", () => {
       options,
     );
     const replayController = new AbortController();
-    await harness.adapter.openPermission(RUN_ID, "Bash", { command: "pwd" }, {
-      ...options,
-      signal: replayController.signal,
-    });
+    await harness.adapter.openPermission(
+      RUN_ID,
+      "Bash",
+      { command: "pwd" },
+      {
+        ...options,
+        signal: replayController.signal,
+      },
+    );
     const interaction = harness.snapshot().interactions[0];
     const allowOnceId =
       interaction?.kind === "permission"
@@ -751,11 +761,16 @@ describe("Claude Contract adapter", () => {
     controller.abort();
 
     await expect(
-      harness.adapter.openPermission(RUN_ID, "Bash", { command: "pwd" }, {
-        requestId: "request-aborted",
-        signal: controller.signal,
-        toolUseID: "tool-aborted",
-      }),
+      harness.adapter.openPermission(
+        RUN_ID,
+        "Bash",
+        { command: "pwd" },
+        {
+          requestId: "request-aborted",
+          signal: controller.signal,
+          toolUseID: "tool-aborted",
+        },
+      ),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(harness.authority).toHaveLength(0);
     expect(harness.snapshot().items).toHaveLength(0);
@@ -894,11 +909,16 @@ describe("Claude Contract adapter", () => {
     });
     await registerRun(harness.adapter);
     const controller = new AbortController();
-    const opening = harness.adapter.openPermission(RUN_ID, "Bash", { command: "pwd" }, {
-      requestId: "request-abort-opening",
-      signal: controller.signal,
-      toolUseID: "tool-abort-opening",
-    });
+    const opening = harness.adapter.openPermission(
+      RUN_ID,
+      "Bash",
+      { command: "pwd" },
+      {
+        requestId: "request-abort-opening",
+        signal: controller.signal,
+        toolUseID: "tool-abort-opening",
+      },
+    );
     await interactionWriting.promise;
 
     controller.abort();

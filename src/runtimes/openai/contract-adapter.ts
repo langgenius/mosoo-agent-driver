@@ -263,9 +263,7 @@ function toFileChanges(item: JsonObject): FileChange[] {
     if (type === "update" && movePath !== null) {
       return [
         {
-          ...(diff === null || diff.length === 0
-            ? {}
-            : { diff: { text: diff, type: "text" } }),
+          ...(diff === null || diff.length === 0 ? {} : { diff: { text: diff, type: "text" } }),
           oldPath: path,
           operation: "move",
           path: movePath,
@@ -275,15 +273,8 @@ function toFileChanges(item: JsonObject): FileChange[] {
 
     return [
       {
-        ...(diff === null || diff.length === 0
-          ? {}
-          : { diff: { text: diff, type: "text" } }),
-        operation:
-          type === "add"
-            ? "create"
-            : type === "delete"
-              ? "delete"
-              : "update",
+        ...(diff === null || diff.length === 0 ? {} : { diff: { text: diff, type: "text" } }),
+        operation: type === "add" ? "create" : type === "delete" ? "delete" : "update",
         path,
       },
     ];
@@ -479,7 +470,10 @@ export class OpenAiContractAdapter {
       if (existing.runId !== run.id || existing.threadId !== input.threadId) {
         throw new Error(`OpenAI turn ${input.turnId} is already registered to another run.`);
       }
-      if (!isDeepStrictEqual(existing.run, run) || !isDeepStrictEqual(existing.cause, input.cause)) {
+      if (
+        !isDeepStrictEqual(existing.run, run) ||
+        !isDeepStrictEqual(existing.cause, input.cause)
+      ) {
         throw new Error(`OpenAI turn ${input.turnId} is registered with different state.`);
       }
 
@@ -939,7 +933,8 @@ export class OpenAiContractAdapter {
 
       if (status === "completed") {
         const plan = activeItems.find(
-          (item) => item.kind === "plan" && item.id === "turn-plan" && !completedItemIds.has(item.id),
+          (item) =>
+            item.kind === "plan" && item.id === "turn-plan" && !completedItemIds.has(item.id),
         );
 
         if (plan !== undefined) {
@@ -1881,10 +1876,7 @@ export class OpenAiContractAdapter {
 
       await this.#replayTurnEnd(turnId);
 
-      if (
-        !this.#pendingTurnNotifications.has(turnId) &&
-        !this.#pendingTurnEnds.has(turnId)
-      ) {
+      if (!this.#pendingTurnNotifications.has(turnId) && !this.#pendingTurnEnds.has(turnId)) {
         return;
       }
     }

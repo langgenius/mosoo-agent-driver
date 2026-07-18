@@ -15,7 +15,10 @@ import type {
   SessionSnapshot,
 } from "../src/contract";
 import { isDriverId } from "../src/protocol/id";
-import { ContractProjection, type ContractAuthorityUpdate } from "../src/runtimes/contract-projection";
+import {
+  ContractProjection,
+  type ContractAuthorityUpdate,
+} from "../src/runtimes/contract-projection";
 
 function protocolId(value: number): string {
   return value.toString().padStart(26, "0");
@@ -1834,27 +1837,30 @@ test.each([
       return [item, item];
     },
   ],
-] as const)("Contract projection rejects terminal snapshots with %s", async (_name, terminalItems) => {
-  const timestamp = "2026-07-16T08:00:00.000Z";
-  const projection = new ContractProjection({
-    authority: async () => {},
-    now: () => new Date(timestamp),
-    preview: () => {},
-    sessionId: SESSION_ID,
-  });
-  projection.attachRun(activeRun(timestamp));
+] as const)(
+  "Contract projection rejects terminal snapshots with %s",
+  async (_name, terminalItems) => {
+    const timestamp = "2026-07-16T08:00:00.000Z";
+    const projection = new ContractProjection({
+      authority: async () => {},
+      now: () => new Date(timestamp),
+      preview: () => {},
+      sessionId: SESSION_ID,
+    });
+    projection.attachRun(activeRun(timestamp));
 
-  await expect(
-    projection.finishRun({
-      cause: { providerEventId: "turn/completed", type: "provider" },
-      event: "turn/completed",
-      runId: RUN_ID,
-      status: "completed",
-      terminalItems: terminalItems(timestamp),
-    }),
-  ).rejects.toThrow("invalid terminal Item");
-  expect(projection.run(RUN_ID)?.status).toBe("active");
-});
+    await expect(
+      projection.finishRun({
+        cause: { providerEventId: "turn/completed", type: "provider" },
+        event: "turn/completed",
+        runId: RUN_ID,
+        status: "completed",
+        terminalItems: terminalItems(timestamp),
+      }),
+    ).rejects.toThrow("invalid terminal Item");
+    expect(projection.run(RUN_ID)?.status).toBe("active");
+  },
+);
 
 test("Contract projection never ends a Run before a later Interaction", async () => {
   let now = new Date("2026-07-16T08:00:00.000Z");

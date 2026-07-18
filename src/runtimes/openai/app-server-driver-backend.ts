@@ -450,11 +450,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     this.#events.releaseTurnState();
   }
 
-  async stop(
-    context: AgentDriverContext,
-    reason: string,
-    signal: AbortSignal,
-  ): Promise<void> {
+  async stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void> {
     const client = this.#client;
     const cancellation = raceWithAbort(this.cancelActiveTurn(context, reason), signal);
 

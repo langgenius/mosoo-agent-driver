@@ -31,24 +31,22 @@ const CLAUDE_BUILT_IN_TOOL_NAMES = {
   write: "Write",
 } as const satisfies Record<DriverBuiltInToolName, string>;
 
-const CLAUDE_PROVIDER_OPTION_KEYS = new Set<string>(
-  [
-    "agentProgressSummaries",
-    "betas",
-    "effort",
-    "enableFileCheckpointing",
-    "fallbackModel",
-    "forwardSubagentText",
-    "includeHookEvents",
-    "maxBudgetUsd",
-    "maxThinkingTokens",
-    "maxTurns",
-    "outputFormat",
-    "taskBudget",
-    "thinking",
-    "title",
-  ] satisfies readonly (keyof ClaudeQueryOptions)[],
-);
+const CLAUDE_PROVIDER_OPTION_KEYS = new Set<string>([
+  "agentProgressSummaries",
+  "betas",
+  "effort",
+  "enableFileCheckpointing",
+  "fallbackModel",
+  "forwardSubagentText",
+  "includeHookEvents",
+  "maxBudgetUsd",
+  "maxThinkingTokens",
+  "maxTurns",
+  "outputFormat",
+  "taskBudget",
+  "thinking",
+  "title",
+] satisfies readonly (keyof ClaudeQueryOptions)[]);
 
 function createCanUseTool(context: AgentDriverContext): CanUseTool {
   return async (toolName, input, options): Promise<PermissionResult> => {

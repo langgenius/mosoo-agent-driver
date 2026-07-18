@@ -731,12 +731,7 @@ function readRunView(
   requireEnumValue(record, "status", runStatuses, context.kind);
 
   return {
-    completedAt: requireNullableTimestamp(
-      record,
-      "completedAt",
-      context.kind,
-      "run.completedAt",
-    ),
+    completedAt: requireNullableTimestamp(record, "completedAt", context.kind, "run.completedAt"),
     error:
       record["error"] === null ? null : readRunError(context.kind, record["error"], "run.error"),
     id: context.runId ?? null,
@@ -830,10 +825,7 @@ function readTimingPhases(value: unknown): RuntimeTimingPhase[] {
   });
 }
 
-function classifyIngressError(
-  input: unknown,
-  error: unknown,
-): RuntimeEventIngressRejection {
+function classifyIngressError(input: unknown, error: unknown): RuntimeEventIngressRejection {
   const message = error instanceof Error ? error.message : "Runtime event input is malformed.";
   const kind = readRuntimeEventInputKind(input);
 

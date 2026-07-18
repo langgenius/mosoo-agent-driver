@@ -156,9 +156,9 @@ describe("DriverPermissionBroker", () => {
   test.each([0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN])(
     "rejects invalid pending limits %p",
     (limit) => {
-      expect(
-        () => new DriverPermissionBroker(() => null, { maxPendingRequests: limit }),
-      ).toThrow("limits must be positive safe integers");
+      expect(() => new DriverPermissionBroker(() => null, { maxPendingRequests: limit })).toThrow(
+        "limits must be positive safe integers",
+      );
       expect(
         () => new DriverPermissionBroker(() => null, { maxPendingRequestBytes: limit }),
       ).toThrow("limits must be positive safe integers");
@@ -168,9 +168,9 @@ describe("DriverPermissionBroker", () => {
   test.each([-1, 1.5, Number.POSITIVE_INFINITY, Number.NaN])(
     "rejects invalid permission timeout %p",
     (timeoutMs) => {
-      expect(
-        () => new DriverPermissionBroker(() => null, { requestTimeoutMs: timeoutMs }),
-      ).toThrow("request timeout must be a non-negative safe integer");
+      expect(() => new DriverPermissionBroker(() => null, { requestTimeoutMs: timeoutMs })).toThrow(
+        "request timeout must be a non-negative safe integer",
+      );
       expect(
         () => new DriverPermissionBroker(() => null, { eventDeliveryTimeoutMs: timeoutMs }),
       ).toThrow("event delivery timeout must be a non-negative safe integer");
@@ -472,12 +472,19 @@ describe("DriverPermissionBroker", () => {
   );
 
   test.each([
-    ["approved", "allow_once", (broker: DriverPermissionBroker) =>
-      broker.resolve(permissionInput.requestId, "allow_once")],
-    ["cancelled", "reject_once", (broker: DriverPermissionBroker) => {
-      broker.rejectAll();
-      return true;
-    }],
+    [
+      "approved",
+      "allow_once",
+      (broker: DriverPermissionBroker) => broker.resolve(permissionInput.requestId, "allow_once"),
+    ],
+    [
+      "cancelled",
+      "reject_once",
+      (broker: DriverPermissionBroker) => {
+        broker.rejectAll();
+        return true;
+      },
+    ],
   ] as const)(
     "does not reuse an old %s request id before resolution delivery finishes",
     async (_reason, firstDecision, resolveFirst) => {
@@ -746,7 +753,10 @@ describe("DriverPermissionBroker", () => {
       phase: "requested",
       requestId: permissionInput.requestId,
     });
-    expect((outcome as Error).cause).toHaveProperty("message", expect.stringContaining("made no progress"));
+    expect((outcome as Error).cause).toHaveProperty(
+      "message",
+      expect.stringContaining("made no progress"),
+    );
     expect(broker.hasPending()).toBe(false);
   });
 
@@ -811,9 +821,9 @@ describe("DriverPermissionBroker", () => {
     const broker = new DriverPermissionBroker(() => null);
     const socket = createRecordingSocket();
 
-    await expect(
-      broker.request(socket, permissionInput, controller.signal),
-    ).resolves.toBe("reject_once");
+    await expect(broker.request(socket, permissionInput, controller.signal)).resolves.toBe(
+      "reject_once",
+    );
 
     expect(broker.hasPending()).toBe(false);
     expect(socket.pushedEvents).toMatchObject([

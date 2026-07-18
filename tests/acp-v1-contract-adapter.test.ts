@@ -558,18 +558,12 @@ describe("ACP V1 Contract adapter", () => {
         toolCall: { title: "Run command", toolCallId: "tool-resolved-unknown" },
       } satisfies RequestPermissionRequest;
       const limit = new TextEncoder().encode(JSON.stringify(request)).byteLength;
-      const harness = createHarness(
-        5 * 60 * 1_000,
-        undefined,
-        limit,
-        undefined,
-        async (update) => {
-          if (loseResult && update.event === "permission/requested") {
-            loseResult = false;
-            throw new Error("authority result lost");
-          }
-        },
-      );
+      const harness = createHarness(5 * 60 * 1_000, undefined, limit, undefined, async (update) => {
+        if (loseResult && update.event === "permission/requested") {
+          loseResult = false;
+          throw new Error("authority result lost");
+        }
+      });
       await registerRun(harness.adapter);
 
       await expect(harness.adapter.openPermission(RUN_ID, request)).rejects.toBeInstanceOf(
@@ -602,9 +596,7 @@ describe("ACP V1 Contract adapter", () => {
 
       harness.advance(1_000);
       await expect(harness.adapter.openPermission(RUN_ID, request)).resolves.toBe(interactionId);
-      const retries = harness.authority.filter(
-        (update) => update.event === "permission/requested",
-      );
+      const retries = harness.authority.filter((update) => update.event === "permission/requested");
       expect(retries).toEqual([first, first]);
       expect(harness.snapshot().interactions.find(({ id }) => id === interactionId)?.status).toBe(
         "resolved",
@@ -943,9 +935,9 @@ describe("ACP V1 Contract adapter", () => {
       harness.adapter.registerTerminal(RUN_ID, "terminal-time", request),
     ).rejects.toBeInstanceOf(AuthorityOutcomeUnknownError);
     harness.advance(1_000);
-    await expect(
-      harness.adapter.registerTerminal(RUN_ID, "terminal-time", request),
-    ).resolves.toBe("terminal:terminal-time");
+    await expect(harness.adapter.registerTerminal(RUN_ID, "terminal-time", request)).resolves.toBe(
+      "terminal:terminal-time",
+    );
 
     expect(mutationIds).toEqual([mutationIds[0], mutationIds[0]]);
   });

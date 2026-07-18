@@ -84,10 +84,7 @@ export class ClaudeAgentSdkMessageTranslator {
     }
   }
 
-  async finishTurn(
-    context: AgentDriverContext,
-    toolStatus: "completed" | "failed",
-  ): Promise<void> {
+  async finishTurn(context: AgentDriverContext, toolStatus: "completed" | "failed"): Promise<void> {
     await this.endActiveThought(context);
 
     for (const [messageId, runId] of this.#assistantMessageRunIds) {
@@ -176,8 +173,7 @@ export class ClaudeAgentSdkMessageTranslator {
         if (text !== null) {
           authoritativeText.push(text);
         }
-        const isDuplicateStreamedText =
-          text === null || this.#streamedTextMessages.has(messageId);
+        const isDuplicateStreamedText = text === null || this.#streamedTextMessages.has(messageId);
 
         if (text && !isDuplicateStreamedText) {
           this.#appendAssistantText(messageId, text);
@@ -283,9 +279,7 @@ export class ClaudeAgentSdkMessageTranslator {
   }
 
   #streamScopeKey(runId: RunId, message: SDKMessage): string {
-    const parentToolUseId = isRecord(message)
-      ? readString(message, "parent_tool_use_id")
-      : null;
+    const parentToolUseId = isRecord(message) ? readString(message, "parent_tool_use_id") : null;
     return `${runId}:${parentToolUseId ?? "main"}`;
   }
 

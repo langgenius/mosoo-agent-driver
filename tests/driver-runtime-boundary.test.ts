@@ -69,11 +69,7 @@ describe("driver runtime boundary", () => {
       startedAt,
       traceId: "trace-1",
     });
-    const [envelope] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.runId,
-    );
+    const [envelope] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
 
     expect(envelope).toMatchObject({
       occurredAt: completedAt,
@@ -95,11 +91,7 @@ describe("driver runtime boundary", () => {
       occurredAt: "2026-07-17T16:00:00.000+08:00",
       payload: { startedAt: "2026-07-17T08:00:00.000Z" },
     } as const;
-    const [envelope] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.runId,
-    );
+    const [envelope] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
 
     expect(envelope?.occurredAt).toBe(draft.occurredAt);
     expect(parseDriverEventEnvelope(envelope)).toEqual(envelope);
@@ -121,9 +113,7 @@ describe("driver runtime boundary", () => {
     } as const;
     expect(() =>
       toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.secondRunId),
-    ).toThrow(
-      "Run ID must be a valid ULID.",
-    );
+    ).toThrow("Run ID must be a valid ULID.");
   });
 
   test("driver socket rejects provider turn ids outside an active platform run", () => {
@@ -161,11 +151,7 @@ describe("driver runtime boundary", () => {
       },
       runId: DRIVER_TEST_IDS.thirdRunId,
     } as const;
-    const [event] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.secondRunId,
-    );
+    const [event] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.secondRunId);
 
     expect(event?.event.runId).toBe(DRIVER_TEST_IDS.thirdRunId);
   });
@@ -178,11 +164,7 @@ describe("driver runtime boundary", () => {
         startedAt: new Date(1_000).toISOString(),
       },
     } as const;
-    const [envelope] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.runId,
-    );
+    const [envelope] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
 
     expect(envelope?.event.correlationId).toBe("request-1");
     expect(parseDriverEventEnvelope(envelope).event.correlationId).toBe("request-1");
@@ -198,16 +180,8 @@ describe("driver runtime boundary", () => {
         role: "agent",
       },
     } as const;
-    const [first] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.runId,
-    );
-    const [second] = toDriverEventEnvelopes(
-      driverBootPayload,
-      draft,
-      DRIVER_TEST_IDS.runId,
-    );
+    const [first] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
+    const [second] = toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId);
 
     expect(isDriverId(first?.event.sourceEventId)).toBe(true);
     expect(isDriverId(second?.event.sourceEventId)).toBe(true);
@@ -232,8 +206,7 @@ describe("driver runtime boundary", () => {
       },
     }));
     const envelopes = drafts.map(
-      (draft) =>
-        toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId)[0],
+      (draft) => toDriverEventEnvelopes(driverBootPayload, draft, DRIVER_TEST_IDS.runId)[0],
     );
 
     expect(new Set(envelopes.map((event) => event?.event.sourceEventId)).size).toBe(chunks.length);
@@ -591,9 +564,7 @@ describe("driver runtime boundary", () => {
       const runtimeState = new DriverRuntimeStateMachine("ready");
       let boundarySignal: AbortSignal | undefined;
       const socket = new FakeDriverRuntimeIo(
-        boundary === "poll"
-          ? []
-          : [{ commandId: "accepted-never-settles", kind: "turn.cancel" }],
+        boundary === "poll" ? [] : [{ commandId: "accepted-never-settles", kind: "turn.cancel" }],
       );
       if (boundary === "poll") {
         socket.nextCommand = async (signal) => {
@@ -1407,9 +1378,7 @@ describe("driver runtime boundary", () => {
               serverId: "mcp-linear",
               toolName: "createIssue",
             };
-      const socket = new FakeDriverRuntimeIo([
-        command,
-      ]);
+      const socket = new FakeDriverRuntimeIo([command]);
       const recordUpdate = socket.commandUpdate.bind(socket);
       const terminalAttempts: string[] = [];
       socket.commandUpdate = async (update) => {
@@ -1787,8 +1756,7 @@ describe("driver runtime boundary", () => {
         isShuttingDown: () =>
           kind === "input"
             ? socket.updates.some(
-                (update) =>
-                  update.commandId === next.commandId && update.status === "completed",
+                (update) => update.commandId === next.commandId && update.status === "completed",
               )
             : socket.isDrained(),
         mcpExecute: async (command) => {

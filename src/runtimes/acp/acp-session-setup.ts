@@ -43,10 +43,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   const existingSessionId = input.currentSessionId;
   const additionalDirectories = input.payload.execution.session.additionalDirectories;
 
-  if (
-    additionalDirectories.length > 0 &&
-    !supportsAdditionalDirs(input.agentCapabilities)
-  ) {
+  if (additionalDirectories.length > 0 && !supportsAdditionalDirs(input.agentCapabilities)) {
     throw new Error("ACP agent does not advertise additional directory support.");
   }
 

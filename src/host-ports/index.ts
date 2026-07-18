@@ -19,11 +19,14 @@ export interface AgentDriverCommandSource {
 }
 
 export interface AgentDriverEventSink {
-  commandUpdate(input: {
-    commandId: string;
-    result?: RuntimeCommandResult;
-    status: "accepted" | "cancelled" | "completed" | "failed";
-  }, signal: AbortSignal): Promise<void>;
+  commandUpdate(
+    input: {
+      commandId: string;
+      result?: RuntimeCommandResult;
+      status: "accepted" | "cancelled" | "completed" | "failed";
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
   currentRunId?(): RunId | null;
   pushEvents(input: {
     events: DriverEventInput[];

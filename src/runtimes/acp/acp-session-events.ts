@@ -501,10 +501,8 @@ export function toUsageEvents(update: JsonObject | null): DriverEventInput[] {
   const rawSize = readNumber(update, "size");
   const cost = readRecord(update, "cost");
   const rawCostAmount = readNumber(cost, "amount");
-  const used =
-    rawUsed !== null && Number.isSafeInteger(rawUsed) && rawUsed >= 0 ? rawUsed : null;
-  const size =
-    rawSize !== null && Number.isSafeInteger(rawSize) && rawSize >= 0 ? rawSize : null;
+  const used = rawUsed !== null && Number.isSafeInteger(rawUsed) && rawUsed >= 0 ? rawUsed : null;
+  const size = rawSize !== null && Number.isSafeInteger(rawSize) && rawSize >= 0 ? rawSize : null;
   const costAmount = rawCostAmount !== null && rawCostAmount >= 0 ? rawCostAmount : null;
   const costCurrency = readNullableString(cost, "currency");
 

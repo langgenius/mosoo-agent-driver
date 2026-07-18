@@ -255,9 +255,7 @@ describe("DriverInstanceSocket lifecycle", () => {
       startedAt: new Date(0).toISOString(),
     });
     const firstWire = PendingWebSocket.instances[0]!;
-    firstWire.dispatchEvent(
-      new CloseEvent("close", { code: 1006, reason: "connection lost" }),
-    );
+    firstWire.dispatchEvent(new CloseEvent("close", { code: 1006, reason: "connection lost" }));
 
     await socket.connect();
 
@@ -288,15 +286,11 @@ describe("DriverInstanceSocket lifecycle", () => {
     await socket.connect();
     await socket.hello(helloInput);
     const firstWire = PendingWebSocket.instances[0]!;
-    firstWire.dispatchEvent(
-      new CloseEvent("close", { code: 1006, reason: "connection lost" }),
-    );
+    firstWire.dispatchEvent(new CloseEvent("close", { code: 1006, reason: "connection lost" }));
     await socket.connect();
     await socket.hello(helloInput);
 
-    firstWire.dispatchEvent(
-      new CloseEvent("close", { code: 1006, reason: "stale close" }),
-    );
+    firstWire.dispatchEvent(new CloseEvent("close", { code: 1006, reason: "stale close" }));
 
     await expect(
       socket.heartbeat({ at: new Date(0).toISOString(), reason: "interval" }),
@@ -385,78 +379,77 @@ describe("DriverInstanceSocket lifecycle", () => {
   test.each([
     ["completeRun", "/driver/completeRun", "/driver/failRun"],
     ["failRun", "/driver/failRun", "/driver/completeRun"],
-  ] as const)("retries a failed %s send without changing the selected terminal", async (
-    selected,
-    sent,
-    skipped,
-  ) => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
-    socket.beginRun(DRIVER_TEST_IDS.runId);
-    const failure = {
-      code: "test.failure",
-      details: {},
-      message: "failed",
-      retryable: false,
-    };
-    const deliver = () =>
-      selected === "completeRun" ? socket.completeRun() : socket.failRun(failure);
-    const deliverOpposite = () =>
-      selected === "completeRun" ? socket.failRun(failure) : socket.completeRun();
-    RpcWebSocket.sendFailurePath = sent;
+  ] as const)(
+    "retries a failed %s send without changing the selected terminal",
+    async (selected, sent, skipped) => {
+      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+      const socket = new DriverInstanceSocket(driverBootPayload, {
+        onClose: () => {},
+      });
+      await socket.connect();
+      socket.beginRun(DRIVER_TEST_IDS.runId);
+      const failure = {
+        code: "test.failure",
+        details: {},
+        message: "failed",
+        retryable: false,
+      };
+      const deliver = () =>
+        selected === "completeRun" ? socket.completeRun() : socket.failRun(failure);
+      const deliverOpposite = () =>
+        selected === "completeRun" ? socket.failRun(failure) : socket.completeRun();
+      RpcWebSocket.sendFailurePath = sent;
 
-    await expect(deliver()).rejects.toThrow("test wire send failed");
-    await expect(deliverOpposite()).resolves.toBeUndefined();
-    await expect(deliver()).resolves.toBeUndefined();
-    await expect(deliver()).resolves.toBeUndefined();
+      await expect(deliver()).rejects.toThrow("test wire send failed");
+      await expect(deliverOpposite()).resolves.toBeUndefined();
+      await expect(deliver()).resolves.toBeUndefined();
+      await expect(deliver()).resolves.toBeUndefined();
 
-    const paths = (PendingWebSocket.instances[0] as RpcWebSocket).paths;
-    expect(paths.filter((path) => path === sent)).toHaveLength(2);
-    expect(paths).not.toContain(skipped);
-  });
+      const paths = (PendingWebSocket.instances[0] as RpcWebSocket).paths;
+      expect(paths.filter((path) => path === sent)).toHaveLength(2);
+      expect(paths).not.toContain(skipped);
+    },
+  );
 
   test.each([
     ["completeRun", "/driver/completeRun"],
     ["failRun", "/driver/failRun"],
-  ] as const)("shares an in-flight %s task and retries after a lost response", async (
-    selected,
-    path,
-  ) => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
-    socket.beginRun(DRIVER_TEST_IDS.runId);
-    const failure = {
-      code: "test.failure",
-      details: {},
-      message: "failed",
-      retryable: false,
-    };
-    const deliver = (signal?: AbortSignal) =>
-      selected === "completeRun" ? socket.completeRun(signal) : socket.failRun(failure, signal);
-    const controller = new AbortController();
-    const reason = new Error("run terminal response lost");
-    RpcWebSocket.lostResponsePath = path;
+  ] as const)(
+    "shares an in-flight %s task and retries after a lost response",
+    async (selected, path) => {
+      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+      const socket = new DriverInstanceSocket(driverBootPayload, {
+        onClose: () => {},
+      });
+      await socket.connect();
+      socket.beginRun(DRIVER_TEST_IDS.runId);
+      const failure = {
+        code: "test.failure",
+        details: {},
+        message: "failed",
+        retryable: false,
+      };
+      const deliver = (signal?: AbortSignal) =>
+        selected === "completeRun" ? socket.completeRun(signal) : socket.failRun(failure, signal);
+      const controller = new AbortController();
+      const reason = new Error("run terminal response lost");
+      RpcWebSocket.lostResponsePath = path;
 
-    const first = deliver(controller.signal);
-    await RpcWebSocket.stalled.promise;
-    const concurrent = deliver();
+      const first = deliver(controller.signal);
+      await RpcWebSocket.stalled.promise;
+      const concurrent = deliver();
 
-    expect(concurrent).toBe(first);
-    expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([path]);
+      expect(concurrent).toBe(first);
+      expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([path]);
 
-    controller.abort(reason);
-    await expect(first).rejects.toBe(reason);
-    await expect(concurrent).rejects.toBe(reason);
-    await expect(deliver()).resolves.toBeUndefined();
+      controller.abort(reason);
+      await expect(first).rejects.toBe(reason);
+      await expect(concurrent).rejects.toBe(reason);
+      await expect(deliver()).resolves.toBeUndefined();
 
-    expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([path, path]);
-  });
+      expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([path, path]);
+    },
+  );
 
   test("freezes a failed run payload across failed delivery attempts", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
@@ -784,9 +777,7 @@ describe("DriverProcess lifecycle", () => {
       const driver = new DriverProcess(driverBootPayload, () => backend);
       const run = driver.run();
 
-      await (stallBackendStart
-        ? backendStartEntered.promise
-        : RpcWebSocket.stalled.promise);
+      await (stallBackendStart ? backendStartEntered.promise : RpcWebSocket.stalled.promise);
       const shutdown = process
         .listeners("SIGTERM")
         .find((listener) => !existingSignalListeners.has(listener));

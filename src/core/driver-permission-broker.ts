@@ -211,13 +211,10 @@ export class DriverPermissionBroker {
       });
 
       const requestedTask = pushLosslessEvents(socket, events);
-      const requestedDelivery = await settlePromiseWithTimeout(
-        requestedTask,
-        {
-          label: `Driver permission request ${input.requestId} event delivery`,
-          timeoutMs: this.#eventDeliveryTimeoutMs,
-        },
-      );
+      const requestedDelivery = await settlePromiseWithTimeout(requestedTask, {
+        label: `Driver permission request ${input.requestId} event delivery`,
+        timeoutMs: this.#eventDeliveryTimeoutMs,
+      });
 
       if (requestedDelivery.status !== "completed") {
         if (requestedDelivery.status === "timed_out") {
@@ -261,24 +258,21 @@ export class DriverPermissionBroker {
       }
 
       const resolutionTask = pushLosslessEvents(socket, [
-          {
-            kind: "permission.resolved",
-            payload: {
-              outcome: decision,
-              permissionRequests: [],
-              reason: resolution.reason,
-              requestId: input.requestId,
-            },
-          },
-          ...toResolutionDiagnostics(input, resolution.reason),
-        ]);
-      const resolutionDelivery = await settlePromiseWithTimeout(
-        resolutionTask,
         {
-          label: `Driver permission resolution ${input.requestId} event delivery`,
-          timeoutMs: this.#eventDeliveryTimeoutMs,
+          kind: "permission.resolved",
+          payload: {
+            outcome: decision,
+            permissionRequests: [],
+            reason: resolution.reason,
+            requestId: input.requestId,
+          },
         },
-      );
+        ...toResolutionDiagnostics(input, resolution.reason),
+      ]);
+      const resolutionDelivery = await settlePromiseWithTimeout(resolutionTask, {
+        label: `Driver permission resolution ${input.requestId} event delivery`,
+        timeoutMs: this.#eventDeliveryTimeoutMs,
+      });
 
       if (resolutionDelivery.status !== "completed") {
         if (resolutionDelivery.status === "timed_out") {
