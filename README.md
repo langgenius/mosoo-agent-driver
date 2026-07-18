@@ -13,7 +13,7 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 
 <!-- Static badges below render cleanly before the package is published to npm.
      Once the first npm release exists, swap in the dynamic versions:
-     build:     https://img.shields.io/github/actions/workflow/status/langgenius/mosoo-agent-driver/ci.yml?branch=main&label=build
+     checks:    https://img.shields.io/github/actions/workflow/status/langgenius/mosoo-agent-driver/pr.yml?label=checks
      version:   https://img.shields.io/npm/v/agent-driver?label=version
      downloads: https://img.shields.io/npm/dm/agent-driver?label=downloads -->
 
