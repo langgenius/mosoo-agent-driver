@@ -4,9 +4,9 @@
 
 <h1>mosoo-agent-driver</h1>
 
-<strong>One Driver Kernel. Multiple agent backends.</strong>
+<strong>A runtime-neutral AI agent harness for sandboxed coding agents.</strong>
 <br />
-The Mosoo Agent Driver — the runtime that drives a sandbox-hosted agent session inside Mosoo.
+One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Client Protocol (ACP).
 
 <br />
 <br />
@@ -28,9 +28,9 @@ The Mosoo Agent Driver — the runtime that drives a sandbox-hosted agent sessio
 
 ---
 
-`mosoo-agent-driver` is the standalone runtime driver for sandbox-hosted agent sessions. It runs inside the sandbox and drives a single agent session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry. The package manifest uses the name `agent-driver`, but the package has not been published to npm yet.
+`mosoo-agent-driver` is the standalone Agent Driver and AI agent harness kernel for sandbox-hosted coding agent sessions. It runs inside the sandbox and drives one session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry. The package manifest uses the name `agent-driver`, but the package has not been published to npm yet.
 
-An experimental, unsupported CMA-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of Mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
+An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of Mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
 
 ## Current Mosoo topology
 
@@ -53,13 +53,13 @@ flowchart LR
 
 The Driver does not open a sandbox-local control listener. In Mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
 
-## Why agent-driver
+## AI Agent Harness Architecture
 
 Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
 
 - **Kernel-level unification.** Three launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
 - **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics. Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports. The library is safe to import and never starts the process runner on its own.
-- **Experimental CMA-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of CMA-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and Mosoo does not mount it as a production API.
+- **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and Mosoo does not mount it as a production API.
 - **Typed public entries.** Every public entry ships a matching declaration file under `dist/types`, and the package carries **no** `@mosoo/*` runtime dependencies — it is self-contained and portable.
 
 ## Package Entries
