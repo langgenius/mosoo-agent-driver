@@ -562,17 +562,20 @@ describe("OpenAI Contract adapter", () => {
       [{ data: "aGVsbG8=", mediaType: "text/plain", type: "inline_blob" as const }],
       "inline Blob",
     ],
-  ] as const)("rejects an oversized attachment %s before Authority", async (_, limits, input, error) => {
-    const harness = createHarness({ admissionLimits: limits });
+  ] as const)(
+    "rejects an oversized attachment %s before Authority",
+    async (_, limits, input, error) => {
+      const harness = createHarness({ admissionLimits: limits });
 
-    await expect(
-      harness.adapter.attachTurn({
-        ...turnAttachment(),
-        run: { ...turnAttachment().run, input: [...input] },
-      }),
-    ).rejects.toThrow(error);
-    expect(harness.authority).toHaveLength(0);
-  });
+      await expect(
+        harness.adapter.attachTurn({
+          ...turnAttachment(),
+          run: { ...turnAttachment().run, input: [...input] },
+        }),
+      ).rejects.toThrow(error);
+      expect(harness.authority).toHaveLength(0);
+    },
+  );
 
   test("projects streaming text as Preview and repairs dropped Preview with the final Item", async () => {
     const harness = createHarness({ previewReplaceIntervalMs: 1_000 });
@@ -1631,17 +1634,20 @@ describe("OpenAI Contract adapter", () => {
       },
       "inline Blob",
     ],
-  ] as const)("rejects an oversized projected %s before Authority", async (_, limits, params, error) => {
-    const harness = createHarness({ admissionLimits: limits });
-    await registerTurn(harness.adapter);
-    const before = harness.authority.length;
+  ] as const)(
+    "rejects an oversized projected %s before Authority",
+    async (_, limits, params, error) => {
+      const harness = createHarness({ admissionLimits: limits });
+      await registerTurn(harness.adapter);
+      const before = harness.authority.length;
 
-    await expect(harness.adapter.handleNotification("item/completed", params)).rejects.toThrow(
-      error,
-    );
-    expect(harness.authority).toHaveLength(before);
-    expect(harness.snapshot().items).toHaveLength(0);
-  });
+      await expect(harness.adapter.handleNotification("item/completed", params)).rejects.toThrow(
+        error,
+      );
+      expect(harness.authority).toHaveLength(before);
+      expect(harness.snapshot().items).toHaveLength(0);
+    },
+  );
 
   test("preserves multi-agent routing and status in Agent Tool items", async () => {
     const harness = createHarness();

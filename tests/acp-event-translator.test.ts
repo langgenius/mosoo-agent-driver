@@ -353,50 +353,53 @@ describe("ACP runtime event translation", () => {
       { content: [{ terminalId: "terminal-late", type: "terminal" }] },
       { content: expect.stringContaining("terminal-late") },
     ],
-  ] as const)("keeps a terminal tool completed while merging a later %s patch", (_name, patch, expected) => {
-    const state = new AcpTurnEventState();
-    state.begin({ messageId: "message-1", runId: "run-1", sessionId: "session-1" });
-    const initial = state.translateUpdate({
-      update: {
-        kind: "shell",
-        rawInput: { command: "true" },
-        sessionUpdate: "tool_call",
-        status: "completed",
-        title: "Run command",
-        toolCallId: "tool-terminal",
-      },
-    });
-    const initialPayload = eventPayload(requireEvent(initial, "tool.call.updated"));
-    const events = state.translateUpdate({
-      update: {
-        ...patch,
-        sessionUpdate: "tool_call_update",
-        status: "running",
-        toolCallId: "tool-terminal",
-      },
-    });
-    const update = requireEvent(events, "tool.call.updated");
-
-    expect(update.delivery).toBe("lossless");
-    expect(eventPayload(update)).toMatchObject({
-      kind: "shell",
-      rawInput: initialPayload["rawInput"],
-      status: "completed",
-      title: "Run command",
-      ...expected,
-    });
-    expect(events.filter((event) => event.kind === "item.completed")).toHaveLength(0);
-    expect(
-      state.translateUpdate({
+  ] as const)(
+    "keeps a terminal tool completed while merging a later %s patch",
+    (_name, patch, expected) => {
+      const state = new AcpTurnEventState();
+      state.begin({ messageId: "message-1", runId: "run-1", sessionId: "session-1" });
+      const initial = state.translateUpdate({
+        update: {
+          kind: "shell",
+          rawInput: { command: "true" },
+          sessionUpdate: "tool_call",
+          status: "completed",
+          title: "Run command",
+          toolCallId: "tool-terminal",
+        },
+      });
+      const initialPayload = eventPayload(requireEvent(initial, "tool.call.updated"));
+      const events = state.translateUpdate({
         update: {
           ...patch,
           sessionUpdate: "tool_call_update",
           status: "running",
           toolCallId: "tool-terminal",
         },
-      }),
-    ).toEqual([]);
-  });
+      });
+      const update = requireEvent(events, "tool.call.updated");
+
+      expect(update.delivery).toBe("lossless");
+      expect(eventPayload(update)).toMatchObject({
+        kind: "shell",
+        rawInput: initialPayload["rawInput"],
+        status: "completed",
+        title: "Run command",
+        ...expected,
+      });
+      expect(events.filter((event) => event.kind === "item.completed")).toHaveLength(0);
+      expect(
+        state.translateUpdate({
+          update: {
+            ...patch,
+            sessionUpdate: "tool_call_update",
+            status: "running",
+            toolCallId: "tool-terminal",
+          },
+        }),
+      ).toEqual([]);
+    },
+  );
 
   test.each([
     ["completed", "running", "without content"],

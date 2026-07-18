@@ -51,9 +51,7 @@ function isLossless(event: DriverEventInput): boolean {
 
 function isRunTerminal(event: DriverEventInput): boolean {
   return (
-    event.kind === "run.cancelled" ||
-    event.kind === "run.completed" ||
-    event.kind === "run.failed"
+    event.kind === "run.cancelled" || event.kind === "run.completed" || event.kind === "run.failed"
   );
 }
 
@@ -61,9 +59,7 @@ function scopeEvent(event: DriverEventInput, activeRunId: RunId | null): DriverE
   const { runId, sourceEventId, ...content } = event;
   const frozenRunId = runId === undefined ? activeRunId : runId;
   const explicitSourceId =
-    typeof sourceEventId === "string" && sourceEventId.length > 0
-      ? sourceEventId
-      : null;
+    typeof sourceEventId === "string" && sourceEventId.length > 0 ? sourceEventId : null;
 
   return {
     ...content,
@@ -219,9 +215,7 @@ export class DriverEventPublisher {
     const losslessCount = terminalBatch ? 0 : losslessEvents.length;
 
     if (
-      this.#pendingLosslessCount +
-        this.#queuedLosslessCount +
-        losslessCount >
+      this.#pendingLosslessCount + this.#queuedLosslessCount + losslessCount >
       MAX_PENDING_DRIVER_EVENTS
     ) {
       throw new Error(`Driver event queue exceeds ${MAX_PENDING_DRIVER_EVENTS} events.`);
@@ -233,9 +227,7 @@ export class DriverEventPublisher {
       admittedEvents = losslessEvents;
     } else if (losslessEvents.length === 0) {
       const capacity =
-        MAX_PENDING_DRIVER_EVENTS -
-        this.#pendingLosslessCount -
-        this.#queuedEventCount;
+        MAX_PENDING_DRIVER_EVENTS - this.#pendingLosslessCount - this.#queuedEventCount;
 
       if (capacity <= 0) {
         return null;
@@ -245,10 +237,7 @@ export class DriverEventPublisher {
     } else {
       const bestEffortCount = events.length - losslessEvents.length;
       const includeBestEffort =
-        this.#pendingLosslessCount +
-          this.#queuedEventCount +
-          losslessCount +
-          bestEffortCount <=
+        this.#pendingLosslessCount + this.#queuedEventCount + losslessCount + bestEffortCount <=
         MAX_PENDING_DRIVER_EVENTS;
       admittedEvents = includeBestEffort ? events : losslessEvents;
     }
@@ -374,11 +363,7 @@ export class DriverEventPublisher {
   }
 
   #requestPendingDrain(context: AgentDriverContext, reason: string): void {
-    if (
-      this.#pendingEvents.length === 0 &&
-      this.#queue.length === 0 &&
-      this.#drainTask === null
-    ) {
+    if (this.#pendingEvents.length === 0 && this.#queue.length === 0 && this.#drainTask === null) {
       return;
     }
 
@@ -427,10 +412,7 @@ export class DriverEventPublisher {
     context: AgentDriverContext,
     wakeReason?: string,
   ): Promise<void> {
-    const queuedEvents = [
-      ...this.#pendingEvents,
-      ...entries.flatMap((entry) => entry.events),
-    ];
+    const queuedEvents = [...this.#pendingEvents, ...entries.flatMap((entry) => entry.events)];
     const remainingLossless = queuedEvents.filter(({ event }) => isLossless(event));
     const ownerErrors = new Map<symbol, unknown>();
     const deadline = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
@@ -456,7 +438,7 @@ export class DriverEventPublisher {
     });
 
     try {
-      for (let index = 0; index < queuedEvents.length; ) {
+      for (let index = 0; index < queuedEvents.length;) {
         const lossless = isLossless(queuedEvents[index]!.event);
         let end = index + 1;
 

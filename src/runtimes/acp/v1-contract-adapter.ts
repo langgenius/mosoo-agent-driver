@@ -409,9 +409,8 @@ export class AcpV1ContractAdapter {
           throw unknown.error;
         }
 
-        const result = await this.#withReceipt(
-          retrying ? unknown.receivedAt : receivedAt,
-          () => this.#applySessionUpdate(runId, snapshot),
+        const result = await this.#withReceipt(retrying ? unknown.receivedAt : receivedAt, () =>
+          this.#applySessionUpdate(runId, snapshot),
         );
 
         if (retrying) {
@@ -586,10 +585,7 @@ export class AcpV1ContractAdapter {
     if (existing !== undefined) {
       const [interactionId, pending] = existing;
 
-      if (
-        pending.intent.runId !== runId ||
-        !isDeepStrictEqual(pending.intent.request, snapshot)
-      ) {
+      if (pending.intent.runId !== runId || !isDeepStrictEqual(pending.intent.request, snapshot)) {
         throw new Error(`ACP v1 permission request ${toolCallId} changed identity or content.`);
       }
 
@@ -808,9 +804,10 @@ export class AcpV1ContractAdapter {
       throw new Error("ACP v1 permission resolution selected an unavailable option.");
     }
 
-    const response: RequestPermissionResponse = nativeOptionId === undefined
-      ? { outcome: { outcome: "cancelled" } }
-      : { outcome: { optionId: nativeOptionId, outcome: "selected" } };
+    const response: RequestPermissionResponse =
+      nativeOptionId === undefined
+        ? { outcome: { outcome: "cancelled" } }
+        : { outcome: { optionId: nativeOptionId, outcome: "selected" } };
 
     this.#projection.releaseInteraction(interactionId);
     if (this.#unknownPermission?.intent === pending.intent) {
@@ -1243,20 +1240,18 @@ export class AcpV1ContractAdapter {
     }
 
     const item = itemSchema.parse({
-        audience: "participants",
-        changes: changes ?? existing?.changes,
-        createdAt: existing?.createdAt ?? now,
-        ...(nextStatus === "active" ? {} : { endedAt: existing?.endedAt ?? now }),
-        ...(nextStatus === "failed"
-          ? { error: existing?.error ?? toolError("File change") }
-          : {}),
-        id,
-        kind: "change",
-        provenance: provenance(event, { toolCallId }),
-        runId,
-        status: nextStatus,
-        updatedAt: now,
-      });
+      audience: "participants",
+      changes: changes ?? existing?.changes,
+      createdAt: existing?.createdAt ?? now,
+      ...(nextStatus === "active" ? {} : { endedAt: existing?.endedAt ?? now }),
+      ...(nextStatus === "failed" ? { error: existing?.error ?? toolError("File change") } : {}),
+      id,
+      kind: "change",
+      provenance: provenance(event, { toolCallId }),
+      runId,
+      status: nextStatus,
+      updatedAt: now,
+    });
 
     if (
       existing !== undefined &&

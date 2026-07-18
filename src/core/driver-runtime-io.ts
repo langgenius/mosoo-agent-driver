@@ -35,9 +35,7 @@ export class DriverEventRejectedError extends Error {
  *
  * Callers retrying across separate delivery invocations must reuse this returned array.
  */
-export function withSourceEventIds(
-  events: readonly DriverEventInput[],
-): DriverEventInput[] {
+export function withSourceEventIds(events: readonly DriverEventInput[]): DriverEventInput[] {
   return events.map((event) =>
     typeof event.sourceEventId === "string" && event.sourceEventId.length > 0
       ? event
@@ -110,12 +108,15 @@ export async function pushLosslessEvents(
 }
 
 export interface DriverRuntimeCommandPort {
-  commandUpdate(input: {
-    commandId: string;
-    error?: RunError;
-    result?: RuntimeCommandResult;
-    status: "accepted" | "cancelled" | "completed" | "failed";
-  }, signal: AbortSignal): Promise<void>;
+  commandUpdate(
+    input: {
+      commandId: string;
+      error?: RunError;
+      result?: RuntimeCommandResult;
+      status: "accepted" | "cancelled" | "completed" | "failed";
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
 }
 

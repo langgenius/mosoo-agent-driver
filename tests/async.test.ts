@@ -93,9 +93,9 @@ describe("async lifecycle utilities", () => {
   test("propagates an operation failure while an abort race is active", async () => {
     const failure = new Error("operation failed first");
 
-    await expect(
-      raceWithAbort(Promise.reject(failure), new AbortController().signal),
-    ).rejects.toBe(failure);
+    await expect(raceWithAbort(Promise.reject(failure), new AbortController().signal)).rejects.toBe(
+      failure,
+    );
   });
 
   test.each([

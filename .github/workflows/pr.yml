@@ -62,6 +62,7 @@ jobs:
       - name: Check
         run: |
           set -euo pipefail
+          vp fmt --check
           vp run lint
           vp run tc
           vp run test

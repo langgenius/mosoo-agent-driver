@@ -217,11 +217,7 @@ describe("OpenAI app-server startup", () => {
         const lifecycle =
           operation === "cancel"
             ? harness.backend.cancelActiveTurn(harness.context, "test.cancel")
-            : harness.backend.stop(
-                harness.context,
-                "test.stop",
-                new AbortController().signal,
-              );
+            : harness.backend.stop(harness.context, "test.stop", new AbortController().signal);
 
         await Bun.sleep(10);
         harness.releaseTurnTiming();
@@ -306,11 +302,7 @@ describe("OpenAI app-server startup", () => {
       );
     } finally {
       permissionGate.resolve();
-      await harness.backend.stop(
-        harness.context,
-        "test complete",
-        new AbortController().signal,
-      );
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
       await harness.logger.destroy();
     }
   });

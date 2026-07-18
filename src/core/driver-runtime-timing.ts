@@ -18,10 +18,7 @@ interface TimingEventInput {
   readonly traceId?: string | null;
 }
 
-export function toDurationMs(
-  startedAtMs: number,
-  completedAtMs: number = Date.now(),
-): number {
+export function toDurationMs(startedAtMs: number, completedAtMs: number = Date.now()): number {
   const durationMs = completedAtMs - startedAtMs;
 
   if (!Number.isFinite(durationMs)) {
@@ -31,10 +28,7 @@ export function toDurationMs(
   return Math.max(0, Math.round(durationMs));
 }
 
-export function createTimingPhase(
-  name: string,
-  durationMs: number,
-): RuntimeTimingPhase {
+export function createTimingPhase(name: string, durationMs: number): RuntimeTimingPhase {
   if (!Number.isFinite(durationMs)) {
     throw new Error("Driver runtime timing phase duration must be finite.");
   }
@@ -45,9 +39,7 @@ export function createTimingPhase(
   };
 }
 
-export function createTimingEvent(
-  input: TimingEventInput,
-): DriverEventInput {
+export function createTimingEvent(input: TimingEventInput): DriverEventInput {
   const completedAt = input.completedAt ?? new Date().toISOString();
   const completedAtMs = Date.parse(completedAt);
   const startedAtMs = Date.parse(input.startedAt);
@@ -59,9 +51,7 @@ export function createTimingEvent(
     payload: {
       completedAt,
       path: input.path,
-      phases: input.phases.map((phase) =>
-        createTimingPhase(phase.name, phase.durationMs),
-      ),
+      phases: input.phases.map((phase) => createTimingPhase(phase.name, phase.durationMs)),
       runId: input.runId,
       sessionId: input.sessionId,
       source: "driver",

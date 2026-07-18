@@ -471,20 +471,16 @@ export class AcpTerminalManager {
       return Promise.resolve();
     }
 
-    return (terminal.exitEventTask ??= this.#pushBestEffort(
-      context,
-      "driver.acp.terminal.exited",
-      [
-        {
-          kind: "terminal.exited",
-          payload: {
-            exitCode: terminal.exitStatus.exitCode,
-            signal: terminal.exitStatus.signal,
-            terminalId: terminal.id,
-          },
+    return (terminal.exitEventTask ??= this.#pushBestEffort(context, "driver.acp.terminal.exited", [
+      {
+        kind: "terminal.exited",
+        payload: {
+          exitCode: terminal.exitStatus.exitCode,
+          signal: terminal.exitStatus.signal,
+          terminalId: terminal.id,
         },
-      ],
-    ));
+      },
+    ]));
   }
 
   #resolveAllowedCwd(cwd: string): string {

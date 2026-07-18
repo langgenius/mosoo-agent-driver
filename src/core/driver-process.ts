@@ -35,11 +35,7 @@ import { createDriverPermissionRequestHandler } from "./driver-permission-policy
 import { pushLosslessEvents } from "./driver-runtime-io";
 import type { DriverRuntimeEventPort, DriverRuntimeRunPort } from "./driver-runtime-io";
 import { DriverRuntimeStateMachine } from "./driver-runtime-state";
-import {
-  createTimingEvent,
-  createTimingPhase,
-  toDurationMs,
-} from "./driver-runtime-timing";
+import { createTimingEvent, createTimingPhase, toDurationMs } from "./driver-runtime-timing";
 
 const DRIVER_VERSION = "0.1.0";
 const DRIVER_BACKEND_START_TIMEOUT_MS = 60_000;
@@ -413,11 +409,7 @@ export class DriverProcess {
   ): Promise<void> {
     const controller = new AbortController();
     const task = logger.span("driver.backend.stop", async () => {
-      await backend.stop(
-        this.createAgentDriverContext(socket, logger),
-        reason,
-        controller.signal,
-      );
+      await backend.stop(this.createAgentDriverContext(socket, logger), reason, controller.signal);
     });
     this.#backendStopController = controller;
     this.#backendStopTask = task;
@@ -575,7 +567,8 @@ export class DriverProcess {
     const retrying = shutdownTask === null && this.#shutdownController.signal.aborted;
 
     try {
-      await (shutdownTask ?? this.shutdown(socket, this.#shutdownReason ?? "runtime.socket.closed"));
+      await (shutdownTask ??
+        this.shutdown(socket, this.#shutdownReason ?? "runtime.socket.closed"));
     } catch (error) {
       if (retrying) {
         shutdownFailure = { error };

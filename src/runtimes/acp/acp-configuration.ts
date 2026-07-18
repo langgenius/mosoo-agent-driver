@@ -197,9 +197,7 @@ export function supportsSessionClose(agentCapabilities: AgentCapabilities | null
   return agentCapabilities?.sessionCapabilities?.close != null;
 }
 
-export function supportsAdditionalDirs(
-  agentCapabilities: AgentCapabilities | null,
-): boolean {
+export function supportsAdditionalDirs(agentCapabilities: AgentCapabilities | null): boolean {
   return agentCapabilities?.sessionCapabilities?.additionalDirectories != null;
 }
 

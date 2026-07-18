@@ -417,10 +417,7 @@ export class AcpTurnEventState {
     return events;
   }
 
-  #tool(
-    update: JsonObject | null,
-    type: "tool_call" | "tool_call_update",
-  ): DriverEventInput[] {
+  #tool(update: JsonObject | null, type: "tool_call" | "tool_call_update"): DriverEventInput[] {
     const toolCallId = readNonEmptyString(update, "toolCallId");
 
     if (toolCallId === null) {

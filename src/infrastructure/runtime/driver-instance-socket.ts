@@ -96,8 +96,7 @@ export class DriverInstanceSocket {
       }
 
       const code = event instanceof CloseEvent ? event.code : 1006;
-      const reason =
-        event instanceof CloseEvent ? event.reason : "runtime.socket.closed";
+      const reason = event instanceof CloseEvent ? event.reason : "runtime.socket.closed";
       this.#rpcAbortController.abort(new Error(reason || "runtime.socket.closed"));
       this.#client = null;
       this.#eventBatchMaxSize = null;
@@ -144,12 +143,15 @@ export class DriverInstanceSocket {
     return this.#activeRunId;
   }
 
-  async commandUpdate(input: {
-    commandId: string;
-    error?: RunError;
-    result?: RuntimeCommandResult;
-    status: "accepted" | "cancelled" | "completed" | "delivered" | "expired" | "failed";
-  }, signal: AbortSignal): Promise<void> {
+  async commandUpdate(
+    input: {
+      commandId: string;
+      error?: RunError;
+      result?: RuntimeCommandResult;
+      status: "accepted" | "cancelled" | "completed" | "delivered" | "expired" | "failed";
+    },
+    signal: AbortSignal,
+  ): Promise<void> {
     await this.#requireClient().driver.commandUpdate(
       {
         commandId: input.commandId,

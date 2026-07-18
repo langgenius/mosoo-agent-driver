@@ -24,10 +24,7 @@ const invalidTokenCounts = [
   ...nonFiniteNumbers,
 ] as const;
 
-const invalidCosts = [
-  { label: "negative", value: -0.01 },
-  ...nonFiniteNumbers,
-] as const;
+const invalidCosts = [{ label: "negative", value: -0.01 }, ...nonFiniteNumbers] as const;
 
 describe("Claude Agent SDK number reader", () => {
   test.each(nonFiniteNumbers)("ignores non-finite runtime value $label", ({ value }) => {
@@ -63,10 +60,7 @@ describe("Claude Agent SDK number reader", () => {
 
   test("drops a derived total that exceeds the safe integer range", () => {
     expect(
-      toClaudeUsageUpdatedEvents(
-        { input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 },
-        null,
-      ),
+      toClaudeUsageUpdatedEvents({ input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 }, null),
     ).toMatchObject([
       {
         payload: {
@@ -79,9 +73,7 @@ describe("Claude Agent SDK number reader", () => {
   });
 
   test.each(invalidCosts)("drops $label costs", ({ value }) => {
-    expect(
-      toClaudeUsageUpdatedEvents({ input_tokens: 1, output_tokens: 2 }, value),
-    ).toMatchObject([
+    expect(toClaudeUsageUpdatedEvents({ input_tokens: 1, output_tokens: 2 }, value)).toMatchObject([
       {
         payload: { costAmount: null, costCurrency: null, totalTokens: 3 },
       },

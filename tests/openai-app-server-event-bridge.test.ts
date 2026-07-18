@@ -279,9 +279,7 @@ describe("OpenAi app-server event bridge", () => {
     expect(
       harness
         .events()
-        .filter((event) =>
-          ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
-        ),
+        .filter((event) => ["run.cancelled", "run.completed", "run.failed"].includes(event.kind)),
     ).toMatchObject([{ kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId }]);
     await harness.logger.destroy();
   });

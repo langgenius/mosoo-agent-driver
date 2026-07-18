@@ -149,7 +149,7 @@ function findSseSeparator(
     return value[index] === 10 ? 1 : 0;
   };
 
-  for (let index = start; index < length; ) {
+  for (let index = start; index < length;) {
     const first = lineBreakLength(index);
 
     if (first === 0) {

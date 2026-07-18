@@ -451,7 +451,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
         failure = updateError;
       }
 
-      if (failure instanceof DriverTurnCancelledError || failure instanceof AcpPromptTerminalError) {
+      if (
+        failure instanceof DriverTurnCancelledError ||
+        failure instanceof AcpPromptTerminalError
+      ) {
         throw failure;
       }
 

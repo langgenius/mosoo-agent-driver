@@ -64,9 +64,9 @@ describe("ACP client request handler", () => {
 
     await handler.waitForTerminalExit({ sessionId: "native-session-1", terminalId });
 
-    expect(
-      handler.terminalOutput({ sessionId: "native-session-1", terminalId }).output,
-    ).toBe("/artifact/bin:/runtime/bin");
+    expect(handler.terminalOutput({ sessionId: "native-session-1", terminalId }).output).toBe(
+      "/artifact/bin:/runtime/bin",
+    );
     await handler.releaseTerminal(context, { sessionId: "native-session-1", terminalId });
   });
 

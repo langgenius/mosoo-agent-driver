@@ -68,12 +68,15 @@ async function settleWithTimeout<T>(
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   const timeout = new Promise<PromiseTimeoutResult<T>>((resolve) => {
-    timeoutId = setTimeout(() => {
-      resolve({
-        error: new AsyncTimeoutError(options.label, options.timeoutMs),
-        status: "timed_out",
-      });
-    }, Math.min(options.timeoutMs, MAX_TIMER_MS));
+    timeoutId = setTimeout(
+      () => {
+        resolve({
+          error: new AsyncTimeoutError(options.label, options.timeoutMs),
+          status: "timed_out",
+        });
+      },
+      Math.min(options.timeoutMs, MAX_TIMER_MS),
+    );
   });
   const aborted = new Promise<PromiseTimeoutResult<T>>((resolve) => {
     if (options.signal === undefined) {
@@ -128,10 +131,13 @@ export async function sleepPromise(ms: number, signal?: AbortSignal): Promise<vo
   signal?.throwIfAborted();
 
   await new Promise<void>((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, Math.min(ms, MAX_TIMER_MS));
+    const timeoutId = setTimeout(
+      () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      Math.min(ms, MAX_TIMER_MS),
+    );
     const onAbort = () => {
       clearTimeout(timeoutId);
       reject(signal?.reason);

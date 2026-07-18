@@ -95,10 +95,7 @@ export class OpenAiAppServerItemEventBridge {
     ]);
   }
 
-  async onFilePatch(
-    context: AgentDriverContext,
-    params: JsonObject,
-  ): Promise<void> {
+  async onFilePatch(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const itemId = readNonEmptyString(params, "itemId");
     const turnId = readNonEmptyString(params, "turnId");
 
@@ -207,10 +204,7 @@ export class OpenAiAppServerItemEventBridge {
     await this.#push(context, "driver.openai.plan.delta", [this.#plans.createUpdatedEvent()]);
   }
 
-  async onReasoningDelta(
-    context: AgentDriverContext,
-    params: JsonObject,
-  ): Promise<void> {
+  async onReasoningDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const itemId = readNonEmptyString(params, "itemId");
     const delta = readString(params, "delta") ?? readString(params, "part");
 
@@ -239,10 +233,7 @@ export class OpenAiAppServerItemEventBridge {
     await this.#push(context, "driver.openai.reasoning.summary", events);
   }
 
-  async onReasoningPart(
-    context: AgentDriverContext,
-    params: JsonObject,
-  ): Promise<void> {
+  async onReasoningPart(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const summaryIndex = params["summaryIndex"];
 
     if (typeof summaryIndex !== "number" || !Number.isInteger(summaryIndex) || summaryIndex < 1) {
@@ -429,11 +420,7 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     if (filteredFinalText !== null) {
-      this.#appendCitationDiag(
-        events,
-        messageId,
-        filteredFinalText.privateCitationCount,
-      );
+      this.#appendCitationDiag(events, messageId, filteredFinalText.privateCitationCount);
     }
 
     if (filteredFinalText !== null && filteredFinalText.text.length > currentText.length) {
@@ -564,11 +551,7 @@ export class OpenAiAppServerItemEventBridge {
     events.push(this.#plans.createUpdatedEvent());
   }
 
-  #appendReasoningEnd(
-    events: DriverEventInput[],
-    item: JsonObject,
-    itemId: string,
-  ): void {
+  #appendReasoningEnd(events: DriverEventInput[], item: JsonObject, itemId: string): void {
     if (readString(item, "type") !== "reasoning") {
       return;
     }

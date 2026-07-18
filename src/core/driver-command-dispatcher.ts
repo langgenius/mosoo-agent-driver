@@ -126,10 +126,7 @@ async function sendCommandUpdate(
     ...(update.result === undefined ? {} : { result: update.result }),
     status: update.status,
   });
-  await raceWithAbort(
-    runtimeContext.ports.eventSink.commandUpdate(delivery, signal),
-    signal,
-  );
+  await raceWithAbort(runtimeContext.ports.eventSink.commandUpdate(delivery, signal), signal);
 
   runtimeContext.logger.debug("driver.runtime.command.status.sent", {
     command: summarizeRuntimeCommand(command),
@@ -276,10 +273,7 @@ export class DriverCommandDispatcher {
 
         if (settleFailure !== null) {
           logger.warn("driver.runtime.active-work.settle-failed", {
-            message: toErrorMessage(
-              settleFailure.error,
-              "Active driver work did not settle.",
-            ),
+            message: toErrorMessage(settleFailure.error, "Active driver work did not settle."),
           });
           throw settleFailure.error;
         }
@@ -334,13 +328,11 @@ export class DriverCommandDispatcher {
         /* Ignore runtime error propagation failures */
       }
 
-      await this.#shutdown(socket, "driver.command_loop_failed").catch(
-        (shutdownError: unknown) => {
-          logger.error("driver.runtime.shutdown.failed", shutdownError, {
-            driverInstanceId: this.#driverInstanceId,
-          });
-        },
-      );
+      await this.#shutdown(socket, "driver.command_loop_failed").catch((shutdownError: unknown) => {
+        logger.error("driver.runtime.shutdown.failed", shutdownError, {
+          driverInstanceId: this.#driverInstanceId,
+        });
+      });
       await this.#joinActiveWork().catch((settleError: unknown) => {
         logger.warn("driver.runtime.active-work.settle-failed", {
           message: toErrorMessage(settleError, "Active driver work did not settle."),
@@ -423,25 +415,27 @@ export class DriverCommandDispatcher {
           cancellation,
           this.#activeRunGeneration,
           runId,
-        ).catch(async (error: unknown) => {
-          this.#activeWorkFailure ??= { error };
-          runtimeContext.logger.error("driver.runtime.input-task.failed", error, {
-            commandId: command.commandId,
-            driverInstanceId: this.#driverInstanceId,
+        )
+          .catch(async (error: unknown) => {
+            this.#activeWorkFailure ??= { error };
+            runtimeContext.logger.error("driver.runtime.input-task.failed", error, {
+              commandId: command.commandId,
+              driverInstanceId: this.#driverInstanceId,
+            });
+            await this.#shutdown(socket, "driver.input_task_failed").catch(
+              (shutdownError: unknown) => {
+                runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
+                  commandId: command.commandId,
+                });
+              },
+            );
+          })
+          .finally(() => {
+            if (this.#activeRunTask === activeRunTask) {
+              this.#activeRunTask = null;
+              this.#activeInputCancellation = null;
+            }
           });
-          await this.#shutdown(socket, "driver.input_task_failed").catch(
-            (shutdownError: unknown) => {
-              runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
-                commandId: command.commandId,
-              });
-            },
-          );
-        }).finally(() => {
-          if (this.#activeRunTask === activeRunTask) {
-            this.#activeRunTask = null;
-            this.#activeInputCancellation = null;
-          }
-        });
         this.#activeRunTask = activeRunTask;
         return;
       }
@@ -572,13 +566,11 @@ export class DriverCommandDispatcher {
           commandId: command.commandId,
           driverInstanceId: this.#driverInstanceId,
         });
-        await this.#shutdown(socket, "driver.mcp_task_failed").catch(
-          (shutdownError: unknown) => {
-            runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
-              commandId: command.commandId,
-            });
-          },
-        );
+        await this.#shutdown(socket, "driver.mcp_task_failed").catch((shutdownError: unknown) => {
+          runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
+            commandId: command.commandId,
+          });
+        });
       })
       .finally(() => {
         if (this.#activeMcpCommands.get(command.commandId)?.task === task) {
@@ -814,10 +806,7 @@ export class DriverCommandDispatcher {
     return task;
   }
 
-  async #deliverRunTerminal(
-    socket: DriverRuntimeIo,
-    terminal: RunTerminalDelivery,
-  ): Promise<void> {
+  async #deliverRunTerminal(socket: DriverRuntimeIo, terminal: RunTerminalDelivery): Promise<void> {
     const deadline = Date.now() + COMMAND_UPDATE_TIMEOUT_MS;
     let cause: unknown = new Error("Run terminal delivery deadline elapsed.");
 

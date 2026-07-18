@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  pushLosslessEvents,
-  withSourceEventIds,
-} from "../src/core/driver-runtime-io";
+import { pushLosslessEvents, withSourceEventIds } from "../src/core/driver-runtime-io";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
@@ -73,10 +70,7 @@ function kinds(batches: readonly (readonly DriverEventInput[])[]): string[][] {
 
 function createContext(input: {
   currentRunId?: () => RunId | null;
-  pushEvents: (
-    events: DriverEventInput[],
-    signal?: AbortSignal,
-  ) => Promise<DriverEventBatchOutput>;
+  pushEvents: (events: DriverEventInput[], signal?: AbortSignal) => Promise<DriverEventBatchOutput>;
 }) {
   return createAgentDriverContext({
     eventSink: {
@@ -168,10 +162,7 @@ describe("DriverEventPublisher", () => {
         },
       };
 
-      const delivery = pushLosslessEvents(port, [
-        createEvent("message.started"),
-        mutable,
-      ]);
+      const delivery = pushLosslessEvents(port, [createEvent("message.started"), mutable]);
       await firstSendEntered.promise;
       mutable.payload.metadata.label = "changed-during-send";
       releaseFirstSend.resolve();
@@ -180,14 +171,10 @@ describe("DriverEventPublisher", () => {
       expect(
         attempts.map((events) =>
           events.map(
-            (event) =>
-              (event.payload as { metadata?: { label?: string } }).metadata?.label ?? null,
+            (event) => (event.payload as { metadata?: { label?: string } }).metadata?.label ?? null,
           ),
         ),
-      ).toEqual([
-        [null, "original"],
-        ["original"],
-      ]);
+      ).toEqual([[null, "original"], ["original"]]);
       expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[1]?.sourceEventId);
 
       if (sourceEventId !== undefined) {
@@ -270,13 +257,9 @@ describe("DriverEventPublisher", () => {
         },
       });
       const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-      const retained = Array.from({ length: 1_024 }, () =>
-        createEvent("message.started"),
-      );
+      const retained = Array.from({ length: 1_024 }, () => createEvent("message.started"));
 
-      await expect(publisher.push(context, "fill", retained)).rejects.toThrow(
-        "socket unavailable",
-      );
+      await expect(publisher.push(context, "fill", retained)).rejects.toThrow("socket unavailable");
       await expect(
         publisher.push(context, "terminal", [createRunTerminal(kind)]),
       ).resolves.toBeUndefined();
@@ -359,9 +342,7 @@ describe("DriverEventPublisher", () => {
       createRunTerminal("run.completed"),
     ];
 
-    await expect(publisher.push(context, "fill", retained)).rejects.toThrow(
-      "socket unavailable",
-    );
+    await expect(publisher.push(context, "fill", retained)).rejects.toThrow("socket unavailable");
     await expect(publisher.push(context, "terminal", closing)).resolves.toBeUndefined();
 
     expect(attempts[1]).toHaveLength(1_027);
@@ -515,9 +496,7 @@ describe("DriverEventPublisher", () => {
     const pushes = Array.from({ length: 1_024 }, () =>
       publisher.push(context, "singleton", [createEvent("message.started")]),
     );
-    pushes.push(
-      publisher.push(context, "terminal", [createRunTerminal("run.completed")]),
-    );
+    pushes.push(publisher.push(context, "terminal", [createRunTerminal("run.completed")]));
 
     await Promise.all(pushes);
 
@@ -569,9 +548,7 @@ describe("DriverEventPublisher", () => {
     const poison = publisher.push(context, "poison", [
       { kind: "invalid.kind", payload: {} } as unknown as DriverEventInput,
     ]);
-    const terminal = publisher.push(context, "terminal", [
-      createRunTerminal("run.completed"),
-    ]);
+    const terminal = publisher.push(context, "terminal", [createRunTerminal("run.completed")]);
 
     const outcomes = await Promise.allSettled([poison, terminal]);
 
@@ -682,9 +659,7 @@ describe("DriverEventPublisher", () => {
       "socket unavailable",
     );
     activeRunId = DRIVER_TEST_IDS.secondRunId;
-    await expect(publisher.push(context, "run-2", [terminal])).rejects.toThrow(
-      "run terminal slot",
-    );
+    await expect(publisher.push(context, "run-2", [terminal])).rejects.toThrow("run terminal slot");
     await oldRunRecovered.promise;
     await Bun.sleep(0);
     await publisher.push(context, "run-2.retry", [terminal]);
@@ -783,8 +758,7 @@ describe("DriverEventPublisher", () => {
       });
       const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
       const raw = createUnscopedRunTerminal("run.completed");
-      const terminal =
-        eventRunId === undefined ? raw : { ...raw, runId: eventRunId };
+      const terminal = eventRunId === undefined ? raw : { ...raw, runId: eventRunId };
 
       await expect(publisher.push(context, "terminal", [terminal])).rejects.toThrow(
         "socket unavailable",
@@ -804,59 +778,56 @@ describe("DriverEventPublisher", () => {
   test.each([
     ["joins the pending terminal for the same", "source-terminal-1", true],
     ["keeps the pending occurrence for a different", "source-terminal-2", false],
-  ] as const)(
-    "%s explicit source ID",
-    async (_name, retrySourceEventId, joinsPending) => {
-      const attempts: DriverEventInput[][] = [];
-      const delivered = Promise.withResolvers<void>();
-      const context = createContext({
-        currentRunId: () => DRIVER_TEST_IDS.runId,
-        pushEvents: async (events) => {
-          attempts.push(events);
+  ] as const)("%s explicit source ID", async (_name, retrySourceEventId, joinsPending) => {
+    const attempts: DriverEventInput[][] = [];
+    const delivered = Promise.withResolvers<void>();
+    const context = createContext({
+      currentRunId: () => DRIVER_TEST_IDS.runId,
+      pushEvents: async (events) => {
+        attempts.push(events);
 
-          if (attempts.length === 1) {
-            throw new Error("socket unavailable");
-          }
+        if (attempts.length === 1) {
+          throw new Error("socket unavailable");
+        }
 
-          delivered.resolve();
-          return {
-            accepted: events.map((event, index) => ({
-              eventId: event.sourceEventId,
-              seq: index + 1,
-              type: event.kind,
-            })),
-          };
-        },
-      });
-      const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-      const terminal = {
-        ...createUnscopedRunTerminal("run.completed"),
-        sourceEventId: "source-terminal-1",
-      };
+        delivered.resolve();
+        return {
+          accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId,
+            seq: index + 1,
+            type: event.kind,
+          })),
+        };
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const terminal = {
+      ...createUnscopedRunTerminal("run.completed"),
+      sourceEventId: "source-terminal-1",
+    };
 
-      await expect(publisher.push(context, "terminal", [terminal])).rejects.toThrow(
-        "socket unavailable",
-      );
-      const retry = publisher.push(context, "terminal.retry", [
-        { ...terminal, sourceEventId: retrySourceEventId },
-      ]);
+    await expect(publisher.push(context, "terminal", [terminal])).rejects.toThrow(
+      "socket unavailable",
+    );
+    const retry = publisher.push(context, "terminal.retry", [
+      { ...terminal, sourceEventId: retrySourceEventId },
+    ]);
 
-      if (joinsPending) {
-        await expect(retry).resolves.toBeUndefined();
-      } else {
-        await expect(retry).rejects.toThrow("run terminal slot");
-        await delivered.promise;
-        await Bun.sleep(0);
-      }
+    if (joinsPending) {
+      await expect(retry).resolves.toBeUndefined();
+    } else {
+      await expect(retry).rejects.toThrow("run terminal slot");
+      await delivered.promise;
+      await Bun.sleep(0);
+    }
 
-      expect(attempts).toHaveLength(2);
-      expect(attempts.map(([event]) => event?.sourceEventId)).toEqual([
-        "source-terminal-1",
-        "source-terminal-1",
-      ]);
-      await context.logger.destroy();
-    },
-  );
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map(([event]) => event?.sourceEventId)).toEqual([
+      "source-terminal-1",
+      "source-terminal-1",
+    ]);
+    await context.logger.destroy();
+  });
 
   test.each([
     ["ordinary lossless", "ordinary"],
@@ -886,9 +857,7 @@ describe("DriverEventPublisher", () => {
         },
       });
       const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-      const retained = Array.from({ length: 1_024 }, () =>
-        createEvent("message.started"),
-      );
+      const retained = Array.from({ length: 1_024 }, () => createEvent("message.started"));
 
       await expect(publisher.push(context, "fill", retained)).rejects.toThrow(
         "socket unavailable 1",
@@ -913,10 +882,7 @@ describe("DriverEventPublisher", () => {
       }
 
       expect(
-        await Promise.race([
-          recovered.promise.then(() => true),
-          Bun.sleep(50).then(() => false),
-        ]),
+        await Promise.race([recovered.promise.then(() => true), Bun.sleep(50).then(() => false)]),
       ).toBe(true);
       expect(attempts).toHaveLength(3);
       expect(attempts[2]?.map((event) => event.sourceEventId)).toEqual(
@@ -958,18 +924,14 @@ describe("DriverEventPublisher", () => {
         },
       });
       const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-      const retained = Array.from({ length: 1_024 }, () =>
-        createEvent("message.started"),
-      );
+      const retained = Array.from({ length: 1_024 }, () => createEvent("message.started"));
       const first = publisher.push(context, "fill", retained);
 
       await firstSendEntered.promise;
       const trigger = publisher.push(
         context,
         "wake",
-        triggerKind === "lossless"
-          ? [createEvent("message.completed")]
-          : [createDelta("wake")],
+        triggerKind === "lossless" ? [createEvent("message.completed")] : [createDelta("wake")],
       );
 
       if (triggerKind === "lossless") {
@@ -981,10 +943,7 @@ describe("DriverEventPublisher", () => {
       releaseFirstSend.resolve();
       await expect(first).rejects.toThrow("socket unavailable");
       expect(
-        await Promise.race([
-          recovered.promise.then(() => true),
-          Bun.sleep(50).then(() => false),
-        ]),
+        await Promise.race([recovered.promise.then(() => true), Bun.sleep(50).then(() => false)]),
       ).toBe(true);
       expect(attempts).toHaveLength(2);
       expect(attempts[1]?.map((event) => event.sourceEventId)).toEqual(
@@ -1085,9 +1044,7 @@ describe("DriverEventPublisher", () => {
     const firstBatch = [createEvent("message.started"), createEvent("message.completed")];
     const laterEvent = createEvent("message.started");
 
-    await expect(publisher.push(context, "first", firstBatch)).rejects.toThrow(
-      "made no progress",
-    );
+    await expect(publisher.push(context, "first", firstBatch)).rejects.toThrow("made no progress");
     await publisher.push(context, "retry", [laterEvent]);
 
     expect(kinds(attempts)).toEqual([
@@ -1237,9 +1194,7 @@ describe("DriverEventPublisher", () => {
       pushEvents: async (events) => {
         attempt += 1;
         observed.push({
-          messageIds: events.map(
-            (event) => (event.payload as { messageId: string }).messageId,
-          ),
+          messageIds: events.map((event) => (event.payload as { messageId: string }).messageId),
           sourceEventIds: events.map((event) => event.sourceEventId),
         });
 
@@ -1334,7 +1289,11 @@ describe("DriverEventPublisher", () => {
     const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
 
     await expect(
-      publisher.push(context, "oversized", Array.from({ length: 1_025 }, () => event)),
+      publisher.push(
+        context,
+        "oversized",
+        Array.from({ length: 1_025 }, () => event),
+      ),
     ).rejects.toThrow("exceeds 1024 events");
     expect(payloadReads).toBe(0);
     await context.logger.destroy();
@@ -1418,17 +1377,9 @@ describe("DriverEventPublisher", () => {
       "does not match",
     ],
     ["NaN seq", [{ seq: Number.NaN, type: "message.started" }], "safe integer"],
-    [
-      "infinite seq",
-      [{ seq: Number.POSITIVE_INFINITY, type: "message.started" }],
-      "safe integer",
-    ],
+    ["infinite seq", [{ seq: Number.POSITIVE_INFINITY, type: "message.started" }], "safe integer"],
     ["fractional seq", [{ seq: 40.5, type: "message.started" }], "safe integer"],
-    [
-      "unsafe seq",
-      [{ seq: Number.MAX_SAFE_INTEGER + 1, type: "message.started" }],
-      "safe integer",
-    ],
+    ["unsafe seq", [{ seq: Number.MAX_SAFE_INTEGER + 1, type: "message.started" }], "safe integer"],
     ["negative seq", [{ seq: -1, type: "message.started" }], "non-negative"],
   ] as const)(
     "retains the full batch after a %s receipt prefix",
@@ -1454,9 +1405,7 @@ describe("DriverEventPublisher", () => {
       const firstBatch = [createEvent("message.started"), createEvent("message.completed")];
       const laterEvent = createEvent("message.started");
 
-      await expect(publisher.push(context, "malformed", firstBatch)).rejects.toThrow(
-        expectedError,
-      );
+      await expect(publisher.push(context, "malformed", firstBatch)).rejects.toThrow(expectedError);
       expect(publisher.lastAcceptedSeq()).toBe(0);
       await publisher.push(context, "retry", [laterEvent]);
 

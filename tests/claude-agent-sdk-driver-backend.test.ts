@@ -169,11 +169,7 @@ describe("Claude Agent SDK driver backend", () => {
       { text: "second" },
       DRIVER_TEST_IDS.secondRunId,
     );
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(coldQueries).toBe(2);
@@ -396,11 +392,7 @@ describe("Claude Agent SDK driver backend", () => {
       if (action === "cancel") {
         await harness.backend.cancelActiveTurn(harness.context, "test.cancel");
       } else {
-        await harness.backend.stop(
-          harness.context,
-          "test.stop",
-          new AbortController().signal,
-        );
+        await harness.backend.stop(harness.context, "test.stop", new AbortController().signal);
       }
       options.resolve({});
 
@@ -411,11 +403,7 @@ describe("Claude Agent SDK driver backend", () => {
           ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
         ),
       ).toMatchObject([{ kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId }]);
-      await harness.backend.stop(
-        harness.context,
-        "test.complete",
-        new AbortController().signal,
-      );
+      await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
       await harness.logger.destroy();
     },
   );
@@ -443,11 +431,7 @@ describe("Claude Agent SDK driver backend", () => {
     await expect(
       harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
     ).rejects.toThrow("event sink unavailable");
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(closes).toBe(1);
@@ -491,11 +475,7 @@ describe("Claude Agent SDK driver backend", () => {
 
     await harness.backend.cancelActiveTurn(harness.context, "test.cancel");
     await expect(handling).rejects.toBeInstanceOf(DriverTurnCancelledError);
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(closes).toBe(1);
@@ -536,11 +516,7 @@ describe("Claude Agent SDK driver backend", () => {
     await harness.backend.cancelActiveTurn(harness.context, "test.cancel");
     releaseFinish.resolve();
     await expect(handling).resolves.toBeUndefined();
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(closes).toBe(1);
@@ -587,11 +563,7 @@ describe("Claude Agent SDK driver backend", () => {
       await expect(
         harness.backend.handleInput(harness.context, { text: "finish" }, DRIVER_TEST_IDS.runId),
       ).rejects.toThrow("terminal delivery unavailable");
-      await harness.backend.stop(
-        harness.context,
-        "test.complete",
-        new AbortController().signal,
-      );
+      await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
       await harness.logger.destroy();
 
       expect(terminalAttempts).toEqual([[terminal]]);
@@ -645,23 +617,11 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.handleInput(
-      harness.context,
-      { text: "first" },
-      DRIVER_TEST_IDS.runId,
-    );
+    await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
     await expect(
-      harness.backend.handleInput(
-        harness.context,
-        { text: "second" },
-        DRIVER_TEST_IDS.secondRunId,
-      ),
+      harness.backend.handleInput(harness.context, { text: "second" }, DRIVER_TEST_IDS.secondRunId),
     ).rejects.toThrow("different native session");
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(
@@ -716,11 +676,7 @@ describe("Claude Agent SDK driver backend", () => {
       { text: "terminal" },
       DRIVER_TEST_IDS.secondRunId,
     );
-    await harness.backend.stop(
-      harness.context,
-      "test.complete",
-      new AbortController().signal,
-    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
     expect(lateFrameRead).toBe(false);

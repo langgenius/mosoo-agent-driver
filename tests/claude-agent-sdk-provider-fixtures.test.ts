@@ -374,9 +374,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
       {
         message: {
-          content: [
-            { id: "tool-1", input: { path: "complete" }, name: "Read", type: "tool_use" },
-          ],
+          content: [{ id: "tool-1", input: { path: "complete" }, name: "Read", type: "tool_use" }],
         },
         type: "assistant",
         uuid: "assistant-1",

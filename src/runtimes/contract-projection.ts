@@ -83,11 +83,7 @@ export interface ContractProjectionOptions {
   readonly sessionId: string;
 }
 
-type TextPreviewChannel =
-  | "message.text"
-  | "reasoning.text"
-  | "terminal.stderr"
-  | "terminal.stdout";
+type TextPreviewChannel = "message.text" | "reasoning.text" | "terminal.stderr" | "terminal.stdout";
 
 function itemKey(runId: string, itemId: string): string {
   return `${runId}\u0000${itemId}`;
@@ -249,7 +245,9 @@ export class ContractProjection {
 
     if (existing !== undefined) {
       if (!isDeepStrictEqual(existing, run)) {
-        throw new Error(`Contract projection run ${run.id} is already attached with different state.`);
+        throw new Error(
+          `Contract projection run ${run.id} is already attached with different state.`,
+        );
       }
 
       return;
@@ -315,7 +313,9 @@ export class ContractProjection {
       const interaction = interactionSchema.parse(stable.value);
 
       if (interaction.runId !== stable.runId) {
-        throw new Error(`Contract projection interaction ${interaction.id} belongs to a different run.`);
+        throw new Error(
+          `Contract projection interaction ${interaction.id} belongs to a different run.`,
+        );
       }
 
       const existing = this.#interactions.get(interaction.id);
@@ -334,9 +334,7 @@ export class ContractProjection {
       const operation = operations[0];
 
       if (operation?.op !== "put" || operation.entity !== "interaction") {
-        throw new Error(
-          `Authority write ${stable.event} did not retain its Interaction intent.`,
-        );
+        throw new Error(`Authority write ${stable.event} did not retain its Interaction intent.`);
       }
 
       return this.#interactions.get(operation.value.id) ?? operation.value;
@@ -832,7 +830,9 @@ export class ContractProjection {
 
     if (pending >= MAX_PENDING_MUTATIONS) {
       return Promise.reject(
-        new RangeError(`Contract projection mutation queue exceeds ${MAX_PENDING_MUTATIONS} entries.`),
+        new RangeError(
+          `Contract projection mutation queue exceeds ${MAX_PENDING_MUTATIONS} entries.`,
+        ),
       );
     }
 
@@ -1026,12 +1026,7 @@ export class ContractProjection {
     }
   }
 
-  #appendItemText(
-    item: Item,
-    channel: TextPreviewChannel,
-    text: string,
-    updatedAt: string,
-  ): Item {
+  #appendItemText(item: Item, channel: TextPreviewChannel, text: string, updatedAt: string): Item {
     if (item.kind === "message" && channel === "message.text") {
       return itemSchema.parse({
         ...item,
@@ -1106,12 +1101,7 @@ export class ContractProjection {
     return next;
   }
 
-  #replaceItemText(
-    item: Item,
-    channel: TextPreviewChannel,
-    text: string,
-    updatedAt: string,
-  ): Item {
+  #replaceItemText(item: Item, channel: TextPreviewChannel, text: string, updatedAt: string): Item {
     if (item.kind === "terminal" && channel === "terminal.stdout") {
       return itemSchema.parse({
         ...item,

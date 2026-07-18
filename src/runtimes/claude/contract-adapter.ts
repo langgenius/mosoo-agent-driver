@@ -285,10 +285,7 @@ export class ClaudeContractAdapter {
     this.#assertActive();
     this.#assertNativeSession(message);
 
-    if (
-      this.#finishingRuns.has(runId) ||
-      this.#projection.run(runId)?.status !== "active"
-    ) {
+    if (this.#finishingRuns.has(runId) || this.#projection.run(runId)?.status !== "active") {
       return false;
     }
 
@@ -514,10 +511,7 @@ export class ClaudeContractAdapter {
     );
 
     this.#assertActive();
-    if (
-      this.#finishingRuns.has(runId) ||
-      this.#projection.run(runId)?.status !== "active"
-    ) {
+    if (this.#finishingRuns.has(runId) || this.#projection.run(runId)?.status !== "active") {
       throw new Error("Claude permission request outlived its active Run.");
     }
 
@@ -980,9 +974,7 @@ export class ClaudeContractAdapter {
   ): Promise<void> {
     if (message.subtype === "files_persisted" && message.files.length > 0) {
       const changes = message.files.flatMap((file) =>
-        file.filename.trim().length === 0
-          ? []
-          : [{ operation: "update", path: file.filename }],
+        file.filename.trim().length === 0 ? [] : [{ operation: "update", path: file.filename }],
       );
 
       if (changes.length === 0) {

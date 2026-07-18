@@ -6,12 +6,7 @@ import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 import { applyCommittedMutation, validateSessionSnapshot } from "../src/contract";
-import type {
-  AuthorityOperation,
-  CommittedMutation,
-  Run,
-  SessionSnapshot,
-} from "../src/contract";
+import type { AuthorityOperation, CommittedMutation, Run, SessionSnapshot } from "../src/contract";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
@@ -26,11 +21,7 @@ import {
   FakeDriverRuntimeIo,
   bootPayload,
 } from "./driver-runtime-boundary-fixtures";
-import {
-  textDeltaFrom,
-  waitForTerminalTurnEvent,
-  withLiveTimeout,
-} from "./live-driver-events";
+import { textDeltaFrom, waitForTerminalTurnEvent, withLiveTimeout } from "./live-driver-events";
 
 const LIVE_API_KEY_ENV = "AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY";
 const PROVIDER_API_KEY_ENV = "ANTHROPIC_API_KEY";
@@ -233,9 +224,7 @@ function payloadString(event: DriverEventInput | undefined, key: string): string
 
 function toolCallId(events: readonly DriverEventInput[], title: string): string | null {
   return payloadString(
-    events.find(
-      (event) => event.kind === "item.started" && hasPayloadValue(event, "title", title),
-    ),
+    events.find((event) => event.kind === "item.started" && hasPayloadValue(event, "title", title)),
     "itemId",
   );
 }
@@ -654,8 +643,7 @@ describe("Claude Agent SDK live provider", () => {
         });
         const runningTool = await waitForLiveEvent(
           iterator,
-          (event) =>
-            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
           "running Bash tool",
         );
         const toolCallId = payloadString(runningTool, "itemId");
@@ -682,12 +670,7 @@ describe("Claude Agent SDK live provider", () => {
           (event) => event.kind === "run.cancelled",
           "cancelled run terminal event",
         );
-        await sendPing(
-          kernel,
-          fromIterator(iterator),
-          "after-cancel",
-          DRIVER_TEST_IDS.secondRunId,
-        );
+        await sendPing(kernel, fromIterator(iterator), "after-cancel", DRIVER_TEST_IDS.secondRunId);
       } finally {
         await stopLiveKernel(kernel, "test.stop");
       }
@@ -723,8 +706,7 @@ describe("Claude Agent SDK live provider", () => {
         });
         const runningTool = await waitForLiveEvent(
           firstEvents,
-          (event) =>
-            event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
+          (event) => event.kind === "item.started" && hasPayloadValue(event, "title", "Bash"),
           "running Bash tool before shutdown",
         );
         const toolCallId = payloadString(runningTool, "itemId");
