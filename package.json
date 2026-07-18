@@ -10,8 +10,8 @@
   "files": [
     "dist",
     "src",
-    "Dockerfile",
-    ".dockerignore",
+    "Containerfile",
+    ".containerignore",
     "README.md"
   ],
   "type": "module",
@@ -66,7 +66,7 @@
     "bench": "bun bench/ttft-bench.ts",
     "build": "vp run build:types && bun build src/bin/driver.ts --outfile dist/driver.mjs --target bun --format esm --bundle",
     "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
-    "docker:build": "vp run build && docker build -t agent-driver:local .",
+    "image:build": "vp run build && buildah build -t agent-driver:local .",
     "lint": "vp lint src tests",
     "tc": "vp exec tsc --noEmit",
     "test": "bun test",

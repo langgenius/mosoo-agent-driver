@@ -64,7 +64,7 @@ describe("driver artifact contract", () => {
     });
     expect(packageJson.types).toBe("./dist/types/index.d.ts");
     expect(packageJson.files).toEqual(
-      expect.arrayContaining(["dist", "src", "Dockerfile", ".dockerignore", "README.md"]),
+      expect.arrayContaining(["dist", "src", "Containerfile", ".containerignore", "README.md"]),
     );
     expect(packageJson.files).not.toContain("tests/fixtures");
   });
@@ -105,30 +105,32 @@ describe("driver artifact contract", () => {
   test("builds and packages only the process runner artifact", () => {
     const packageJson = readDriverPackageJson();
     const buildScript = packageJson.scripts?.["build"] ?? "";
-    const dockerBuildScript = packageJson.scripts?.["docker:build"] ?? "";
-    const dockerignore = readText("../.dockerignore");
-    const dockerfile = readText("../Dockerfile");
+    const imageBuildScript = packageJson.scripts?.["image:build"] ?? "";
+    const containerignore = readText("../.containerignore");
+    const containerfile = readText("../Containerfile");
     const processEntry = readText("../src/bin/driver.ts");
 
     expect(processEntry.startsWith("#!/usr/bin/env bun\n")).toBe(true);
     expect(buildScript).toContain("src/bin/driver.ts");
     expect(buildScript).toContain("dist/driver.mjs");
     expect(buildScript).not.toContain("src/index.ts");
-    expect(dockerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
-    expect(dockerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
-    expect(dockerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
-    expect(dockerignore).toContain("!dist/driver.mjs");
-    expect(dockerBuildScript).toBe("vp run build && docker build -t agent-driver:local .");
+    expect(containerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
+    expect(containerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
+    expect(containerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
+    expect(containerignore).toContain("!dist/driver.mjs");
+    expect(imageBuildScript).toBe("vp run build && buildah build -t agent-driver:local .");
   });
 
   test("pins the OpenAI runtime, SDK, and app-server schema to one stable version", () => {
     const packageJson = readDriverPackageJson();
-    const dockerfile = readText("../Dockerfile");
+    const containerfile = readText("../Containerfile");
 
     expect(packageJson.devDependencies?.["@openai/codex-sdk"]).toBe(
       OPENAI_APP_SERVER_SCHEMA_VERSION,
     );
-    expect(dockerfile).toContain(`ARG OPENAI_RUNTIME_VERSION=${OPENAI_APP_SERVER_SCHEMA_VERSION}`);
+    expect(containerfile).toContain(
+      `ARG OPENAI_RUNTIME_VERSION=${OPENAI_APP_SERVER_SCHEMA_VERSION}`,
+    );
   });
 
   test("keeps the standalone package out of Mosoo workspace dependencies", () => {

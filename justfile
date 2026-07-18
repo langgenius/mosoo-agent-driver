@@ -16,8 +16,8 @@ test: lint
 build: test
     vp run build
 
-docker-build:
-    vp run docker:build
+image-build:
+    vp run image:build
 
 live-anthropic:
     vp run test:live:anthropic

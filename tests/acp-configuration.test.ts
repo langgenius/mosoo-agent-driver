@@ -113,19 +113,19 @@ describe("ACP runtime configuration", () => {
         },
       },
       {
-        HTTPS_PROXY: "http://host.docker.internal:7897",
+        HTTPS_PROXY: "http://host.containers.internal:7897",
         NODE_USE_ENV_PROXY: "1",
         PATH: "/usr/local/bin:/usr/bin",
         RANDOM_SECRET: "secret",
-        http_proxy: "http://host.docker.internal:7897",
+        http_proxy: "http://host.containers.internal:7897",
       },
     );
 
     expect(env).toMatchObject({
-      HTTPS_PROXY: "http://host.docker.internal:7897",
+      HTTPS_PROXY: "http://host.containers.internal:7897",
       NODE_USE_ENV_PROXY: "1",
       PATH: "/artifact/bin:/usr/local/bin:/usr/bin",
-      http_proxy: "http://host.docker.internal:7897",
+      http_proxy: "http://host.containers.internal:7897",
     });
     expect(env["RANDOM_SECRET"]).toBeUndefined();
   });
