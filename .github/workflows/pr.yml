@@ -59,11 +59,17 @@ jobs:
           run-install: |
             - args: ['--frozen-lockfile']
 
-      - name: Setup just
-        uses: extractions/setup-just@v3
-
       - name: Check
-        run: just check
+        run: |
+          set -euo pipefail
+          vp run lint
+          vp run tc
+          vp run test
+          vp run build
+          test -f dist/driver.mjs
+          test -s dist/driver.mjs
+          test -x dist/driver.mjs
+          test "$(head -n 1 dist/driver.mjs)" = '#!/usr/bin/env bun'
 
   image:
     name: Container image

@@ -22,6 +22,9 @@ check:
     vp run test
     vp run build
     test -f dist/driver.mjs
+    test -s dist/driver.mjs
+    test -x dist/driver.mjs
+    test "$(head -n 1 dist/driver.mjs)" = '#!/usr/bin/env bun'
 
 image-build:
     vp run image:build
