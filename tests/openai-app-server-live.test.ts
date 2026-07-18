@@ -274,6 +274,15 @@ function hasPayloadText(event: DriverEventInput, key: string, text: string): boo
   return typeof value === "string" && value.includes(text);
 }
 
+function payloadString(event: DriverEventInput, key: string): string | null {
+  if (typeof event.payload !== "object" || event.payload === null || Array.isArray(event.payload)) {
+    return null;
+  }
+
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
 function hasFileChange(event: DriverEventInput, path: string): boolean {
   if (event.kind !== "file.change.updated" || typeof event.payload !== "object") {
     return false;
@@ -315,6 +324,14 @@ async function waitForLiveEvent(
 
         if (predicate(next.value)) {
           return next.value;
+        }
+
+        if (
+          next.value.kind === "run.completed" ||
+          next.value.kind === "run.failed" ||
+          next.value.kind === "run.cancelled"
+        ) {
+          throw new Error(`Driver turn ended with ${next.value.kind} before ${label}.`);
         }
       }
     },
@@ -522,6 +539,128 @@ describe("OpenAI app-server live provider", () => {
       }
     },
     LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "edits and deletes workspace files through the file-change tool",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const kernel = createLiveKernel();
+      const editName = "edit-target.txt";
+      const deleteName = "delete-target.txt";
+      await Promise.all([
+        writeFile(join(paths.cwd, editName), "before\n", "utf8"),
+        writeFile(join(paths.cwd, deleteName), "remove me\n", "utf8"),
+      ]);
+
+      try {
+        await kernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt:
+              "Use the file patch tool for requested file changes, then answer exactly as requested.",
+          }),
+        );
+        const events = await sendTurn(
+          kernel,
+          kernel.events(),
+          "edit-delete-files",
+          `Use the file patch tool to replace before with after in ${editName} and delete ${deleteName}. Then reply with exactly mutated.`,
+        );
+
+        expect(events.some((event) => hasPayloadValue(event, "title", "File change"))).toBe(true);
+        expect(events.some((event) => hasFileChange(event, editName))).toBe(true);
+        expect(events.some((event) => hasFileChange(event, deleteName))).toBe(true);
+        expect(await readFile(join(paths.cwd, editName), "utf8")).toBe("after\n");
+        await expect(readFile(join(paths.cwd, deleteName), "utf8")).rejects.toThrow();
+      } finally {
+        await stopLiveKernel(kernel, "test.stop");
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS + 5_000,
+  );
+
+  liveTest(
+    "resumes the native thread in a fresh process",
+    async () => {
+      const paths = await createLiveDriverPaths();
+      const firstKernel = createLiveKernel();
+      const firstEvents = firstKernel.events()[Symbol.asyncIterator]();
+      const memoryToken = "resume-memory-4172";
+      let firstStopped = false;
+
+      try {
+        await firstKernel.start(
+          createLiveStartInput({
+            apiKey: liveApiKey,
+            cwd: paths.cwd,
+            homePath: paths.homePath,
+            sharedRootPath: paths.sharedRootPath,
+            systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+          }),
+        );
+        await sendTurn(
+          firstKernel,
+          fromIterator(firstEvents),
+          "resume-store",
+          `Remember the token ${memoryToken}. Reply with exactly stored.`,
+        );
+        const resumeEvent = await waitForLiveEvent(
+          firstEvents,
+          (event) => event.kind === "runtime.resume.updated",
+          "native resume reference",
+        );
+        const threadId = payloadString(resumeEvent, "threadId");
+        expect(threadId).not.toBeNull();
+        await stopLiveKernel(firstKernel, "live.resume-restart");
+        firstStopped = true;
+
+        const baseInput = createLiveStartInput({
+          apiKey: liveApiKey,
+          cwd: paths.cwd,
+          homePath: paths.homePath,
+          sharedRootPath: paths.sharedRootPath,
+          systemPrompt: "Remember user-provided tokens and answer exactly as requested.",
+        });
+        const resumedKernel = createLiveKernel();
+
+        try {
+          await resumedKernel.start({
+            ...baseInput,
+            execution: {
+              ...baseInput.execution,
+              session: {
+                ...baseInput.execution.session,
+                nativeResumeRef: {
+                  kind: "openai_thread_id",
+                  runtimeId: "openai-runtime",
+                  value: threadId!,
+                },
+              },
+            },
+          });
+          const events = await sendTurn(
+            resumedKernel,
+            resumedKernel.events(),
+            "resume-recall",
+            "Reply with exactly the token I asked you to remember in the previous turn.",
+            DRIVER_TEST_IDS.secondRunId,
+          );
+
+          expect(events.map(textDeltaFrom).join("")).toContain(memoryToken);
+        } finally {
+          await stopLiveKernel(resumedKernel, "test.stop");
+        }
+      } finally {
+        if (!firstStopped) {
+          await stopLiveKernel(firstKernel, "test.stop");
+        }
+      }
+    },
+    LIVE_TURN_TIMEOUT_MS * 2 + 10_000,
   );
 
   liveTest(
