@@ -1,7 +1,12 @@
-import { CmaUnsupportedFieldError, parseCmaInboundEvent } from "../../projections/cma";
+import {
+  CmaInvalidEventError,
+  CmaUnsupportedFieldError,
+  parseCmaInboundEvent,
+} from "../../projections/cma";
 import type { CmaInboundEvent } from "../../projections/cma";
 import { projectCmaInboundToDriverCommand } from "../../projections/cma";
 import type { RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
+import { isDriverId } from "../../protocol/id";
 import type {
   CmaCreateAgentInput,
   CmaCreateEnvironmentInput,
@@ -11,11 +16,19 @@ import type {
   CmaEnvironmentNetworking,
   CmaEnvironmentPackages,
   CmaEnvironmentPackageManager,
+  CmaInboundEventLease,
   CmaSessionEventRecord,
   CmaSessionRecord,
   CmaStore,
 } from "../../stores/cma-store";
-import { CmaStoreConflictError, CmaStoreNotFoundError } from "../../stores/cma-store";
+import {
+  CMA_MAX_EVENT_BYTES,
+  CmaSessionTerminatedError,
+  CmaStoreConflictError,
+  CmaStoreNotFoundError,
+  encodeCmaSseRecord,
+} from "../../stores/cma-store";
+import { sleepPromise } from "../../utils/async";
 
 type HttpMethod = "DELETE" | "GET" | "POST";
 
@@ -40,6 +53,7 @@ export interface CmaHttpDriverCommandDispatchInput {
   readonly command: RuntimeCommand;
   readonly event: CmaInboundEvent;
   readonly session: CmaSessionRecord;
+  readonly signal: AbortSignal;
 }
 
 export type CmaHttpDriverCommandDispatcher = (
@@ -68,12 +82,9 @@ class CmaHttpRequestError extends Error {
 }
 
 class CmaHttpDriverDispatchError extends Error {
-  readonly source: unknown;
-
-  constructor(source: unknown) {
+  constructor() {
     super("Driver command dispatch failed.");
     this.name = "CmaHttpDriverDispatchError";
-    this.source = source;
   }
 }
 
@@ -326,23 +337,105 @@ function readRequiredRecord(
 }
 
 async function readJsonBody(request: Request): Promise<unknown> {
+  const contentLength = request.headers.get("content-length");
+
+  if (contentLength !== null && Number(contentLength) > CMA_MAX_EVENT_BYTES) {
+    throw new CmaHttpRequestError(
+      413,
+      "CMA_REQUEST_BODY_TOO_LARGE",
+      `Request body exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
+    );
+  }
+
+  const reader = request.body?.getReader();
+
+  if (!reader) {
+    throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
+  }
+
+  let body = new Uint8Array(0);
+  let size = 0;
+
   try {
-    return await request.json();
+    while (true) {
+      const chunk = await reader.read();
+
+      if (chunk.done) {
+        break;
+      }
+
+      const nextSize = size + chunk.value.byteLength;
+
+      if (nextSize > CMA_MAX_EVENT_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new CmaHttpRequestError(
+          413,
+          "CMA_REQUEST_BODY_TOO_LARGE",
+          `Request body exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
+        );
+      }
+
+      if (nextSize > body.byteLength) {
+        const grown = new Uint8Array(
+          Math.min(CMA_MAX_EVENT_BYTES, Math.max(nextSize, body.byteLength * 2, 1_024)),
+        );
+        grown.set(body);
+        body = grown;
+      }
+
+      body.set(chunk.value, size);
+      size = nextSize;
+    }
+  } catch (error) {
+    if (error instanceof CmaHttpRequestError) {
+      throw error;
+    }
+
+    throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
+  } finally {
+    reader.releaseLock();
+  }
+
+  try {
+    return JSON.parse(new TextDecoder().decode(body.subarray(0, size))) as unknown;
   } catch {
     throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
   }
 }
 
-function assertHttpsHosts(hosts: readonly string[], field: string): void {
-  for (const host of hosts) {
-    if (!host.startsWith("https://")) {
+function normalizeHttpsHosts(hosts: readonly string[], field: string): string[] {
+  return hosts.map((host) => {
+    let url: URL;
+
+    try {
+      url = new URL(host);
+    } catch {
       throw new CmaHttpRequestError(
         400,
         "CMA_INVALID_FIELD",
-        `CMA field ${field} entries must start with https://.`,
+        `CMA field ${field} entries must be HTTPS origins.`,
       );
     }
-  }
+
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.length === 0 ||
+      url.hostname.includes("*") ||
+      url.username.length > 0 ||
+      url.password.length > 0 ||
+      url.pathname !== "/" ||
+      url.search.length > 0 ||
+      url.hash.length > 0
+    ) {
+      throw new CmaHttpRequestError(
+        400,
+        "CMA_INVALID_FIELD",
+        `CMA field ${field} entries must be HTTPS origins.`,
+      );
+    }
+
+    return url.origin;
+  });
 }
 
 function readEnvironmentPackages(input: Record<string, unknown>): CmaEnvironmentPackages {
@@ -384,8 +477,10 @@ function readEnvironmentNetworking(input: unknown): CmaEnvironmentNetworking {
 
   if (type === "limited") {
     assertSupportedFields(networking, environmentLimitedNetworkingFields, "config.networking.");
-    const allowedHosts = readOptionalStringArray(networking, "allowed_hosts") ?? [];
-    assertHttpsHosts(allowedHosts, "config.networking.allowed_hosts");
+    const allowedHosts = normalizeHttpsHosts(
+      readOptionalStringArray(networking, "allowed_hosts") ?? [],
+      "config.networking.allowed_hosts",
+    );
 
     return {
       allow_mcp_servers: readBoolean(networking, "allow_mcp_servers", false),
@@ -472,12 +567,54 @@ function readCreateSessionInput(input: unknown): CmaCreateSessionInput {
   };
 }
 
+function keepClaimAlive(
+  store: CmaStore,
+  sessionId: string,
+  commandId: string,
+  initialLease: CmaInboundEventLease,
+): { readonly signal: AbortSignal; stop(): void } {
+  const stopped = new AbortController();
+  const failed = new AbortController();
+
+  void (async () => {
+    let lease = initialLease;
+
+    while (!stopped.signal.aborted) {
+      await sleepPromise(
+        Math.max(1_000, Date.parse(lease.renewAfter) - Date.now()),
+        stopped.signal,
+      );
+      lease = await store.renewInboundEventClaim({
+        commandId,
+        leaseId: lease.id,
+        sessionId,
+      });
+    }
+  })().catch((error: unknown) => {
+    if (!stopped.signal.aborted) {
+      failed.abort(error);
+    }
+  });
+
+  return {
+    signal: failed.signal,
+    stop: () => stopped.abort(),
+  };
+}
+
 function readPathSegments(request: Request): readonly string[] {
-  const url = new URL(request.url);
-  return url.pathname
-    .split("/")
-    .filter((segment) => segment.length > 0)
-    .map((segment) => decodeURIComponent(segment));
+  try {
+    return new URL(request.url).pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => decodeURIComponent(segment));
+  } catch {
+    throw new CmaHttpRequestError(
+      400,
+      "CMA_INVALID_PATH",
+      "Request path must use valid percent encoding.",
+    );
+  }
 }
 
 async function handleAgents(
@@ -592,13 +729,26 @@ async function handleGetSessionEvents(
     return createErrorResponse(404, "CMA_SESSION_NOT_FOUND", "Session was not found.");
   }
 
-  const events = await store.listSessionEvents(sessionId);
-
   if (request.headers.get("accept")?.includes("text/event-stream") === true) {
-    return createSseResponse(events, store.watchSessionEvents(sessionId));
+    const afterCursor = request.headers.get("last-event-id")?.trim();
+
+    if (afterCursor !== undefined && afterCursor.length > 0 && !isDriverId(afterCursor)) {
+      throw new CmaHttpRequestError(
+        400,
+        "CMA_INVALID_LAST_EVENT_ID",
+        "Last-Event-ID must be a ULID.",
+      );
+    }
+
+    return createSseResponse(
+      store.streamSessionEvents(
+        sessionId,
+        afterCursor === undefined || afterCursor.length === 0 ? undefined : afterCursor,
+      ),
+    );
   }
 
-  return createDataResponse(events);
+  return createDataResponse(await store.listSessionEvents(sessionId));
 }
 
 async function handlePostSessionEvent(
@@ -616,30 +766,73 @@ async function handlePostSessionEvent(
   const body = await readJsonBody(request);
   const event = parseCmaInboundEvent(body);
   const command = projectCmaInboundToDriverCommand(event);
-  let commandResult: RuntimeCommandResult | null = null;
-
-  try {
-    commandResult = (await dispatchDriverCommand({ command, event, session })) ?? null;
-  } catch (error) {
-    throw new CmaHttpDriverDispatchError(error);
-  }
-
-  const record = await store.appendInboundEvent({
+  const claim = await store.claimInboundEvent({
     command,
-    commandResult,
     event,
     sessionId,
   });
 
-  return createDataResponse(
-    {
-      command,
-      event: record,
-      result: commandResult,
-      status: "accepted",
-    },
-    202,
-  );
+  if (!claim.claimed) {
+    if (claim.event.commandStatus === "failed") {
+      throw new CmaHttpDriverDispatchError();
+    }
+
+    return createDataResponse(
+      {
+        command,
+        event: claim.event,
+        result: claim.event.commandResult,
+        status: "accepted",
+      },
+      202,
+    );
+  }
+
+  const keeper = keepClaimAlive(store, sessionId, command.commandId, claim.lease);
+  const signal = AbortSignal.any([request.signal, keeper.signal]);
+
+  try {
+    let commandResult: RuntimeCommandResult | null;
+
+    try {
+      signal.throwIfAborted();
+      commandResult = (await dispatchDriverCommand({ command, event, session, signal })) ?? null;
+      signal.throwIfAborted();
+    } catch {
+      if (!keeper.signal.aborted) {
+        await store
+          .settleInboundEvent({
+            commandId: command.commandId,
+            commandResult: null,
+            leaseId: claim.lease.id,
+            sessionId,
+            status: "failed",
+          })
+          .catch(() => undefined);
+      }
+      throw new CmaHttpDriverDispatchError();
+    }
+
+    const record = await store.settleInboundEvent({
+      commandId: command.commandId,
+      commandResult,
+      leaseId: claim.lease.id,
+      sessionId,
+      status: "completed",
+    });
+
+    return createDataResponse(
+      {
+        command,
+        event: record,
+        result: commandResult,
+        status: "accepted",
+      },
+      202,
+    );
+  } finally {
+    keeper.stop();
+  }
 }
 
 async function handleSessions(
@@ -701,55 +894,39 @@ async function handleSessions(
   return createNotFoundResponse();
 }
 
-function formatSseRecord(record: CmaSessionEventRecord): string {
-  return `id: ${record.id}\nevent: ${record.event.type}\ndata: ${JSON.stringify(record)}\n\n`;
-}
+function createSseResponse(events: AsyncIterable<CmaSessionEventRecord>): Response {
+  let cleanupPromise: Promise<void> | undefined;
+  let iterator: AsyncIterator<CmaSessionEventRecord> | undefined;
+  const cleanup = () =>
+    (cleanupPromise ??= (async () => {
+      await iterator?.return?.();
+    })());
 
-function createSseResponse(
-  replayEvents: readonly CmaSessionEventRecord[],
-  liveEvents: AsyncIterable<CmaSessionEventRecord>,
-): Response {
-  const encoder = new TextEncoder();
-  let cancelled = false;
-  let iterator: AsyncIterator<CmaSessionEventRecord> | null = null;
-
-  const body = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
-        for (const record of replayEvents) {
-          controller.enqueue(encoder.encode(formatSseRecord(record)));
-        }
-
-        iterator = liveEvents[Symbol.asyncIterator]();
-
-        for (;;) {
-          if (cancelled) {
-            break;
-          }
-
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          iterator ??= events[Symbol.asyncIterator]();
           const result = await iterator.next();
 
           if (result.done) {
-            break;
+            await cleanup();
+            controller.close();
+            return;
           }
 
-          controller.enqueue(encoder.encode(formatSseRecord(result.value)));
-        }
-
-        if (!cancelled) {
-          controller.close();
-        }
-      } catch (error) {
-        if (!cancelled) {
+          controller.enqueue(encodeCmaSseRecord(result.value));
+        } catch (error) {
+          await cleanup().catch(() => undefined);
           controller.error(error);
         }
-      }
+      },
+      async cancel() {
+        await cleanup();
+      },
     },
-    cancel() {
-      cancelled = true;
-      void iterator?.return?.();
-    },
-  });
+    { highWaterMark: 0 },
+  );
 
   return new Response(body, {
     headers: {
@@ -760,11 +937,11 @@ function createSseResponse(
   });
 }
 
-function messageFromUnknown(error: unknown): string {
-  return error instanceof Error ? error.message : "Unknown error.";
-}
-
 function createThrownErrorResponse(error: unknown): Response {
+  if (error instanceof CmaInvalidEventError) {
+    return createErrorResponse(400, "CMA_INVALID_EVENT", error.message);
+  }
+
   if (error instanceof CmaUnsupportedFieldError) {
     return createErrorResponse(400, "CMA_UNSUPPORTED_FIELD", error.message, {
       field: error.field,
@@ -789,11 +966,17 @@ function createThrownErrorResponse(error: unknown): Response {
     });
   }
 
+  if (error instanceof CmaSessionTerminatedError) {
+    return createErrorResponse(409, "CMA_SESSION_TERMINATED", error.message, {
+      id: error.id,
+    });
+  }
+
   if (error instanceof CmaHttpDriverDispatchError) {
     return createErrorResponse(
       502,
       "CMA_DRIVER_COMMAND_DISPATCH_FAILED",
-      messageFromUnknown(error.source),
+      "Driver command dispatch failed.",
     );
   }
 
@@ -803,7 +986,11 @@ function createThrownErrorResponse(error: unknown): Response {
     });
   }
 
-  return createErrorResponse(500, "CMA_INTERNAL_ERROR", messageFromUnknown(error));
+  if (error instanceof RangeError) {
+    return createErrorResponse(413, "CMA_RESOURCE_LIMIT", error.message);
+  }
+
+  return createErrorResponse(500, "CMA_INTERNAL_ERROR", "Internal server error.");
 }
 
 export function createCmaHttpHandler(options: CmaHttpHandlerOptions): CmaHttpHandler {
