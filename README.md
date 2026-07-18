@@ -70,11 +70,23 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - `agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
 - `agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
 - `agent-driver/events`: canonical driver event envelope contracts.
+- `agent-driver/contract`: vendor-neutral Authority, Preview, control, synchronization, and JSON-RPC contracts.
 - `agent-driver/orpc`: Driver-to-`DriverInstance` ORPC wire input/output contracts.
 - `agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
 - `agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.
 
-Every public entry has a matching declaration file under `dist/types`.
+## Runtime Contract
+
+The Contract is the vendor-neutral state and control boundary between the host and provider executors.
+
+- **Stable model.** A `Session` owns ordered `Run` work, each Run owns observable `Item` values, and `Interaction` represents input required from outside the executor.
+- **Authority and Preview.** Authority is the only durable truth and advances through atomic full-entity mutations, while Preview is a bounded best-effort overlay for streaming content that may be merged or dropped and is always repairable from Authority.
+- **Single writer.** The host coordinator serializes authoritative state, lifecycle timestamps, user facts, and interaction resolution, while executors propose updates under fenced leases and retry with stable mutation or command IDs.
+- **Monotonic lifecycle.** Session, Run, Item, and Interaction follow small one-way state machines, terminal state never reopens, and display state is derived instead of persisted.
+- **Bounded recovery.** Queues, payloads, leases, waits, and cleanup work have hard limits, durable state survives coordinator restart or hibernation, and failed cleanup remains owned for idempotent retry.
+- **Closed core.** Unknown control values are rejected, while named capabilities, provenance, and namespaced extensions carry provider-specific behavior without weakening core invariants.
+
+Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qualified ISO 8601 strings with UTC as the default.
 
 ## Quick Start
 
