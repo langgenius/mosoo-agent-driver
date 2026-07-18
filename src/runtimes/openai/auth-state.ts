@@ -1,7 +1,6 @@
 import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { isTruthy } from "../../core/truthiness";
 import type { JsonObject, JsonValue } from "../../protocol/json";
 import { isJsonObject } from "../../protocol/json";
 import { mergeProviderOptions } from "../provider-options";
@@ -42,7 +41,7 @@ function readOpenAiApiKey(env: NodeJS.ProcessEnv): string | null {
 
 function readEnvVar(env: NodeJS.ProcessEnv, key: string): string | null {
   const value = env[key]?.trim();
-  return isTruthy(value) ? value : null;
+  return value || null;
 }
 
 function toTomlString(value: string): string {
@@ -152,7 +151,7 @@ export async function materializeOpenAiApiKeyAuthState(
   const authJsonPath = join(input.runtimeHome, "auth.json");
   const apiKey = readOpenAiApiKey(input.env);
 
-  if (!isTruthy(apiKey)) {
+  if (!apiKey) {
     return {
       authJsonPath,
       hasApiKey: false,

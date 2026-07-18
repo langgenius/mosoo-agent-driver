@@ -25,7 +25,7 @@ function toBearerTokenEnvName(index: number): string {
 }
 
 /**
- * Translate authorized boot MCP servers into the OpenAI runtime (Codex)
+ * Translate authorized boot MCP servers into the OpenAI runtime.
  * `config.toml` shape. Only `authorizationState === "active"` servers are
  * wired; unavailable servers are skipped, mirroring the Claude and ACP
  * backends. The proxy grant is passed through a dedicated environment variable

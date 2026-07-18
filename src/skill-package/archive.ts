@@ -31,7 +31,7 @@ interface ZipArchiveMetadata {
 const DEFAULT_ZIP_OPTIONS: ZipOptions = {
   level: 6,
 };
-const DEFAULT_ZIP_LEVEL = 6 as const;
+const DEFAULT_ZIP_LEVEL = 6;
 const FIXED_ZIP_MTIME = new Date("1980-01-01T00:00:00.000Z");
 const UNIX_ZIP_OS = 3;
 const EXECUTABLE_FILE_MODE = 0o10_0755;
