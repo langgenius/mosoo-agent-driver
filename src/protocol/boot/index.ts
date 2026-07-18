@@ -43,10 +43,9 @@ export type {
   DriverOrigin,
 } from "./host-snapshot";
 
-export const DRIVER_PROTOCOL_VERSION = 1 as const;
-export const DRIVER_CONTROL_PORT_MIN = 20_000 as const;
-export const DRIVER_CONTROL_PORT_MAX = 59_999 as const;
-export const DRIVER_CONTROL_PORT_COUNT = 40_000 as const;
+export const DRIVER_PROTOCOL_VERSION = 1;
+export const DRIVER_CONTROL_PORT_MIN = 20_000;
+export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";
 export const DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD_FILE";
 
