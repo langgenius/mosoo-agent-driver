@@ -39,7 +39,8 @@ RUN OPENAI_RUNTIME_PACKAGE="@openai/co""dex@${OPENAI_RUNTIME_VERSION}" \
     && CLAUDE_ARCH_PACKAGE="$(node -p "'@anthropic-ai/claude-agent-sdk-' + (process.arch === 'arm64' ? 'linux-arm64' : 'linux-x64')")" \
     && CLAUDE_BIN="/usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/node_modules/${CLAUDE_ARCH_PACKAGE}/claude" \
     && test -x "$CLAUDE_BIN" \
-    && ln -sf "$CLAUDE_BIN" /usr/local/bin/mosoo-claude-code
+    && ln -sf "$CLAUDE_BIN" /usr/local/bin/mosoo-claude-code \
+    && npm cache clean --force
 
 ENV MOSOO_CLAUDE_CODE_EXECUTABLE=/usr/local/bin/mosoo-claude-code
 ENV MOSOO_ACP_FALLBACK_COMMAND=opencode
