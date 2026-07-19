@@ -7,9 +7,9 @@ import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId } from "../src/protocol/id";
 import { AcpTerminalManager } from "../src/runtimes/acp/acp-terminal-manager";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
-import { driverBootPayload } from "./driver-boot-payload-fixture";
+import { driverStartInput } from "./driver-boot-payload-fixture";
 
 function createHarness(
   onPush: ((reason: string, events: DriverEventInput[]) => Promise<void>) | undefined = undefined,
@@ -23,9 +23,9 @@ function createHarness(
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => {} },
+    eventSink: { pushEvents: async () => ({ accepted: [] }) },
     logger,
-    payload: driverBootPayload,
+    payload: driverStartInput,
     permission: { request: async () => "reject_once" },
   });
   const manager = new AcpTerminalManager({
@@ -161,7 +161,9 @@ describe("ACP terminal manager", () => {
     let terminalId: string | undefined;
     const harness = createHarness(async (reason, events) => {
       if (reason === "driver.acp.terminal.created") {
-        terminalId = events[0]?.payload.terminalId as string;
+        terminalId = (events[0]?.payload as Record<string, unknown> | undefined)?.[
+          "terminalId"
+        ] as string;
         entered.resolve();
         await release.promise;
       }
@@ -292,7 +294,9 @@ describe("ACP terminal manager", () => {
     const harness = createHarness(
       async (reason, events) => {
         if (reason === "driver.acp.terminal.created") {
-          terminalId = events[0]?.payload.terminalId as string;
+          terminalId = (events[0]?.payload as Record<string, unknown> | undefined)?.[
+            "terminalId"
+          ] as string;
           entered.resolve();
           await releaseCreated.promise;
         }
@@ -509,8 +513,11 @@ describe("ACP terminal manager", () => {
         }),
       ).rejects.toThrow();
       childPid = Number(await Bun.file(pidPath).text());
-      const terminalId = harness.events.find((event) => event.kind === "terminal.created")?.payload
-        .terminalId;
+      const terminalId = (
+        harness.events.find((event) => event.kind === "terminal.created")?.payload as
+          | Record<string, unknown>
+          | undefined
+      )?.["terminalId"];
 
       expect(terminalId).toBeString();
       expect(() => harness.manager.output({ terminalId })).not.toThrow();

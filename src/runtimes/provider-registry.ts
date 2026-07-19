@@ -3,7 +3,7 @@ import type { DriverRuntime, DriverRuntimeTransport } from "../protocol/runtime"
 import type { DriverStartInput } from "../protocol/start";
 import type { DriverCapability } from "../runtime-command";
 import { AcpDriverBackend } from "./acp/acp-driver-backend";
-import type { AgentDriverBackend } from "./agent-driver-backend";
+import type { AgentDriverBackend } from "../core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "./claude/agent-sdk-driver-backend";
 import { OpenAiAppServerDriverBackend } from "./openai/app-server-driver-backend";
 

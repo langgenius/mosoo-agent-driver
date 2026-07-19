@@ -207,7 +207,7 @@ function readOpenCodeVersion(command: string): string {
 }
 
 function toOpenCodeModelId(model: string): string {
-  const providerConfig = liveProviderConfig ?? PROVIDER_CONFIGS.openai;
+  const providerConfig: OpenCodeLiveProviderConfig = liveProviderConfig ?? PROVIDER_CONFIGS.openai;
   const providerId = providerConfig.openCodeProviderId ?? providerConfig.id;
 
   return model.includes("/") ? model : `${providerId}/${model}`;
@@ -271,10 +271,8 @@ function createLiveHostIntegrationSnapshot(input: {
       additionalDirectories: [],
       context: {
         ...driverBootPayload.execution.session.context,
-        appAccessSnapshot: { entries: [] },
         homePath: input.homePath,
         sessionOrganizationPath: input.sharedRootPath,
-        spaceAliases: [],
       },
       cwd: input.cwd,
       mcpServers: [],
@@ -291,6 +289,8 @@ function createLiveStartInput(input: {
   homePath: string;
   sharedRootPath: string;
 }): DriverStartInput {
+  const providerConfig = requireLiveProviderConfig();
+
   return {
     ...bootPayload,
     execution: {
@@ -299,18 +299,17 @@ function createLiveStartInput(input: {
         variables: {
           ...bootPayload.execution.environment.variables,
           OPENCODE_CONFIG_CONTENT: createOpenCodeConfig(),
-          [liveProviderConfig.providerApiKeyEnv]: input.apiKey,
+          [providerConfig.providerApiKeyEnv]: input.apiKey,
         },
       },
       model: readLiveModel(),
-      provider: liveProviderConfig.id,
+      provider: providerConfig.id,
       session: {
         ...bootPayload.execution.session,
         additionalDirectories: [],
         cwd: input.cwd,
         homePath: input.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: input.sharedRootPath,
       },
@@ -355,11 +354,28 @@ const liveTest =
     ? test
     : test.skip;
 
+function requireLiveProviderConfig(): OpenCodeLiveProviderConfig {
+  if (liveProviderConfig === null) {
+    throw new Error(`Set ${LIVE_ENABLED_ENV}=1 to run OpenCode live tests.`);
+  }
+
+  return liveProviderConfig;
+}
+
+function requireLiveApiKey(): string {
+  if (liveApiKey === null) {
+    throw new Error(`Set ${LIVE_API_KEY_ENV} or the provider API key to run live tests.`);
+  }
+
+  return liveApiKey;
+}
+
 describe("OpenCode ACP live provider", () => {
   liveTest(
     "sends ping through the ACP fallback driver and receives pong from OpenCode",
     async () => {
       expect(liveApiKey).toBeString();
+      const providerConfig = requireLiveProviderConfig();
       const paths = await createLiveDriverPaths();
       const runtimeDetails = {
         command: liveCommand,
@@ -367,7 +383,7 @@ describe("OpenCode ACP live provider", () => {
         keySource: liveApiKeySource ?? "none",
         model: readLiveModel(),
         openCodeVersion: readOpenCodeVersion(liveCommand),
-        provider: liveProviderConfig.id,
+        provider: providerConfig.id,
         smallModel: readLiveSmallModel(),
       };
       logLiveStatus("starting live smoke", runtimeDetails);
@@ -377,13 +393,13 @@ describe("OpenCode ACP live provider", () => {
         sharedRootPath: paths.sharedRootPath,
       });
       logLiveStatus("OpenCode config prepared", {
-        apiKeyEnv: liveProviderConfig.providerApiKeyEnv,
+        apiKeyEnv: providerConfig.providerApiKeyEnv,
         configModel: toOpenCodeModelId(readLiveModel()),
         configSmallModel: toOpenCodeModelId(readLiveSmallModel()),
-        enabledProvider: liveProviderConfig.id,
+        enabledProvider: providerConfig.id,
       });
       const startInput = createLiveStartInput({
-        apiKey: liveApiKey,
+        apiKey: requireLiveApiKey(),
         cwd: paths.cwd,
         homePath: paths.homePath,
         sharedRootPath: paths.sharedRootPath,
@@ -411,9 +427,7 @@ describe("OpenCode ACP live provider", () => {
           hostIntegration: {
             snapshot: async () => {
               logLiveStatus("host integration snapshot requested");
-              logLiveStatus("host integration snapshot prepared", {
-                accessEntries: hostSnapshot.sessionContext.appAccessSnapshot.entries.length,
-              });
+              logLiveStatus("host integration snapshot prepared");
               return hostSnapshot;
             },
           },

@@ -1,0 +1,161 @@
+import type { WarmQuery } from "@anthropic-ai/claude-agent-sdk";
+
+import type { DriverStartInput } from "../../protocol/start";
+import { raceWithAbort } from "../../utils/async";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
+import type { createClaudeQueryOptions } from "./agent-sdk-query-options";
+
+const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
+
+interface ClaudePrewarmState {
+  readonly abortController: AbortController;
+  readonly detach: () => void;
+  query: WarmQuery | null;
+}
+
+export interface ClaudeAgentSdkPrewarmOptions {
+  readonly createQueryOptions: typeof createClaudeQueryOptions;
+  readonly getNativeSessionId: () => string | null;
+  readonly payload: DriverStartInput;
+  readonly startup: (input: {
+    options: Awaited<ReturnType<typeof createClaudeQueryOptions>>;
+  }) => Promise<WarmQuery>;
+}
+
+export interface ClaudePrewarmTake {
+  readonly abortController: AbortController;
+  readonly warmQuery: WarmQuery | null;
+}
+
+/**
+ * Owns the optional extra CLI process used to reduce first-turn latency.
+ * Prewarm remains opt-in because a second CLI can exceed small container limits.
+ */
+export class ClaudeAgentSdkPrewarm {
+  readonly #createQueryOptions: typeof createClaudeQueryOptions;
+  readonly #getNativeSessionId: () => string | null;
+  readonly #payload: DriverStartInput;
+  readonly #startup: ClaudeAgentSdkPrewarmOptions["startup"];
+  #state: ClaudePrewarmState | null = null;
+  #stopped = false;
+  #task: Promise<void> | null = null;
+
+  constructor(options: ClaudeAgentSdkPrewarmOptions) {
+    this.#createQueryOptions = options.createQueryOptions;
+    this.#getNativeSessionId = options.getNativeSessionId;
+    this.#payload = options.payload;
+    this.#startup = options.startup;
+  }
+
+  start(context: AgentDriverContext, signal: AbortSignal): void {
+    if (readProcessEnvString(CLAUDE_PREWARM_ENV) !== "1" || this.#stopped) {
+      return;
+    }
+
+    const task = this.#run(context, signal);
+    this.#task = task;
+    const release = () => {
+      if (this.#task === task) {
+        this.#task = null;
+      }
+    };
+    void task.then(release, release);
+  }
+
+  take(): ClaudePrewarmTake {
+    const state = this.#state;
+    this.#state = null;
+    state?.detach();
+
+    if (state?.query) {
+      return {
+        abortController: state.abortController,
+        warmQuery: state.query,
+      };
+    }
+
+    state?.abortController.abort("driver.claude.prewarm.superseded");
+    return {
+      abortController: new AbortController(),
+      warmQuery: null,
+    };
+  }
+
+  async stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void> {
+    this.#stopped = true;
+    const state = this.#state;
+    const task = this.#task;
+    this.#state = null;
+    state?.detach();
+    state?.abortController.abort(reason);
+
+    try {
+      state?.query?.close();
+    } catch (error) {
+      context.logger.debug("driver.claude.prewarm.close_failed", {
+        message: toErrorMessage(error, "prewarm close failed"),
+        reason,
+      });
+    }
+
+    if (task === null) {
+      signal.throwIfAborted();
+      return;
+    }
+
+    await raceWithAbort(task, signal);
+  }
+
+  async #run(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
+    const startedAtMs = Date.now();
+    const abortController = new AbortController();
+    const onAbort = () => abortController.abort(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    const state: ClaudePrewarmState = {
+      abortController,
+      detach: () => signal.removeEventListener("abort", onAbort),
+      query: null,
+    };
+    this.#state = state;
+
+    try {
+      const options = await this.#createQueryOptions({
+        abortController,
+        context,
+        nativeSessionId: this.#getNativeSessionId(),
+        payload: this.#payload,
+      });
+
+      if (this.#stopped || abortController.signal.aborted || this.#state !== state) {
+        return;
+      }
+
+      const warmQuery = await this.#startup({ options });
+
+      if (this.#stopped || abortController.signal.aborted || this.#state !== state) {
+        warmQuery.close();
+        return;
+      }
+
+      state.query = warmQuery;
+      context.logger.debug("driver.claude.prewarm.ready", {
+        prewarmMs: Date.now() - startedAtMs,
+      });
+    } catch (error) {
+      if (!abortController.signal.aborted && !this.#stopped) {
+        context.logger.debug("driver.claude.prewarm.failed", {
+          message: toErrorMessage(error, "Claude prewarm failed."),
+        });
+      }
+    } finally {
+      state.detach();
+      if (this.#state === state && state.query === null) {
+        this.#state = null;
+      }
+    }
+  }
+}

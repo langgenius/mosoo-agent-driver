@@ -10,7 +10,7 @@ import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 

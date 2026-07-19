@@ -4,16 +4,16 @@ default:
 fmt:
     vp fmt .
 
-lint: fmt
+lint:
     vp run lint
 
-tc: lint
+tc:
     vp run tc
 
-test: lint
+test:
     vp run test
 
-build: test
+build:
     vp run build
 
 check:

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { parseDriverBootPayload } from "../src/protocol/boot";
+import type { DriverExecutionEnvironment } from "../src/protocol/boot";
 import {
   DRIVER_BOOT_PAYLOAD_ENV_NAME,
   DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME,
@@ -20,7 +21,8 @@ function withEnvironmentPaths(paths: unknown) {
 
 describe("buildRuntimeChildProcessEnv", () => {
   test("keeps the final environment and removes driver-only boot payload", () => {
-    const env = buildRuntimeChildProcessEnv(driverBootPayload.execution.environment.paths, {
+    const environment: DriverExecutionEnvironment = driverBootPayload.execution.environment;
+    const env = buildRuntimeChildProcessEnv(environment.paths, {
       [DRIVER_BOOT_PAYLOAD_ENV_NAME]: "large-private-payload",
       [DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME]: "large-private-payload-file",
       INHERITED_VAR: "keep",

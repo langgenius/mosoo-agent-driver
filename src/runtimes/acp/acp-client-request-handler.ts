@@ -20,15 +20,14 @@ import type {
 } from "@agentclientprotocol/sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { shouldIgnoreReplay } from "./acp-event-translator";
 import type { AcpPermissionOption, AcpTurnEventState } from "./acp-event-translator";
 import { AcpFileSystem } from "./acp-file-system";
+import { AcpPathScope } from "./acp-path-scope";
+import { AcpSessionUpdateInbox, type AcpSessionUpdateScope } from "./acp-session-update-inbox";
 import { AcpTerminalManager } from "./acp-terminal-manager";
 import { isRecord, raceWithAbort, readNonEmptyString, stringifyForDisplay } from "./acp-types";
-
-const MAX_PENDING_UPDATES = 1_024;
-const MAX_PENDING_UPDATE_BYTES = 32 * 1_024 * 1_024;
 
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
@@ -45,77 +44,41 @@ export class AcpClientRequestHandler {
   readonly #fileSystem: AcpFileSystem;
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
-  readonly #onUpdateFailure: AcpClientRequestHandlerOptions["onUpdateFailure"];
-  #pendingUpdateBytes = 0;
-  #pendingUpdates = 0;
   readonly #push: AcpClientRequestHandlerOptions["push"];
-  #replayingSession = false;
   #stopping = false;
-  #updatesClosed = false;
-  #updateTail: Promise<void> = Promise.resolve();
-  #updateFailure: Error | null = null;
-  #updatesSuppressed = false;
+  readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
   readonly #turnEvents: AcpTurnEventState;
 
   constructor(options: AcpClientRequestHandlerOptions) {
     this.#isCancelling = options.isCancelling;
     this.#nativeSessionId = options.nativeSessionId;
-    this.#onUpdateFailure = options.onUpdateFailure;
     this.#push = options.push;
     this.#turnEvents = options.turnEvents;
+    const pathScope = new AcpPathScope({
+      allowedRoots: options.allowedRoots,
+      cwd: options.cwd,
+    });
     this.#fileSystem = new AcpFileSystem({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
+      pathScope,
     });
     this.#terminalManager = new AcpTerminalManager({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
       env: options.env,
+      pathScope,
       push: options.push,
+    });
+    this.#updateInbox = new AcpSessionUpdateInbox({
+      apply: (context, notification, scope) => this.#applyUpdate(context, notification, scope),
+      onFailure: options.onUpdateFailure,
     });
   }
 
   enqueueUpdate(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
-    if (this.#updatesClosed) {
-      return Promise.reject(new Error("ACP session update ingress is closed."));
-    }
-
-    if (this.#updateFailure !== null) {
-      return Promise.reject(this.#updateFailure);
-    }
-
-    const bytes = Buffer.byteLength(JSON.stringify(notification), "utf8");
-
-    if (
-      this.#pendingUpdates >= MAX_PENDING_UPDATES ||
-      bytes > MAX_PENDING_UPDATE_BYTES - this.#pendingUpdateBytes
-    ) {
-      const error = new Error("ACP session update queue limit exceeded.");
-      this.#failUpdates(error);
-      return Promise.reject(error);
-    }
-
-    this.#pendingUpdateBytes += bytes;
-    this.#pendingUpdates += 1;
-    const replaying = this.#replayingSession;
-    const suppressed = this.#updatesSuppressed;
-    const update = this.#updateTail
-      .then(() => {
-        if (this.#updateFailure !== null) {
-          throw this.#updateFailure;
-        }
-
-        return this.#applyUpdate(context, notification, { replaying, suppressed });
-      })
-      .finally(() => {
-        this.#pendingUpdateBytes -= bytes;
-        this.#pendingUpdates -= 1;
-      });
-    this.#updateTail = update.catch((error: unknown) => {
-      this.#failUpdates(error);
-    });
-    return update;
+    return this.#updateInbox.enqueue(context, notification);
   }
 
   async readTextFile(
@@ -148,7 +111,7 @@ export class AcpClientRequestHandler {
     }
 
     try {
-      if (!this.#updatesSuppressed) {
+      if (!this.#updateInbox.isSuppressed()) {
         await raceWithAbort(this.drainUpdates(), signal);
       }
 
@@ -213,56 +176,19 @@ export class AcpClientRequestHandler {
 
   async closeUpdates(): Promise<void> {
     this.#stopping = true;
-    this.#updatesClosed = true;
-    await this.drainUpdates();
+    await this.#updateInbox.close();
   }
 
   async drainUpdates(): Promise<void> {
-    for (;;) {
-      const tail = this.#updateTail;
-      await tail;
-      await Promise.resolve();
-
-      if (tail !== this.#updateTail) {
-        continue;
-      }
-
-      if (this.#updateFailure !== null) {
-        throw this.#updateFailure;
-      }
-
-      return;
-    }
+    await this.#updateInbox.drain();
   }
 
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.#replayingSession;
-    this.#replayingSession = true;
-
-    try {
-      return await operation();
-    } finally {
-      try {
-        await this.drainUpdates();
-      } finally {
-        this.#replayingSession = previous;
-      }
-    }
+    return this.#updateInbox.withReplay(operation);
   }
 
   async suppressUpdates<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.#updatesSuppressed;
-    this.#updatesSuppressed = true;
-
-    try {
-      return await operation();
-    } finally {
-      try {
-        await this.drainUpdates();
-      } finally {
-        this.#updatesSuppressed = previous;
-      }
-    }
+    return this.#updateInbox.suppress(operation);
   }
 
   async #requestPermission(
@@ -271,7 +197,7 @@ export class AcpClientRequestHandler {
     params: RequestPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
-    if (this.#updatesSuppressed) {
+    if (this.#updateInbox.isSuppressed()) {
       return { outcome: { outcome: "cancelled" } };
     }
 
@@ -306,21 +232,10 @@ export class AcpClientRequestHandler {
     };
   }
 
-  #failUpdates(cause: unknown): void {
-    if (this.#updateFailure !== null) {
-      return;
-    }
-
-    const error =
-      cause instanceof Error ? cause : new Error("ACP session update handling failed.", { cause });
-    this.#updateFailure = error;
-    this.#onUpdateFailure(error);
-  }
-
   async #applyUpdate(
     context: AgentDriverContext,
     params: SessionNotification,
-    scope: { readonly replaying: boolean; readonly suppressed: boolean },
+    scope: AcpSessionUpdateScope,
   ): Promise<void> {
     this.#assertSession("session/update", params);
 

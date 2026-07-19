@@ -11,7 +11,7 @@ import type { DriverBootMcpServer } from "../../protocol/boot";
 import type { DriverBuiltInToolName } from "../../protocol/boot";
 import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { toMcpServerKey } from "../mcp/server-key";
 import { mergeProviderOptions } from "../provider-options";

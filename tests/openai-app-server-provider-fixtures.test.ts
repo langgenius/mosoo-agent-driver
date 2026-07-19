@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import {
   isServerRequestMethod,
@@ -16,7 +16,7 @@ import {
 } from "../src/runtimes/openai/generated/app-server-protocol";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/generated/app-server-protocol";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
-import { driverBootPayload as bootPayload } from "./driver-boot-payload-fixture";
+import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 interface EventBatch {
   readonly events: DriverEventInput[];
@@ -147,7 +147,7 @@ function normalizeBridgeValue(value: unknown, fieldName?: string): unknown {
 }
 
 function normalizeBridgeEvent(event: DriverEventInput): Record<string, unknown> {
-  const eventRecord = event as Record<string, unknown>;
+  const eventRecord = event as unknown as Record<string, unknown>;
   const normalized: Record<string, unknown> = {
     kind: event.kind,
     payload: normalizeBridgeValue(event.payload),
@@ -171,7 +171,7 @@ function createHarness() {
   });
   const context: AgentDriverContext = createAgentDriverContext({
     eventSink: {
-      pushEvents: async () => {},
+      pushEvents: async () => ({ accepted: [] }),
     },
     logger,
     payload: bootPayload,

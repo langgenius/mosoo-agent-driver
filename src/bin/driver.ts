@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { readDriverBootPayload } from "../boot/read-driver-boot-payload";
-import { DriverProcess } from "../core/driver-process";
+import { DriverProcess } from "./driver-process";
 import { logDriverFatal } from "../infrastructure/logging/driver-logger";
 import { isSupportedDriverRuntime, isSupportedDriverRuntimeTransport } from "../protocol/runtime";
 

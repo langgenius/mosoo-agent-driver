@@ -1,12 +1,11 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { isAbsolute, resolve } from "node:path";
 
 import type { DriverEventInput } from "../../protocol/events";
 import { createDriverId } from "../../protocol/id";
 import { settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { killProcessGroup } from "../child-process";
 import {
   isRecord,
@@ -17,6 +16,7 @@ import {
   readString,
 } from "./acp-types";
 import type { JsonObject } from "./acp-types";
+import { AcpPathScope } from "./acp-path-scope";
 
 interface AcpTerminalState {
   committed: boolean;
@@ -42,6 +42,7 @@ interface AcpTerminalManagerOptions {
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
   readonly maxTerminals?: number | undefined;
+  readonly pathScope?: AcpPathScope | undefined;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
 }
 
@@ -59,22 +60,18 @@ class AcpTerminalCleanupError extends Error {
 }
 
 export class AcpTerminalManager {
-  readonly #allowedRoots: readonly string[];
-  readonly #cwd: string;
   readonly #env: Readonly<Record<string, string>>;
   readonly #maxTerminals: number;
+  readonly #pathScope: AcpPathScope;
   readonly #push: AcpTerminalManagerOptions["push"];
   readonly #createTasks = new Set<Promise<unknown>>();
   #stopping = false;
   readonly #terminals = new Map<string, AcpTerminalState>();
 
   constructor(options: AcpTerminalManagerOptions) {
-    this.#allowedRoots = [options.cwd, ...options.allowedRoots].map((root) =>
-      resolve(options.cwd, root),
-    );
-    this.#cwd = resolve(options.cwd);
     this.#env = options.env;
     this.#maxTerminals = options.maxTerminals ?? DEFAULT_MAX_TERMINALS;
+    this.#pathScope = options.pathScope ?? new AcpPathScope(options);
     this.#push = options.push;
 
     if (!Number.isSafeInteger(this.#maxTerminals) || this.#maxTerminals < 1) {
@@ -127,7 +124,10 @@ export class AcpTerminalManager {
     const args = readArray(record, "args").filter(
       (entry): entry is string => typeof entry === "string",
     );
-    const cwd = this.#resolveAllowedCwd(readNonEmptyString(record, "cwd") ?? this.#cwd);
+    const cwd = await this.#pathScope.resolveExisting(
+      readNonEmptyString(record, "cwd") ?? this.#pathScope.cwd(),
+      "ACP terminal cwd",
+    );
     const requestedOutputByteLimit = readNumber(record, "outputByteLimit");
     const outputByteLimit = normalizeByteLimit(requestedOutputByteLimit);
     const env = this.#readTerminalEnv(record);
@@ -481,24 +481,6 @@ export class AcpTerminalManager {
         },
       },
     ]));
-  }
-
-  #resolveAllowedCwd(cwd: string): string {
-    if (!isAbsolute(cwd)) {
-      throw new Error(`ACP terminal cwd must be absolute: ${cwd}.`);
-    }
-
-    const resolvedPath = resolve(this.#cwd, cwd);
-
-    if (
-      this.#allowedRoots.some(
-        (root) => resolvedPath === root || resolvedPath.startsWith(`${root}/`),
-      )
-    ) {
-      return resolvedPath;
-    }
-
-    throw new Error(`ACP terminal cwd is outside the allowed roots: ${cwd}.`);
   }
 
   #requireTerminal(params: unknown): AcpTerminalState {

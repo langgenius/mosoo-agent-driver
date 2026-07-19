@@ -11,7 +11,7 @@ import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeContractAdapter } from "../src/runtimes/claude/contract-adapter";
 import { createClaudeQueryOptions } from "../src/runtimes/claude/agent-sdk-query-options";
 import type { ContractAuthorityUpdate } from "../src/runtimes/contract-projection";
@@ -113,6 +113,14 @@ function createLiveStartInput(input: {
 
 const liveApiKey = readLiveApiKey();
 const liveTest = liveApiKey ? test : test.skip;
+
+function requireLiveApiKey(): string {
+  if (liveApiKey === null) {
+    throw new Error(`Set ${LIVE_API_KEY_ENV} or ${PROVIDER_API_KEY_ENV} to run live tests.`);
+  }
+
+  return liveApiKey;
+}
 
 function createLiveKernel(): AgentDriverKernelCore {
   return new AgentDriverKernelCore({
@@ -340,7 +348,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -367,7 +375,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -414,7 +422,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -451,7 +459,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -507,7 +515,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -550,7 +558,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await firstKernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -572,7 +580,7 @@ describe("Claude Agent SDK live provider", () => {
         firstStopped = true;
 
         const baseInput = createLiveStartInput({
-          apiKey: liveApiKey,
+          apiKey: requireLiveApiKey(),
           cwd: paths.cwd,
           homePath: paths.homePath,
           sharedRootPath: paths.sharedRootPath,
@@ -626,7 +634,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await kernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -689,7 +697,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await firstKernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -742,7 +750,7 @@ describe("Claude Agent SDK live provider", () => {
       try {
         await restartedKernel.start(
           createLiveStartInput({
-            apiKey: liveApiKey,
+            apiKey: requireLiveApiKey(),
             cwd: paths.cwd,
             homePath: paths.homePath,
             sharedRootPath: paths.sharedRootPath,
@@ -780,7 +788,7 @@ describe("Claude Contract adapter live provider", () => {
       } satisfies Run;
       const contract = createLiveContractAdapter(run);
       const payload = createLiveStartInput({
-        apiKey: liveApiKey,
+        apiKey: requireLiveApiKey(),
         cwd: paths.cwd,
         homePath: paths.homePath,
         sharedRootPath: paths.sharedRootPath,

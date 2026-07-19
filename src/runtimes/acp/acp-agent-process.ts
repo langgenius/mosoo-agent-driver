@@ -4,10 +4,10 @@ import { once } from "node:events";
 import { mkdir } from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
 
-import { summarizePath } from "../../infrastructure/logging/driver-debug";
+import { summarizePath } from "../../observability/driver-debug";
 import type { DriverStartInput } from "../../protocol/start";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { killProcessGroup } from "../child-process";
 import { readFallbackArgs, readFallbackCommand } from "./acp-configuration";
 

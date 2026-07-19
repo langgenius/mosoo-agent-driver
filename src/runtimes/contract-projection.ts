@@ -1,182 +1,73 @@
 import { isDeepStrictEqual } from "node:util";
 
-import {
-  assertProtocolAdmission,
-  AuthorityOutcomeUnknownError,
-  authorityContent,
-  compareTimestamps,
-  interactionSchema,
-  itemSchema,
-  jsonByteLength,
-  jsonValueSchema,
-  runSchema,
-} from "../contract";
+import { interactionSchema, itemSchema, jsonByteLength, runSchema } from "../contract";
 import type {
   AuthorityOperation,
-  ContentBlock,
   Interaction,
   Item,
   MutationCause,
   PreviewUpdate,
-  ProtocolAdmissionLimits,
   ProtocolError,
   Run,
   TokenUsage,
 } from "../contract";
-import { createDriverId } from "../protocol/id";
+import {
+  authorityKey,
+  ContractProjectionAuthority,
+  MAX_PENDING_MUTATION_BYTES,
+  MAX_PENDING_MUTATIONS,
+  type QueuedMutation,
+} from "./contract-projection-authority";
+import {
+  advancePreviews,
+  appendItemText,
+  type AppendTextInput,
+  type CheckpointTextInput,
+  DEFAULT_PREVIEW_CHECKPOINT_BYTES,
+  DEFAULT_PREVIEW_REPLACE_INTERVAL_MS,
+  emitContractPreview,
+  flushItemText,
+  itemKey,
+  itemText,
+  latestTimestamp,
+  matchesPreviewChannel,
+  type ContractProjectionOptions,
+  type PreviewStreamState,
+  replaceCheckpointCause,
+  type ReplacePreviewInput,
+  replaceItemText,
+  streamKey,
+  type TextPreviewChannel,
+  truncateUtf8,
+} from "./contract-projection-preview";
+import { ContractProjectionState } from "./contract-projection-state";
 
 export { AuthorityOutcomeUnknownError } from "../contract";
-
-const DEFAULT_PREVIEW_CHECKPOINT_BYTES = 128 * 1_024;
-const DEFAULT_PREVIEW_REPLACE_INTERVAL_MS = 1_000;
-const MAX_PENDING_MUTATION_BYTES = 32 * 1_024 * 1_024;
-const MAX_PENDING_MUTATIONS = 1_024;
-
-interface PreviewStreamState {
-  bytes: number;
-  lastReplaceAtMs: number;
-  mode: "append" | "replace";
-  segment: number;
-  sequence: number;
-  text: string;
-}
-
-interface AuthorityWrite {
-  readonly intent: unknown;
-  readonly key: string;
-  readonly mutationId: string;
-  readonly update: Omit<ContractAuthorityUpdate, "mutationId">;
-}
-
-interface UnknownAuthorityWrite extends AuthorityWrite {
-  readonly error: AuthorityOutcomeUnknownError;
-}
-
-interface QueuedMutation {
-  readonly bytes: number;
-  readonly reject: (reason: unknown) => void;
-  readonly run: () => Promise<void>;
-}
-
-export interface ContractAuthorityUpdate {
-  readonly cause: MutationCause;
-  readonly event: string;
-  readonly mutationId: string;
-  readonly operations: readonly AuthorityOperation[];
-  readonly runId: string;
-  readonly sessionId: string;
-}
-
-export interface ContractPreviewUpdate {
-  readonly runId: string;
-  readonly sessionId: string;
-  readonly update: PreviewUpdate;
-}
-
-export interface ContractProjectionOptions {
-  readonly admissionLimits?: ProtocolAdmissionLimits | undefined;
-  readonly authority: (update: ContractAuthorityUpdate) => Promise<void>;
-  readonly now?: (() => Date) | undefined;
-  readonly preview: (update: ContractPreviewUpdate) => void;
-  readonly previewCheckpointBytes?: number | undefined;
-  readonly previewReplaceIntervalMs?: number | undefined;
-  readonly sessionId: string;
-}
-
-type TextPreviewChannel = "message.text" | "reasoning.text" | "terminal.stderr" | "terminal.stdout";
-
-function itemKey(runId: string, itemId: string): string {
-  return `${runId}\u0000${itemId}`;
-}
-
-function streamKey(runId: string, itemId: string, channel: string): string {
-  return `${itemKey(runId, itemId)}\u0000${channel}`;
-}
-
-function authorityKey(runId: string, event: string, cause: MutationCause): string {
-  const causeId =
-    cause.type === "command"
-      ? cause.commandId
-      : cause.type === "provider"
-        ? cause.providerEventId
-        : cause.type === "alarm"
-          ? cause.alarm
-          : cause.name;
-  return JSON.stringify([runId, event, cause.type, causeId]);
-}
-
-function replaceCheckpointCause(runId: string, itemId: string, segment: number): MutationCause {
-  return {
-    providerEventId: `preview/replace:${runId}:${segment}:${itemId}`.slice(0, 256),
-    type: "provider",
-  };
-}
-
-function latestTimestamp(previous: string, next: string): string {
-  return compareTimestamps(previous, next) > 0 ? previous : next;
-}
-
-function textContent(text: string): ContentBlock[] {
-  return text.length === 0 ? [] : [{ text, type: "text" }];
-}
-
-export function asJsonValue(value: unknown) {
-  const parsed = jsonValueSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
-
-export function nonEmpty(value: string | null | undefined, fallback: string): string {
-  return value?.trim() || fallback;
-}
-
-export function createProviderMeta(provider: string) {
-  return {
-    cause(event: string, id?: string): MutationCause {
-      return {
-        providerEventId: `${event}${id === undefined ? "" : `:${id}`}`.slice(0, 256),
-        type: "provider",
-      };
-    },
-    provenance(event: string, nativeIds?: Readonly<Record<string, string>>) {
-      const boundedIds = Object.fromEntries(
-        Object.entries(nativeIds ?? {}).filter(
-          ([, value]) => value.length > 0 && value.length <= 256,
-        ),
-      );
-
-      return {
-        event,
-        ...(Object.keys(boundedIds).length === 0 ? {} : { nativeIds: boundedIds }),
-        provider,
-      };
-    },
-  };
-}
+export { asJsonValue, createProviderMeta, nonEmpty } from "./contract-adapter-meta";
+export type { ContractAuthorityUpdate } from "./contract-projection-authority";
+export type {
+  ContractPreviewUpdate,
+  ContractProjectionOptions,
+} from "./contract-projection-preview";
 
 export class ContractProjection {
-  readonly #admissionLimits: ProtocolAdmissionLimits | undefined;
-  readonly #authority: ContractProjectionOptions["authority"];
+  readonly #authority: ContractProjectionAuthority;
   #disposed = false;
-  readonly #childEndedAt = new Map<string, string>();
-  readonly #interactions = new Map<string, Interaction>();
-  readonly #items = new Map<string, Item>();
   readonly #now: () => Date;
   readonly #preview: ContractProjectionOptions["preview"];
   readonly #previewCheckpointBytes: number;
   readonly #previewReplaceIntervalMs: number;
   readonly #previewStreams = new Map<string, PreviewStreamState>();
-  readonly #runs = new Map<string, Run>();
+  readonly #state = new ContractProjectionState();
   readonly #sessionId: string;
   readonly #textEncoder = new TextEncoder();
   #mutationActive = false;
   #mutationBytes = 0;
   readonly #mutationQueue: QueuedMutation[] = [];
-  #unknownAuthority: UnknownAuthorityWrite | undefined;
 
   constructor(options: ContractProjectionOptions) {
-    this.#admissionLimits =
+    const admissionLimits =
       options.admissionLimits === undefined ? undefined : { ...options.admissionLimits };
-    this.#authority = options.authority;
     this.#now = options.now ?? (() => new Date());
     this.#preview = options.preview;
     this.#previewCheckpointBytes =
@@ -189,13 +80,21 @@ export class ContractProjection {
       [
         this.#previewCheckpointBytes,
         this.#previewReplaceIntervalMs,
-        ...(this.#admissionLimits === undefined
+        ...(admissionLimits === undefined
           ? []
-          : [this.#admissionLimits.maxBytes, this.#admissionLimits.maxInlineBytes]),
+          : [admissionLimits.maxBytes, admissionLimits.maxInlineBytes]),
       ].some((value) => !Number.isSafeInteger(value) || value < 1)
     ) {
       throw new RangeError("Contract projection limits must be finite and positive.");
     }
+
+    this.#authority = new ContractProjectionAuthority({
+      active: () => !this.#disposed,
+      admissionLimits,
+      apply: (operations) => this.#applyAuthorityOperations(operations),
+      authority: options.authority,
+      sessionId: options.sessionId,
+    });
   }
 
   now(): Date {
@@ -205,55 +104,37 @@ export class ContractProjection {
 
   run(runId: string): Run | undefined {
     this.#assertActive();
-    return this.#runs.get(runId);
+    return this.#state.run(runId);
   }
 
   item(runId: string, id: string): Item | undefined {
     this.#assertActive();
-    return this.#items.get(itemKey(runId, id));
+    return this.#state.item(runId, id);
   }
 
   interaction(id: string): Interaction | undefined {
     this.#assertActive();
-    return this.#interactions.get(id);
+    return this.#state.interaction(id);
   }
 
   releaseInteraction(id: string): void {
     this.#assertActive();
-    this.#interactions.delete(id);
+    this.#state.releaseInteraction(id);
   }
 
   items(runId: string): Item[] {
     this.#assertActive();
-    return [...this.#items.values()].filter((item) => item.runId === runId);
+    return this.#state.items(runId);
   }
 
   interactions(runId: string): Interaction[] {
     this.#assertActive();
-    return [...this.#interactions.values()].filter((interaction) => interaction.runId === runId);
+    return this.#state.interactions(runId);
   }
 
   attachRun(value: Run): void {
     this.#assertActive();
-    const run = runSchema.parse(value);
-
-    if (run.status !== "active") {
-      throw new Error(`Contract projection can only attach an active run ${run.id}.`);
-    }
-
-    const existing = this.#runs.get(run.id);
-
-    if (existing !== undefined) {
-      if (!isDeepStrictEqual(existing, run)) {
-        throw new Error(
-          `Contract projection run ${run.id} is already attached with different state.`,
-        );
-      }
-
-      return;
-    }
-
-    this.#runs.set(run.id, run);
+    this.#state.attachRun(value);
   }
 
   async putItem(runId: string, event: string, cause: MutationCause, value: Item): Promise<Item> {
@@ -278,7 +159,7 @@ export class ContractProjection {
       throw new Error(`Contract projection item ${item.id} belongs to a different run.`);
     }
 
-    const existing = this.#items.get(itemKey(runId, item.id));
+    const existing = this.#state.item(runId, item.id);
 
     if (existing !== undefined && isDeepStrictEqual(existing, item)) {
       return existing;
@@ -298,7 +179,7 @@ export class ContractProjection {
       throw new Error(`Authority write ${event} did not retain its Item intent.`);
     }
 
-    return this.#items.get(itemKey(runId, operation.value.id)) ?? operation.value;
+    return this.#state.item(runId, operation.value.id) ?? operation.value;
   }
 
   async putInteraction(
@@ -318,7 +199,7 @@ export class ContractProjection {
         );
       }
 
-      const existing = this.#interactions.get(interaction.id);
+      const existing = this.#state.interaction(interaction.id);
 
       if (existing !== undefined && isDeepStrictEqual(existing, interaction)) {
         return existing;
@@ -337,7 +218,7 @@ export class ContractProjection {
         throw new Error(`Authority write ${stable.event} did not retain its Interaction intent.`);
       }
 
-      return this.#interactions.get(operation.value.id) ?? operation.value;
+      return this.#state.interaction(operation.value.id) ?? operation.value;
     });
   }
 
@@ -376,14 +257,7 @@ export class ContractProjection {
     });
   }
 
-  async appendText(input: {
-    readonly cause: MutationCause;
-    readonly channel: TextPreviewChannel;
-    readonly delta: string;
-    readonly event: string;
-    readonly itemId: string;
-    readonly runId: string;
-  }): Promise<void> {
+  async appendText(input: AppendTextInput): Promise<void> {
     return this.#mutate(
       authorityKey(input.runId, `${input.event}.checkpoint`, input.cause),
       input,
@@ -394,12 +268,12 @@ export class ContractProjection {
           return;
         }
 
-        const item = this.#items.get(itemKey(input.runId, input.itemId));
+        const item = this.#state.item(input.runId, input.itemId);
 
         if (
           item === undefined ||
           item.status !== "active" ||
-          !this.#matchesChannel(item, input.channel)
+          !matchesPreviewChannel(item, input.channel)
         ) {
           return;
         }
@@ -422,8 +296,8 @@ export class ContractProjection {
         const bytes = current.bytes + this.#textEncoder.encode(input.delta).byteLength;
 
         if (bytes >= this.#previewCheckpointBytes) {
-          const checkpoint = this.#appendItemText(
-            this.#flushItemText(item, now.toISOString()),
+          const checkpoint = appendItemText(
+            flushItemText(this.#previewStreams, item, now.toISOString()),
             input.channel,
             input.delta,
             now.toISOString(),
@@ -485,24 +359,18 @@ export class ContractProjection {
     );
   }
 
-  async checkpointText(input: {
-    readonly cause: MutationCause;
-    readonly channel: TextPreviewChannel;
-    readonly event: string;
-    readonly itemId: string;
-    readonly runId: string;
-  }): Promise<Item | undefined> {
+  async checkpointText(input: CheckpointTextInput): Promise<Item | undefined> {
     return this.#mutate(
       authorityKey(input.runId, input.event, input.cause),
       input,
       async (input) => {
         this.#assertActive();
-        const item = this.#items.get(itemKey(input.runId, input.itemId));
+        const item = this.#state.item(input.runId, input.itemId);
 
         if (
           item === undefined ||
           item.status !== "active" ||
-          !this.#matchesChannel(item, input.channel)
+          !matchesPreviewChannel(item, input.channel)
         ) {
           return item;
         }
@@ -519,18 +387,13 @@ export class ContractProjection {
         }
 
         const now = this.#now();
-        const checkpoint = this.#flushItemText(item, now.toISOString());
+        const checkpoint = flushItemText(this.#previewStreams, item, now.toISOString());
         return this.#putItem(input.runId, input.event, input.cause, checkpoint, input, true);
       },
     );
   }
 
-  async replacePreview(input: {
-    readonly channel: PreviewUpdate["channel"];
-    readonly itemId: string;
-    readonly runId: string;
-    readonly text: string;
-  }): Promise<void> {
+  async replacePreview(input: ReplacePreviewInput): Promise<void> {
     return this.#mutate(
       (stable) => {
         const key = streamKey(stable.runId, stable.itemId, stable.channel);
@@ -544,12 +407,12 @@ export class ContractProjection {
       input,
       async (input) => {
         this.#assertActive();
-        const item = this.#items.get(itemKey(input.runId, input.itemId));
+        const item = this.#state.item(input.runId, input.itemId);
 
         if (
           item === undefined ||
           item.status !== "active" ||
-          !this.#matchesChannel(item, input.channel)
+          !matchesPreviewChannel(item, input.channel)
         ) {
           return;
         }
@@ -569,7 +432,7 @@ export class ContractProjection {
           const now = this.#now();
           const nextSegment = (current?.segment ?? 0) + 1;
 
-          if (this.#itemText(item, input.channel) === input.text) {
+          if (itemText(item, input.channel) === input.text) {
             this.#previewStreams.set(key, {
               bytes: 0,
               lastReplaceAtMs: now.getTime(),
@@ -581,8 +444,8 @@ export class ContractProjection {
             return;
           }
 
-          const checkpoint = this.#replaceItemText(
-            this.#flushItemText(item, now.toISOString()),
+          const checkpoint = replaceItemText(
+            flushItemText(this.#previewStreams, item, now.toISOString()),
             input.channel,
             input.text,
             now.toISOString(),
@@ -612,7 +475,7 @@ export class ContractProjection {
         const text =
           bytes < this.#previewCheckpointBytes
             ? input.text
-            : this.#truncateUtf8(input.text, this.#previewCheckpointBytes - 1);
+            : truncateUtf8(input.text, this.#previewCheckpointBytes - 1);
         const sequence = (current?.sequence ?? 0) + 1;
         const update = {
           channel: input.channel,
@@ -637,17 +500,13 @@ export class ContractProjection {
   }
 
   #emitPreview(runId: string, update: PreviewUpdate): void {
-    try {
-      this.#preview({ runId, sessionId: this.#sessionId, update });
-    } catch {
-      // Preview is best-effort; the retained state repairs any dropped callback.
-    }
+    emitContractPreview(this.#preview, runId, this.#sessionId, update);
   }
 
   materializedText(runId: string, itemId: string, channel: TextPreviewChannel): string {
     this.#assertActive();
-    const item = this.#items.get(itemKey(runId, itemId));
-    const committed = item === undefined ? "" : this.#itemText(item, channel);
+    const item = this.#state.item(runId, itemId);
+    const committed = item === undefined ? "" : itemText(item, channel);
     const preview = this.#previewStreams.get(streamKey(runId, itemId, channel));
 
     if (preview?.mode === "replace") {
@@ -721,7 +580,7 @@ export class ContractProjection {
               ),
             latestTimestamp(
               latestTimestamp(current.startedAt, requestedEnd),
-              this.#childEndedAt.get(input.runId) ?? current.startedAt,
+              this.#state.latestChildEnd(input.runId) ?? current.startedAt,
             ),
           ),
         );
@@ -735,7 +594,7 @@ export class ContractProjection {
             return [];
           }
 
-          const withText = this.#flushItemText(item, endedAt);
+          const withText = flushItemText(this.#previewStreams, item, endedAt);
           return [
             itemSchema.parse(
               input.status === "completed"
@@ -811,12 +670,9 @@ export class ContractProjection {
       mutation.reject(error);
     }
 
-    this.#childEndedAt.clear();
-    this.#interactions.clear();
-    this.#items.clear();
+    this.#state.clear();
     this.#previewStreams.clear();
-    this.#runs.clear();
-    this.#unknownAuthority = undefined;
+    this.#authority.clear();
   }
 
   #mutate<I, T>(
@@ -845,7 +701,7 @@ export class ContractProjection {
     }
 
     const stableIntent = structuredClone(intent);
-    const unknownAtEnqueue = this.#unknownAuthority;
+    const unknownAtEnqueue = this.#authority.unknown;
     const task = Promise.withResolvers<T>();
     this.#mutationQueue.push({
       bytes,
@@ -853,24 +709,8 @@ export class ContractProjection {
       run: async () => {
         try {
           this.#assertActive();
-          const unknown = this.#unknownAuthority;
-
-          if (unknown !== undefined) {
-            if (unknownAtEnqueue !== unknown) {
-              throw unknown.error;
-            }
-
-            const resolvedKey = typeof key === "function" ? key(stableIntent) : key;
-            if (unknown.key !== resolvedKey) {
-              throw unknown.error;
-            }
-
-            if (!isDeepStrictEqual(unknown.intent, stableIntent)) {
-              throw new AuthorityOutcomeUnknownError(
-                "Authority retry changed while its outcome was unknown.",
-              );
-            }
-          }
+          const resolvedKey = typeof key === "function" ? key(stableIntent) : key;
+          this.#authority.assertRetry(resolvedKey, stableIntent, unknownAtEnqueue);
 
           task.resolve(await operation(stableIntent));
         } catch (error) {
@@ -911,303 +751,27 @@ export class ContractProjection {
     reuseDerived = false,
   ): Promise<readonly AuthorityOperation[]> {
     this.#assertActive();
-
-    if (operations.length === 0) {
-      return operations;
-    }
-
-    const update = {
-      cause,
-      event,
-      operations,
-      runId,
-      sessionId: this.#sessionId,
-    };
-    const key = authorityKey(runId, event, cause);
-    const unknown = this.#unknownAuthority;
-    let pending: AuthorityWrite;
-
-    if (unknown === undefined) {
-      pending = {
-        intent: structuredClone(intent),
-        key,
-        mutationId: createDriverId(),
-        update,
-      };
-    } else if (unknown.key !== key) {
-      throw unknown.error;
-    } else if (
-      !isDeepStrictEqual(unknown.intent, intent) ||
-      (!reuseDerived && !isDeepStrictEqual(unknown.update, update))
-    ) {
-      throw new AuthorityOutcomeUnknownError(
-        `Authority write ${event} changed while its outcome was unknown.`,
-      );
-    } else {
-      pending = unknown;
-    }
-
-    const submission = structuredClone({ ...pending.update, mutationId: pending.mutationId });
-
-    if (this.#admissionLimits !== undefined) {
-      assertProtocolAdmission(
-        submission,
-        this.#admissionLimits,
-        authorityContent(submission.operations),
-      );
-    }
-
-    try {
-      await this.#authority(submission);
-    } catch (error) {
-      if (error instanceof AuthorityOutcomeUnknownError && !this.#disposed) {
-        this.#unknownAuthority = { ...pending, error };
-      } else {
-        this.#unknownAuthority = undefined;
-      }
-      throw error;
-    }
-
-    if (this.#disposed) {
-      return pending.update.operations;
-    }
-
-    try {
-      this.#applyAuthorityOperations(pending.update.operations);
-    } catch (error) {
-      const unknown = new AuthorityOutcomeUnknownError(
-        `Authority write ${event} committed but local apply failed.`,
-        { cause: error },
-      );
-      this.#unknownAuthority = { ...pending, error: unknown };
-      throw unknown;
-    }
-
-    this.#unknownAuthority = undefined;
-    return pending.update.operations;
+    return this.#authority.commit(runId, event, cause, operations, intent, reuseDerived);
   }
 
   #applyAuthorityOperations(operations: readonly AuthorityOperation[]): void {
-    const terminalRuns: string[] = [];
-
-    for (const operation of operations) {
-      if (operation.op === "remove") {
-        terminalRuns.push(operation.id);
-        continue;
-      }
-
-      switch (operation.entity) {
-        case "session":
-          break;
-        case "run":
-          this.#runs.set(operation.value.id, operation.value);
-          if (operation.value.status !== "active") {
-            terminalRuns.push(operation.value.id);
+    this.#state.apply(operations, {
+      activeItem: (item) =>
+        advancePreviews(this.#previewStreams, item.runId, item.id, Date.parse(item.updatedAt)),
+      clearItem: (runId, itemId) => this.clearPreviews(runId, itemId),
+      releaseRun: (runId) => {
+        for (const key of this.#previewStreams.keys()) {
+          if (key.startsWith(`${runId}\u0000`)) {
+            this.#previewStreams.delete(key);
           }
-          break;
-        case "item": {
-          const item = operation.value;
-          this.#items.set(itemKey(item.runId, item.id), item);
-          if (item.status === "active") {
-            this.#advancePreviews(item.runId, item.id, Date.parse(item.updatedAt));
-          } else {
-            this.clearPreviews(item.runId, item.id);
-          }
-          break;
         }
-        case "interaction":
-          this.#interactions.set(operation.value.id, operation.value);
-          break;
-      }
-    }
-
-    for (const runId of terminalRuns) {
-      this.#releaseRun(runId);
-    }
-  }
-
-  #appendItemText(item: Item, channel: TextPreviewChannel, text: string, updatedAt: string): Item {
-    if (item.kind === "message" && channel === "message.text") {
-      return itemSchema.parse({
-        ...item,
-        content: [...item.content, ...textContent(text)],
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    if (item.kind === "reasoning" && channel === "reasoning.text") {
-      return itemSchema.parse({
-        ...item,
-        content: [...item.content, ...textContent(text)],
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    if (item.kind === "terminal" && channel === "terminal.stdout") {
-      return itemSchema.parse({
-        ...item,
-        stdout: [...item.stdout, ...textContent(text)],
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    if (item.kind === "terminal" && channel === "terminal.stderr") {
-      return itemSchema.parse({
-        ...item,
-        stderr: [...item.stderr, ...textContent(text)],
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    return item;
-  }
-
-  #advancePreviews(runId: string, itemId: string, atMs: number): void {
-    const prefix = `${itemKey(runId, itemId)}\u0000`;
-
-    for (const [key, preview] of this.#previewStreams) {
-      if (!key.startsWith(prefix)) {
-        continue;
-      }
-
-      this.#previewStreams.set(key, {
-        bytes: 0,
-        lastReplaceAtMs: atMs,
-        mode: preview.mode,
-        segment: preview.segment + 1,
-        sequence: 0,
-        text: "",
-      });
-    }
-  }
-
-  #flushItemText(item: Item, updatedAt: string): Item {
-    let next = item;
-
-    for (const channel of [
-      "message.text",
-      "reasoning.text",
-      "terminal.stdout",
-      "terminal.stderr",
-    ] as const) {
-      const preview = this.#previewStreams.get(streamKey(item.runId, item.id, channel));
-      if (preview?.mode === "replace" && preview.sequence > 0) {
-        next = this.#replaceItemText(next, channel, preview.text, updatedAt);
-      } else if (preview?.text !== undefined && preview.text.length > 0) {
-        next = this.#appendItemText(next, channel, preview.text, updatedAt);
-      }
-    }
-
-    return next;
-  }
-
-  #replaceItemText(item: Item, channel: TextPreviewChannel, text: string, updatedAt: string): Item {
-    if (item.kind === "terminal" && channel === "terminal.stdout") {
-      return itemSchema.parse({
-        ...item,
-        stdout: textContent(text),
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    if (item.kind === "terminal" && channel === "terminal.stderr") {
-      return itemSchema.parse({
-        ...item,
-        stderr: textContent(text),
-        updatedAt: latestTimestamp(item.updatedAt, updatedAt),
-      });
-    }
-
-    return this.#appendItemText(item, channel, text, updatedAt);
-  }
-
-  #truncateUtf8(value: string, maxBytes: number): string {
-    const encoded = this.#textEncoder.encode(value);
-    return new TextDecoder().decode(encoded.subarray(0, maxBytes), { stream: true });
-  }
-
-  #itemText(item: Item, channel: TextPreviewChannel): string {
-    if (item.kind === "message" && channel === "message.text") {
-      return item.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-    }
-
-    if (item.kind === "reasoning" && channel === "reasoning.text") {
-      return item.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-    }
-
-    if (item.kind === "terminal" && channel === "terminal.stdout") {
-      return item.stdout.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-    }
-
-    if (item.kind === "terminal" && channel === "terminal.stderr") {
-      return item.stderr.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-    }
-
-    return "";
-  }
-
-  #matchesChannel(item: Item, channel: PreviewUpdate["channel"]): boolean {
-    switch (channel) {
-      case "message.text":
-        return item.kind === "message";
-      case "reasoning.text":
-        return item.kind === "reasoning";
-      case "terminal.stderr":
-      case "terminal.stdout":
-        return item.kind === "terminal";
-      case "tool.progress":
-        return item.kind === "tool";
-      default:
-        return true;
-    }
-  }
-
-  #releaseRun(runId: string): void {
-    const run = this.#runs.get(runId);
-
-    if (run !== undefined && run.status !== "active" && run.parentRunId !== undefined) {
-      const parent = this.#runs.get(run.parentRunId);
-
-      if (parent?.status === "active") {
-        const previous = this.#childEndedAt.get(parent.id);
-        this.#childEndedAt.set(
-          parent.id,
-          previous === undefined ? run.endedAt : latestTimestamp(previous, run.endedAt),
-        );
-      }
-    }
-
-    this.#childEndedAt.delete(runId);
-    this.#runs.delete(runId);
-
-    for (const key of this.#items.keys()) {
-      if (key.startsWith(`${runId}\u0000`)) {
-        this.#items.delete(key);
-      }
-    }
-
-    for (const [id, interaction] of this.#interactions) {
-      if (interaction.runId === runId) {
-        this.#interactions.delete(id);
-      }
-    }
-
-    for (const key of this.#previewStreams.keys()) {
-      if (key.startsWith(`${runId}\u0000`)) {
-        this.#previewStreams.delete(key);
-      }
-    }
+      },
+    });
   }
 
   #requireRun(runId: string): Run {
     this.#assertActive();
-    const run = this.#runs.get(runId);
-
-    if (run === undefined) {
-      throw new Error(`Contract projection references unknown run ${runId}.`);
-    }
-
-    return run;
+    return this.#state.requireRun(runId);
   }
 
   #assertActive(): void {

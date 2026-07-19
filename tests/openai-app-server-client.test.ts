@@ -6,8 +6,9 @@ import { Readable } from "node:stream";
 
 import type { AgentDriverPermissionPort } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
+import type { DriverExecutionEnvironment } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerClient, limitNdjsonLines } from "../src/runtimes/openai/app-server-client";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/generated/app-server-protocol";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -21,7 +22,7 @@ async function createClientHarness(
   handleNotification: (method: ServerNotificationMethod) => Promise<void> = async () => {},
   requestPermission: AgentDriverPermissionPort["request"] = async () => "allow_once",
   interpreter = "bun",
-  environment = driverBootPayload.execution.environment,
+  environment: DriverExecutionEnvironment = driverBootPayload.execution.environment,
 ) {
   const directory = await mkdtemp(join(tmpdir(), "mosoo-openai-client-"));
   temporaryDirectories.push(directory);
@@ -52,7 +53,7 @@ async function createClientHarness(
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => {} },
+    eventSink: { pushEvents: async () => ({ accepted: [] }) },
     logger,
     payload,
     permission: { request: requestPermission },
@@ -799,7 +800,7 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors).toHaveLength(1);
       expect(harness.protocolErrors[0]?.message).toBe("App-server message queue limit exceeded.");
     } finally {
-      releaseNotification?.();
+      (releaseNotification as (() => void) | null)?.();
       await harness.client.stop();
       await harness.logger.destroy();
     }

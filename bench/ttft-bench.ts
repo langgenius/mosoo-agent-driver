@@ -92,7 +92,7 @@ interface CellResult {
   readonly scenario: ScenarioId;
   readonly model: string;
   readonly trials: TrialMetrics[];
-  readonly agg: Record<string, number | null>;
+  readonly agg: ReturnType<typeof aggregate>;
 }
 
 function readEnv(name: string): string | null {
@@ -109,7 +109,7 @@ function percentile(values: number[], p: number): number | null {
   return clean[idx] ?? null;
 }
 
-function aggregate(trials: TrialMetrics[]): Record<string, number | null> {
+function aggregate(trials: TrialMetrics[]) {
   const okTrials = trials.filter((t) => t.ok);
   const pick = (key: keyof TrialMetrics): number[] =>
     okTrials.map((t) => t[key]).filter((v): v is number => typeof v === "number");
@@ -208,7 +208,6 @@ function openaiStartInput(a: StartInputArgs): DriverStartInput {
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: a.sharedRootPath,
       },
@@ -255,7 +254,6 @@ function opencodeStartInput(
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: a.sharedRootPath,
       },
@@ -277,10 +275,8 @@ function opencodeHostSnapshot(paths: { cwd: string; homePath: string; sharedRoot
       additionalDirectories: [],
       context: {
         ...driverBootPayload.execution.session.context,
-        appAccessSnapshot: { entries: [] },
         homePath: paths.homePath,
         sessionOrganizationPath: paths.sharedRootPath,
-        spaceAliases: [],
       },
       cwd: paths.cwd,
       mcpServers: [],
@@ -409,7 +405,7 @@ async function runTrial(input: {
 
   const gaps: number[] = [];
   for (let i = 1; i < deltaTimestamps.length; i += 1) {
-    gaps.push(deltaTimestamps[i] - deltaTimestamps[i - 1]);
+    gaps.push(deltaTimestamps[i]! - deltaTimestamps[i - 1]!);
   }
 
   return {

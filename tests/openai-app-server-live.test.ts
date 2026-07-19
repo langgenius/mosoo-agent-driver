@@ -10,7 +10,7 @@ import { OPENAI_DEFAULT_MODEL_ID } from "../src/models";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
 import { createTurnParams } from "../src/runtimes/openai/app-server-driver-backend";
 import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "../src/runtimes/openai/app-server-env";
@@ -133,7 +133,6 @@ function createLiveStartInput(input: {
         cwd: input.cwd,
         homePath: input.homePath,
         mcpServers: [],
-        mountAliases: [],
         nativeResumeRef: null,
         sharedRootPath: input.sharedRootPath,
       },

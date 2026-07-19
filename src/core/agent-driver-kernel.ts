@@ -7,13 +7,13 @@ import type { DriverStartInput } from "../protocol/start";
 import { parseRuntimeCommand } from "../runtime-command";
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
 import type {
-  AgentDriverBackend,
   AgentDriverBackendFactory,
   AgentDriverContext,
   AgentDriverContextPortOverrides,
-} from "../runtimes/agent-driver-backend";
-import { createAgentDriverContext } from "../runtimes/agent-driver-backend";
-import { promiseWithTimeout } from "../utils/async";
+} from "./agent-driver-backend";
+import { createAgentDriverContext } from "./agent-driver-backend";
+import { AgentBackendLifecycle } from "./agent-backend-lifecycle";
+import { AsyncValueQueue } from "./async-value-queue";
 import { DriverCommandDispatcher } from "./driver-command-dispatcher";
 import { DriverPermissionBroker } from "./driver-permission-broker";
 import { createDriverPermissionRequestHandler } from "./driver-permission-policy";
@@ -45,186 +45,6 @@ const KERNEL_QUEUE_MAX_SIZE = 1_024;
 const KERNEL_QUEUE_MAX_BYTES = 32 * 1_024 * 1_024;
 const KERNEL_TERMINAL_QUEUE_MAX_SIZE = 1;
 const KERNEL_TERMINAL_QUEUE_MAX_BYTES = 1_024 * 1_024;
-
-export interface AsyncValueQueueReserve {
-  readonly maxBytes: number;
-  readonly maxSize: number;
-}
-
-interface BufferedValue<T> {
-  readonly bytes: number;
-  readonly reserved: boolean;
-  readonly value: T;
-}
-
-export class AsyncValueQueue<T> {
-  readonly #label: string;
-  readonly #maxBytes: number;
-  readonly #maxSize: number;
-  readonly #measure: (value: T) => number;
-  readonly #reserve: AsyncValueQueueReserve | undefined;
-  readonly #values: BufferedValue<T>[] = [];
-  readonly #waiters: PromiseWithResolvers<IteratorResult<T>>[] = [];
-  #bytes = 0;
-  #closed = false;
-  #reservedBytes = 0;
-  #reservedSize = 0;
-  #size = 0;
-
-  constructor(
-    label: string,
-    maxSize: number,
-    maxBytes = Number.POSITIVE_INFINITY,
-    measure: (value: T) => number = () => 0,
-    reserve?: AsyncValueQueueReserve,
-  ) {
-    this.#label = label;
-    this.#maxBytes = maxBytes;
-    this.#maxSize = maxSize;
-    this.#measure = measure;
-    this.#reserve = reserve;
-  }
-
-  close(options: { readonly discard?: boolean } = {}): void {
-    if (options.discard) {
-      this.#values.length = 0;
-      this.#bytes = 0;
-      this.#reservedBytes = 0;
-      this.#reservedSize = 0;
-      this.#size = 0;
-    }
-
-    if (this.#closed) {
-      return;
-    }
-
-    this.#closed = true;
-
-    for (const waiter of this.#waiters.splice(0)) {
-      waiter.resolve({
-        done: true,
-        value: undefined,
-      });
-    }
-  }
-
-  next(): Promise<IteratorResult<T>> {
-    const buffered = this.#values.shift();
-
-    if (buffered !== undefined) {
-      if (buffered.reserved) {
-        this.#reservedBytes -= buffered.bytes;
-        this.#reservedSize -= 1;
-      } else {
-        this.#bytes -= buffered.bytes;
-        this.#size -= 1;
-      }
-      return Promise.resolve({
-        done: false,
-        value: buffered.value,
-      });
-    }
-
-    if (this.#closed) {
-      return Promise.resolve({
-        done: true,
-        value: undefined,
-      });
-    }
-
-    const waiter = Promise.withResolvers<IteratorResult<T>>();
-    this.#waiters.push(waiter);
-    return waiter.promise;
-  }
-
-  push(value: T): void {
-    this.pushMany([value]);
-  }
-
-  pushReserved(value: T): void {
-    if (this.#closed) {
-      throw new Error("Driver kernel queue is closed.");
-    }
-    if (this.#reserve === undefined) {
-      throw new Error(`Driver kernel ${this.#label} queue has no reserve.`);
-    }
-
-    const buffered = this.#buffer(value, true);
-    if (buffered.bytes > this.#reserve.maxBytes) {
-      throw new Error(
-        `Driver kernel ${this.#label} queue reserve exceeds ${this.#reserve.maxBytes} UTF-8 JSON bytes.`,
-      );
-    }
-
-    const waiter = this.#waiters.shift();
-    if (waiter !== undefined) {
-      waiter.resolve({ done: false, value });
-      return;
-    }
-
-    if (this.#reservedSize >= this.#reserve.maxSize) {
-      throw new Error(
-        `Driver kernel ${this.#label} queue reserve exceeds ${this.#reserve.maxSize} items.`,
-      );
-    }
-    if (buffered.bytes > this.#reserve.maxBytes - this.#reservedBytes) {
-      throw new Error(
-        `Driver kernel ${this.#label} queue reserve exceeds ${this.#reserve.maxBytes} UTF-8 JSON bytes.`,
-      );
-    }
-
-    this.#values.push(buffered);
-    this.#reservedBytes += buffered.bytes;
-    this.#reservedSize += 1;
-  }
-
-  pushMany(values: readonly T[]): void {
-    if (this.#closed) {
-      throw new Error("Driver kernel queue is closed.");
-    }
-
-    const directCount = Math.min(values.length, this.#waiters.length);
-    const buffered = values.slice(directCount).map((value) => this.#buffer(value));
-
-    if (this.#size + buffered.length > this.#maxSize) {
-      throw new Error(`Driver kernel ${this.#label} queue exceeds ${this.#maxSize} items.`);
-    }
-    const addedBytes = buffered.reduce((sum, entry) => sum + entry.bytes, 0);
-    if (addedBytes > this.#maxBytes - this.#bytes) {
-      throw new Error(
-        `Driver kernel ${this.#label} queue exceeds ${this.#maxBytes} UTF-8 JSON bytes.`,
-      );
-    }
-
-    for (const value of values.slice(0, directCount)) {
-      const waiter = this.#waiters.shift();
-      waiter?.resolve({ done: false, value });
-    }
-    this.#values.push(...buffered);
-    this.#bytes += addedBytes;
-    this.#size += buffered.length;
-  }
-
-  async *values(): AsyncIterable<T> {
-    while (true) {
-      const result = await this.next();
-
-      if (result.done) {
-        return;
-      }
-
-      yield result.value;
-    }
-  }
-
-  #buffer(value: T, reserved = false): BufferedValue<T> {
-    const bytes = this.#measure(value);
-    if (!Number.isSafeInteger(bytes) || bytes < 0) {
-      throw new RangeError(`Driver kernel ${this.#label} queue measured invalid bytes.`);
-    }
-    return { bytes, reserved, value };
-  }
-}
 
 function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -274,14 +94,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   readonly #runtimeState = new DriverRuntimeStateMachine("created");
   readonly #shutdownController = new AbortController();
   #activeRunId: RunId | null = null;
-  #backend: AgentDriverBackend | null = null;
-  #backendFinalStopTask: Promise<void> | null = null;
-  #backendStartController: AbortController | null = null;
-  #backendStartTask: Promise<void> | null = null;
-  #backendStopNeedsReplay = false;
-  #backendStopController: AbortController | null = null;
-  #backendStopTask: Promise<void> | null = null;
-  #payload: DriverStartInput | null = null;
+  #backendLifecycle: AgentBackendLifecycle | null = null;
   #pushedEventSeq = 0;
   #runTask: Promise<void> | null = null;
   #runTerminal: "completed" | "failed" | null = null;
@@ -441,42 +254,32 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   }
 
   async #start(input: AgentDriverKernelStartInput): Promise<void> {
-    this.#payload = input;
     const context = this.#createContext(input);
 
     try {
       const backend = this.#backendFactory(input);
-      this.#backend = backend;
-      const backendStartController = new AbortController();
-      this.#backendStartController = backendStartController;
-      const backendStartTask = Promise.resolve().then(() => {
-        this.#shutdownController.signal.throwIfAborted();
-        return backend.start(context, backendStartController.signal);
+      const lifecycle = new AgentBackendLifecycle({
+        backend,
+        createContext: () => this.#createContext(input),
+        labels: {
+          deferredStop: "Driver kernel deferred backend shutdown",
+          finalStop: "Driver kernel final backend shutdown",
+          start: "Driver kernel backend startup",
+          stop: "Driver kernel backend shutdown",
+        },
+        onDeferredStopComplete: () => this.#events.close(),
+        onDeferredStopError: (error) => {
+          this.#logger.error("driver.kernel.deferred_shutdown.failed", error, {});
+        },
+        shutdownSignal: this.#shutdownController.signal,
+        startTimeoutMs: KERNEL_START_TIMEOUT_MS,
+        stopTimeoutMs: KERNEL_SHUTDOWN_TIMEOUT_MS,
       });
-      this.#backendStartTask = backendStartTask;
-      void backendStartTask.then(
-        () => {
-          if (this.#backendStartTask === backendStartTask) {
-            this.#backendStartTask = null;
-            this.#backendStartController = null;
-          }
-        },
-        () => {
-          if (this.#backendStartTask === backendStartTask) {
-            this.#backendStartTask = null;
-            this.#backendStartController = null;
-          }
-        },
-      );
+      this.#backendLifecycle = lifecycle;
 
       try {
-        await promiseWithTimeout(backendStartTask, {
-          label: "Driver kernel backend startup",
-          signal: this.#shutdownController.signal,
-          timeoutMs: KERNEL_START_TIMEOUT_MS,
-        });
+        await lifecycle.start();
       } catch (error) {
-        backendStartController.abort(error);
         if (this.#shutdownController.signal.aborted && this.#terminalCause === null) {
           return;
         }
@@ -681,80 +484,6 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#events.pushReserved(structuredClone(event));
   }
 
-  #stopBackend(
-    backend: AgentDriverBackend,
-    payload: DriverStartInput,
-    reason: string,
-  ): Promise<void> {
-    const controller = new AbortController();
-    const task = Promise.resolve().then(() =>
-      backend.stop(this.#createContext(payload), reason, controller.signal),
-    );
-    this.#backendStopController = controller;
-    this.#backendStopTask = task;
-    void task.then(undefined, () => {
-      if (this.#backendStopTask === task) {
-        this.#backendStopController = null;
-        this.#backendStopTask = null;
-      }
-    });
-    return task;
-  }
-
-  #scheduleFinalStop(
-    startTask: Promise<void>,
-    backend: AgentDriverBackend,
-    payload: DriverStartInput,
-    reason: string,
-  ): void {
-    if (this.#backendFinalStopTask !== null) {
-      return;
-    }
-
-    let stopTask: Promise<void> | null = null;
-    let task!: Promise<void>;
-    task = startTask
-      .catch(() => {})
-      .then(async () => {
-        if (this.#backendFinalStopTask !== task || !this.#backendStopNeedsReplay) {
-          return;
-        }
-
-        this.#backendStopNeedsReplay = false;
-        stopTask = this.#stopBackend(backend, payload, reason);
-        await promiseWithTimeout(stopTask, {
-          label: "Driver kernel deferred backend shutdown",
-          timeoutMs: KERNEL_SHUTDOWN_TIMEOUT_MS,
-        });
-
-        if (this.#backendFinalStopTask === task && this.#backendStopTask === stopTask) {
-          this.#backend = null;
-          this.#backendStopController = null;
-          this.#backendStopTask = null;
-          this.#events.close();
-        }
-      });
-    this.#backendFinalStopTask = task;
-    void task.then(
-      () => {
-        if (this.#backendFinalStopTask === task) {
-          this.#backendFinalStopTask = null;
-        }
-      },
-      (error: unknown) => {
-        if (this.#backendFinalStopTask === task) {
-          this.#backendFinalStopTask = null;
-        }
-        if (stopTask !== null && this.#backendStopTask === stopTask) {
-          this.#backendStopController?.abort(error);
-          this.#backendStopController = null;
-          this.#backendStopTask = null;
-        }
-        this.#logger.error("driver.kernel.deferred_shutdown.failed", error, {});
-      },
-    );
-  }
-
   #throwTerminalCause(): void {
     if (this.#terminalCause !== null) {
       throw this.#terminalCause.error;
@@ -779,71 +508,16 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#shutdownController.abort(new Error(reason));
     this.#commands.close({ discard: true });
     this.#permissionBroker.rejectAll();
-    const backend = this.#backend;
-    const payload = this.#payload;
-    const backendStartTask = this.#backendStartTask;
-    const backendFinalStopTask = this.#backendFinalStopTask;
-
-    if (backendStartTask !== null) {
-      this.#backendStartController?.abort(new Error(reason));
-    }
 
     try {
-      if (backendStartTask !== null) {
-        this.#backendStopNeedsReplay = true;
-      }
-
-      if (backend && payload && this.#backendStopTask === null) {
-        if (backendStartTask === null) {
-          this.#backendStopNeedsReplay = false;
-        }
-        this.#stopBackend(backend, payload, reason);
-      }
-
-      const shutdownTasks: Promise<unknown>[] = [];
-
-      if (this.#backendStopTask !== null) {
-        shutdownTasks.push(this.#backendStopTask);
-      }
-      if (backendStartTask !== null) {
-        shutdownTasks.push(backendStartTask.catch(() => {}));
-      }
-      if (backendFinalStopTask !== null) {
-        shutdownTasks.push(backendFinalStopTask);
-      }
-
-      await promiseWithTimeout(Promise.all(shutdownTasks), {
-        label: "Driver kernel backend shutdown",
-        timeoutMs: KERNEL_SHUTDOWN_TIMEOUT_MS,
-      });
-
-      if (backend && payload && this.#backendStopNeedsReplay) {
-        this.#backendStopNeedsReplay = false;
-        await promiseWithTimeout(this.#stopBackend(backend, payload, reason), {
-          label: "Driver kernel final backend shutdown",
-          timeoutMs: KERNEL_SHUTDOWN_TIMEOUT_MS,
-        });
-      }
+      await this.#backendLifecycle?.shutdown(reason);
 
       if (this.#runtimeState.status() === "stopping") {
         this.#runtimeState.enter("stopped");
       }
-      this.#backend = null;
-      this.#backendFinalStopTask = null;
-      this.#backendStartController = null;
-      this.#backendStopController = null;
-      this.#backendStopTask = null;
+      this.#backendLifecycle = null;
       this.#events.close();
     } catch (error) {
-      this.#backendStopController?.abort(error);
-      this.#backendStopController = null;
-      this.#backendStopTask = null;
-      if (this.#backendFinalStopTask === backendFinalStopTask) {
-        this.#backendFinalStopTask = null;
-      }
-      if (backend && payload && backendStartTask && this.#backendStopNeedsReplay) {
-        this.#scheduleFinalStop(backendStartTask, backend, payload, reason);
-      }
       if (this.#runtimeState.status() === "stopping") {
         this.#runtimeState.enter("failed");
       }

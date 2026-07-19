@@ -85,7 +85,7 @@ function readBeginFixture(value: unknown): AcpTurnEventStateInput | undefined {
 
   return {
     messageId: readStringField(value, "messageId"),
-    runId: readStringField(value, "runId"),
+    runId: readStringField(value, "runId") as AcpTurnEventStateInput["runId"],
     sessionId: readStringField(value, "sessionId"),
   };
 }
@@ -297,7 +297,15 @@ function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   }
 
   if (fixture.failPrompt !== undefined) {
-    events.push(...state.failPrompt(fixture.failPrompt));
+    events.push(
+      ...state.failPrompt({
+        code: fixture.failPrompt.code,
+        message: fixture.failPrompt.message,
+        ...(fixture.failPrompt.recoverable === undefined
+          ? {}
+          : { recoverable: fixture.failPrompt.recoverable }),
+      }),
+    );
   }
 
   if (fixture.completePrompt !== undefined) {

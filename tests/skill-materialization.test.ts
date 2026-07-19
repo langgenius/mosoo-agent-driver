@@ -45,9 +45,9 @@ function createSkill(root: string, archive: Uint8Array): DriverResolvedSkill {
     materializationStatus: "pending",
     mountPath: join(root, ".mosoo", "skill", "review"),
     resolutionMode: "explicit",
-    skillId: "skill-1",
+    skillId: "skill-1" as DriverResolvedSkill["skillId"],
     skillName: "review",
-    snapshotId: "snapshot-1",
+    snapshotId: "snapshot-1" as DriverResolvedSkill["snapshotId"],
     warningCode: null,
   };
 }

@@ -775,7 +775,7 @@ describe("DriverPermissionBroker", () => {
           events.some(
             (event) =>
               event.kind === "permission.resolved" &&
-              event.payload.requestId === permissionInput.requestId,
+              (event.payload as Record<string, unknown>)["requestId"] === permissionInput.requestId,
           )
         ) {
           cancelledPublishing.resolve();
