@@ -149,7 +149,7 @@ describe("OpenCode ACP contract", () => {
             clientCapabilities: buildClientCapabilities(),
             clientInfo: {
               name: "mosoo-driver-contract-test",
-              title: "Mosoo Driver Contract Test",
+              title: "mosoo Driver Contract Test",
               version: "0.1.0",
             },
             protocolVersion: ACP_PROTOCOL_VERSION,

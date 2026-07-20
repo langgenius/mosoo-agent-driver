@@ -133,7 +133,7 @@ describe("driver artifact contract", () => {
     );
   });
 
-  test("keeps the standalone package out of Mosoo workspace dependencies", () => {
+  test("keeps the standalone package out of mosoo workspace dependencies", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});
     const tsconfig = readText("../tsconfig.json");

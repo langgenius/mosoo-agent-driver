@@ -98,7 +98,7 @@ describe("Claude Agent SDK query options", () => {
     expect(merged.mcpServers).toEqual(base.mcpServers);
   });
 
-  test("maps Mosoo built-in tool toggles into Claude SDK tool names", () => {
+  test("maps mosoo built-in tool toggles into Claude SDK tool names", () => {
     const payload = createDriverStartInputFromBootPayload({
       ...driverBootPayload,
       execution: {

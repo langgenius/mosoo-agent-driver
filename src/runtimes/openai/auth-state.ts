@@ -205,7 +205,7 @@ export async function materializeOpenAiModelProviderConfig(
       [input.provider]: {
         base_url: baseUrl,
         env_key: OPENAI_COMPATIBLE_API_KEY_ENV_NAME,
-        name: "Mosoo OpenAI-Compatible",
+        name: "mosoo OpenAI-Compatible",
         wire_api: "responses",
       },
     };

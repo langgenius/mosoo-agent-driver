@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./assets/logo.svg" alt="Mosoo" width="138" height="138" />
+<img src="./assets/logo.svg" alt="mosoo" width="138" height="138" />
 
 <h1>mosoo-agent-driver</h1>
 
@@ -30,13 +30,13 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 
 `mosoo-agent-driver` is the standalone Agent Driver and AI agent harness kernel for sandbox-hosted coding agent sessions. It runs inside the sandbox and drives one session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry. The package manifest uses the name `agent-driver`, but the package has not been published to npm yet.
 
-An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of Mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
+An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
 
-## Current Mosoo topology
+## Current mosoo topology
 
 ```mermaid
 flowchart LR
-    Runtime["Mosoo Runtime"]
+    Runtime["mosoo Runtime"]
     Boot["Private boot payload file<br/>controlUrl + one-time token + trace context"]
     Driver["agent-driver<br/>inside Sandbox"]
     Ingress["API Worker<br/>/api/driver/socket"]
@@ -51,7 +51,7 @@ flowchart LR
     Driver -->|"launches and supervises"| Backend
 ```
 
-The Driver does not open a sandbox-local control listener. In Mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
+The Driver does not open a sandbox-local control listener. In mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
 
 ## AI Agent Harness Architecture
 
@@ -59,12 +59,12 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 
 - **Kernel-level unification.** Three launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
 - **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics. Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports. The library is safe to import and never starts the process runner on its own.
-- **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and Mosoo does not mount it as a production API.
+- **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and mosoo does not mount it as a production API.
 - **Typed public entries.** Every public entry ships a matching declaration file under `dist/types`, and the package carries **no** `@mosoo/*` runtime dependencies — it is self-contained and portable.
 
 ## Package Entries
 
-- Command `agent-driver`: Bun process runner, built to `dist/driver.mjs`; in Mosoo it consumes the private boot payload and dials the API control socket.
+- Command `agent-driver`: Bun process runner, built to `dist/driver.mjs`; in mosoo it consumes the private boot payload and dials the API control socket.
 - Package root `agent-driver`: Driver Kernel, provider registry, host ports, commands, events, diagnostics, the in-memory CMA store, and CMA projection exports.
 - `agent-driver/boot`: process boot payload, protocol version, boot environment names, and host snapshot contracts.
 - `agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
@@ -140,13 +140,13 @@ test("create an agent, environment, and session over the CMA surface", async () 
 });
 ```
 
-This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessions` preview routes. It does not establish CMA compatibility, and Mosoo does not mount this handler. An embedding application must supply its own authorization, durable store, network server, and Driver command dispatcher.
+This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessions` preview routes. It does not establish CMA compatibility, and mosoo does not mount this handler. An embedding application must supply its own authorization, durable store, network server, and Driver command dispatcher.
 
-### How it is used in Mosoo
+### How it is used in mosoo
 
-`agent-driver` is the **runtime kernel of the Mosoo agent runtime**. When Mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object. The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
+`agent-driver` is the **runtime kernel of the mosoo agent runtime**. When mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object. The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
 
-[Mosoo](https://github.com/langgenius/mosoo) and this Driver repository are already public. Mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter. The `agent-driver` npm package has not been published yet.
+[mosoo](https://github.com/langgenius/mosoo) and this Driver repository are already public. mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter. The `agent-driver` npm package has not been published yet.
 
 ## Commands
 
@@ -167,9 +167,9 @@ vp run image:build
 - Host applications own credential, file, skill, MCP, policy, logging, persistence, and transport implementations.
 - Provider backends depend on Driver contracts and host ports only.
 - The library root is safe to import and must not start the process runner.
-- The package must not depend on Mosoo workspace packages at runtime.
-- Mosoo control traffic uses the outbound ORPC WebSocket to `DriverInstance`; the Driver does not expose a sandbox-local control listener.
-- The CMA-shaped exports are an experimental library adapter, not a Mosoo production endpoint or a compatibility guarantee.
+- The package must not depend on mosoo workspace packages at runtime.
+- mosoo control traffic uses the outbound ORPC WebSocket to `DriverInstance`; the Driver does not expose a sandbox-local control listener.
+- The CMA-shaped exports are an experimental library adapter, not a mosoo production endpoint or a compatibility guarantee.
 
 ## Checks
 

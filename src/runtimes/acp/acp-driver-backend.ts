@@ -201,7 +201,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
               clientCapabilities: buildClientCapabilities(),
               clientInfo: {
                 name: "mosoo-driver",
-                title: "Mosoo Driver",
+                title: "mosoo Driver",
                 version: "0.1.0",
               },
               protocolVersion: ACP_PROTOCOL_VERSION,
