@@ -1,0 +1,6 @@
+/.github/          @WH-2099
+/package.json      @WH-2099
+/bun.lock          @WH-2099
+/Containerfile     @WH-2099
+/.containerignore  @WH-2099
+/tsconfig*.json    @WH-2099

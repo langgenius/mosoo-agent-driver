@@ -104,8 +104,8 @@ function summarizeJsonRpcErrorData(value: unknown): JsonObject | null {
   };
 }
 
-const OPENAI_RUNTIME_HOME_ENV_NAME = ["CODE", "X_HOME"].join("");
-const DEFAULT_OPENAI_RUNTIME_EXECUTABLE = ["co", "dex"].join("");
+const OPENAI_RUNTIME_HOME_ENV_NAME = "CODEX_HOME";
+const DEFAULT_OPENAI_RUNTIME_EXECUTABLE = "codex";
 const APP_SERVER_TERMINATE_TIMEOUT_MS = 2_000;
 const APP_SERVER_KILL_TIMEOUT_MS = 1_000;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;

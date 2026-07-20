@@ -146,14 +146,17 @@ This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessio
 
 ```sh
 vp install --frozen-lockfile
+vp run fmt
 vp run lint
 vp run tc
 vp run test
 vp run build
-vp run image:build
+vp run build:image
+vp run check
+vp run clean
 ```
 
-`vp run image:build` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
+`vp run build:image` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
 ## Boundaries
 
@@ -167,11 +170,8 @@ vp run image:build
 
 ## Checks
 
-- `vp run lint`
-- `vp run tc`
-- `vp run test`
-- `vp run build`
-- `vp run image:build`
+- `vp run check`
+- `vp run build:image`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live provider smoke tests are gated by environment credentials

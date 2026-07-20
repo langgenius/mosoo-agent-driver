@@ -26,7 +26,7 @@ RUN apt-get update \
 # `@anthropic-ai/claude-agent-sdk-<linux-x64|linux-arm64>` so the image works
 # on CF Containers (linux/amd64) and local arm64 hosts (e.g. Apple Silicon)
 # without forcing platform emulation.
-RUN OPENAI_RUNTIME_PACKAGE="@openai/co""dex@${OPENAI_RUNTIME_VERSION}" \
+RUN OPENAI_RUNTIME_PACKAGE="@openai/codex@${OPENAI_RUNTIME_VERSION}" \
     && npm install -g \
       @anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_VERSION} \
       @anthropic-ai/sdk@${ANTHROPIC_SDK_VERSION} \

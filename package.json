@@ -69,19 +69,21 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "bench": "bun bench/ttft-bench.ts",
-    "build": "vp run build:types && bun build src/bin/driver.ts --outfile dist/driver.mjs --target bun --format esm --bundle",
-    "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
-    "check": "vp run tc && vp run test && vp run build",
-    "image:build": "vp run build && buildah build -t agent-driver:local .",
-    "lint": "vp lint src tests",
-    "prepack": "vp run build",
-    "tc": "vp exec tsc --noEmit",
+    "clean": "rm -rf dist node_modules",
+    "fmt": "vp fmt",
+    "lint": "vp lint",
+    "tc": "vp exec tsc",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
     "test:live:anthropic": "bun test tests/claude-agent-sdk-live.test.ts",
     "test:live:openai": "bun test tests/openai-app-server-live.test.ts",
-    "test:live:opencode": "AGENT_DRIVER_LIVE_OPENCODE=1 bun test tests/opencode-acp-live.test.ts"
+    "test:live:opencode": "AGENT_DRIVER_LIVE_OPENCODE=1 bun test tests/opencode-acp-live.test.ts",
+    "bench": "bun bench/ttft-bench.ts",
+    "build": "vp run build:types && bun build src/bin/driver.ts --target bun --outfile dist/driver.mjs",
+    "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
+    "build:image": "vp run build && buildah build -t agent-driver:local .",
+    "check": "vp check && vp run tc && vp run test && vp run build",
+    "prepack": "vp run build"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
