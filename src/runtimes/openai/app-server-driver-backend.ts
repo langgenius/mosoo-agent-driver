@@ -6,16 +6,13 @@ import {
   createTimingPhase,
   toDurationMs,
 } from "../../core/driver-runtime-timing";
-import {
-  summarizePath,
-  summarizeRuntimeCommandInput,
-} from "../../infrastructure/logging/driver-debug";
+import { summarizePath, summarizeRuntimeCommandInput } from "../../observability/driver-debug";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
-import type { AgentDriverBackend, AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildNativeRuntimeSystemPrompt,

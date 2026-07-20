@@ -68,7 +68,9 @@ function createOpenCodeAcpClient(input: {
   }) as ChildProcessWithoutNullStreams;
   const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
   const output = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
-  const inputStream = limitAcpInput(Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>);
+  const inputStream = limitAcpInput(
+    Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
+  );
   const connection = createAcpClient({ name: "mosoo-driver-contract-test" }).connect(
     ndJsonStream(output, inputStream),
   );

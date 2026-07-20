@@ -10,7 +10,7 @@ import type { TransformCallback } from "node:stream";
 import { toDurationMs } from "../../core/driver-runtime-timing";
 import type { DriverStartInput } from "../../protocol/start";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { killProcessGroup } from "../child-process";
 import { summarizeOpenAiProxyEnv } from "./app-server-env";
@@ -19,7 +19,6 @@ import {
   readNonEmptyString,
   readRecord,
   readString,
-  stringifyForDisplay,
   toJsonRpcId,
 } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
@@ -31,14 +30,9 @@ import type {
   ClientRequestMethod,
   ClientRequestParams,
   ClientRequestResult,
-  CommandExecutionRequestApprovalResponse,
-  CurrentTimeReadResponse,
-  FileChangeRequestApprovalResponse,
-  PermissionsRequestApprovalResponse,
   RequestId,
   ServerNotificationMethod,
   ServerNotificationParams,
-  ServerRequestMethod,
 } from "./generated/app-server-protocol";
 import {
   CLIENT_REQUEST_RESULT_PARSERS,
@@ -47,6 +41,7 @@ import {
   parseServerNotificationParams,
 } from "./generated/app-server-protocol";
 import { buildOpenAiMcpServerConfig } from "./mcp-config";
+import { OpenAiAppServerRequestHandler } from "./app-server-request-handler";
 
 interface PendingJsonRpcRequest {
   method: ClientRequestMethod;
@@ -69,28 +64,6 @@ interface OpenAiClientContext extends AgentDriverContext {
     params: ServerNotificationParams[M],
   ): Promise<void>;
   handleProtocolError(error: Error): Promise<void>;
-}
-
-function toApprovalDecision(
-  decision: "allow_once" | "reject_once",
-): CommandExecutionRequestApprovalResponse["decision"] {
-  return decision === "allow_once" ? "accept" : "decline";
-}
-
-function toPermissionProfileGrant(params: JsonObject): PermissionsRequestApprovalResponse {
-  const permissions = readRecord(params, "permissions");
-
-  if (permissions === null) {
-    return {
-      permissions: {},
-      scope: "turn",
-    };
-  }
-
-  return {
-    permissions: { ...permissions },
-    scope: "turn",
-  };
 }
 
 function summarizeJsonRpcErrorData(value: unknown): JsonObject | null {
@@ -186,8 +159,8 @@ function readRuntimeExecutable(): string {
 export class OpenAiAppServerClient {
   readonly #context: OpenAiClientContext;
   readonly #pendingRequests = new Map<RequestId, PendingJsonRpcRequest>();
-  readonly #pendingServerRequests = new Map<RequestId, AbortController>();
   readonly #payload: DriverStartInput;
+  readonly #requestHandler: OpenAiAppServerRequestHandler;
   #nextId = 1;
   #pendingServerMessageBytes = 0;
   #pendingServerMessages = 0;
@@ -202,6 +175,13 @@ export class OpenAiAppServerClient {
   constructor(payload: DriverStartInput, context: OpenAiClientContext) {
     this.#payload = payload;
     this.#context = context;
+    this.#requestHandler = new OpenAiAppServerRequestHandler({
+      context,
+      handleError: async (error) => this.#notifyProtocolError(error),
+      isStopped: () => this.#stopRequested,
+      respond: (id, result) => this.respond(id, result),
+      respondError: (id, message) => this.respondError(id, message),
+    });
   }
 
   async start(signal?: AbortSignal): Promise<OpenAiAppServerClientStartResult> {
@@ -455,10 +435,7 @@ export class OpenAiAppServerClient {
   }
 
   abortServerRequests(reason: Error): void {
-    for (const request of this.#pendingServerRequests.values()) {
-      request.abort(reason);
-    }
-    this.#pendingServerRequests.clear();
+    this.#requestHandler.abortAll(reason);
   }
 
   stop(signal?: AbortSignal): Promise<void> {
@@ -717,10 +694,7 @@ export class OpenAiAppServerClient {
 
       if (method === "serverRequest/resolved") {
         const parsed = parseServerNotificationParams(method, params);
-        this.#pendingServerRequests
-          .get(parsed.requestId)
-          ?.abort(new Error("OpenAi app-server request was resolved elsewhere."));
-        this.#pendingServerRequests.delete(parsed.requestId);
+        this.#requestHandler.resolveElsewhere(parsed.requestId);
         await this.#context.handleNotification(method, parsed);
         return;
       }
@@ -734,103 +708,7 @@ export class OpenAiAppServerClient {
       return;
     }
 
-    if (this.#pendingServerRequests.has(id)) {
-      throw new Error(`OpenAi app-server request ${String(id)} is already pending.`);
-    }
-
-    const controller = new AbortController();
-    this.#pendingServerRequests.set(id, controller);
-    void this.#onRequest(method, id, params, controller.signal).catch(async (error: unknown) => {
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      this.#context.logger.error("driver.openai.server_request.failed", error, { method });
-      await this.#notifyProtocolError(
-        error instanceof Error ? error : new Error("OpenAi app-server request failed."),
-      );
-      this.#replyError(id, error instanceof Error ? error.message : "Server request failed.");
-    });
-  }
-
-  async #onRequest(
-    method: ServerRequestMethod,
-    id: RequestId,
-    params: unknown,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const payload = isRecord(params) ? params : {};
-    const requestId = `${method}:${String(id)}`;
-
-    if (method === "currentTime/read") {
-      const response: CurrentTimeReadResponse = {
-        currentTimeAt: Math.floor(Date.now() / 1_000),
-      };
-      this.#reply(id, response);
-      return;
-    }
-
-    if (
-      method === "item/commandExecution/requestApproval" ||
-      method === "item/fileChange/requestApproval"
-    ) {
-      const decision = await this.#context.ports.permission.request(
-        {
-          rawInput: stringifyForDisplay(payload["command"] ?? payload["reason"] ?? payload),
-          requestId,
-          title:
-            method === "item/fileChange/requestApproval"
-              ? "Approve file changes"
-              : "Approve command execution",
-          toolCallId: readString(payload, "itemId"),
-          toolKind: method,
-        },
-        signal,
-      );
-      const response: CommandExecutionRequestApprovalResponse | FileChangeRequestApprovalResponse =
-        {
-          decision: toApprovalDecision(decision),
-        };
-      this.#reply(id, response);
-      return;
-    }
-
-    if (method === "item/permissions/requestApproval") {
-      const decision = await this.#context.ports.permission.request(
-        {
-          rawInput: stringifyForDisplay(payload["permissions"] ?? payload),
-          requestId,
-          title: "Approve runtime permissions",
-          toolCallId: readString(payload, "itemId"),
-          toolKind: method,
-        },
-        signal,
-      );
-      this.#reply(
-        id,
-        decision === "allow_once"
-          ? toPermissionProfileGrant(payload)
-          : {
-              permissions: {},
-              scope: "turn",
-            },
-      );
-      return;
-    }
-
-    this.#replyError(id, "Unsupported OpenAi app-server request.");
-  }
-
-  #reply(id: RequestId, result: unknown): void {
-    if (this.#pendingServerRequests.delete(id) && !this.#stopRequested) {
-      this.respond(id, result);
-    }
-  }
-
-  #replyError(id: RequestId, message: string): void {
-    if (this.#pendingServerRequests.delete(id) && !this.#stopRequested) {
-      this.respondError(id, message);
-    }
+    this.#requestHandler.dispatch(method, id, params);
   }
 
   #rejectPending(error: Error): void {

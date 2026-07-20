@@ -11,7 +11,7 @@ import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { DriverStartInput } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "../src/runtimes/claude/agent-sdk-driver-backend";
 import { bootPayload, DRIVER_TEST_IDS } from "./driver-runtime-boundary-fixtures";
 
@@ -42,7 +42,7 @@ function resultMessage(sessionId = "native-session-1"): SDKMessage {
     type: "result",
     usage: { input_tokens: 1, output_tokens: 1 },
     uuid: "result-1",
-  };
+  } as unknown as SDKMessage;
 }
 
 function errorResultMessage(): SDKMessage {
@@ -61,7 +61,7 @@ function errorResultMessage(): SDKMessage {
     type: "result",
     usage: { input_tokens: 1, output_tokens: 1 },
     uuid: "result-1",
-  };
+  } as unknown as SDKMessage;
 }
 
 function fakeQuery(
@@ -124,6 +124,44 @@ function createHarness(
 }
 
 describe("Claude Agent SDK driver backend", () => {
+  test("consumes a ready prewarm for the first turn", async () => {
+    process.env[PREWARM_ENV] = "1";
+    const startupCalled = Promise.withResolvers<void>();
+    const prompts: string[] = [];
+    let coldQueries = 0;
+    const harness = createHarness({
+      createQueryOptions: async (input) =>
+        ({
+          abortController: input.abortController,
+        }) as ClaudeQueryOptions,
+      query: () => {
+        coldQueries += 1;
+        return fakeQuery([resultMessage()]);
+      },
+      startup: async () => {
+        startupCalled.resolve();
+        return {
+          close: () => {},
+          query: (prompt) => {
+            prompts.push(String(prompt));
+            return fakeQuery([resultMessage()]);
+          },
+          async [Symbol.asyncDispose]() {},
+        };
+      },
+    });
+
+    await harness.backend.start(harness.context, new AbortController().signal);
+    await startupCalled.promise;
+    await nextEventLoopTurn();
+    await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    await harness.logger.destroy();
+
+    expect(prompts).toEqual(["first"]);
+    expect(coldQueries).toBe(0);
+  });
+
   test("discards a late prewarm after the first turn takes the cold path", async () => {
     process.env[PREWARM_ENV] = "1";
     const startup = Promise.withResolvers<WarmQuery>();
@@ -657,7 +695,7 @@ describe("Claude Agent SDK driver backend", () => {
               session_id: "native-session-1",
               type: "assistant",
               uuid: "late-assistant",
-            } as SDKMessage;
+            } as unknown as SDKMessage;
           })(),
         );
       },

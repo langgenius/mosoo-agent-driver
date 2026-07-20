@@ -30,10 +30,10 @@
     "strictNullChecks": true,
     "strictPropertyInitialization": true,
     "target": "ESNext",
-    "types": ["node"],
+    "types": ["bun", "node"],
     "useDefineForClassFields": true,
     "useUnknownInCatchVariables": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["bench/**/*.ts", "src/**/*.ts", "tests/**/*.ts"]
 }

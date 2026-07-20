@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,9 +8,9 @@ import type { Logger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { AcpFileSystem } from "../src/runtimes/acp/acp-file-system";
-import type { AgentDriverContext } from "../src/runtimes/agent-driver-backend";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
-import { driverBootPayload } from "./driver-boot-payload-fixture";
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { driverStartInput } from "./driver-boot-payload-fixture";
 
 function createFileSystem(cwd = process.cwd()): AcpFileSystem {
   return new AcpFileSystem({
@@ -43,7 +43,7 @@ function createContext(events: DriverEventInput[]): {
         },
       },
       logger,
-      payload: driverBootPayload,
+      payload: driverStartInput,
       permission: {
         request: async () => "reject_once",
       },
@@ -67,6 +67,24 @@ describe("ACP file system bridge", () => {
     await expect(fileSystem.readTextFile({ path: "/tmp/outside.txt" })).rejects.toThrow(
       "outside the allowed roots",
     );
+  });
+
+  test("rejects a symlink that escapes an allowed root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-scope-"));
+    const outside = await mkdtemp(join(tmpdir(), "driver-acp-fs-outside-"));
+    const link = join(root, "escape");
+    const target = join(outside, "secret.txt");
+
+    try {
+      await writeFile(target, "secret");
+      await symlink(outside, link);
+      await expect(
+        createFileSystem(root).readTextFile({ path: join(link, "secret.txt") }),
+      ).rejects.toThrow("resolves outside the allowed roots");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
+    }
   });
 
   test("writes allowed text files and reports the file change through the host port", async () => {

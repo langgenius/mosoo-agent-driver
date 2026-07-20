@@ -12,21 +12,15 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
 
-import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
-import {
-  summarizePath,
-  summarizePathCollection,
-  summarizeRuntimeCommandInput,
-} from "../../infrastructure/logging/driver-debug";
+import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
 import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
-import { createDriverId } from "../../protocol/id";
-import type { MessageId, RunId } from "../../protocol/id";
+import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
-import { promiseWithTimeout, raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverBackend, AgentDriverContext } from "../agent-driver-backend";
+import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
@@ -36,6 +30,7 @@ import {
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
+import { limitAcpInput } from "./acp-input-limit";
 import {
   ACP_PROTOCOL_VERSION,
   buildChildEnv,
@@ -44,33 +39,12 @@ import {
   readResumeId,
   resolveAuthMethod,
   supportsSessionClose,
-  toRequestMeta,
 } from "./acp-configuration";
-import {
-  AcpTurnEventState,
-  toAuthEvent,
-  toInitializeEvents,
-  toPromptStartEvents,
-  toSessionReadyEvents,
-} from "./acp-event-translator";
+import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-event-translator";
 import { setupAcpSession } from "./acp-session-setup";
+import { withAcpStartupStage } from "./acp-startup";
+import { AcpTurnController } from "./acp-turn-controller";
 
-interface ActiveAcpTurn {
-  readonly cancellation: AbortController;
-  cancelRequested: boolean;
-  readonly runId: RunId;
-}
-
-class AcpPromptTerminalError extends Error {
-  override readonly name = "AcpPromptTerminalError";
-
-  constructor(stopReason: string) {
-    super(`ACP prompt stopped with terminal stop reason: ${stopReason}.`);
-  }
-}
-
-const MAX_ACP_MESSAGE_BYTES = 8 * 1_024 * 1_024;
-const ACP_STARTUP_STAGE_TIMEOUT_MS = 30_000;
 const ACP_STOP_BUDGET_MS = 4_000;
 const ACP_SESSION_SHUTDOWN_TIMEOUT_MS = 750;
 const ACP_UPDATE_DRAIN_TIMEOUT_MS = 750;
@@ -79,58 +53,10 @@ function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
-export function limitAcpInput(
-  input: ReadableStream<Uint8Array>,
-  maxMessageBytes = MAX_ACP_MESSAGE_BYTES,
-): ReadableStream<Uint8Array> {
-  if (!Number.isSafeInteger(maxMessageBytes) || maxMessageBytes < 1) {
-    throw new RangeError("ACP message byte limit must be a positive safe integer.");
-  }
-
-  let pendingBytes = 0;
-  return input.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        for (const byte of chunk) {
-          if (byte === 0x0a) {
-            pendingBytes = 0;
-          } else {
-            pendingBytes += 1;
-            if (pendingBytes > maxMessageBytes) {
-              throw new Error(`ACP message exceeds ${maxMessageBytes} bytes.`);
-            }
-          }
-        }
-
-        controller.enqueue(chunk);
-      },
-    }),
-  );
-}
-
-async function withAcpStartupStage<T>(
-  stage: string,
-  task: () => Promise<T>,
-  signal: AbortSignal,
-): Promise<T> {
-  try {
-    signal.throwIfAborted();
-    return await promiseWithTimeout(task(), {
-      label: stage,
-      signal,
-      timeoutMs: ACP_STARTUP_STAGE_TIMEOUT_MS,
-    });
-  } catch (error) {
-    signal.throwIfAborted();
-    throw new Error(`${stage} failed: ${toErrorMessage(error, "ACP startup step failed.")}`, {
-      cause: error,
-    });
-  }
-}
+export { limitAcpInput } from "./acp-input-limit";
 
 export class AcpDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "acp-fallback";
-  #activeTurn: ActiveAcpTurn | null = null;
   #agentCapabilities: AgentCapabilities | null = null;
   #agentProcess: AcpAgentProcess | null = null;
   readonly #childProcessEnv: Record<string, string>;
@@ -144,7 +70,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #runtimeBootstrapText: string;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
-  readonly #turnEvents = new AcpTurnEventState();
+  readonly #turnController: AcpTurnController;
 
   constructor(payload: DriverStartInput) {
     this.#payload = payload;
@@ -152,15 +78,18 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#nativeSessionId = readResumeId(payload);
     this.#runtimeBootstrapDigest = computeRuntimeBootstrapDigest(payload.execution);
     this.#runtimeBootstrapText = buildRuntimeBootstrapText(payload.execution);
+    this.#turnController = new AcpTurnController((context, reason, events) =>
+      this.#push(context, reason, events),
+    );
     this.#clientRequests = new AcpClientRequestHandler({
       allowedRoots: payload.execution.session.additionalDirectories,
       cwd: payload.execution.session.cwd,
       env: this.#childProcessEnv,
-      isCancelling: () => this.#activeTurn?.cancelRequested ?? false,
+      isCancelling: () => this.#turnController.isCancelling(),
       nativeSessionId: () => this.#nativeSessionId,
       onUpdateFailure: (error) => this.#connection?.close(error),
       push: async (context, reason, events) => this.#push(context, reason, events),
-      turnEvents: this.#turnEvents,
+      turnEvents: this.#turnController.events,
     });
   }
 
@@ -247,7 +176,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
         );
       const output = Writable.toWeb(agentProcess.stdin) as WritableStream<Uint8Array>;
       const input = limitAcpInput(
-        Readable.toWeb(agentProcess.stdout) as ReadableStream<Uint8Array>,
+        Readable.toWeb(agentProcess.stdout) as unknown as ReadableStream<Uint8Array>,
       );
       const connection = app.connect(ndJsonStream(output, input));
       this.#connection = connection;
@@ -359,162 +288,24 @@ export class AcpDriverBackend implements AgentDriverBackend {
     input: RuntimeCommandInput,
     runId: RunId,
   ): Promise<void> {
-    const connection = this.#requireConnection();
-    const sessionId = this.#requireSessionId();
-    const messageId = createDriverId() as MessageId;
-
-    if (this.#activeTurn !== null) {
-      throw new Error("ACP driver backend already has an active turn.");
-    }
-
-    this.#activeTurn = {
-      cancellation: new AbortController(),
-      cancelRequested: false,
+    await this.#turnController.handleInput(
+      context,
+      input,
       runId,
-    };
-    this.#turnEvents.begin({ messageId, runId, sessionId });
-    const hostSnapshot = this.#requireHostSnapshot();
-
-    context.logger.info("driver.acp.prompt.sending", {
-      sessionId,
-      textLength: input.text.length,
-    });
-    context.logger.debug("driver.acp.prompt.requested", {
-      input: summarizeRuntimeCommandInput(input),
-      sessionId,
-    });
-
-    try {
-      await this.#push(
-        context,
-        "driver.acp.prompt.started",
-        toPromptStartEvents({ messageId, runId, text: input.text }),
-      );
-
-      if (this.#activeTurn.cancelRequested) {
-        await this.#push(
-          context,
-          "driver.acp.prompt.cancelled",
-          this.#turnEvents.completePrompt("cancelled", null),
-        );
-        throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
-      }
-
-      const promptResult = await connection.request(acpMethods.agent.session.prompt, {
-        _meta: {
-          ...toRequestMeta({
-            sessionContext: hostSnapshot.sessionContext,
-          }),
-          "mosoo.ai/messageId": messageId,
-        },
-        prompt: [{ text: input.text, type: "text" }],
-        sessionId,
-      });
-      await this.#clientRequests.drainUpdates();
-      const stopReason = this.#activeTurn.cancelRequested ? "cancelled" : promptResult.stopReason;
-      const completionEvents = this.#turnEvents.completePrompt(stopReason, promptResult.usage);
-      const promptCancelled =
-        this.#activeTurn.cancelRequested || promptResult.stopReason === "cancelled";
-      const promptFailed = completionEvents.some((event) => event.kind === "run.failed");
-
-      await this.#push(
-        context,
-        promptCancelled
-          ? "driver.acp.prompt.cancelled"
-          : promptFailed
-            ? "driver.acp.prompt.failed"
-            : "driver.acp.prompt.completed",
-        completionEvents,
-      );
-
-      context.logger.info(
-        promptFailed ? "driver.acp.prompt.failed" : "driver.acp.prompt.completed",
-        {
-          sessionId,
-          stopReason: promptResult.stopReason,
-        },
-      );
-
-      if (promptCancelled) {
-        throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
-      }
-
-      if (promptFailed) {
-        throw new AcpPromptTerminalError(stopReason);
-      }
-    } catch (error) {
-      let failure = error;
-
-      try {
-        await this.#clientRequests.drainUpdates();
-      } catch (updateError) {
-        failure = updateError;
-      }
-
-      if (
-        failure instanceof DriverTurnCancelledError ||
-        failure instanceof AcpPromptTerminalError
-      ) {
-        throw failure;
-      }
-
-      if (this.#activeTurn?.cancelRequested) {
-        const events =
-          this.#turnEvents.activeRunId() === null
-            ? []
-            : this.#turnEvents.completePrompt("cancelled", null);
-        await this.#push(context, "driver.acp.prompt.cancelled", events);
-        throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
-      }
-
-      const message =
-        failure instanceof Error ? failure.message : "ACP driver backend turn failed.";
-      await this.#push(
-        context,
-        "driver.acp.prompt.failed",
-        this.#turnEvents.failPrompt({
-          code: "acp.turn_failed",
-          message,
-        }),
-      );
-      throw failure;
-    } finally {
-      this.#activeTurn = null;
-      this.#turnEvents.clear();
-    }
+      this.#requireConnection(),
+      this.#requireSessionId(),
+      this.#requireHostSnapshot(),
+      this.#clientRequests,
+    );
   }
 
   async cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void> {
-    const activeTurn = this.#activeTurn;
-    const sessionId = this.#nativeSessionId;
-    const connection = this.#connection?.agent;
-
-    if (activeTurn === null || sessionId === null || connection === undefined) {
-      return;
-    }
-
-    if (!activeTurn.cancelRequested) {
-      activeTurn.cancelRequested = true;
-      activeTurn.cancellation.abort(
-        new DriverTurnCancelledError("ACP driver backend turn was cancelled."),
-      );
-      const cancel = connection.notify(acpMethods.agent.session.cancel, { sessionId });
-      const eventPush = this.#push(context, "driver.acp.turn.cancel.requested", [
-        {
-          kind: "run.cancel.requested",
-          payload: {
-            reason,
-            requestedBy: "user",
-            targetRunId: activeTurn.runId,
-          },
-          runId: activeTurn.runId,
-        },
-      ]);
-      await Promise.all([cancel, eventPush]);
-      return;
-    }
-
-    await connection.notify(acpMethods.agent.session.cancel, { sessionId });
+    await this.#turnController.cancel(
+      context,
+      reason,
+      this.#connection?.agent ?? null,
+      this.#nativeSessionId,
+    );
   }
 
   stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void> {
@@ -538,9 +329,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     signal: AbortSignal,
   ): Promise<void> {
     const deadline = Date.now() + ACP_STOP_BUDGET_MS;
-    this.#activeTurn?.cancellation.abort(
-      new DriverTurnCancelledError("ACP driver backend stopped."),
-    );
+    this.#turnController.abort("ACP driver backend stopped.");
     const terminalCleanupTask = settlePromiseWithTimeout(
       this.#clientRequests.stopTerminals(context),
       {
@@ -741,7 +530,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   }
 
   #requestSignal(signal: AbortSignal): AbortSignal {
-    const turnSignal = this.#activeTurn?.cancellation.signal;
+    const turnSignal = this.#turnController.activeSignal();
     return turnSignal === undefined ? signal : AbortSignal.any([signal, turnSignal]);
   }
 

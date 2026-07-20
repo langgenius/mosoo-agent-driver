@@ -1,18 +1,28 @@
-import type { DriverBootPayload } from "../src/protocol/boot";
+import type {
+  AccountId,
+  AgentId,
+  DriverBootPayload,
+  EnvironmentId,
+  EnvironmentRevisionId,
+  SandboxId,
+  SandboxSessionId,
+} from "../src/protocol/boot";
 import { DRIVER_CONTROL_PORT_MIN } from "../src/protocol/boot";
+import type { DriverInstanceId, RunId, SessionId } from "../src/protocol/id";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 
 export const DRIVER_TEST_IDS = {
-  agentId: "01J00000000000000000000009",
-  callerAccountId: "01J00000000000000000000001",
-  driverInstanceId: "01J0000000000000000000000F",
-  environmentId: "01J00000000000000000000010",
-  environmentRevisionId: "01J00000000000000000000011",
-  runId: "01J00000000000000000000012",
-  sandboxId: "01J0000000000000000000000D",
-  sandboxSessionId: "01J0000000000000000000000E",
-  secondRunId: "01J00000000000000000000013",
-  sessionId: "01J00000000000000000000008",
-  thirdRunId: "01J00000000000000000000015",
+  agentId: "01J00000000000000000000009" as AgentId,
+  callerAccountId: "01J00000000000000000000001" as AccountId,
+  driverInstanceId: "01J0000000000000000000000F" as DriverInstanceId,
+  environmentId: "01J00000000000000000000010" as EnvironmentId,
+  environmentRevisionId: "01J00000000000000000000011" as EnvironmentRevisionId,
+  runId: "01J00000000000000000000012" as RunId,
+  sandboxId: "01J0000000000000000000000D" as SandboxId,
+  sandboxSessionId: "01J0000000000000000000000E" as SandboxSessionId,
+  secondRunId: "01J00000000000000000000013" as RunId,
+  sessionId: "01J00000000000000000000008" as SessionId,
+  thirdRunId: "01J00000000000000000000015" as RunId,
 } as const;
 
 export const driverBootPayload = {
@@ -81,3 +91,5 @@ export const driverBootPayload = {
   sandboxId: DRIVER_TEST_IDS.sandboxId,
   traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
 } satisfies DriverBootPayload;
+
+export const driverStartInput = createDriverStartInputFromBootPayload(driverBootPayload);

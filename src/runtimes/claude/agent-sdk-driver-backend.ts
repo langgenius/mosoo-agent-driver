@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
 import { query, startup } from "@anthropic-ai/claude-agent-sdk";
-import type { Query, WarmQuery } from "@anthropic-ai/claude-agent-sdk";
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
@@ -13,17 +13,18 @@ import {
   summarizePath,
   summarizePathCollection,
   summarizeRuntimeCommandInput,
-} from "../../infrastructure/logging/driver-debug";
+} from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
-import type { AgentDriverBackend, AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import { computeRuntimeBootstrapDigest, writeSkillBootstrapArtifacts } from "../skill-bootstrap";
 import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
+import { ClaudeAgentSdkPrewarm } from "./agent-sdk-prewarm";
 import {
   ClaudeAgentSdkMessageTranslator,
   ClaudeTerminalWriteError,
@@ -44,12 +45,6 @@ interface ActiveClaudeTurn {
   state: "running" | "finalizing" | "cancelled";
 }
 
-interface ClaudePrewarm {
-  readonly abortController: AbortController;
-  readonly detach: () => void;
-  query: WarmQuery | null;
-}
-
 interface ClaudeAgentSdkDriverBackendDependencies {
   readonly createQueryOptions: typeof createClaudeQueryOptions;
   readonly query: typeof query;
@@ -62,23 +57,6 @@ const DEFAULT_DEPENDENCIES: ClaudeAgentSdkDriverBackendDependencies = {
   startup,
 };
 
-const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
-
-/**
- * Prewarm the Claude CLI subprocess during backend start. OPT-IN (default off).
- *
- * Prewarm pre-spawns a SECOND native Claude CLI process via `startup()` to cut
- * first-token latency. On a memory-constrained container (e.g. the CF "basic"
- * instance, ~1 GiB) that extra process can OOM-kill the driver before it signals
- * `ready`, surfacing as RUN FAILED "Driver instance <id> closed before ready".
- * So it is disabled by default and must be explicitly enabled only on an
- * instance with headroom for a second CLI via AGENT_DRIVER_CLAUDE_PREWARM=1.
- * It is also fired non-blocking (see start()) so it never delays `ready`.
- */
-function isClaudePrewarmEnabled(): boolean {
-  return readProcessEnvString(CLAUDE_PREWARM_ENV) === "1";
-}
-
 function isTurnCancelled(turn: ActiveClaudeTurn): boolean {
   return turn.state === "cancelled";
 }
@@ -89,10 +67,9 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
   readonly #messageTranslator: ClaudeAgentSdkMessageTranslator;
   readonly #payload: DriverStartInput;
+  readonly #prewarm: ClaudeAgentSdkPrewarm;
   #activeTurn: ActiveClaudeTurn | null = null;
   #nativeSessionId: string | null = null;
-  #prewarm: ClaudePrewarm | null = null;
-  #prewarmTask: Promise<void> | null = null;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
 
@@ -103,6 +80,12 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     this.#dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies };
     this.#payload = payload;
     this.#nativeSessionId = readClaudeNativeResumeSessionId(payload);
+    this.#prewarm = new ClaudeAgentSdkPrewarm({
+      createQueryOptions: this.#dependencies.createQueryOptions,
+      getNativeSessionId: () => this.#nativeSessionId,
+      payload,
+      startup: async (input) => this.#dependencies.startup(input),
+    });
     this.#messageTranslator = new ClaudeAgentSdkMessageTranslator({
       push: async (context, reason, events) => this.#push(context, reason, events),
       recordNativeSessionId: async (context, sessionId) =>
@@ -152,86 +135,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       skillCount: materializedSkills.length,
     });
 
-    // Fire prewarm non-blocking: it must NOT gate the driver's `ready` handshake
-    // (start() is awaited before socket.ready()). If the first turn arrives
-    // before prewarm finishes, handleInput cold-spawns (warmQuery is still null).
-    const prewarmTask = this.#prewarmQuery(context, signal);
-    this.#prewarmTask = prewarmTask;
-    const releasePrewarmTask = () => {
-      if (this.#prewarmTask === prewarmTask) {
-        this.#prewarmTask = null;
-      }
-    };
-    void prewarmTask.then(releasePrewarmTask, releasePrewarmTask);
-  }
-
-  /**
-   * Pre-spawn the CLI so the first turn writes to a ready process. Best-effort:
-   * a prewarm failure (e.g. missing CLI in a constrained environment) is logged
-   * and the runtime falls back to lazy spawn on the first `query()`.
-   */
-  async #prewarmQuery(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
-    if (!isClaudePrewarmEnabled()) {
-      return;
-    }
-
-    const startedAtMs = Date.now();
-    const abortController = new AbortController();
-    const onAbort = () => abortController.abort(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) {
-      onAbort();
-    }
-    const prewarm: ClaudePrewarm = {
-      abortController,
-      detach: () => signal.removeEventListener("abort", onAbort),
-      query: null,
-    };
-    this.#prewarm = prewarm;
-
-    try {
-      const options = await this.#dependencies.createQueryOptions({
-        abortController: prewarm.abortController,
-        context,
-        nativeSessionId: this.#nativeSessionId,
-        payload: this.#payload,
-      });
-
-      if (
-        this.#stopRequested ||
-        prewarm.abortController.signal.aborted ||
-        this.#prewarm !== prewarm
-      ) {
-        return;
-      }
-
-      const warmQuery = await this.#dependencies.startup({ options });
-
-      if (
-        this.#stopRequested ||
-        prewarm.abortController.signal.aborted ||
-        this.#prewarm !== prewarm
-      ) {
-        warmQuery.close();
-        return;
-      }
-
-      prewarm.query = warmQuery;
-      context.logger.debug("driver.claude.prewarm.ready", {
-        prewarmMs: Date.now() - startedAtMs,
-      });
-    } catch (error) {
-      if (!prewarm.abortController.signal.aborted && !this.#stopRequested) {
-        context.logger.debug("driver.claude.prewarm.failed", {
-          message: toErrorMessage(error, "Claude prewarm failed."),
-        });
-      }
-    } finally {
-      prewarm.detach();
-      if (this.#prewarm === prewarm && prewarm.query === null) {
-        this.#prewarm = null;
-      }
-    }
+    this.#prewarm.start(context, signal);
   }
 
   async handleInput(
@@ -249,19 +153,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     this.#messageTranslator.resetTurnMessageState();
 
-    const prewarm = this.#prewarm;
-    this.#prewarm = null;
-    prewarm?.detach();
-    let abortController: AbortController;
-    let warmQuery: WarmQuery | null;
-    if (prewarm?.query) {
-      abortController = prewarm.abortController;
-      warmQuery = prewarm.query;
-    } else {
-      prewarm?.abortController.abort("driver.claude.prewarm.superseded");
-      abortController = new AbortController();
-      warmQuery = null;
-    }
+    const { abortController, warmQuery } = this.#prewarm.take();
     const activeTurn: ActiveClaudeTurn = {
       abortController,
       cancelReason: null,
@@ -485,26 +377,9 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     reason: string,
     signal: AbortSignal,
   ): Promise<void> {
-    const prewarm = this.#prewarm;
-    const prewarmTask = this.#prewarmTask;
-    this.#prewarm = null;
-    prewarm?.detach();
-    prewarm?.abortController.abort(reason);
-    try {
-      prewarm?.query?.close();
-    } catch (error) {
-      context.logger.debug("driver.claude.prewarm.close_failed", {
-        message: toErrorMessage(error, "prewarm close failed"),
-        reason,
-      });
-    }
+    const prewarmStop = this.#prewarm.stop(context, reason, signal);
     await this.cancelActiveTurn(context, reason);
-    if (prewarmTask === null) {
-      signal.throwIfAborted();
-      return;
-    }
-
-    await raceWithAbort(prewarmTask, signal);
+    await prewarmStop;
   }
 
   async #recordNativeSessionId(context: AgentDriverContext, sessionId: string): Promise<void> {

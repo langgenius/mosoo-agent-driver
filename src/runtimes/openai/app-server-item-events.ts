@@ -1,5 +1,5 @@
 import type { DriverEventInput } from "../../protocol/events";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiPlanStatus } from "./app-server-event-mapping";
 import type {
   OpenAiEventPush,

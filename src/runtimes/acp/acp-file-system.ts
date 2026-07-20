@@ -1,25 +1,23 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname } from "node:path";
 
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { isRecord, raceWithAbort, readNonEmptyString, readNumber } from "./acp-types";
+import { AcpPathScope } from "./acp-path-scope";
 
 interface AcpFileSystemOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
+  readonly pathScope?: AcpPathScope | undefined;
 }
 
 const MAX_ACP_FILE_BYTES = 8 * 1_024 * 1_024;
 
 export class AcpFileSystem {
-  readonly #allowedRoots: readonly string[];
-  readonly #cwd: string;
+  readonly #pathScope: AcpPathScope;
 
   constructor(options: AcpFileSystemOptions) {
-    this.#allowedRoots = [options.cwd, ...options.allowedRoots].map((root) =>
-      resolve(options.cwd, root),
-    );
-    this.#cwd = resolve(options.cwd);
+    this.#pathScope = options.pathScope ?? new AcpPathScope(options);
   }
 
   async readTextFile(params: unknown, signal?: AbortSignal): Promise<{ content: string }> {
@@ -31,7 +29,7 @@ export class AcpFileSystem {
       throw new Error("ACP fs/read_text_file requires a path.");
     }
 
-    const path = this.#resolveAllowedPath(requestedPath);
+    const path = await this.#pathScope.resolveExisting(requestedPath, "ACP file path");
     const file = await stat(path);
     signal?.throwIfAborted();
 
@@ -78,7 +76,7 @@ export class AcpFileSystem {
       throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
     }
 
-    const path = this.#resolveAllowedPath(requestedPath);
+    const path = await this.#pathScope.resolveWritable(requestedPath, "ACP file path");
     await mkdir(dirname(path), { recursive: true });
     signal?.throwIfAborted();
     await writeFile(path, content, { encoding: "utf8", signal });
@@ -92,23 +90,5 @@ export class AcpFileSystem {
     );
 
     return {};
-  }
-
-  #resolveAllowedPath(path: string): string {
-    if (!isAbsolute(path)) {
-      throw new Error(`ACP file path must be absolute: ${path}.`);
-    }
-
-    const resolvedPath = resolve(this.#cwd, path);
-
-    if (
-      this.#allowedRoots.some(
-        (root) => resolvedPath === root || resolvedPath.startsWith(`${root}/`),
-      )
-    ) {
-      return resolvedPath;
-    }
-
-    throw new Error(`ACP file path is outside the allowed roots: ${path}.`);
   }
 }

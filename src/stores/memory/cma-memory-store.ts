@@ -11,7 +11,6 @@ import type {
   CmaCreateAgentInput,
   CmaCreateEnvironmentInput,
   CmaCreateSessionInput,
-  CmaEnvironmentConfig,
   CmaEnvironmentRecord,
   CmaInboundEventLease,
   CmaRenewInboundEventClaimInput,
@@ -22,17 +21,15 @@ import type {
 } from "../cma-store";
 import {
   CMA_MAX_EVENT_BYTES,
-  CMA_MAX_REPLAY_BYTES,
-  CMA_MAX_STREAMS,
   CmaSessionTerminatedError,
   CmaStoreConflictError,
   CmaStoreNotFoundError,
-  encodeCmaSseRecord,
 } from "../cma-store";
+import { createDefaultCmaEnvironmentConfig } from "../cma-environment";
+import { CmaMemoryEventBroker } from "./cma-event-broker";
 
-export type CmaMemoryStoreIdFactory = (
-  resource: "agent" | "environment" | "event" | "session",
-) => string;
+type CmaMemoryResource = "agent" | "environment" | "event" | "session";
+export type CmaMemoryStoreIdFactory = (resource: CmaMemoryResource) => string;
 
 export interface CmaMemoryStoreOptions {
   readonly agents?: readonly CmaCreateAgentInput[];
@@ -45,16 +42,10 @@ export interface CmaMemoryStoreOptions {
 const createDefaultId: CmaMemoryStoreIdFactory = () => createDriverId();
 const CLAIM_LEASE_MS = 30_000;
 const CLAIM_RENEW_MS = 10_000;
-const MAX_PENDING_SUBSCRIBER_EVENTS = 64;
-const UTF8 = new TextEncoder();
 
 interface CmaInboundClaim {
   lease: CmaInboundEventLease;
   record: CmaSessionEventRecord;
-}
-
-interface CmaMemorySubscriber {
-  push(record: CmaSessionEventRecord): void;
 }
 
 interface CmaSourceEventRecord {
@@ -70,30 +61,12 @@ function eventKey(sessionId: string, id: string): string {
   return `${sessionId}\u0000${id}`;
 }
 
-function isTerminalEvent(record: CmaSessionEventRecord): boolean {
-  return "sessionStatus" in record.event && record.event.sessionStatus === "terminated";
-}
-
 function jsonBytes(value: unknown): number {
-  return UTF8.encode(JSON.stringify(value)).byteLength;
-}
-
-function eventFrameBytes(record: CmaSessionEventRecord): number {
-  return encodeCmaSseRecord(record).byteLength;
+  return Buffer.byteLength(JSON.stringify(value));
 }
 
 function sortById<T extends { readonly id: string }>(records: Iterable<T>): T[] {
   return [...records].toSorted((left, right) => left.id.localeCompare(right.id));
-}
-
-function createDefaultEnvironmentConfig(): CmaEnvironmentConfig {
-  return {
-    networking: {
-      type: "unrestricted",
-    },
-    packages: {},
-    type: "cloud",
-  };
 }
 
 export function createCmaMemoryStore(options: CmaMemoryStoreOptions = {}): CmaStore {
@@ -103,15 +76,13 @@ export function createCmaMemoryStore(options: CmaMemoryStoreOptions = {}): CmaSt
 class CmaMemoryStore implements CmaStore {
   readonly #agents = new Map<string, CmaAgentRecord>();
   readonly #environments = new Map<string, CmaEnvironmentRecord>();
-  readonly #eventsBySessionId = new Map<string, CmaSessionEventRecord[]>();
+  readonly #eventBroker = new CmaMemoryEventBroker();
   readonly #idFactory: CmaMemoryStoreIdFactory;
   readonly #inboundClaims = new Map<string, CmaInboundClaim>();
   readonly #now: () => Date;
   readonly #pendingPermissionsBySessionId = new Map<string, Map<string, unknown>>();
   readonly #sessions = new Map<string, CmaSessionRecord>();
   readonly #sourceEvents = new Map<string, CmaSourceEventRecord>();
-  readonly #subscribersBySessionId = new Map<string, Set<CmaMemorySubscriber>>();
-  #subscriberCount = 0;
 
   constructor(options: CmaMemoryStoreOptions = {}) {
     this.#idFactory = options.idFactory ?? createDefaultId;
@@ -240,10 +211,10 @@ class CmaMemoryStore implements CmaStore {
 
     for (const { record, status } of transitions) {
       if (persistent) {
-        this.#persistEvent(record);
+        this.#eventBroker.persist(record);
       }
       this.#updateSessionStatus(sessionId, status, record.createdAt);
-      this.#publishEvent(record);
+      this.#eventBroker.publish(record);
     }
 
     const records = transitions.map(({ record }) => record);
@@ -304,10 +275,10 @@ class CmaMemoryStore implements CmaStore {
       event: input.event,
       sessionId: input.sessionId,
     });
-    this.#persistEvent(record);
+    this.#eventBroker.persist(record);
     const lease = this.#createLease();
     this.#inboundClaims.set(key, { lease, record });
-    this.#publishEvent(record);
+    this.#eventBroker.publish(record);
 
     return {
       claimed: true,
@@ -368,18 +339,9 @@ class CmaMemoryStore implements CmaStore {
       cursor: createDriverId(),
       updatedAt: this.#nowIso(),
     } satisfies CmaSessionEventRecord;
-    eventFrameBytes(updated);
-    const events = this.#eventsBySessionId.get(input.sessionId) ?? [];
-    const index = events.findIndex((event) => event.id === claim.record.id);
-
-    if (index < 0) {
-      throw new CmaStoreNotFoundError("event", claim.record.id);
-    }
-
-    events.splice(index, 1);
-    events.push(updated);
+    this.#eventBroker.replace(input.sessionId, claim.record.id, updated);
     claim.record = updated;
-    this.#publishEvent(updated);
+    this.#eventBroker.publish(updated);
     return structuredClone(updated);
   }
 
@@ -436,7 +398,7 @@ class CmaMemoryStore implements CmaStore {
 
   async listSessionEvents(sessionId: string): Promise<readonly CmaSessionEventRecord[]> {
     this.#requireSession(sessionId);
-    return this.#readReplay(sessionId).map((event) => structuredClone(event));
+    return this.#eventBroker.list(sessionId).map((event) => structuredClone(event));
   }
 
   streamSessionEvents(
@@ -444,151 +406,11 @@ class CmaMemoryStore implements CmaStore {
     afterCursor?: string,
   ): AsyncIterable<CmaSessionEventRecord> {
     this.#requireSession(sessionId);
-    return {
-      [Symbol.asyncIterator]: () => {
-        const session = this.#requireSession(sessionId);
-        const replay = this.#readReplay(sessionId, afterCursor);
-        const replayCount = replay.length;
-        const pending: { readonly bytes: number; readonly record: CmaSessionEventRecord }[] = [];
-        const subscribers = this.#subscribersBySessionId.get(sessionId) ?? new Set();
-        let accepting = session.status !== "terminated";
-        let closed = false;
-        let controller: ReadableStreamDefaultController<CmaSessionEventRecord>;
-        let demanded = false;
-        let pendingBytes = 0;
-        let replayIndex = 0;
-        let registered = true;
-        let subscribed = false;
-
-        if (this.#subscriberCount >= CMA_MAX_STREAMS) {
-          throw new RangeError(`CMA subscription limit of ${CMA_MAX_STREAMS} was exceeded.`);
-        }
-        this.#subscriberCount += 1;
-
-        const unsubscribe = () => {
-          if (!subscribed) {
-            return;
-          }
-
-          subscribed = false;
-          subscribers.delete(subscriber);
-
-          if (subscribers.size === 0) {
-            this.#subscribersBySessionId.delete(sessionId);
-          }
-        };
-        const release = () => {
-          if (!registered) {
-            return;
-          }
-
-          registered = false;
-          unsubscribe();
-          this.#subscriberCount -= 1;
-        };
-        const drain = () => {
-          if (closed || !demanded) {
-            return;
-          }
-
-          let record: CmaSessionEventRecord | undefined;
-
-          if (replayIndex < replayCount) {
-            record = replay[replayIndex++];
-          } else {
-            const next = pending.shift();
-
-            if (next) {
-              pendingBytes -= next.bytes;
-              record = next.record;
-            }
-          }
-
-          if (record) {
-            demanded = false;
-            controller.enqueue(structuredClone(record));
-          }
-
-          if (!closed && replayIndex >= replayCount && pending.length === 0 && !accepting) {
-            closed = true;
-            controller.close();
-            release();
-          }
-        };
-        const subscriber: CmaMemorySubscriber = {
-          push: (record) => {
-            if (!accepting) {
-              return;
-            }
-
-            const bytes = eventFrameBytes(record);
-
-            if (
-              pending.length >= MAX_PENDING_SUBSCRIBER_EVENTS ||
-              bytes > CMA_MAX_EVENT_BYTES - pendingBytes
-            ) {
-              accepting = false;
-              closed = true;
-              release();
-              controller.error(
-                new Error(
-                  bytes > CMA_MAX_EVENT_BYTES - pendingBytes
-                    ? "CMA subscriber byte limit exceeded."
-                    : "CMA event stream slow consumer limit exceeded.",
-                ),
-              );
-              return;
-            }
-
-            pending.push({ bytes, record });
-            pendingBytes += bytes;
-
-            if (isTerminalEvent(record)) {
-              accepting = false;
-              unsubscribe();
-            }
-
-            drain();
-          },
-        };
-        const stream = new ReadableStream<CmaSessionEventRecord>(
-          {
-            start: (value) => {
-              controller = value;
-
-              if (accepting) {
-                subscribers.add(subscriber);
-                this.#subscribersBySessionId.set(sessionId, subscribers);
-                subscribed = true;
-              }
-            },
-            pull() {
-              demanded = true;
-              drain();
-            },
-            cancel() {
-              accepting = false;
-              closed = true;
-              release();
-            },
-          },
-          { highWaterMark: 0 },
-        );
-        const reader = stream.getReader();
-
-        return {
-          next: () => reader.read(),
-          async return() {
-            await reader.cancel();
-            return { done: true, value: undefined };
-          },
-          async throw(error?: unknown) {
-            await reader.cancel(error);
-            throw error;
-          },
-        };
-      },
-    };
+    return this.#eventBroker.stream(
+      sessionId,
+      afterCursor,
+      () => this.#requireSession(sessionId).status !== "terminated",
+    );
   }
 
   #createEvent(
@@ -602,36 +424,8 @@ class CmaMemoryStore implements CmaStore {
       id: this.#idFactory("event"),
       updatedAt: now,
     } satisfies CmaSessionEventRecord;
-    eventFrameBytes(record);
+    this.#eventBroker.assertFrame(record);
     return record;
-  }
-
-  #persistEvent(record: CmaSessionEventRecord): void {
-    const events = this.#eventsBySessionId.get(record.sessionId) ?? [];
-    events.push(record);
-    this.#eventsBySessionId.set(record.sessionId, events);
-  }
-
-  #readReplay(sessionId: string, afterCursor?: string): CmaSessionEventRecord[] {
-    const replay: CmaSessionEventRecord[] = [];
-    let bytes = 0;
-
-    for (const event of this.#eventsBySessionId.get(sessionId) ?? []) {
-      if (afterCursor !== undefined && event.cursor <= afterCursor) {
-        continue;
-      }
-
-      const eventBytes = eventFrameBytes(event);
-
-      if (eventBytes > CMA_MAX_REPLAY_BYTES - bytes) {
-        throw new RangeError(`CMA replay exceeds ${CMA_MAX_REPLAY_BYTES} UTF-8 bytes.`);
-      }
-
-      bytes += eventBytes;
-      replay.push(event);
-    }
-
-    return replay;
   }
 
   #nowIso(): string {
@@ -676,7 +470,7 @@ class CmaMemoryStore implements CmaStore {
     const now = this.#nowIso();
     const record = {
       archivedAt: null,
-      config: structuredClone(input.config ?? createDefaultEnvironmentConfig()),
+      config: structuredClone(input.config ?? createDefaultCmaEnvironmentConfig()),
       createdAt: now,
       id,
       metadata: structuredClone(input.metadata ?? {}),
@@ -714,12 +508,6 @@ class CmaMemoryStore implements CmaStore {
     } satisfies CmaSessionRecord;
     this.#sessions.set(id, record);
     return record;
-  }
-
-  #publishEvent(record: CmaSessionEventRecord): void {
-    for (const subscriber of this.#subscribersBySessionId.get(record.sessionId) ?? []) {
-      subscriber.push(record);
-    }
   }
 
   #nextSessionStatus(

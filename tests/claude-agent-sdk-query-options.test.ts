@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { createBufferedSinkLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
   createClaudeQueryOptions,
   mergeClaudeQueryOptions,
@@ -179,7 +179,7 @@ describe("Claude Agent SDK query options", () => {
     let permissionSignal: AbortSignal | undefined;
     const context = createAgentDriverContext({
       eventSink: {
-        pushEvents: async () => {},
+        pushEvents: async () => ({ accepted: [] }),
       },
       logger,
       payload,

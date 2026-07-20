@@ -12,7 +12,7 @@ import {
   supportsSessionResume,
 } from "../src/runtimes/acp/acp-configuration";
 import { AcpDriverBackend, limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { bootPayload } from "./driver-runtime-boundary-fixtures";
 
 function createInitializeResult(protocolVersion: number | string | null) {
@@ -84,15 +84,15 @@ describe("ACP runtime configuration", () => {
 
   test("fails fast when a configured auth method is not advertised", () => {
     expect(
-      resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {
+      resolveAuthMethod([{ id: "browser-login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "browser-login",
       }),
     ).toBe("browser-login");
 
-    expect(resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {})).toBeNull();
+    expect(resolveAuthMethod([{ id: "browser-login" }], {})).toBeNull();
 
     expect(() =>
-      resolveAuthMethod([{ id: "browser-login", name: "Browser Login" }], {
+      resolveAuthMethod([{ id: "browser-login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "device-login",
       }),
     ).toThrow();
@@ -164,7 +164,7 @@ describe("ACP runtime configuration", () => {
     const context = createAgentDriverContext({
       eventSink: {
         commandUpdate: async () => {},
-        pushEvents: async () => {},
+        pushEvents: async () => ({ accepted: [] }),
       },
       logger,
       payload: bootPayload,

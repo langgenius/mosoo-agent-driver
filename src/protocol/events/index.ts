@@ -1,6 +1,6 @@
 import { timestampSchema } from "../../contract/common";
-import { parseRuntimeEventEnvelope } from "../../runtime-events";
-import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "../../runtime-events";
+import { parseRuntimeEventEnvelope } from "./runtime-events";
+import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "./runtime-events";
 
 export type DriverEvent = RuntimeEventEnvelope;
 export type DriverEventInput = RuntimeEventEnvelope | RuntimeEventInputDraft;

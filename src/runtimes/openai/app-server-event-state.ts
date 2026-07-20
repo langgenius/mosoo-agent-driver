@@ -1,6 +1,6 @@
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId } from "../../protocol/id";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 
 export type OpenAiEventPush = (

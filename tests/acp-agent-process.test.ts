@@ -12,8 +12,8 @@ import {
   type AcpAgentProcess,
 } from "../src/runtimes/acp/acp-agent-process";
 import { buildChildEnv } from "../src/runtimes/acp/acp-configuration";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
-import { driverBootPayload } from "./driver-boot-payload-fixture";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
 
 function createHarness() {
   const logger = createBufferedSinkLogger({
@@ -22,9 +22,9 @@ function createHarness() {
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => {} },
+    eventSink: { pushEvents: async () => ({ accepted: [] }) },
     logger,
-    payload: driverBootPayload,
+    payload: driverStartInput,
     permission: { request: async () => "reject_once" },
   });
 
@@ -50,7 +50,7 @@ describe("ACP agent process lifecycle", () => {
       signals.push(signal);
 
       if (signal === exitSignal) {
-        child.signalCode = signal;
+        Reflect.set(child, "signalCode", signal);
       }
 
       return true;
@@ -74,7 +74,7 @@ describe("ACP agent process lifecycle", () => {
     let canExit = false;
     process.kill = ((_pid: number, signal: NodeJS.Signals) => {
       if (canExit && signal === "SIGKILL") {
-        child.signalCode = signal;
+        Reflect.set(child, "signalCode", signal);
       }
 
       return true;

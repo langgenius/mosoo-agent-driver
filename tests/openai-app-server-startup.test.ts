@@ -7,7 +7,7 @@ import type { AgentDriverPermissionPort } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/runtimes/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { settlePromiseWithTimeout } from "../src/utils/async";

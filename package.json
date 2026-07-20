@@ -66,10 +66,12 @@
     "bench": "bun bench/ttft-bench.ts",
     "build": "vp run build:types && bun build src/bin/driver.ts --outfile dist/driver.mjs --target bun --format esm --bundle",
     "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
+    "check": "vp run tc && vp run test && vp run build",
     "image:build": "vp run build && buildah build -t agent-driver:local .",
     "lint": "vp lint src tests",
     "tc": "vp exec tsc --noEmit",
     "test": "bun test",
+    "test:coverage": "bun test --coverage",
     "test:live:anthropic": "bun test tests/claude-agent-sdk-live.test.ts",
     "test:live:openai": "bun test tests/openai-app-server-live.test.ts",
     "test:live:opencode": "AGENT_DRIVER_LIVE_OPENCODE=1 bun test tests/opencode-acp-live.test.ts"
@@ -86,6 +88,7 @@
   },
   "devDependencies": {
     "@openai/codex-sdk": "0.144.5",
+    "@types/bun": "1.3.14",
     "@types/node": "^25.8.0",
     "typescript": "^6.0.3",
     "vite-plus": "0.2.5"

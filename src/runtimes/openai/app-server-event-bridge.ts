@@ -1,7 +1,7 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
-import type { AgentDriverContext } from "../agent-driver-backend";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiErrorMessage, toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
 import {
   OpenAiItemState,

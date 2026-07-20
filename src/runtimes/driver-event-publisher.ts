@@ -3,33 +3,27 @@ import {
   DRIVER_EVENT_DELIVERY_TIMEOUT_MS,
   DriverEventRejectedError,
   pushLosslessEvents,
-  withSourceEventIds,
 } from "../core/driver-runtime-io";
-import { summarizeDriverEventBatch } from "../infrastructure/logging/driver-debug";
+import { summarizeDriverEventBatch } from "../observability/driver-debug";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type { DriverEventReceipt } from "../protocol/orpc";
 import type { DriverRuntime } from "../protocol/runtime";
-import type { AgentDriverContext } from "./agent-driver-backend";
-
-const MAX_PENDING_DRIVER_EVENTS = 1_024;
-const MAX_PENDING_DRIVER_EVENT_BYTES = 32 * 1_024 * 1_024;
-const MAX_RUN_TERMINAL_BATCH_EVENTS = 64;
-const MAX_RUN_TERMINAL_BATCH_BYTES = 1_024 * 1_024;
-
-interface QueuedEvent {
-  readonly bytes: number;
-  readonly event: DriverEventInput;
-  readonly owner: symbol | null;
-  readonly terminalLane: boolean;
-}
+import type { AgentDriverContext } from "../core/agent-driver-backend";
+import {
+  admitDriverEventPush,
+  driverEventBatchBytes,
+  isLosslessDriverEvent,
+  terminalDriverEventRetryKey,
+  type QueuedDriverEvent,
+} from "./driver-event-admission";
 
 interface QueuedPush {
   readonly awaitPending: boolean;
   readonly context: AgentDriverContext;
   readonly eventBytes: number;
   readonly eventCount: number;
-  readonly events: QueuedEvent[];
+  readonly events: QueuedDriverEvent[];
   readonly id: symbol;
   readonly losslessBytes: number;
   readonly losslessCount: number;
@@ -41,58 +35,12 @@ interface QueuedPush {
   readonly terminalKey: string | null;
 }
 
-function batchBytes(bytes: number, count: number): number {
-  return count === 0 ? 0 : bytes + count + 1;
-}
-
-function isLossless(event: DriverEventInput): boolean {
-  return event.delivery !== "best_effort";
-}
-
-function isRunTerminal(event: DriverEventInput): boolean {
-  return (
-    event.kind === "run.cancelled" || event.kind === "run.completed" || event.kind === "run.failed"
-  );
-}
-
-function scopeEvent(event: DriverEventInput, activeRunId: RunId | null): DriverEventInput {
-  const { runId, sourceEventId, ...content } = event;
-  const frozenRunId = runId === undefined ? activeRunId : runId;
-  const explicitSourceId =
-    typeof sourceEventId === "string" && sourceEventId.length > 0 ? sourceEventId : null;
-
-  return {
-    ...content,
-    ...(explicitSourceId === null ? {} : { sourceEventId: explicitSourceId }),
-    ...(frozenRunId === null ? {} : { runId: frozenRunId }),
-  } as DriverEventInput;
-}
-
-function terminalRetryKey(
-  events: readonly DriverEventInput[],
-  activeRunId: RunId | null,
-): string | null {
-  const losslessEvents = events.filter(isLossless);
-
-  if (
-    losslessEvents.length === 0 ||
-    losslessEvents.length > MAX_RUN_TERMINAL_BATCH_EVENTS ||
-    losslessEvents.filter(isRunTerminal).length !== 1 ||
-    !isRunTerminal(losslessEvents.at(-1)!)
-  ) {
-    return null;
-  }
-
-  const key = JSON.stringify(losslessEvents.map((event) => scopeEvent(event, activeRunId)));
-  return Buffer.byteLength(key, "utf8") <= MAX_RUN_TERMINAL_BATCH_BYTES ? key : null;
-}
-
 export class DriverEventPublisher {
   readonly #getSessionRef: () => string | null;
   readonly #runtime: DriverRuntime;
   #drainTask: Promise<void> | null = null;
   #lastAcceptedSeq = 0;
-  #pendingEvents: QueuedEvent[] = [];
+  #pendingEvents: QueuedDriverEvent[] = [];
   #pendingLosslessBytes = 0;
   #pendingLosslessCount = 0;
   #pendingTerminalBatch = false;
@@ -125,7 +73,7 @@ export class DriverEventPublisher {
 
       if (
         this.#pendingTerminalKey !== null &&
-        terminalRetryKey(events, activeRunId) === this.#pendingTerminalKey
+        terminalDriverEventRetryKey(events, activeRunId) === this.#pendingTerminalKey
       ) {
         const retry = this.#createPendingRetry(context, reason);
         this.#enqueue(retry);
@@ -188,177 +136,32 @@ export class DriverEventPublisher {
     events: readonly DriverEventInput[],
     activeRunId: RunId | null,
   ): QueuedPush | null {
-    const losslessEvents = events.filter(isLossless);
-    const runTerminals = losslessEvents.filter(isRunTerminal);
-    const terminalBatch = runTerminals.length > 0;
+    const id = Symbol(reason);
+    const admission = admitDriverEventPush(events, activeRunId, id, {
+      pendingLosslessBytes: this.#pendingLosslessBytes,
+      pendingLosslessCount: this.#pendingLosslessCount,
+      pendingTerminalBatch: this.#pendingTerminalBatch,
+      queuedEventBytes: this.#queuedEventBytes,
+      queuedEventCount: this.#queuedEventCount,
+      queuedLosslessBytes: this.#queuedLosslessBytes,
+      queuedLosslessCount: this.#queuedLosslessCount,
+      queuedTerminalBatches: this.#queuedTerminalBatches,
+    });
 
-    if (runTerminals.length > 1) {
-      throw new Error("Driver event run terminal slot is full.");
-    }
-
-    if (terminalBatch) {
-      if (this.#pendingTerminalBatch || this.#queuedTerminalBatches > 0) {
-        throw new Error("Driver event run terminal slot is full.");
-      }
-
-      if (losslessEvents.length > MAX_RUN_TERMINAL_BATCH_EVENTS) {
-        throw new Error(
-          `Driver event run terminal batch exceeds ${MAX_RUN_TERMINAL_BATCH_EVENTS} events.`,
-        );
-      }
-
-      if (!isRunTerminal(losslessEvents.at(-1)!)) {
-        throw new Error("Driver event run terminal must be the final lossless event.");
-      }
-    }
-
-    const losslessCount = terminalBatch ? 0 : losslessEvents.length;
-
-    if (
-      this.#pendingLosslessCount + this.#queuedLosslessCount + losslessCount >
-      MAX_PENDING_DRIVER_EVENTS
-    ) {
-      throw new Error(`Driver event queue exceeds ${MAX_PENDING_DRIVER_EVENTS} events.`);
-    }
-
-    let admittedEvents: readonly DriverEventInput[];
-
-    if (terminalBatch) {
-      admittedEvents = losslessEvents;
-    } else if (losslessEvents.length === 0) {
-      const capacity =
-        MAX_PENDING_DRIVER_EVENTS - this.#pendingLosslessCount - this.#queuedEventCount;
-
-      if (capacity <= 0) {
-        return null;
-      }
-
-      admittedEvents = events.slice(0, capacity);
-    } else {
-      const bestEffortCount = events.length - losslessEvents.length;
-      const includeBestEffort =
-        this.#pendingLosslessCount + this.#queuedEventCount + losslessCount + bestEffortCount <=
-        MAX_PENDING_DRIVER_EVENTS;
-      admittedEvents = includeBestEffort ? events : losslessEvents;
-    }
-
-    const frozenEvents = admittedEvents.map((event) => scopeEvent(event, activeRunId));
-    const terminalKey = terminalBatch ? JSON.stringify(frozenEvents) : null;
-    const stampedEvents = withSourceEventIds(frozenEvents);
-    const serialized: (string | undefined)[] = [];
-    const serializedBytes: (number | undefined)[] = [];
-    let losslessByteSum = 0;
-    let serializedLosslessCount = 0;
-    let terminalByteSum = 0;
-    let terminalCount = 0;
-
-    for (const [index, event] of stampedEvents.entries()) {
-      if (!isLossless(event)) {
-        continue;
-      }
-
-      const json = JSON.stringify(event);
-      const bytes = Buffer.byteLength(json, "utf8");
-
-      if (terminalBatch) {
-        terminalByteSum += bytes;
-        terminalCount += 1;
-
-        if (batchBytes(terminalByteSum, terminalCount) > MAX_RUN_TERMINAL_BATCH_BYTES) {
-          throw new Error(
-            `Driver event run terminal batch exceeds ${MAX_RUN_TERMINAL_BATCH_BYTES} UTF-8 bytes.`,
-          );
-        }
-      } else {
-        losslessByteSum += bytes;
-        serializedLosslessCount += 1;
-
-        if (
-          this.#pendingLosslessBytes +
-            this.#queuedLosslessBytes +
-            batchBytes(losslessByteSum, serializedLosslessCount) >
-          MAX_PENDING_DRIVER_EVENT_BYTES
-        ) {
-          throw new Error(
-            `Driver event queue exceeds ${MAX_PENDING_DRIVER_EVENT_BYTES} UTF-8 bytes.`,
-          );
-        }
-      }
-
-      serialized[index] = json;
-      serializedBytes[index] = bytes;
-    }
-
-    let eventByteSum = losslessByteSum;
-    let eventCount = serializedLosslessCount;
-    let includeBestEffort = admittedEvents.length > losslessEvents.length;
-
-    if (includeBestEffort) {
-      for (const [index, event] of stampedEvents.entries()) {
-        if (isLossless(event)) {
-          continue;
-        }
-
-        const json = JSON.stringify(event);
-        const bytes = Buffer.byteLength(json, "utf8");
-        const nextBytes = batchBytes(eventByteSum + bytes, eventCount + 1);
-
-        if (
-          this.#pendingLosslessBytes + this.#queuedEventBytes + nextBytes >
-          MAX_PENDING_DRIVER_EVENT_BYTES
-        ) {
-          includeBestEffort = false;
-          break;
-        }
-
-        serialized[index] = json;
-        serializedBytes[index] = bytes;
-        eventByteSum += bytes;
-        eventCount += 1;
-      }
-    }
-
-    if (!includeBestEffort && losslessEvents.length === 0) {
+    if (admission === null) {
       return null;
     }
 
-    if (!includeBestEffort) {
-      eventByteSum = losslessByteSum;
-      eventCount = serializedLosslessCount;
-    }
-
-    const id = Symbol(reason);
     const deferred = Promise.withResolvers<void>();
-    const queuedEvents: QueuedEvent[] = [];
-
-    for (const [index, event] of stampedEvents.entries()) {
-      if (!includeBestEffort && !isLossless(event)) {
-        continue;
-      }
-
-      queuedEvents.push({
-        bytes: serializedBytes[index]!,
-        event: JSON.parse(serialized[index]!) as DriverEventInput,
-        owner: id,
-        terminalLane: terminalBatch && isLossless(event),
-      });
-    }
-
     return {
+      ...admission,
       awaitPending: false,
       context,
-      eventBytes: batchBytes(eventByteSum, eventCount),
-      eventCount,
-      events: queuedEvents,
       id,
-      losslessBytes: batchBytes(losslessByteSum, serializedLosslessCount),
-      losslessCount: serializedLosslessCount,
       promise: deferred.promise,
       reason,
       reject: deferred.reject,
       resolve: deferred.resolve,
-      terminalBatch,
-      terminalKey,
     };
   }
 
@@ -413,7 +216,7 @@ export class DriverEventPublisher {
     wakeReason?: string,
   ): Promise<void> {
     const queuedEvents = [...this.#pendingEvents, ...entries.flatMap((entry) => entry.events)];
-    const remainingLossless = queuedEvents.filter(({ event }) => isLossless(event));
+    const remainingLossless = queuedEvents.filter(({ event }) => isLosslessDriverEvent(event));
     const ownerErrors = new Map<symbol, unknown>();
     const deadline = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
     const reason =
@@ -439,10 +242,13 @@ export class DriverEventPublisher {
 
     try {
       for (let index = 0; index < queuedEvents.length;) {
-        const lossless = isLossless(queuedEvents[index]!.event);
+        const lossless = isLosslessDriverEvent(queuedEvents[index]!.event);
         let end = index + 1;
 
-        while (end < queuedEvents.length && isLossless(queuedEvents[end]!.event) === lossless) {
+        while (
+          end < queuedEvents.length &&
+          isLosslessDriverEvent(queuedEvents[end]!.event) === lossless
+        ) {
           end += 1;
         }
 
@@ -551,7 +357,7 @@ export class DriverEventPublisher {
     }
   }
 
-  #setPending(events: readonly QueuedEvent[], terminalKey: string | null): void {
+  #setPending(events: readonly QueuedDriverEvent[], terminalKey: string | null): void {
     this.#pendingEvents = events.map((event) => ({ ...event, owner: null }));
     let losslessByteSum = 0;
     let losslessCount = 0;
@@ -566,7 +372,7 @@ export class DriverEventPublisher {
       }
     }
 
-    this.#pendingLosslessBytes = batchBytes(losslessByteSum, losslessCount);
+    this.#pendingLosslessBytes = driverEventBatchBytes(losslessByteSum, losslessCount);
     this.#pendingLosslessCount = losslessCount;
     this.#pendingTerminalBatch = terminalBatch;
     this.#pendingTerminalKey = terminalBatch ? terminalKey : null;
