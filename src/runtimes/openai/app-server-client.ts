@@ -10,6 +10,7 @@ import type { TransformCallback } from "node:stream";
 import { toDurationMs } from "../../core/driver-runtime-timing";
 import type { DriverStartInput } from "../../protocol/start";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { killProcessGroup } from "../child-process";
@@ -336,7 +337,7 @@ export class OpenAiAppServerClient {
           clientInfo: {
             name: "mosoo_driver",
             title: "mosoo Driver",
-            version: "0.1.0",
+            version: AGENT_DRIVER_VERSION,
           },
         },
         signal,

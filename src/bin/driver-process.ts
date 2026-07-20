@@ -24,6 +24,7 @@ import {
 } from "../runtimes/provider-registry";
 import { materializeResolvedSkills } from "../runtimes/skill-materialization";
 import { promiseWithTimeout } from "../utils/async";
+import { AGENT_DRIVER_VERSION } from "../core/version";
 import { DriverCommandDispatcher } from "../core/driver-command-dispatcher";
 import { pushDriverDiagnosticEvent } from "../core/driver-diagnostics";
 import { DriverHeartbeatLoop } from "../core/driver-heartbeat-loop";
@@ -34,7 +35,6 @@ import type { DriverRuntimeEventPort, DriverRuntimeRunPort } from "../core/drive
 import { DriverRuntimeStateMachine } from "../core/driver-runtime-state";
 import { createTimingEvent, createTimingPhase, toDurationMs } from "../core/driver-runtime-timing";
 
-const DRIVER_VERSION = "0.1.0";
 const DRIVER_BACKEND_START_TIMEOUT_MS = 60_000;
 const DRIVER_SHUTDOWN_TIMEOUT_MS = 5_000;
 
@@ -113,7 +113,7 @@ export class DriverProcess {
 
         logger.debug("driver.runtime.hello.sending", {
           capabilities: [...capabilities],
-          driverVersion: DRIVER_VERSION,
+          driverVersion: AGENT_DRIVER_VERSION,
           protocolVersion: DRIVER_PROTOCOL_VERSION,
           startedAt: this.#startedAt,
         });
@@ -122,7 +122,7 @@ export class DriverProcess {
         const hello = await logger.span("runtime.socket.hello", async () =>
           socket.hello({
             capabilities: [...capabilities],
-            driverVersion: DRIVER_VERSION,
+            driverVersion: AGENT_DRIVER_VERSION,
             protocolVersion: DRIVER_PROTOCOL_VERSION,
             startedAt: this.#startedAt,
           }),

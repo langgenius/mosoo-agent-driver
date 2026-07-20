@@ -3,11 +3,11 @@ import type {
   AgentDriverKernel,
   CmaStore,
   DriverStartInput,
-} from "agent-driver";
-import type { SessionSnapshot } from "agent-driver/contract";
-import type { CmaHttpHandler } from "agent-driver/cma-http";
-import type { CmaSdkClient } from "agent-driver/cma-sdk";
-import type { DriverEventInput } from "agent-driver/events";
+} from "@mosoo/agent-driver";
+import type { SessionSnapshot } from "@mosoo/agent-driver/contract";
+import type { CmaHttpHandler } from "@mosoo/agent-driver/cma-http";
+import type { CmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
+import type { DriverEventInput } from "@mosoo/agent-driver/events";
 
 export interface PublicApiConsumer {
   readonly backend: AgentDriverBackend;

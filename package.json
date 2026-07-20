@@ -1,18 +1,24 @@
 {
-  "name": "agent-driver",
+  "name": "@mosoo/agent-driver",
   "version": "0.1.0",
   "private": false,
   "description": "Runtime-neutral Agent Driver and AI agent harness for Claude Agent SDK, Codex app-server, and ACP inside isolated sandboxes.",
+  "homepage": "https://github.com/langgenius/mosoo-agent-driver",
+  "bugs": {
+    "url": "https://github.com/langgenius/mosoo-agent-driver/issues"
+  },
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/langgenius/mosoo-agent-driver.git"
+  },
   "bin": {
     "agent-driver": "./dist/driver.mjs"
   },
   "files": [
     "dist",
     "src",
-    "Containerfile",
-    ".containerignore",
-    "README.md"
+    "assets"
   ],
   "type": "module",
   "types": "./dist/types/index.d.ts",
@@ -20,10 +26,6 @@
     ".": {
       "types": "./dist/types/index.d.ts",
       "default": "./src/index.ts"
-    },
-    "./bin/driver": {
-      "types": "./dist/types/bin/driver.d.ts",
-      "default": "./src/bin/driver.ts"
     },
     "./boot": {
       "types": "./dist/types/boot.d.ts",
@@ -62,6 +64,10 @@
       "default": "./src/cma-sdk.ts"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "bench": "bun bench/ttft-bench.ts",
     "build": "vp run build:types && bun build src/bin/driver.ts --outfile dist/driver.mjs --target bun --format esm --bundle",
@@ -69,6 +75,7 @@
     "check": "vp run tc && vp run test && vp run build",
     "image:build": "vp run build && buildah build -t agent-driver:local .",
     "lint": "vp lint src tests",
+    "prepack": "vp run build",
     "tc": "vp exec tsc --noEmit",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
@@ -92,6 +99,9 @@
     "@types/node": "^25.8.0",
     "typescript": "^6.0.3",
     "vite-plus": "0.2.5"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
   },
   "packageManager": "bun@1.3.14"
 }

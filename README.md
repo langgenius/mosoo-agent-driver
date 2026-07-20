@@ -11,14 +11,9 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 <br />
 <br />
 
-<!-- Static badges below render cleanly before the package is published to npm.
-     Once the first npm release exists, swap in the dynamic versions:
-     checks:    https://img.shields.io/github/actions/workflow/status/langgenius/mosoo-agent-driver/pr.yml?label=checks
-     version:   https://img.shields.io/npm/v/agent-driver?label=version
-     downloads: https://img.shields.io/npm/dm/agent-driver?label=downloads -->
-
-[![Build](https://img.shields.io/badge/tests-passing-3fb911)](#checks)
-[![Version](https://img.shields.io/badge/version-0.1.0-orange)](./package.json)
+[![Build](https://img.shields.io/github/actions/workflow/status/langgenius/mosoo-agent-driver/pr.yml?label=checks)](https://github.com/langgenius/mosoo-agent-driver/actions/workflows/pr.yml)
+[![Version](https://img.shields.io/npm/v/%40mosoo%2Fagent-driver?label=version)](https://www.npmjs.com/package/@mosoo/agent-driver)
+[![Downloads](https://img.shields.io/npm/dm/%40mosoo%2Fagent-driver?label=downloads)](https://www.npmjs.com/package/@mosoo/agent-driver)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE.txt)
 
 [![Built by langgenius](https://img.shields.io/badge/built%20by-langgenius-6fd305)](https://github.com/langgenius)
@@ -28,7 +23,7 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 
 ---
 
-`mosoo-agent-driver` is the standalone Agent Driver and AI agent harness kernel for sandbox-hosted coding agent sessions. It runs inside the sandbox and drives one session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry. The package manifest uses the name `agent-driver`, but the package has not been published to npm yet.
+`mosoo-agent-driver` is the repository for the `@mosoo/agent-driver` package: a standalone Agent Driver and AI agent harness kernel for sandbox-hosted coding agent sessions. It runs inside the sandbox and drives one session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
 
 An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
 
@@ -55,7 +50,7 @@ The Driver does not open a sandbox-local control listener. In mosoo's production
 
 ## AI Agent Harness Architecture
 
-Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
+Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `@mosoo/agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
 
 - **Kernel-level unification.** Three launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
 - **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics. Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports. The library is safe to import and never starts the process runner on its own.
@@ -65,15 +60,15 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 ## Package Entries
 
 - Command `agent-driver`: Bun process runner, built to `dist/driver.mjs`; in mosoo it consumes the private boot payload and dials the API control socket.
-- Package root `agent-driver`: Driver Kernel, provider registry, host ports, commands, events, diagnostics, the in-memory CMA store, and CMA projection exports.
-- `agent-driver/boot`: process boot payload, protocol version, boot environment names, and host snapshot contracts.
-- `agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
-- `agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
-- `agent-driver/events`: canonical driver event envelope contracts.
-- `agent-driver/contract`: vendor-neutral Authority, Preview, control, synchronization, and JSON-RPC contracts.
-- `agent-driver/orpc`: Driver-to-`DriverInstance` ORPC wire input/output contracts.
-- `agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
-- `agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.
+- Package root `@mosoo/agent-driver`: Driver Kernel, provider registry, host ports, commands, events, diagnostics, the in-memory CMA store, and CMA projection exports.
+- `@mosoo/agent-driver/boot`: process boot payload, protocol version, boot environment names, and host snapshot contracts.
+- `@mosoo/agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
+- `@mosoo/agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
+- `@mosoo/agent-driver/events`: canonical driver event envelope contracts.
+- `@mosoo/agent-driver/contract`: vendor-neutral Authority, Preview, control, synchronization, and JSON-RPC contracts.
+- `@mosoo/agent-driver/orpc`: Driver-to-`DriverInstance` ORPC wire input/output contracts.
+- `@mosoo/agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
+- `@mosoo/agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.
 
 ## Runtime Contract
 
@@ -90,23 +85,22 @@ Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qual
 
 ## Quick Start
 
-`agent-driver` targets [Bun](https://bun.sh), with [Vite+](https://viteplus.dev) as the development toolchain and command entry point.
+`@mosoo/agent-driver` targets [Bun](https://bun.sh), with [Vite+](https://viteplus.dev) as the development toolchain and command entry point.
 Vite+ provisions the Bun version declared by `packageManager`; Bun remains the runtime, package manager, test runner, and binary bundler underneath it.
-The package is not currently available from npm, so work from this repository checkout, install dependencies, and run the test suite:
+Install the package in a Bun project:
 
 ```sh
-vp install --frozen-lockfile
-vp run test
+bun add @mosoo/agent-driver
 ```
 
-The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required. Drop the following into `tests/quickstart.test.ts` and run `vp run test tests/quickstart.test.ts`:
+The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required. Drop the following into `quickstart.test.ts` and run `bun test quickstart.test.ts`:
 
 ```ts
 import { expect, test } from "bun:test";
 
-import { createCmaMemoryStore } from "agent-driver";
-import { createCmaHttpHandler } from "agent-driver/cma-http";
-import { createCmaSdkClient } from "agent-driver/cma-sdk";
+import { createCmaMemoryStore } from "@mosoo/agent-driver";
+import { createCmaHttpHandler } from "@mosoo/agent-driver/cma-http";
+import { createCmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
 
 test("create an agent, environment, and session over the CMA surface", async () => {
   // 1. An in-memory store stands in for the host's persistence port.
@@ -144,9 +138,9 @@ This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessio
 
 ### How it is used in mosoo
 
-`agent-driver` is the **runtime kernel of the mosoo agent runtime**. When mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object. The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
+`@mosoo/agent-driver` is the **runtime kernel of the mosoo agent runtime**. When mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object. The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
 
-[mosoo](https://github.com/langgenius/mosoo) and this Driver repository are already public. mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter. The `agent-driver` npm package has not been published yet.
+[mosoo](https://github.com/langgenius/mosoo) and this Driver repository are public. mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter. The reusable Driver library and CLI are distributed as `@mosoo/agent-driver` on npmjs.
 
 ## Commands
 
