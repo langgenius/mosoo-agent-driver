@@ -11,6 +11,7 @@ import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client"
 import type { DriverStartInput } from "../../protocol/start";
 import type { McpExecuteCommand } from "../../runtime-command";
 import { settlePromiseWithTimeout } from "../../utils/async";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
 type ActiveMcpServer = Extract<SessionMcpServer, { authorizationState: "active" }>;
@@ -191,7 +192,7 @@ export async function executeRemoteHttpMcpCommand(
   };
   const client = new Client({
     name: "mosoo-driver",
-    version: "0.1.0",
+    version: AGENT_DRIVER_VERSION,
   });
   const transport = new StreamableHTTPClientTransport(new URL(server.proxyUrl), {
     authProvider,

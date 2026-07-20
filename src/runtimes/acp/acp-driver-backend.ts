@@ -20,6 +20,7 @@ import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
@@ -202,7 +203,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
               clientInfo: {
                 name: "mosoo-driver",
                 title: "mosoo Driver",
-                version: "0.1.0",
+                version: AGENT_DRIVER_VERSION,
               },
               protocolVersion: ACP_PROTOCOL_VERSION,
             },
