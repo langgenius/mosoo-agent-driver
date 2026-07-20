@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build:
-    name: Verify and build package
+    name: Build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,22 +54,33 @@ jobs:
 
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Check and build
-        run: |
-          set -euo pipefail
-          vp fmt --check
-          vp run lint
-          vp run tc
-          vp run test
-          vp run build
-          test -s dist/types/index.d.ts
-          test -x dist/driver.mjs
-          test "$(head -n 1 dist/driver.mjs)" = '#!/usr/bin/env bun'
+      - name: Check
+        run: vp run check
 
       - name: Pack package
         run: |
           mkdir package
           npm pack --ignore-scripts --pack-destination package
+
+      - name: Build image
+        env:
+          VERSION: ${{ steps.verify.outputs.version }}
+        run: |
+          title="$(node -p "require('./package.json').name")"
+          description="$(node -p "require('./package.json').description")"
+          license="$(node -p "require('./package.json').license")"
+
+          buildah build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.title=$title" \
+            --label "org.opencontainers.image.description=$description" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=$license" \
+            -t localhost/agent-driver \
+            .
+          buildah push localhost/agent-driver oci-archive:image.oci.tar
 
       - name: Upload package
         uses: actions/upload-artifact@v7
@@ -79,7 +90,39 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+      - name: Upload image
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-image
+          path: image.oci.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish-image:
+    name: Publish image
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      VERSION: ${{ needs.build.outputs.version }}
+    permissions:
+      packages: write
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v8
+        with:
+          name: container-image
+
+      - name: Publish image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          skopeo copy oci-archive:image.oci.tar "docker://$IMAGE:$VERSION"
+          skopeo copy oci-archive:image.oci.tar "docker://$IMAGE:latest"
+
+  publish-npm:
     name: Publish to npm
     needs: build
     runs-on: ubuntu-latest
