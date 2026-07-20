@@ -89,7 +89,7 @@ function createCanUseTool(context: AgentDriverContext): CanUseTool {
 
     return {
       behavior: "deny",
-      message: "Rejected by Mosoo permission review.",
+      message: "Rejected by mosoo permission review.",
       toolUseID: options.toolUseID,
     };
   };

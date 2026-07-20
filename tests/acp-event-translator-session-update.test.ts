@@ -404,7 +404,7 @@ describe("ACP runtime event translation", () => {
     });
   });
 
-  test("normalizes ACP config options to the Mosoo session config contract", () => {
+  test("normalizes ACP config options to the mosoo session config contract", () => {
     const events = toSessionReadyEvents({
       mode: "created",
       nativeSessionId: "native-session-1",
@@ -504,7 +504,7 @@ describe("ACP runtime event translation", () => {
     });
   });
 
-  test("normalizes ACP commands to the Mosoo session commands contract", () => {
+  test("normalizes ACP commands to the mosoo session commands contract", () => {
     const state = new AcpTurnEventState();
     const events = state.translateUpdate({
       update: {
@@ -533,7 +533,7 @@ describe("ACP runtime event translation", () => {
     ]);
   });
 
-  test("normalizes ACP usage sources to the Mosoo usage contract", () => {
+  test("normalizes ACP usage sources to the mosoo usage contract", () => {
     const state = new AcpTurnEventState();
 
     state.begin({

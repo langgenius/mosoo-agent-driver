@@ -335,7 +335,7 @@ export class OpenAiAppServerClient {
           },
           clientInfo: {
             name: "mosoo_driver",
-            title: "Mosoo Driver",
+            title: "mosoo Driver",
             version: "0.1.0",
           },
         },

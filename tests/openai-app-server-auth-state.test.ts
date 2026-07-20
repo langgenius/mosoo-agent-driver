@@ -94,7 +94,7 @@ describe("OpenAI app-server auth state", () => {
     expect(modelProviders["openai-compatible"]).toEqual({
       base_url: "https://compat.example/v1",
       env_key: "OPENAI_COMPATIBLE_API_KEY",
-      name: "Mosoo OpenAI-Compatible",
+      name: "mosoo OpenAI-Compatible",
       wire_api: "chat",
     });
     expect(requireRecord(config["features"], "runtime features")).toMatchObject({
