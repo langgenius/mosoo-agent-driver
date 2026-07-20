@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Verify and build package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          cache: false
+          run-install: |
+            - args: ['--frozen-lockfile']
+
+      - id: verify
+        name: Verify release tag
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="$(node -p "require('./package.json').version")"
+          release_commit="$(git rev-parse "${tag}^{commit}")"
+
+          if [[ "${tag}" != "v${version}" ]]; then
+            echo "::error::Tag ${tag} does not match package version ${version}."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "${release_commit}" origin/main; then
+            echo "::error::Tag ${tag} must point to a commit reachable from origin/main."
+            exit 1
+          fi
+
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check and build
+        run: |
+          set -euo pipefail
+          vp fmt --check
+          vp run lint
+          vp run tc
+          vp run test
+          vp run build
+          test -s dist/types/index.d.ts
+          test -x dist/driver.mjs
+          test "$(head -n 1 dist/driver.mjs)" = '#!/usr/bin/env bun'
+
+      - name: Pack package
+        run: |
+          mkdir package
+          npm pack --ignore-scripts --pack-destination package
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: package/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@mosoo/agent-driver/v/${{ needs.build.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: package
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish package
+        run: npm publish package/*.tgz --ignore-scripts
+        # Bootstrap only: remove this env block after configuring npm Trusted Publishing.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
