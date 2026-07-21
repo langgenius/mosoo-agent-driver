@@ -162,6 +162,53 @@ describe("driver artifact contract", () => {
     );
   });
 
+  test("runs every live suite through the packed driver controller", () => {
+    const packageJson = readDriverPackageJson();
+    const controller = readText("./driver-artifact-test-controller.ts");
+    const liveTest = readText("./driver-artifact-live.test.ts");
+    const artifactScript = packageJson.scripts?.["test:live:artifact"] ?? "";
+
+    expect(artifactScript).toContain("AGENT_DRIVER_LIVE=1");
+    expect(artifactScript).toContain("tests/driver-artifact-live.test.ts");
+    expect(packageJson.scripts?.["test:live"]).toBe("vp run build && vp run test:live:artifact");
+    for (const suite of ["anthropic", "openai", "opencode"] as const) {
+      const script = packageJson.scripts?.[`test:live:${suite}`] ?? "";
+      expect(script).toContain("vp run build");
+      expect(script).toContain(`AGENT_DRIVER_LIVE_SUITE=${suite}`);
+      expect(script).toContain("tests/driver-artifact-live.test.ts");
+    }
+    expect(controller).toContain("export class DriverArtifactTestController");
+    expect(controller).toContain("crashDriver(): void");
+    expect(controller).toContain("disconnectDriver(): void");
+    expect(controller).toContain("failHeartbeats(): void");
+    expect(controller).toContain("signalDriver(signal: NodeJS.Signals): void");
+    expect(liveTest).toContain("const compatibilityScenarios");
+    expect(liveTest).toContain("const lifecycleScenarios");
+    expect(liveTest).toContain("const controlScenarios");
+    expect(liveTest).toContain("for (const runtimeCase of runtimeCases)");
+    expect(liveTest).toContain("for (const runtimeCase of lifecycleCases)");
+    expect(liveTest).not.toMatch(/from ["']\.\.\/src\/(?:core|runtimes)/);
+  });
+
+  test("pins the release OpenCode executable and gates publishing on the packed artifact", () => {
+    const packageJson = readDriverPackageJson();
+    const containerfile = readText("../Containerfile");
+    const releaseWorkflow = readText("../.github/workflows/release.yml");
+    const openCodeVersion = packageJson.devDependencies?.["opencode-ai"];
+    const packIndex = releaseWorkflow.indexOf("- name: Pack package");
+    const liveIndex = releaseWorkflow.indexOf("- name: Test packed driver");
+    const imageIndex = releaseWorkflow.indexOf("- name: Build image");
+
+    expect(openCodeVersion).toBe("1.18.4");
+    expect(containerfile).toContain(`ARG OPENCODE_VERSION=${openCodeVersion}`);
+    expect(releaseWorkflow).toContain("AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs");
+    expect(releaseWorkflow).toContain("--strip-components=1");
+    expect(releaseWorkflow).toContain("secrets.OPENROUTER_API_KEY");
+    expect(packIndex).toBeGreaterThan(-1);
+    expect(liveIndex).toBeGreaterThan(packIndex);
+    expect(imageIndex).toBeGreaterThan(liveIndex);
+  });
+
   test("keeps the standalone package out of mosoo workspace dependencies", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});

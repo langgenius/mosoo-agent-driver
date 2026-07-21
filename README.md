@@ -4,7 +4,7 @@
 
 <h1>mosoo-agent-driver</h1>
 
-<strong>A runtime-neutral AI agent harness for sandboxed coding agents.</strong>
+<strong>A runtime-neutral AI execution bridge for sandboxed coding agents.</strong>
 <br />
 One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Client Protocol (ACP).
 
@@ -23,7 +23,9 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 
 ---
 
-`mosoo-agent-driver` is the repository for the `@mosoo/agent-driver` package: a standalone Agent Driver and AI agent harness kernel for sandbox-hosted coding agent sessions. It runs inside the sandbox and drives one session from boot to stop. The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
+`mosoo-agent-driver` is the repository for the `@mosoo/agent-driver` package: a standalone Agent Driver and AI execution bridge for sandbox-hosted coding agent sessions.
+It runs inside the sandbox and drives one session from boot to stop.
+The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
 
 An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
 
@@ -48,7 +50,7 @@ flowchart LR
 
 The Driver does not open a sandbox-local control listener. In mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
 
-## AI Agent Harness Architecture
+## AI Execution Bridge Architecture
 
 Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `@mosoo/agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
 
@@ -174,7 +176,25 @@ vp run clean
 - `vp run build:image`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
-- live provider smoke tests are gated by environment credentials
+- live artifact tests are gated by environment credentials
+
+## Artifact Live Tests
+
+Every live test launches `dist/driver.mjs` as a child process and talks to it only through the production boot payload and control protocol.
+
+The compatibility tier runs sequential turns, workspace operations, and command-failure recovery against every configured model.
+
+The lifecycle tier runs native resume, crash resume, stale resume, cancellation and replay, supervised permissions, active stop, and `SIGTERM` against one representative model per runtime.
+
+The control tier runs changed-command replay, heartbeat failure, and active socket disconnection once because those paths are runtime-neutral.
+
+- `vp run test:live` builds the artifact and runs the complete matrix.
+- `vp run test:live:openai` runs the OpenAI runtime slice.
+- `vp run test:live:anthropic` runs the Anthropic runtime slice.
+- `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
+- `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
+
+The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the complete matrix.
 
 ## License
 
