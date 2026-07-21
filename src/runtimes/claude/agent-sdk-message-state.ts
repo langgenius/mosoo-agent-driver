@@ -9,6 +9,23 @@ interface ClaudeAssistantFinalCandidate {
   readonly ordinal: number;
 }
 
+interface ClaudeStreamMessageAnchor {
+  /**
+   * True when the anchor came from a message_start frame carrying the native
+   * message id. An unconfirmed anchor was inferred from the first streamed
+   * content frame after message_start was lost, so its native key is a
+   * synthetic burst key derived from that frame's envelope uuid.
+   */
+  readonly confirmed: boolean;
+  readonly nativeId: string;
+}
+
+// Envelope uuids are per-frame, so a burst key must never collide with a
+// native id a later assistant envelope could present on its own.
+function toStreamBurstNativeId(nativeMessageId: string): string {
+  return `stream-burst:${nativeMessageId}`;
+}
+
 function toClaudeThoughtId(messageId: string): string {
   return `${messageId}:thought`;
 }
@@ -27,14 +44,17 @@ export class ClaudeAgentSdkMessageState {
   readonly #assistantMessageRunIds = new Map<MessageId, RunId>();
   readonly #assistantMessageSequences = new Map<RunId, number>();
   readonly #blockToolCallIds = new Map<string, Map<number, string>>();
+  readonly #assistantNativeAliases = new Map<string, string>();
   readonly #lastCompletedAssistantMessages = new Map<RunId, ClaudeAssistantFinalCandidate>();
+  readonly #pendingAssistantStreamAnchors = new Map<string, ClaudeStreamMessageAnchor>();
   readonly #streamedTextMessages = new Set<string>();
-  readonly #streamingNativeMessageIds = new Map<string, string>();
+  readonly #streamingNativeMessageIds = new Map<string, ClaudeStreamMessageAnchor>();
   readonly #textByAssistantMessageId = new Map<MessageId, string>();
 
   reset(): void {
     this.#activeAssistantMessageIds.clear();
     this.#activeThoughtIds.clear();
+    this.#assistantNativeAliases.clear();
     this.#authoritativeAssistantMessageIds.clear();
     this.#assistantMessageIds.reset();
     this.#assistantMessageOrdinals.clear();
@@ -42,6 +62,7 @@ export class ClaudeAgentSdkMessageState {
     this.#assistantMessageSequences.clear();
     this.#blockToolCallIds.clear();
     this.#lastCompletedAssistantMessages.clear();
+    this.#pendingAssistantStreamAnchors.clear();
     this.#streamedTextMessages.clear();
     this.#streamingNativeMessageIds.clear();
     this.#textByAssistantMessageId.clear();
@@ -138,15 +159,98 @@ export class ClaudeAgentSdkMessageState {
   }
 
   setStreamingNativeMessageId(scope: string, nativeMessageId: string): void {
-    this.#streamingNativeMessageIds.set(scope, nativeMessageId);
+    this.#streamingNativeMessageIds.set(scope, { confirmed: true, nativeId: nativeMessageId });
+    this.#pendingAssistantStreamAnchors.delete(scope);
   }
 
   streamingNativeMessageId(scope: string): string | undefined {
-    return this.#streamingNativeMessageIds.get(scope);
+    return this.#streamingNativeMessageIds.get(scope)?.nativeId;
+  }
+
+  /**
+   * Resolves the native key for a streamed content frame. The Anthropic wire
+   * carries one message per scope between message boundaries, so the first
+   * content frame after a lost message_start pins the scope to a burst key
+   * instead of letting every frame's envelope uuid mint a new message.
+   */
+  anchorStreamingNativeMessageId(scope: string, nativeMessageId: string | null): string | null {
+    const anchor = this.#streamingNativeMessageIds.get(scope);
+
+    if (anchor !== undefined) {
+      return anchor.nativeId;
+    }
+
+    if (nativeMessageId === null) {
+      return null;
+    }
+
+    const burstNativeId = toStreamBurstNativeId(nativeMessageId);
+    this.#streamingNativeMessageIds.set(scope, { confirmed: false, nativeId: burstNativeId });
+    this.#pendingAssistantStreamAnchors.delete(scope);
+    return burstNativeId;
   }
 
   clearStreamingNativeMessageId(scope: string): void {
+    const anchor = this.#streamingNativeMessageIds.get(scope);
     this.#streamingNativeMessageIds.delete(scope);
+
+    // The aggregated assistant envelope for this burst arrives after
+    // message_stop; park the anchor so that envelope can bind to the streamed
+    // message instead of minting a duplicate.
+    if (anchor !== undefined) {
+      this.#pendingAssistantStreamAnchors.set(scope, anchor);
+    }
+  }
+
+  /**
+   * Resolves the native key an aggregated assistant envelope should use. An
+   * unconfirmed streamed burst in the same scope is that envelope's own
+   * stream (per-scope bursts are serial), so bind to it and consume the
+   * anchor — one envelope aggregates one burst. A confirmed anchor proves
+   * the stream's identity and the envelope's native id wins.
+   */
+  resolveAssistantMessageNativeId(scope: string, nativeMessageId: string | null): string | null {
+    if (nativeMessageId !== null) {
+      const alias = this.#assistantNativeAliases.get(nativeMessageId);
+
+      if (alias !== undefined) {
+        return alias;
+      }
+    }
+
+    const pending = this.#pendingAssistantStreamAnchors.get(scope);
+
+    if (pending !== undefined) {
+      this.#pendingAssistantStreamAnchors.delete(scope);
+      return pending.confirmed
+        ? (nativeMessageId ?? pending.nativeId)
+        : this.#bindAssistantNativeAlias(pending.nativeId, nativeMessageId);
+    }
+
+    const live = this.#streamingNativeMessageIds.get(scope);
+
+    if (live === undefined) {
+      return nativeMessageId;
+    }
+
+    if (live.confirmed) {
+      // The envelope arrived before message_stop; keep the confirmed anchor
+      // so the remaining stream frames stay on the same message.
+      return nativeMessageId ?? live.nativeId;
+    }
+
+    this.#streamingNativeMessageIds.delete(scope);
+    return this.#bindAssistantNativeAlias(live.nativeId, nativeMessageId);
+  }
+
+  #bindAssistantNativeAlias(burstNativeId: string, nativeMessageId: string | null): string {
+    if (nativeMessageId !== null) {
+      // A replayed envelope re-presents the same native id after the anchor
+      // is consumed; remember the binding so it stays on the same message.
+      this.#assistantNativeAliases.set(nativeMessageId, burstNativeId);
+    }
+
+    return burstNativeId;
   }
 
   setToolCallId(messageId: string, index: number, toolCallId: string): void {

@@ -348,7 +348,105 @@ describe("Claude Agent SDK provider fixtures", () => {
     },
   );
 
-  test("closes every interleaved assistant message before the Run terminal", async () => {
+  test("keeps a start-less streamed reply on one message through its assistant envelope", async () => {
+    // YEF-884 wire shape: message_start was lost, every frame carries its own
+    // envelope uuid, and the aggregated assistant envelope (with the native
+    // message id) arrives before message_stop. The reply must stay one
+    // message instead of rendering as "P" / "ong. …" / full-text duplicates.
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          delta: { text: "P", type: "text_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "frame-delta-1",
+      },
+      {
+        event: {
+          delta: { text: "ong. What would you like to work on?", type: "text_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "frame-delta-2",
+      },
+      {
+        message: {
+          content: [{ text: "Pong. What would you like to work on?", type: "text" }],
+          id: "msg-pong",
+        },
+        type: "assistant",
+        uuid: "envelope-1",
+      },
+      {
+        event: { index: 0, type: "content_block_stop" },
+        type: "stream_event",
+        uuid: "frame-stop-1",
+      },
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "frame-stop-2",
+      },
+      {
+        result: "Pong. What would you like to work on?",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const translated = events();
+    const textMessages = translated.flatMap((event) => {
+      if (event.kind !== "message.delta" || !isRecord(event.payload)) {
+        return [];
+      }
+
+      const contentDelta = event.payload["contentDelta"];
+      const messageId = event.payload["messageId"];
+      return typeof contentDelta === "string" && typeof messageId === "string"
+        ? [{ contentDelta, messageId }]
+        : [];
+    });
+    const started = translated
+      .filter((event) => event.kind === "message.started" && isRecord(event.payload))
+      .map((event) => (event.payload as Record<string, unknown>)["messageId"]);
+    const snapshot = translated.find(
+      (event) => event.kind === "message.added" && isRecord(event.payload),
+    );
+    const snapshotPayload =
+      snapshot === undefined || !isRecord(snapshot.payload) ? null : snapshot.payload;
+    const runCompleted = translated.find((event) => event.kind === "run.completed");
+    const payload =
+      runCompleted === undefined || !isRecord(runCompleted.payload) ? null : runCompleted.payload;
+
+    expect(textMessages.map((entry) => entry.contentDelta)).toEqual([
+      "P",
+      "ong. What would you like to work on?",
+    ]);
+    expect(new Set(textMessages.map((entry) => entry.messageId)).size).toBe(1);
+    expect(started).toHaveLength(1);
+    expect(snapshotPayload?.["messageId"]).toBe(textMessages[0]?.messageId);
+    expect(snapshotPayload?.["content"]).toEqual([
+      { text: "Pong. What would you like to work on?", type: "text" },
+    ]);
+    expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
+    expect(payload?.["finalMessageText"]).toBe("Pong. What would you like to work on?");
+  });
+
+  test("anchors uuid-fractured stream fragments to one closed assistant message", async () => {
+    // One scope streams one message at a time; per-envelope uuids must not
+    // fracture a burst whose message_start frame was lost (YEF-884).
     const { context, events, logger, translator } = createHarness();
     const messages = [
       {
@@ -393,12 +491,20 @@ describe("Claude Agent SDK provider fixtures", () => {
       .slice(0, terminalIndex)
       .filter((event) => event.kind === "message.completed" && isRecord(event.payload))
       .map((event) => (event.payload as Record<string, unknown>)["messageId"]);
+    const deltaMessageIds = translated
+      .filter((event) => event.kind === "message.delta" && isRecord(event.payload))
+      .map((event) => (event.payload as Record<string, unknown>)["messageId"]);
 
-    expect(started).toHaveLength(2);
+    expect(started).toHaveLength(1);
     expect(completed).toEqual(started);
+    expect(new Set(deltaMessageIds)).toEqual(new Set(started));
   });
 
-  test("keeps duplicate text scoped to its native assistant message", async () => {
+  test("binds the aggregated assistant envelope to an unconfirmed streamed burst", async () => {
+    // Without a message_start frame the streamed burst is anchored to an
+    // envelope uuid; the aggregated assistant envelope that follows in the
+    // same scope is that burst's own aggregation and must not mint a
+    // duplicate message (YEF-884).
     const { context, events, logger, translator } = createHarness();
     const messages = [
       {
@@ -420,6 +526,82 @@ describe("Claude Agent SDK provider fixtures", () => {
         },
         type: "assistant",
         uuid: "assistant-final-b",
+      },
+      {
+        result: "相同文本",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const textMessages = events().flatMap((event) => {
+      if (event.kind !== "message.delta" || !isRecord(event.payload)) {
+        return [];
+      }
+
+      const contentDelta = event.payload["contentDelta"];
+      const messageId = event.payload["messageId"];
+      return typeof contentDelta === "string" && typeof messageId === "string"
+        ? [{ contentDelta, messageId }]
+        : [];
+    });
+    const snapshot = events().find(
+      (event) => event.kind === "message.added" && isRecord(event.payload),
+    );
+    const snapshotPayload =
+      snapshot === undefined || !isRecord(snapshot.payload) ? null : snapshot.payload;
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+    const payload =
+      runCompleted === undefined || !isRecord(runCompleted.payload) ? null : runCompleted.payload;
+
+    expect(textMessages.map((entry) => entry.contentDelta)).toEqual(["相同文本"]);
+    expect(snapshotPayload?.["messageId"]).toBe(textMessages[0]?.messageId);
+    expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
+    expect(payload?.["finalMessageText"]).toBe("相同文本");
+  });
+
+  test("keeps duplicate text on distinct messages when the stream identity is confirmed", async () => {
+    // A message_start frame proves the streamed message's native id, so an
+    // assistant envelope with a different native id is a genuinely separate
+    // message even when the text repeats.
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          message: { id: "msg-progress" },
+          type: "message_start",
+        },
+        type: "stream_event",
+        uuid: "stream-1",
+      },
+      {
+        event: {
+          delta: { text: "相同文本", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "stream-2",
+      },
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "stream-3",
+      },
+      {
+        message: {
+          content: [{ text: "相同文本", type: "text" }],
+          id: "msg-final",
+        },
+        type: "assistant",
+        uuid: "assistant-final",
       },
       {
         result: "相同文本",
