@@ -62,6 +62,16 @@ jobs:
           mkdir package
           npm pack --ignore-scripts --pack-destination package
 
+      - name: Test packed driver
+        timeout-minutes: 180
+        env:
+          AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          mkdir packed
+          tar -xzf package/*.tgz -C packed --strip-components=1
+          vp run test:live:artifact
+
       - name: Build image
         env:
           VERSION: ${{ steps.verify.outputs.version }}
