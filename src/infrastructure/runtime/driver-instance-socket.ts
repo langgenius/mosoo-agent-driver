@@ -18,6 +18,7 @@ import type {
   DriverRpcOptions,
 } from "../../protocol/orpc";
 import type { DriverRuntimeClient } from "../../protocol/orpc";
+import { parseRuntimeCommand } from "../../runtime-command";
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
 import { dialDriverControlSocket } from "./driver-control-dial";
 import type { DriverWireSocket } from "./driver-control-dial";
@@ -51,6 +52,10 @@ export class DriverInstanceSocket {
   #connectAbortController: AbortController | null = null;
   #eventBatchMaxSize: number | null = null;
   #rpcAbortController = new AbortController();
+  #runEventTerminal: {
+    readonly runId: RunId;
+    readonly status: "cancelled" | "completed" | "failed";
+  } | null = null;
   #runTerminal: RunTerminalDelivery | null = null;
   private readonly handlers: DriverInstanceSocketHandlers;
   private readonly payload: DriverBootPayload;
@@ -128,6 +133,7 @@ export class DriverInstanceSocket {
 
   beginRun(runId: RunId): void {
     this.#activeRunId = runId;
+    this.#runEventTerminal = null;
     this.#runTerminal = null;
   }
 
@@ -139,6 +145,10 @@ export class DriverInstanceSocket {
 
   currentRunId(): RunId | null {
     return this.#activeRunId;
+  }
+
+  runEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
+    return this.#runEventTerminal?.runId === runId ? this.#runEventTerminal.status : null;
   }
 
   async commandUpdate(
@@ -267,6 +277,19 @@ export class DriverInstanceSocket {
         }
 
         accepted.push(...result.accepted);
+        for (const { event } of remaining.slice(0, result.accepted.length)) {
+          const status =
+            event.kind === "run.cancelled"
+              ? "cancelled"
+              : event.kind === "run.completed"
+                ? "completed"
+                : event.kind === "run.failed"
+                  ? "failed"
+                  : null;
+          if (status !== null && event.runId !== undefined) {
+            this.#runEventTerminal = { runId: event.runId, status };
+          }
+        }
 
         if (delivery === "best_effort" && result.accepted.length < remaining.length) {
           return { accepted };
@@ -301,14 +324,31 @@ export class DriverInstanceSocket {
   }
 
   async nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null> {
-    const result = await this.#requireClient().driverInstance.nextCommand(
-      {
-        driverInstanceId: this.payload.driverInstanceId,
-      },
-      this.#rpcOptions(signal),
-    );
+    const rpcAbortSignal = this.#rpcAbortController.signal;
+    const timeoutSignal = AbortSignal.timeout(DRIVER_RPC_TIMEOUT_MS);
+    let result: Awaited<ReturnType<DriverRuntimeClient["driverInstance"]["nextCommand"]>>;
 
-    return result.command;
+    try {
+      result = await this.#requireClient().driverInstance.nextCommand(
+        {
+          driverInstanceId: this.payload.driverInstanceId,
+        },
+        this.#rpcOptions(signal, timeoutSignal),
+      );
+    } catch (error) {
+      if (
+        timeoutSignal.aborted &&
+        error === timeoutSignal.reason &&
+        !rpcAbortSignal.aborted &&
+        !signal.aborted
+      ) {
+        return null;
+      }
+
+      throw error;
+    }
+
+    return result.command === null ? null : parseRuntimeCommand(result.command);
   }
 
   #deliverRunTerminal(
@@ -398,11 +438,15 @@ export class DriverInstanceSocket {
     return this.#client;
   }
 
-  #rpcOptions(signal?: AbortSignal): DriverRpcOptions {
+  #rpcOptions(
+    signal?: AbortSignal,
+    timeoutSignal = AbortSignal.timeout(DRIVER_RPC_TIMEOUT_MS),
+  ): DriverRpcOptions {
     return {
       signal: AbortSignal.any([
         this.#rpcAbortController.signal,
-        signal ?? AbortSignal.timeout(DRIVER_RPC_TIMEOUT_MS),
+        ...(signal === undefined ? [] : [signal]),
+        timeoutSignal,
       ]),
     };
   }

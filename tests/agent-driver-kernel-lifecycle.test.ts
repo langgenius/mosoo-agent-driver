@@ -202,14 +202,19 @@ describe("AgentDriverKernelCore", () => {
       const backend = createBackend();
       const inputEntered = Promise.withResolvers<void>();
       const releaseInput = Promise.withResolvers<void>();
+      const nextInputEntered = Promise.withResolvers<void>();
+      const releaseNextInput = Promise.withResolvers<void>();
       const resolutionPublishing = Promise.withResolvers<void>();
       const releaseResolution = Promise.withResolvers<void>();
       let inputCount = 0;
       let permission: Promise<unknown> | null = null;
+      let resolutionRunId: unknown;
       backend.handleInput = async (context) => {
         inputCount += 1;
 
         if (inputCount > 1) {
+          nextInputEntered.resolve();
+          await releaseNextInput.promise;
           return;
         }
 
@@ -229,7 +234,9 @@ describe("AgentDriverKernelCore", () => {
       const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
       const pushEvents = kernel.pushEvents.bind(kernel);
       kernel.pushEvents = async (input) => {
-        if (input.events.some((event) => event.kind === "permission.resolved")) {
+        const resolution = input.events.find((event) => event.kind === "permission.resolved");
+        if (resolution !== undefined) {
+          resolutionRunId = resolution.runId;
           resolutionPublishing.resolve();
           await releaseResolution.promise;
         }
@@ -264,18 +271,19 @@ describe("AgentDriverKernelCore", () => {
         requestId: "permission-stale",
       });
       await resolutionPublishing.promise;
+      const nextInput = kernel.dispatch({
+        commandId: "next-input",
+        input: { text: "continue" },
+        kind: "input.start",
+        requestId: "next-request",
+        runId: DRIVER_TEST_IDS.secondRunId,
+      });
+      await nextInputEntered.promise;
       releaseResolution.resolve();
       await permission;
-
-      await expect(
-        kernel.dispatch({
-          commandId: "next-input",
-          input: { text: "continue" },
-          kind: "input.start",
-          requestId: "next-request",
-          runId: DRIVER_TEST_IDS.secondRunId,
-        }),
-      ).resolves.toEqual({ requestId: "next-request" });
+      expect(resolutionRunId).toBe(DRIVER_TEST_IDS.runId);
+      releaseNextInput.resolve();
+      await expect(nextInput).resolves.toEqual({ requestId: "next-request" });
       await kernel.stop("test.stop");
     },
   );

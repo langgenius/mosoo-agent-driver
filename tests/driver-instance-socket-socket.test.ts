@@ -52,6 +52,7 @@ class RpcWebSocket extends OpenWebSocket {
   static heartbeatFails = false;
   static heartbeatIntervalMs = 1_000;
   static lostResponsePath: string | null = null;
+  static nextCommand: unknown = null;
   static receiptOverride: Partial<{ eventId: string; seq: number; type: string }> | null = null;
   static sendFailurePath: string | null = null;
   static stalledPath: string | null = null;
@@ -141,7 +142,7 @@ class RpcWebSocket extends OpenWebSocket {
         output = { heartbeatCount: 1, ok: true };
       }
     } else if (path === "/driverInstance/nextCommand") {
-      output = { command: null };
+      output = { command: RpcWebSocket.nextCommand };
     } else {
       output = { ok: true };
     }
@@ -171,6 +172,7 @@ afterEach(() => {
   RpcWebSocket.heartbeatFails = false;
   RpcWebSocket.heartbeatIntervalMs = 1_000;
   RpcWebSocket.lostResponsePath = null;
+  RpcWebSocket.nextCommand = null;
   RpcWebSocket.receiptOverride = null;
   RpcWebSocket.sendFailurePath = null;
   RpcWebSocket.stalledPath = null;
@@ -178,6 +180,92 @@ afterEach(() => {
 });
 
 describe("DriverInstanceSocket lifecycle", () => {
+  test.each([
+    [
+      "malformed",
+      {
+        commandId: "command-1",
+        input: { text: "hello" },
+        kind: "input.start",
+        requestId: "request-1",
+      },
+      "runId must be a non-empty string",
+    ],
+    ["unknown", { commandId: "command-1", kind: "unknown" }, "Unsupported runtime command kind"],
+  ] as const)("rejects a %s command from the wire", async (_name, command, message) => {
+    RpcWebSocket.nextCommand = command;
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    await socket.connect();
+
+    await expect(socket.nextCommand(new AbortController().signal)).rejects.toThrow(message);
+  });
+
+  test("returns an empty poll after the next-command deadline and remains reusable", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
+    let deadline = new AbortController();
+    AbortSignal.timeout = () => deadline.signal;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    await socket.connect();
+    const shutdown = new AbortController();
+
+    const poll = socket.nextCommand(shutdown.signal);
+    await RpcWebSocket.stalled.promise;
+    deadline.abort(new Error("test RPC timeout"));
+
+    await expect(poll).resolves.toBeNull();
+    expect(shutdown.signal.aborted).toBeFalse();
+    expect(PendingWebSocket.instances[0]?.readyState).toBe(1);
+
+    deadline = new AbortController();
+    RpcWebSocket.stalledPath = null;
+    await expect(socket.nextCommand(shutdown.signal)).resolves.toBeNull();
+    expect(
+      (PendingWebSocket.instances[0] as RpcWebSocket).paths.filter(
+        (path) => path === "/driverInstance/nextCommand",
+      ),
+    ).toHaveLength(2);
+  });
+
+  test("shutdown immediately aborts a stalled next-command poll before its deadline", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
+    AbortSignal.timeout = () => new AbortController().signal;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    await socket.connect();
+    const shutdown = new AbortController();
+    const reason = new Error("test shutdown");
+
+    const poll = socket.nextCommand(shutdown.signal);
+    await RpcWebSocket.stalled.promise;
+    shutdown.abort(reason);
+
+    await expect(poll).rejects.toBe(reason);
+  });
+
+  test("peer close immediately aborts a stalled next-command poll before its deadline", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
+    AbortSignal.timeout = () => new AbortController().signal;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    await socket.connect();
+
+    const poll = socket.nextCommand(new AbortController().signal);
+    await RpcWebSocket.stalled.promise;
+    (PendingWebSocket.instances[0] as RpcWebSocket).close(1006, "test connection lost");
+
+    await expect(poll).rejects.toThrow("test connection lost");
+  });
+
   test("abortConnect closes and rejects an in-flight dial", async () => {
     globalThis.WebSocket = PendingWebSocket as unknown as typeof WebSocket;
     let closeNotifications = 0;

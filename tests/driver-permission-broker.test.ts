@@ -662,6 +662,192 @@ describe("DriverPermissionBroker", () => {
     ]);
   });
 
+  test("waits for the cancelled permission event pipeline to become idle", async () => {
+    const requestedPublishing = Promise.withResolvers<void>();
+    const releaseRequested = Promise.withResolvers<void>();
+    const resolutionPublishing = Promise.withResolvers<void>();
+    const releaseResolution = Promise.withResolvers<void>();
+    const pushedEvents: DriverEventInput[] = [];
+    const socket: DriverRuntimeEventPort = {
+      pushEvents: async ({ events }) => {
+        pushedEvents.push(...events);
+
+        if (events.some((event) => event.kind === "permission.requested")) {
+          requestedPublishing.resolve();
+          await releaseRequested.promise;
+        }
+        if (events.some((event) => event.kind === "permission.resolved")) {
+          resolutionPublishing.resolve();
+          await releaseResolution.promise;
+        }
+
+        return acceptEvents(events);
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 200,
+    });
+    const request = broker.request(socket, permissionInput);
+
+    await requestedPublishing.promise;
+    const cancellation = broker.rejectAllAndWait();
+    let cancellationSettled = false;
+    void cancellation.then(
+      () => {
+        cancellationSettled = true;
+      },
+      () => {
+        cancellationSettled = true;
+      },
+    );
+    expect(broker.rejectAllAndWait()).toBe(cancellation);
+    await Bun.sleep(120);
+    expect(cancellationSettled).toBe(false);
+
+    releaseRequested.resolve();
+    await resolutionPublishing.promise;
+    await Bun.sleep(120);
+    expect(cancellationSettled).toBe(false);
+
+    releaseResolution.resolve();
+    await expect(Promise.all([request, cancellation])).resolves.toEqual(["reject_once", undefined]);
+    expect(broker.hasPending()).toBe(false);
+    expect(pushedEvents.map(({ kind }) => kind)).toEqual([
+      "permission.requested",
+      "permission.resolved",
+      "diagnostic.reported",
+    ]);
+  });
+
+  test("bounds ordinary cancellation delivery below the active-turn grace", async () => {
+    const requestedPublishing = Promise.withResolvers<void>();
+    const pushedKinds: string[] = [];
+    const socket: DriverRuntimeEventPort = {
+      pushEvents: async ({ events, signal }) => {
+        pushedKinds.push(...events.map((event) => event.kind));
+
+        if (events.some((event) => event.kind === "permission.requested")) {
+          requestedPublishing.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+
+        return acceptEvents(events);
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 5_000,
+    });
+    const request = broker.request(socket, permissionInput);
+
+    await requestedPublishing.promise;
+    broker.rejectAll();
+    const outcome = await request.catch((error: unknown) => error);
+
+    expect(outcome).toMatchObject({
+      phase: "requested",
+      requestId: permissionInput.requestId,
+    });
+    expect(String((outcome as Error).cause)).toContain("cancellation delivery timed out");
+    expect(pushedKinds).toEqual(["permission.requested"]);
+  }, 10_000);
+
+  test("bounds cancellation after a decision while its resolution is still delivering", async () => {
+    const resolutionPublishing = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const acceptedKinds: string[] = [];
+    const pushedKinds: string[] = [];
+    const socket: DriverRuntimeEventPort = {
+      pushEvents: async ({ events, signal }) => {
+        pushedKinds.push(...events.map((event) => event.kind));
+
+        if (events.some((event) => event.kind === "permission.resolved")) {
+          resolutionPublishing.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
+
+        acceptedKinds.push(...events.map((event) => event.kind));
+        return acceptEvents(events);
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 5_000,
+    });
+    const request = broker.request(socket, permissionInput, controller.signal);
+
+    await Promise.resolve();
+    expect(broker.resolve(permissionInput.requestId, "allow_once")).toBe(true);
+    await resolutionPublishing.promise;
+    controller.abort();
+    const outcome = await request.catch((error: unknown) => error);
+
+    expect(outcome).toMatchObject({
+      phase: "resolved",
+      requestId: permissionInput.requestId,
+    });
+    expect(String((outcome as Error).cause)).toContain("cancellation delivery timed out");
+    expect(pushedKinds).toEqual(["permission.requested", "permission.resolved"]);
+    expect(acceptedKinds).toEqual(["permission.requested"]);
+  }, 10_000);
+
+  test("keeps the full shutdown budget after a decision starts delivering", async () => {
+    const resolutionPublishing = Promise.withResolvers<void>();
+    const releaseResolution = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    let deliveryAborted = false;
+    const socket: DriverRuntimeEventPort = {
+      pushEvents: async ({ events, signal }) => {
+        if (events.some((event) => event.kind === "permission.resolved")) {
+          resolutionPublishing.resolve();
+          await Promise.race([
+            releaseResolution.promise,
+            new Promise<never>((_resolve, reject) => {
+              signal?.addEventListener(
+                "abort",
+                () => {
+                  deliveryAborted = true;
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+            }),
+          ]);
+        }
+
+        return acceptEvents(events);
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 5_000,
+    });
+    const request = broker.request(socket, permissionInput, controller.signal);
+
+    await Promise.resolve();
+    expect(broker.resolve(permissionInput.requestId, "allow_once")).toBe(true);
+    await resolutionPublishing.promise;
+    broker.rejectAll();
+    const shutdown = broker.rejectAllAndWait();
+    let shutdownSettled = false;
+    void shutdown.then(
+      () => {
+        shutdownSettled = true;
+      },
+      () => {
+        shutdownSettled = true;
+      },
+    );
+    controller.abort();
+    await Bun.sleep(1_600);
+
+    expect(deliveryAborted).toBe(false);
+    expect(shutdownSettled).toBe(false);
+    releaseResolution.resolve();
+    await expect(Promise.all([request, shutdown])).resolves.toEqual(["allow_once", undefined]);
+  }, 3_000);
+
   test("reports timed out permission requests explicitly", async () => {
     const broker = new DriverPermissionBroker(() => null, { requestTimeoutMs: 1 });
     const socket = createRecordingSocket();

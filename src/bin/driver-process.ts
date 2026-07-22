@@ -14,6 +14,7 @@ import { parseDriverId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
 import { createDriverStartInputFromBootPayload } from "../protocol/start";
 import type { DriverStartInput } from "../protocol/start";
+import type { RunError } from "../runtime-command";
 import type { AgentDriverBackendFactory, AgentDriverContext } from "../core/agent-driver-backend";
 import { createAgentDriverContext } from "../core/agent-driver-backend";
 import { AgentBackendLifecycle } from "../core/agent-backend-lifecycle";
@@ -26,12 +27,13 @@ import { materializeResolvedSkills } from "../runtimes/skill-materialization";
 import { promiseWithTimeout } from "../utils/async";
 import { AGENT_DRIVER_VERSION } from "../core/version";
 import { DriverCommandDispatcher } from "../core/driver-command-dispatcher";
+import { deliverRunTerminal } from "../core/driver-command-delivery";
 import { pushDriverDiagnosticEvent } from "../core/driver-diagnostics";
 import { DriverHeartbeatLoop } from "../core/driver-heartbeat-loop";
 import { DriverPermissionBroker } from "../core/driver-permission-broker";
 import { createDriverPermissionRequestHandler } from "../core/driver-permission-policy";
 import { pushLosslessEvents } from "../core/driver-runtime-io";
-import type { DriverRuntimeEventPort, DriverRuntimeRunPort } from "../core/driver-runtime-io";
+import type { DriverRuntimeEventPort } from "../core/driver-runtime-io";
 import { DriverRuntimeStateMachine } from "../core/driver-runtime-state";
 import { createTimingEvent, createTimingPhase, toDurationMs } from "../core/driver-runtime-timing";
 
@@ -49,6 +51,8 @@ export class DriverProcess {
   #backendLifecycle: AgentBackendLifecycle | null = null;
   #logger: Logger | null = null;
   #logUplink: DriverLogUplink | null = null;
+  #pendingRunCompletion = false;
+  #pendingRunFailure: RunError | null = null;
   private readonly payload: DriverBootPayload;
   readonly #permissionBroker: DriverPermissionBroker;
   readonly #shutdownController = new AbortController();
@@ -91,6 +95,10 @@ export class DriverProcess {
           return;
         }
 
+        this.rememberTerminalCause(new Error(reason || "runtime.socket.closed"));
+        if (!this.#runtimeState.isShuttingDown()) {
+          this.#runtimeState.enter("failed");
+        }
         void this.shutdown(socket, reason || "runtime.socket.closed").catch(() => {});
       },
     });
@@ -228,6 +236,10 @@ export class DriverProcess {
           driverInstanceId: this.payload.driverInstanceId,
           isShuttingDown: () => this.#runtimeState.isShuttingDown(),
           permissionRequests: this.#permissionBroker,
+          rememberRunFailure: (error) => {
+            this.#pendingRunFailure ??= structuredClone(error);
+            this.rememberTerminalCause(new Error(error.message, { cause: error }));
+          },
           runtimeContextFactory: (_runtimeSocket, runtimeLogger) =>
             this.createAgentDriverContext(socket, runtimeLogger),
           runtimeState: this.#runtimeState,
@@ -247,10 +259,16 @@ export class DriverProcess {
 
       if (!shutdownAbort) {
         this.rememberTerminalCause(error);
+        const failure = this.#terminalCause?.error ?? error;
+        this.#pendingRunFailure ??= {
+          code: "driver.runtime_failed",
+          details: {},
+          message: failure instanceof Error ? failure.message : "Driver runtime failed.",
+          retryable: false,
+        };
         if (!this.#runtimeState.isShuttingDown()) {
           this.#runtimeState.enter("failed");
         }
-        await this.reportRunFailure(socket, this.#terminalCause?.error ?? error);
       }
     }
 
@@ -294,12 +312,23 @@ export class DriverProcess {
 
   private async runShutdown(socket: DriverInstanceSocket, reason: string): Promise<void> {
     this.#shutdownReason = reason;
+    if (
+      socket.currentRunId() !== null &&
+      (reason === "signal.sigint" || reason === "signal.sigterm")
+    ) {
+      this.#pendingRunCompletion = true;
+    }
     if (this.#runtimeState.status() !== "failed" && this.#runtimeState.status() !== "stopped") {
       this.#runtimeState.enter("stopping");
     }
+    const permissionPending = this.#permissionBroker.hasPending();
+    const permissionCancellation = this.#permissionBroker.rejectAllAndWait();
     this.#shutdownController.abort(new Error(reason));
     socket.abortConnect(reason);
-    socket.abortPendingRequests(reason);
+    // Keep the RPC lane open long enough to publish the lossless permission cancellation.
+    if (!permissionPending) {
+      socket.abortPendingRequests(reason);
+    }
 
     // If hello never completed, a gated flush may still be pending; open the
     // gate so log teardown cannot hang shutdown.
@@ -310,10 +339,25 @@ export class DriverProcess {
     });
 
     this.#heartbeatLoop.stop(this.#logger, reason);
-    this.#permissionBroker.rejectAll();
 
     try {
-      await this.#backendLifecycle?.shutdown(reason);
+      let permissionFailure: { error: unknown } | null = null;
+
+      try {
+        await permissionCancellation;
+      } catch (error) {
+        permissionFailure = { error };
+      }
+
+      const backendShutdown = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
+      const failure = backendShutdown.find((result) => result.status === "rejected");
+
+      if (permissionFailure !== null) {
+        throw permissionFailure.error;
+      }
+      if (failure?.status === "rejected") {
+        throw failure.reason;
+      }
 
       if (this.#runtimeState.status() === "stopping") {
         this.#runtimeState.enter("stopped");
@@ -362,23 +406,12 @@ export class DriverProcess {
     }
   }
 
-  private async reportRunFailure(
-    socket: DriverRuntimeEventPort & DriverRuntimeRunPort,
-    error: unknown,
-  ): Promise<void> {
-    if (
-      !this.#logger ||
-      (this.#shutdownTask !== null &&
-        this.#shutdownReason !== "driver.backend_failed" &&
-        this.#shutdownReason !== "runtime.heartbeat.failed")
-    ) {
+  private async reportRunFailure(socket: DriverInstanceSocket, error: RunError): Promise<void> {
+    if (!this.#logger) {
       return;
     }
 
-    const message = error instanceof Error ? error.message : "Driver runtime failed.";
-    const code = "driver.runtime_failed";
-    this.#shutdownReason = code;
-
+    this.#shutdownReason = error.code;
     this.#logger.error("driver.runtime.failed", error, {
       driverInstanceId: this.payload.driverInstanceId,
     });
@@ -387,31 +420,30 @@ export class DriverProcess {
       await pushDriverDiagnosticEvent(
         socket,
         {
-          code,
+          code: "driver.runtime_failed",
           details: {
             driverInstanceId: this.payload.driverInstanceId,
           },
-          message,
+          message: error.message,
           severity: "error",
           source: "process",
         },
         this.#logger,
       );
-      await socket.failRun({
-        code,
-        details: {},
-        message,
-        retryable: false,
-      });
     } catch (failureError) {
       this.#logger.error("driver.runtime.failure_report_failed", failureError, {
         driverInstanceId: this.payload.driverInstanceId,
       });
     }
+    await deliverRunTerminal(socket, {
+      error: structuredClone(error),
+      status: "failed",
+    });
   }
 
   private async finalize(socket: DriverInstanceSocket): Promise<void> {
     let shutdownFailure: { error: unknown } | null = null;
+    let terminalFailure: { error: unknown } | null = null;
     const shutdownTask = this.#shutdownTask;
     const retrying = shutdownTask === null && this.#shutdownController.signal.aborted;
 
@@ -427,6 +459,20 @@ export class DriverProcess {
         } catch (retryError) {
           shutdownFailure = { error: retryError };
         }
+      }
+    }
+
+    if (this.#pendingRunFailure !== null && shutdownFailure === null) {
+      try {
+        await this.reportRunFailure(socket, this.#pendingRunFailure);
+      } catch (error) {
+        terminalFailure = { error };
+      }
+    } else if (this.#pendingRunCompletion && shutdownFailure === null) {
+      try {
+        await deliverRunTerminal(socket, { status: "completed" });
+      } catch (error) {
+        terminalFailure = { error };
       }
     }
 
@@ -450,6 +496,9 @@ export class DriverProcess {
     if (shutdownFailure !== null) {
       throw shutdownFailure.error;
     }
+    if (terminalFailure !== null) {
+      throw terminalFailure.error;
+    }
   }
 
   private createAgentDriverContext(
@@ -468,6 +517,9 @@ export class DriverProcess {
           payload: this.#startInput,
           supervised: async (input, signal) => {
             const generation = this.#runtimeState.beginApproval();
+            if (generation === null) {
+              return "reject_once";
+            }
 
             try {
               return await this.#permissionBroker.request(socket, input, signal);

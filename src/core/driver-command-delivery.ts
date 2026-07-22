@@ -20,6 +20,15 @@ export interface TerminalCommandUpdate {
   status: "cancelled" | "completed" | "failed";
 }
 
+export type RunTerminalUpdate =
+  | {
+      status: "completed";
+    }
+  | {
+      error: RunError;
+      status: "failed";
+    };
+
 type RunTerminalDelivery =
   | {
       delivered: boolean;
@@ -225,7 +234,7 @@ export class DriverCommandDelivery {
       return terminal.task;
     }
 
-    const task = this.#deliverRunTerminal(socket, terminal);
+    const task = deliverRunTerminal(socket, terminal);
     terminal.task = task;
     void task.then(
       () => {
@@ -241,43 +250,6 @@ export class DriverCommandDelivery {
       },
     );
     return task;
-  }
-
-  async #deliverRunTerminal(socket: DriverRuntimeIo, terminal: RunTerminalDelivery): Promise<void> {
-    const deadline = Date.now() + COMMAND_UPDATE_TIMEOUT_MS;
-    let cause: unknown = new Error("Run terminal delivery deadline elapsed.");
-
-    for (let attempt = 1; attempt <= TERMINAL_UPDATE_MAX_ATTEMPTS; attempt += 1) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        break;
-      }
-
-      const controller = new AbortController();
-      const delivery = await settlePromiseWithTimeout(
-        Promise.resolve().then(() =>
-          terminal.status === "completed"
-            ? socket.completeRun(controller.signal)
-            : socket.failRun(structuredClone(terminal.error), controller.signal),
-        ),
-        {
-          label: `Driver run ${terminal.status} terminal delivery`,
-          timeoutMs: Math.min(remainingMs, TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS),
-        },
-      );
-
-      if (delivery.status === "completed") {
-        return;
-      }
-
-      cause = delivery.error;
-      controller.abort(delivery.error);
-      await sleepPromise(0);
-    }
-
-    throw new Error(`Driver run ${terminal.status} terminal could not be delivered.`, {
-      cause,
-    });
   }
 
   async #deliverTerminal(
@@ -321,4 +293,44 @@ export class DriverCommandDelivery {
 
     throw new TerminalCommandDeliveryError(command, cause);
   }
+}
+
+export async function deliverRunTerminal(
+  socket: DriverRuntimeIo,
+  terminal: RunTerminalUpdate,
+): Promise<void> {
+  const deadline = Date.now() + COMMAND_UPDATE_TIMEOUT_MS;
+  let cause: unknown = new Error("Run terminal delivery deadline elapsed.");
+
+  for (let attempt = 1; attempt <= TERMINAL_UPDATE_MAX_ATTEMPTS; attempt += 1) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    const controller = new AbortController();
+    const delivery = await settlePromiseWithTimeout(
+      Promise.resolve().then(() =>
+        terminal.status === "completed"
+          ? socket.completeRun(controller.signal)
+          : socket.failRun(structuredClone(terminal.error), controller.signal),
+      ),
+      {
+        label: `Driver run ${terminal.status} terminal delivery`,
+        timeoutMs: Math.min(remainingMs, TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS),
+      },
+    );
+
+    if (delivery.status === "completed") {
+      return;
+    }
+
+    cause = delivery.error;
+    controller.abort(delivery.error);
+    await sleepPromise(0);
+  }
+
+  throw new Error(`Driver run ${terminal.status} terminal could not be delivered.`, {
+    cause,
+  });
 }

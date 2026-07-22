@@ -121,6 +121,8 @@ export function createDispatcher(input: {
   backend: AgentDriverBackend;
   isShuttingDown?: () => boolean;
   mcpExecute?: AgentDriverMcpPort["execute"];
+  permissionRequests?: DriverPermissionBroker;
+  rememberRunFailure?: (error: Parameters<DriverRuntimeIo["failRun"]>[0]) => void;
   runtimeState: DriverRuntimeStateMachine;
   shutdownSignal?: AbortSignal;
   shutdown?: (socket: DriverRuntimeIo, reason: string) => Promise<void>;
@@ -133,13 +135,22 @@ export function createDispatcher(input: {
   const commandReads = {
     count: 0,
   };
-  const permissions = new DriverPermissionBroker(() => logger);
+  const permissions = input.permissionRequests ?? new DriverPermissionBroker(() => logger);
+  let pendingRunFailure: Parameters<DriverRuntimeIo["failRun"]>[0] | null = null;
+  let runFailureDelivered = false;
   const shutdownCalls: string[] = [];
   const dispatcher = new DriverCommandDispatcher({
     backend: input.backend,
     driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
     isShuttingDown: input.isShuttingDown ?? (() => false),
     permissionRequests: permissions,
+    rememberRunFailure: (error) => {
+      if (input.rememberRunFailure !== undefined) {
+        input.rememberRunFailure(error);
+        return;
+      }
+      pendingRunFailure ??= structuredClone(error);
+    },
     runtimeContextFactory: (socket, runtimeLogger) =>
       createAgentDriverContext({
         eventSink: socket,
@@ -170,11 +181,24 @@ export function createDispatcher(input: {
     runtimeState: input.runtimeState,
     sandboxId: DRIVER_TEST_IDS.sandboxId,
     shutdownSignal: input.shutdownSignal ?? new AbortController().signal,
-    shutdown:
-      input.shutdown ??
-      (async (_socket, reason) => {
+    shutdown: async (socket, reason) => {
+      if (input.shutdown === undefined) {
         shutdownCalls.push(reason);
-      }),
+      } else {
+        await input.shutdown(socket, reason);
+      }
+      if (pendingRunFailure !== null && !runFailureDelivered) {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            await socket.failRun(pendingRunFailure);
+            runFailureDelivered = true;
+            break;
+          } catch {
+            /* The owner retries control delivery without reopening the cleanup barrier. */
+          }
+        }
+      }
+    },
   });
 
   return {

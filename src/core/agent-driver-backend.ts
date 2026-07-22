@@ -139,7 +139,12 @@ export function createAgentDriverContext(input: AgentDriverContextInput): AgentD
 export interface AgentDriverBackend {
   readonly runtime: DriverRuntime;
   cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void>;
-  handleInput(context: AgentDriverContext, input: RuntimeCommandInput, runId: RunId): Promise<void>;
+  handleInput(
+    context: AgentDriverContext,
+    input: RuntimeCommandInput,
+    runId: RunId,
+    signal?: AbortSignal,
+  ): Promise<void>;
   start(context: AgentDriverContext, signal: AbortSignal): Promise<void>;
   stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void>;
 }

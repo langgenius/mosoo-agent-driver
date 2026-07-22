@@ -1,13 +1,15 @@
 import { summarizeDriverPermissionRequest } from "../observability/driver-debug";
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
-import { settlePromiseWithTimeout } from "../utils/async";
+import type { RunId } from "../protocol/id";
+import { promiseWithTimeout, settlePromiseWithTimeout } from "../utils/async";
 import { createDriverDiagnosticEvent } from "./driver-diagnostics";
 import { pushLosslessEvents } from "./driver-runtime-io";
 import type { DriverRuntimeEventPort } from "./driver-runtime-io";
 
 const PERMISSION_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const PERMISSION_EVENT_DELIVERY_TIMEOUT_MS = 10_000;
+const PERMISSION_CANCEL_DELIVERY_TIMEOUT_MS = 1_500;
 const MAX_PENDING_PERMISSION_REQUEST_BYTES = 8 * 1_024 * 1_024;
 const MAX_PENDING_PERMISSION_REQUESTS = 1_024;
 const UTF8 = new TextEncoder();
@@ -30,6 +32,11 @@ export class PermissionEventDeliveryError extends Error {
 interface PermissionResolution {
   decision: PermissionDecision;
   reason: PermissionResolutionReason;
+}
+
+interface PermissionCancellationDelivery {
+  useFullBudget(): void;
+  useTurnBudget(): void;
 }
 
 export interface DriverPermissionRequest {
@@ -57,6 +64,9 @@ export class DriverPermissionBroker {
   readonly #requestTimeoutMs: number;
   readonly #activeRequestIds = new Set<string>();
   #activeRequestBytes = 0;
+  readonly #cancellationDeliveries = new Map<string, PermissionCancellationDelivery>();
+  #cancellationTask: Promise<void> | null = null;
+  #idle: PromiseWithResolvers<void> | null = null;
   readonly #resolvers = new Map<string, (resolution: PermissionResolution) => void>();
 
   constructor(logger: () => Logger | null, options: DriverPermissionBrokerOptions = {}) {
@@ -106,12 +116,48 @@ export class DriverPermissionBroker {
   }
 
   rejectAll(reason: PermissionResolutionReason = "cancelled"): void {
+    this.#rejectAll(reason, PERMISSION_CANCEL_DELIVERY_TIMEOUT_MS);
+  }
+
+  #rejectAll(reason: PermissionResolutionReason, deliveryTimeoutMs?: number): void {
+    for (const delivery of this.#cancellationDeliveries.values()) {
+      if (deliveryTimeoutMs === undefined) {
+        delivery.useFullBudget();
+      } else {
+        delivery.useTurnBudget();
+      }
+    }
+
     for (const requestId of this.#resolvers.keys()) {
       this.resolveRequest(requestId, {
         decision: "reject_once",
         reason,
       });
     }
+  }
+
+  rejectAllAndWait(reason: PermissionResolutionReason = "cancelled"): Promise<void> {
+    this.#rejectAll(reason);
+
+    if (!this.hasPending()) {
+      return Promise.resolve();
+    }
+    if (this.#cancellationTask !== null) {
+      return this.#cancellationTask;
+    }
+
+    const idle = this.#idle!;
+    const task = promiseWithTimeout(idle.promise, {
+      label: "Driver permission cancellation",
+      timeoutMs: this.#eventDeliveryTimeoutMs * 2,
+    });
+    this.#cancellationTask = task;
+    void idle.promise.then(() => {
+      if (this.#cancellationTask === task) {
+        this.#cancellationTask = null;
+      }
+    });
+    return task;
   }
 
   private resolveRequest(requestId: string, resolution: PermissionResolution): boolean {
@@ -153,6 +199,7 @@ export class DriverPermissionBroker {
       throw new RangeError("Driver permission broker pending request byte budget is exhausted.");
     }
 
+    const runId = socket.currentRunId?.() ?? null;
     const events: DriverEventInput[] = [
       {
         kind: "permission.requested",
@@ -167,16 +214,44 @@ export class DriverPermissionBroker {
             toolCallId: input.toolCallId,
           },
         },
+        ...(runId === null ? {} : { runId }),
       },
     ];
     const deferred = Promise.withResolvers<PermissionResolution>();
+    const cancellationDelivery = new AbortController();
+    let cancellationDeliveryTimeout: ReturnType<typeof setTimeout> | null = null;
+    let useFullCancellationBudget = false;
+    const cancellation: PermissionCancellationDelivery = {
+      useFullBudget: () => {
+        useFullCancellationBudget = true;
+        if (cancellationDeliveryTimeout !== null) {
+          clearTimeout(cancellationDeliveryTimeout);
+          cancellationDeliveryTimeout = null;
+        }
+      },
+      useTurnBudget: () => {
+        if (useFullCancellationBudget || cancellationDeliveryTimeout !== null) {
+          return;
+        }
+
+        cancellationDeliveryTimeout = setTimeout(
+          () =>
+            cancellationDelivery.abort(
+              new Error("Driver permission cancellation delivery timed out."),
+            ),
+          PERMISSION_CANCEL_DELIVERY_TIMEOUT_MS,
+        );
+      },
+    };
+    const resolvePermission = deferred.resolve;
     const unregister = () => {
-      if (this.#resolvers.get(input.requestId) === deferred.resolve) {
+      if (this.#resolvers.get(input.requestId) === resolvePermission) {
         this.#resolvers.delete(input.requestId);
       }
     };
     const cancel = () => {
-      if (this.#resolvers.get(input.requestId) === deferred.resolve) {
+      cancellation.useTurnBudget();
+      if (this.#resolvers.get(input.requestId) === resolvePermission) {
         this.resolveRequest(input.requestId, {
           decision: "reject_once",
           reason: "cancelled",
@@ -193,8 +268,19 @@ export class DriverPermissionBroker {
       released = true;
       this.#activeRequestIds.delete(input.requestId);
       this.#activeRequestBytes -= bytes;
+      this.#cancellationDeliveries.delete(input.requestId);
+      if (!this.hasPending()) {
+        const idle = this.#idle;
+        this.#idle = null;
+        idle?.resolve();
+      }
     };
-    this.#resolvers.set(input.requestId, deferred.resolve);
+    if (!this.hasPending()) {
+      this.#cancellationTask = null;
+      this.#idle = Promise.withResolvers<void>();
+    }
+    this.#cancellationDeliveries.set(input.requestId, cancellation);
+    this.#resolvers.set(input.requestId, resolvePermission);
     this.#activeRequestIds.add(input.requestId);
     this.#activeRequestBytes += bytes;
 
@@ -210,7 +296,15 @@ export class DriverPermissionBroker {
         timeoutMs: this.#requestTimeoutMs,
       });
 
-      const requestedTask = pushLosslessEvents(socket, events);
+      const requestedTask = pushLosslessEvents(
+        socket,
+        events,
+        undefined,
+        AbortSignal.any([
+          cancellationDelivery.signal,
+          AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
+        ]),
+      );
       const requestedDelivery = await settlePromiseWithTimeout(requestedTask, {
         label: `Driver permission request ${input.requestId} event delivery`,
         timeoutMs: this.#eventDeliveryTimeoutMs,
@@ -257,18 +351,27 @@ export class DriverPermissionBroker {
         });
       }
 
-      const resolutionTask = pushLosslessEvents(socket, [
-        {
-          kind: "permission.resolved",
-          payload: {
-            outcome: decision,
-            permissionRequests: [],
-            reason: resolution.reason,
-            requestId: input.requestId,
+      const resolutionTask = pushLosslessEvents(
+        socket,
+        [
+          {
+            kind: "permission.resolved",
+            payload: {
+              outcome: decision,
+              permissionRequests: [],
+              reason: resolution.reason,
+              requestId: input.requestId,
+            },
+            ...(runId === null ? {} : { runId }),
           },
-        },
-        ...toResolutionDiagnostics(input, resolution.reason),
-      ]);
+          ...toResolutionDiagnostics(input, resolution.reason, runId),
+        ],
+        undefined,
+        AbortSignal.any([
+          cancellationDelivery.signal,
+          AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
+        ]),
+      );
       const resolutionDelivery = await settlePromiseWithTimeout(resolutionTask, {
         label: `Driver permission resolution ${input.requestId} event delivery`,
         timeoutMs: this.#eventDeliveryTimeoutMs,
@@ -295,6 +398,9 @@ export class DriverPermissionBroker {
     } finally {
       unregister();
       signal?.removeEventListener("abort", cancel);
+      if (cancellationDeliveryTimeout !== null) {
+        clearTimeout(cancellationDeliveryTimeout);
+      }
       if (lateDelivery === null) {
         releaseLease();
       } else {
@@ -307,26 +413,30 @@ export class DriverPermissionBroker {
 function toResolutionDiagnostics(
   input: DriverPermissionRequest,
   reason: PermissionResolutionReason,
+  runId: RunId | null,
 ): DriverEventInput[] {
   if (reason !== "cancelled" && reason !== "timed_out") {
     return [];
   }
 
   return [
-    createDriverDiagnosticEvent({
-      code: reason === "cancelled" ? "permission.cancelled" : "permission.timed_out",
-      details: {
-        requestId: input.requestId,
-        toolCallId: input.toolCallId,
-        toolKind: input.toolKind,
-      },
-      message:
-        reason === "cancelled"
-          ? "Permission request was cancelled."
-          : "Permission request timed out.",
-      reason,
-      severity: reason === "cancelled" ? "info" : "warn",
-      source: "permission",
-    }),
+    {
+      ...createDriverDiagnosticEvent({
+        code: reason === "cancelled" ? "permission.cancelled" : "permission.timed_out",
+        details: {
+          requestId: input.requestId,
+          toolCallId: input.toolCallId,
+          toolKind: input.toolKind,
+        },
+        message:
+          reason === "cancelled"
+            ? "Permission request was cancelled."
+            : "Permission request timed out.",
+        reason,
+        severity: reason === "cancelled" ? "info" : "warn",
+        source: "permission",
+      }),
+      ...(runId === null ? {} : { runId }),
+    },
   ];
 }
