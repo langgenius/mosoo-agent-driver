@@ -24,7 +24,6 @@ export class CmaUnsupportedFieldError extends Error {
 }
 
 export interface CmaUserMessageEvent {
-  readonly attachmentIds?: readonly string[];
   readonly commandId: string;
   readonly requestId: string;
   readonly runId: string;
@@ -70,7 +69,7 @@ const supportedFieldsByInboundType = {
     "type",
   ]),
   "user.interrupt": new Set(["commandId", "reason", "type"]),
-  "user.message": new Set(["attachmentIds", "commandId", "requestId", "runId", "text", "type"]),
+  "user.message": new Set(["commandId", "requestId", "runId", "text", "type"]),
   "user.tool_confirmation": new Set(["commandId", "decision", "requestId", "type"]),
 } satisfies Record<CmaInboundType, ReadonlySet<string>>;
 
@@ -97,23 +96,6 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
 
   if (typeof value !== "string") {
     throw new CmaInvalidEventError(`CMA field ${field} must be a string.`);
-  }
-
-  return value;
-}
-
-function readOptionalStringArray(
-  record: Record<string, unknown>,
-  field: string,
-): string[] | undefined {
-  const value = record[field];
-
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new CmaInvalidEventError(`CMA field ${field} must be a string array.`);
   }
 
   return value;
@@ -155,10 +137,7 @@ export function parseCmaInboundEvent(input: unknown): CmaInboundEvent {
 
   switch (type) {
     case "user.message": {
-      const attachmentIds = readOptionalStringArray(record, "attachmentIds");
-
       return {
-        ...(attachmentIds === undefined ? {} : { attachmentIds }),
         commandId: readString(record, "commandId"),
         requestId: readString(record, "requestId"),
         runId: readString(record, "runId"),
@@ -210,7 +189,6 @@ export function projectCmaInboundToDriverCommand(input: unknown): RuntimeCommand
       return {
         commandId: event.commandId,
         input: {
-          ...(event.attachmentIds === undefined ? {} : { attachmentIds: [...event.attachmentIds] }),
           text: event.text,
         },
         kind: "input.start",

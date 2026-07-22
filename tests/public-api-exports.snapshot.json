@@ -500,7 +500,17 @@
       "DriverRpcOptions",
       "DriverRuntimeClient"
     ],
-    "values": ["parseDriverHeartbeatInput", "parseDriverHelloInput", "parseDriverReadyInput"]
+    "values": [
+      "parseDriverCommandUpdateInput",
+      "parseDriverCompletionInput",
+      "parseDriverEventBatchInput",
+      "parseDriverFailureInput",
+      "parseDriverHeartbeatInput",
+      "parseDriverHelloInput",
+      "parseDriverLogBatchInput",
+      "parseDriverNextCommandInput",
+      "parseDriverReadyInput"
+    ]
   },
   "./paths": {
     "types": ["SandboxFileBrowserPathPurpose"],

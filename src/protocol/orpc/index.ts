@@ -6,7 +6,7 @@ import type {
   RuntimeCommandStatus,
 } from "../../runtime-command";
 import type { DriverBootPayload } from "../boot";
-import type { DriverEventEnvelope } from "../events";
+import { parseDriverEventEnvelope, type DriverEventEnvelope } from "../events";
 import { isSupportedDriverRuntime } from "../runtime";
 import type { DriverRuntime } from "../runtime";
 
@@ -219,6 +219,36 @@ function readNumber(record: Record<string, unknown>, field: string): number {
   return value;
 }
 
+function readPositiveInteger(record: Record<string, unknown>, field: string): number {
+  const value = readNumber(record, field);
+
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${field} must be a positive safe integer.`);
+  }
+
+  return value;
+}
+
+function readNonNegativeInteger(record: Record<string, unknown>, field: string): number {
+  const value = readNumber(record, field);
+
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer.`);
+  }
+
+  return value;
+}
+
+function readBoolean(record: Record<string, unknown>, field: string): boolean {
+  const value = record[field];
+
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${field} must be a boolean.`);
+  }
+
+  return value;
+}
+
 function readProtocolVersion(
   record: Record<string, unknown>,
 ): DriverBootPayload["protocolVersion"] {
@@ -308,7 +338,13 @@ function readDriverCapabilities(record: Record<string, unknown>): DriverCapabili
     throw new TypeError("capabilities must be an array.");
   }
 
-  return value.map(readDriverCapability);
+  const capabilities = value.map(readDriverCapability);
+
+  if (new Set(capabilities.map(({ id }) => id)).size !== capabilities.length) {
+    throw new TypeError("capabilities must not contain duplicate ids.");
+  }
+
+  return capabilities;
 }
 
 export function parseDriverHelloInput(value: unknown): DriverHelloInput {
@@ -317,10 +353,10 @@ export function parseDriverHelloInput(value: unknown): DriverHelloInput {
   return {
     capabilities: readDriverCapabilities(record),
     driverVersion: readNonEmptyString(record, "driverVersion"),
-    pid: readNumber(record, "pid"),
+    pid: readPositiveInteger(record, "pid"),
     protocolVersion: readProtocolVersion(record),
     runtime: readDriverRuntime(record),
-    startedAt: readString(record, "startedAt"),
+    startedAt: readNonEmptyString(record, "startedAt"),
   };
 }
 
@@ -328,8 +364,8 @@ export function parseDriverHeartbeatInput(value: unknown): DriverHeartbeatInput 
   const record = readRecord(value, "driver heartbeat input");
 
   return {
-    at: readString(record, "at"),
-    pid: readNumber(record, "pid"),
+    at: readNonEmptyString(record, "at"),
+    pid: readPositiveInteger(record, "pid"),
     reason: readHeartbeatReason(record["reason"]),
   };
 }
@@ -340,6 +376,242 @@ export function parseDriverReadyInput(value: unknown): DriverReadyInput {
   return {
     at: readNonEmptyString(record, "at"),
     driverInstanceId: readNonEmptyString(record, "driverInstanceId"),
-    pid: readNumber(record, "pid"),
+    pid: readPositiveInteger(record, "pid"),
   };
+}
+
+const DRIVER_COMMAND_STATUSES = new Set<RuntimeCommandStatus>([
+  "accepted",
+  "cancelled",
+  "completed",
+  "delivered",
+  "expired",
+  "failed",
+  "queued",
+]);
+
+function readDriverCommandStatus(value: unknown): RuntimeCommandStatus {
+  if (typeof value === "string" && DRIVER_COMMAND_STATUSES.has(value as RuntimeCommandStatus)) {
+    return value as RuntimeCommandStatus;
+  }
+
+  throw new TypeError("status is not a supported runtime command status.");
+}
+
+function readPrimitiveRecord(
+  value: unknown,
+  label: string,
+): Record<string, string | number | boolean | null> {
+  const record = readRecord(value, label);
+
+  for (const [field, entry] of Object.entries(record)) {
+    if (
+      entry !== null &&
+      typeof entry !== "string" &&
+      typeof entry !== "boolean" &&
+      (typeof entry !== "number" || !Number.isFinite(entry))
+    ) {
+      throw new TypeError(`${label}.${field} must be a primitive value.`);
+    }
+  }
+
+  return { ...record } as Record<string, string | number | boolean | null>;
+}
+
+function readDriverFailure(value: unknown): DriverFailureInput["error"] {
+  const record = readRecord(value, "driver failure");
+
+  return {
+    code: readNonEmptyString(record, "code"),
+    details: readPrimitiveRecord(record["details"], "driver failure details"),
+    message: readString(record, "message"),
+    retryable: readBoolean(record, "retryable"),
+  };
+}
+
+function readRuntimeCommandResult(value: unknown): RuntimeCommandResult {
+  if (value === null) {
+    return null;
+  }
+
+  const record = readRecord(value, "runtime command result");
+  const requestId = readNonEmptyString(record, "requestId");
+
+  if (
+    record["outputText"] !== undefined ||
+    record["serverId"] !== undefined ||
+    record["toolName"] !== undefined
+  ) {
+    const isError = record["isError"] === undefined ? undefined : readBoolean(record, "isError");
+
+    return {
+      ...(isError === undefined ? {} : { isError }),
+      outputText: readString(record, "outputText"),
+      requestId,
+      serverId: readNonEmptyString(record, "serverId"),
+      toolName: readNonEmptyString(record, "toolName"),
+    };
+  }
+
+  return { requestId };
+}
+
+export function parseDriverCommandUpdateInput(value: unknown): DriverCommandUpdateInput {
+  const record = readRecord(value, "driver command update input");
+  const error = record["error"] === undefined ? undefined : readDriverFailure(record["error"]);
+  const result =
+    record["result"] === undefined ? undefined : readRuntimeCommandResult(record["result"]);
+
+  return {
+    commandId: readNonEmptyString(record, "commandId"),
+    driverInstanceId: readNonEmptyString(record, "driverInstanceId"),
+    ...(error === undefined ? {} : { error }),
+    ...(result === undefined ? {} : { result }),
+    status: readDriverCommandStatus(record["status"]),
+  };
+}
+
+export function parseDriverCompletionInput(value: unknown): DriverCompletionInput {
+  const record = readRecord(value, "driver completion input");
+  return { driverInstanceId: readNonEmptyString(record, "driverInstanceId") };
+}
+
+export function parseDriverFailureInput(value: unknown): DriverFailureInput {
+  const record = readRecord(value, "driver failure input");
+
+  return {
+    driverInstanceId: readNonEmptyString(record, "driverInstanceId"),
+    error: readDriverFailure(record["error"]),
+  };
+}
+
+function readOptionalLogContext(value: unknown): DriverLogContext | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const record = readRecord(value, "driver log context");
+  const context = {
+    parentSpanId: readOptionalString(record, "parentSpanId"),
+    requestId: readOptionalString(record, "requestId"),
+    sandboxId: readOptionalString(record, "sandboxId"),
+    sessionId: readOptionalString(record, "sessionId"),
+    spanId: readOptionalString(record, "spanId"),
+    traceId: readOptionalString(record, "traceId"),
+  };
+
+  return Object.fromEntries(
+    Object.entries(context).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+}
+
+function readOptionalLogError(value: unknown): DriverLogError | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const record = readRecord(value, "driver log error");
+  const code = record["code"];
+  const stack = record["stack"];
+
+  if (
+    code !== undefined &&
+    typeof code !== "string" &&
+    (typeof code !== "number" || !Number.isFinite(code))
+  ) {
+    throw new TypeError("driver log error.code must be a string or finite number.");
+  }
+
+  if (stack !== undefined && stack !== null && typeof stack !== "string") {
+    throw new TypeError("driver log error.stack must be a string or null.");
+  }
+
+  return {
+    ...(code === undefined ? {} : { code }),
+    message: readString(record, "message"),
+    name: readString(record, "name"),
+    ...(stack === undefined ? {} : { stack }),
+  };
+}
+
+function readOptionalNullableString(
+  record: Record<string, unknown>,
+  field: string,
+): string | null | undefined {
+  const value = record[field];
+
+  if (value === undefined || value === null || typeof value === "string") {
+    return value;
+  }
+
+  throw new TypeError(`${field} must be a string or null.`);
+}
+
+function readDriverLogLevel(value: unknown): DriverLogEntry["level"] {
+  if (
+    value === "debug" ||
+    value === "error" ||
+    value === "info" ||
+    value === "trace" ||
+    value === "warn"
+  ) {
+    return value;
+  }
+
+  throw new TypeError("driver log level is unsupported.");
+}
+
+function readDriverLogEntry(value: unknown): DriverLogEntry {
+  const record = readRecord(value, "driver log entry");
+  const context = readOptionalLogContext(record["context"]);
+  const error = readOptionalLogError(record["error"]);
+  const fields =
+    record["fields"] === undefined
+      ? undefined
+      : readPrimitiveRecord(record["fields"], "driver log fields");
+  const namespace = readOptionalNullableString(record, "namespace");
+
+  return {
+    ...(context === undefined ? {} : { context }),
+    ...(error === undefined ? {} : { error }),
+    ...(fields === undefined ? {} : { fields }),
+    level: readDriverLogLevel(record["level"]),
+    message: readString(record, "message"),
+    ...(namespace === undefined ? {} : { namespace }),
+    seq: readNonNegativeInteger(record, "seq"),
+    timestamp: readNonEmptyString(record, "timestamp"),
+  };
+}
+
+export function parseDriverLogBatchInput(value: unknown): DriverLogBatchInput {
+  const record = readRecord(value, "driver log batch input");
+  const logs = record["logs"];
+
+  if (!Array.isArray(logs)) {
+    throw new TypeError("logs must be an array.");
+  }
+
+  return {
+    driverInstanceId: readNonEmptyString(record, "driverInstanceId"),
+    logs: logs.map(readDriverLogEntry),
+  };
+}
+
+export function parseDriverEventBatchInput(value: unknown): DriverEventBatchInput {
+  const record = readRecord(value, "driver event batch input");
+  const events = record["events"];
+
+  if (!Array.isArray(events)) {
+    throw new TypeError("events must be an array.");
+  }
+
+  return {
+    driverInstanceId: readNonEmptyString(record, "driverInstanceId"),
+    events: events.map(parseDriverEventEnvelope),
+  };
+}
+
+export function parseDriverNextCommandInput(value: unknown): DriverNextCommandInput {
+  const record = readRecord(value, "driver next command input");
+  return { driverInstanceId: readNonEmptyString(record, "driverInstanceId") };
 }
