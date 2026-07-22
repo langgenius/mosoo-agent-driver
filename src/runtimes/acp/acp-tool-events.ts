@@ -40,6 +40,10 @@ export class AcpToolEventState {
     return this.#started.size > 0;
   }
 
+  hasStarted(toolCallId: string): boolean {
+    return this.#started.has(toolCallId);
+  }
+
   clear(): void {
     this.#completed.clear();
     this.#snapshots.clear();
@@ -47,6 +51,7 @@ export class AcpToolEventState {
   }
 
   patch(input: {
+    parentMessageId?: string | undefined;
     status: RuntimeToolStatus | null;
     toolCallId: string;
     update: JsonObject | null;
@@ -57,10 +62,17 @@ export class AcpToolEventState {
       previousStatus === "completed" || previousStatus === "failed"
         ? previousStatus
         : (input.status ?? "running");
+    // The projection layer links tool calls to their assistant message via
+    // parentMessageId; keep the first observed parent for the call's lifetime.
+    const parentMessageId =
+      (typeof previous?.["parentMessageId"] === "string"
+        ? previous["parentMessageId"]
+        : undefined) ?? input.parentMessageId;
     const payload = {
       ...previous,
       ...toToolCallPayload(input.toolCallId, status, input.update),
       kind: readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool",
+      ...(parentMessageId === undefined ? {} : { parentMessageId }),
       status,
       title: readNullableString(input.update, "title") ?? previous?.["title"] ?? null,
       toolCallId: input.toolCallId,

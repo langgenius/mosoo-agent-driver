@@ -299,6 +299,7 @@ export class AcpAssistantTranscriptState {
     return {
       ...translation,
       events: [
+        ...this.#ensureToolParentMessage(translation.targetItemId),
         ...this.#tools.ensureStarted({
           parentMessageId: this.#toolParentMessageId(),
           runId,
@@ -415,26 +416,31 @@ export class AcpAssistantTranscriptState {
     }
 
     const runId = this.#requireRunId();
+    const parentStart = this.#ensureToolParentMessage(toolCallId);
     const nativeStatus = readString(update, "status");
     const projected = this.#tools.patch({
+      parentMessageId: this.#toolParentMessageId(),
       status: nativeStatus === null ? null : toRuntimeToolStatus(nativeStatus),
       toolCallId,
       update,
     });
 
     if (!projected.changed) {
-      return [];
+      return parentStart;
     }
 
     const title =
       (typeof projected.payload["title"] === "string" ? projected.payload["title"] : null) ??
       (typeof projected.payload["kind"] === "string" ? projected.payload["kind"] : "tool");
-    const events = this.#tools.ensureStarted({
-      parentMessageId: this.#toolParentMessageId(),
-      runId,
-      title,
-      toolCallId,
-    });
+    const events = [
+      ...parentStart,
+      ...this.#tools.ensureStarted({
+        parentMessageId: this.#toolParentMessageId(),
+        runId,
+        title,
+        toolCallId,
+      }),
+    ];
 
     events.push({
       ...(type === "tool_call_update"
@@ -638,5 +644,18 @@ export class AcpAssistantTranscriptState {
 
   #toolParentMessageId(): string | undefined {
     return this.#activeAssistantMessage?.id ?? this.#promptMessageId ?? undefined;
+  }
+
+  // Tool calls must be parented to an assistant message: the session event
+  // projection drops tool starts without a parent, and the prompt message id
+  // would attach them to the user's bubble. ACP agents may open a tool call
+  // before any assistant chunk, so start an anonymous assistant message first,
+  // matching the Claude runtime's ensureMessageStarted behavior.
+  #ensureToolParentMessage(toolCallId: string): DriverEventInput[] {
+    if (this.#tools.hasStarted(toolCallId) || this.#activeAssistantMessage !== null) {
+      return [];
+    }
+
+    return this.#startAnonymousMessage().events;
   }
 }

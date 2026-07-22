@@ -94,7 +94,8 @@
         "rawInput": "{\"command\":\"pwd\"}",
         "status": "running",
         "title": "Run command",
-        "toolCallId": "tool-1"
+        "toolCallId": "tool-1",
+        "parentMessageId": "assistant-message-1"
       },
       "runId": "run-1",
       "sourceEventId": "acp:session-1:run-1:tool-call:2"
@@ -105,10 +106,11 @@
       "payload": {
         "kind": "shell",
         "rawInput": "{\"command\":\"pwd\"}",
-        "rawOutput": "{\"text\":\"/workspace\"}",
         "status": "completed",
         "title": "Run command",
-        "toolCallId": "tool-1"
+        "toolCallId": "tool-1",
+        "parentMessageId": "assistant-message-1",
+        "rawOutput": "{\"text\":\"/workspace\"}"
       },
       "runId": "run-1",
       "sourceEventId": "acp:session-1:run-1:tool-call-update:3"

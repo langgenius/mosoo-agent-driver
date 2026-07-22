@@ -61,9 +61,11 @@ describe("ACP runtime event translation", () => {
     const events = [...translation.events, ...state.completePrompt("end_turn", null)];
 
     expect(eventKinds(events)).toEqual([
+      "message.started",
       "item.started",
       "tool.call.updated",
       "permission.requested",
+      "message.completed",
       "item.completed",
       "run.completed",
     ]);
@@ -91,12 +93,14 @@ describe("ACP runtime event translation", () => {
     ];
 
     expect(eventKinds(events)).toEqual([
+      "message.started",
       "item.started",
       "tool.call.updated",
+      "message.completed",
       "item.completed",
       "run.completed",
     ]);
-    expect(eventPayload(events[2]!)).toMatchObject({
+    expect(eventPayload(events[4]!)).toMatchObject({
       itemId: "tool-1",
       status: "completed",
     });
@@ -124,16 +128,18 @@ describe("ACP runtime event translation", () => {
     ];
 
     expect(eventKinds(events)).toEqual([
+      "message.started",
       "item.started",
       "tool.call.updated",
+      "message.completed",
       "item.completed",
       "run.completed",
     ]);
-    expect(eventPayload(events[2]!)).toMatchObject({
+    expect(eventPayload(events[4]!)).toMatchObject({
       itemId: "tool-1",
       status: "completed",
     });
-    expect(eventPayload(events[3]!)).toMatchObject({
+    expect(eventPayload(events[5]!)).toMatchObject({
       stopReason: "max_turn_requests",
     });
   });

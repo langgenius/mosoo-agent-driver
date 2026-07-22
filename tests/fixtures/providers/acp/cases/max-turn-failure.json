@@ -20,11 +20,19 @@
   },
   "expectedEvents": [
     {
+      "kind": "message.started",
+      "payload": {
+        "messageId": "assistant-message-1",
+        "role": "agent"
+      },
+      "runId": "run-1"
+    },
+    {
       "kind": "item.started",
       "payload": {
         "itemId": "tool-1",
         "itemType": "tool_call",
-        "parentMessageId": "message-1",
+        "parentMessageId": "assistant-message-1",
         "title": "Run command"
       },
       "runId": "run-1"
@@ -32,13 +40,22 @@
     {
       "kind": "tool.call.updated",
       "payload": {
-        "kind": "tool",
         "status": "running",
         "title": "Run command",
-        "toolCallId": "tool-1"
+        "toolCallId": "tool-1",
+        "kind": "tool",
+        "parentMessageId": "assistant-message-1"
       },
       "runId": "run-1",
       "sourceEventId": "acp:session-1:run-1:tool-call:1"
+    },
+    {
+      "kind": "message.completed",
+      "payload": {
+        "messageId": "assistant-message-1",
+        "role": "agent"
+      },
+      "runId": "run-1"
     },
     {
       "kind": "item.completed",
