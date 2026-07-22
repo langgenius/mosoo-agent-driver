@@ -10,7 +10,8 @@ import {
 } from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
-const ACP_USAGE_CONTRACT = "openai_total_with_cached_breakdown";
+// Keep in sync with acp-lifecycle-events.ts: ACP usage is Anthropic-bucketed.
+const ACP_USAGE_CONTRACT = "anthropic_bucketed";
 
 export function summarizeContentBlock(content: unknown): string | null {
   if (!isRecord(content)) {

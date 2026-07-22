@@ -554,9 +554,12 @@ describe("ACP runtime event translation", () => {
       },
     });
     const completionUsage = state.completePrompt("end_turn", {
+      cachedReadTokens: 90,
+      cachedWriteTokens: 7,
       inputTokens: 10,
       outputTokens: 2,
-      totalTokens: 12,
+      thoughtTokens: 3,
+      totalTokens: 112,
     });
 
     expect(sessionUsage).toEqual([
@@ -567,7 +570,7 @@ describe("ACP runtime event translation", () => {
           costCurrency: "USD",
           size: 1_000,
           source: "session_update",
-          usageContract: "openai_total_with_cached_breakdown",
+          usageContract: "anthropic_bucketed",
           used: 12,
         },
       },
@@ -575,16 +578,22 @@ describe("ACP runtime event translation", () => {
     expect(completionUsage).toContainEqual({
       kind: "usage.updated",
       payload: {
+        cachedReadTokens: 90,
+        cachedWriteTokens: 7,
         inputTokens: 10,
         outputTokens: 2,
         raw: {
+          cachedReadTokens: 90,
+          cachedWriteTokens: 7,
           inputTokens: 10,
           outputTokens: 2,
-          totalTokens: 12,
+          thoughtTokens: 3,
+          totalTokens: 112,
         },
         source: "prompt_response",
-        totalTokens: 12,
-        usageContract: "openai_total_with_cached_breakdown",
+        thoughtTokens: 3,
+        totalTokens: 112,
+        usageContract: "anthropic_bucketed",
       },
       runId: RUN_ID,
     });
