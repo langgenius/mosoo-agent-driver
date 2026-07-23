@@ -298,6 +298,13 @@ export class ClaudeAgentSdkMessageState {
     return selected === null ? null : { id: selected.id, text: resultText };
   }
 
+  hasAssistantText(runId: RunId): boolean {
+    return [...this.#textByAssistantMessageId].some(
+      ([messageId, text]) =>
+        this.#assistantMessageRunIds.get(messageId) === runId && text.length > 0,
+    );
+  }
+
   readNativeMessageId(message: SDKMessage): string | null {
     if (!isRecord(message)) {
       return null;

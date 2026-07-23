@@ -416,6 +416,48 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(payload).not.toHaveProperty("finalMessageText");
   });
 
+  test("materializes a result-only native resume completion", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "replayed-empty-message",
+      },
+      {
+        result: "recovered final answer",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const translated = events();
+    const started = translated.filter((event) => event.kind === "message.started");
+    const completed = translated.filter((event) => event.kind === "message.completed");
+    const snapshot = translated.find((event) => event.kind === "message.added");
+    const runCompleted = translated.find((event) => event.kind === "run.completed");
+    const snapshotPayload =
+      snapshot === undefined || !isRecord(snapshot.payload) ? null : snapshot.payload;
+    const completedPayload =
+      runCompleted === undefined || !isRecord(runCompleted.payload) ? null : runCompleted.payload;
+
+    expect(started).toHaveLength(1);
+    expect(completed).toHaveLength(1);
+    expect(snapshotPayload?.["content"]).toEqual([
+      { text: "recovered final answer", type: "text" },
+    ]);
+    expect(completedPayload?.["finalMessageId"]).toBe(snapshotPayload?.["messageId"]);
+    expect(completedPayload?.["finalMessageText"]).toBe("recovered final answer");
+  });
+
   test("does not let a late older assistant completion replace the final message", async () => {
     const { context, events, logger, translator } = createHarness();
     const messages = [

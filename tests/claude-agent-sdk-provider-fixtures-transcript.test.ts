@@ -183,6 +183,14 @@ describe("Claude Agent SDK provider fixtures", () => {
         uuid: "assistant-final",
       },
       {
+        event: {
+          delta: { text: "迟到流", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-final",
+      },
+      {
         message: {
           content: [{ text: "完整最终回答", type: "text" }],
         },
@@ -210,6 +218,10 @@ describe("Claude Agent SDK provider fixtures", () => {
     const snapshot = events().find(
       (event) => event.kind === "message.added" && isRecord(event.payload),
     );
+    const translated = events();
+    const snapshotIndex = translated.indexOf(snapshot!);
+    const completedIndex = translated.findIndex((event) => event.kind === "message.completed");
+    const terminalIndex = translated.findIndex((event) => event.kind === "run.completed");
 
     expect(payload?.["finalMessageText"]).toBe("完整最终回答");
     expect(snapshot).toMatchObject({
@@ -218,6 +230,181 @@ describe("Claude Agent SDK provider fixtures", () => {
         content: [{ text: "完整最终回答", type: "text" }],
         role: "agent",
       },
+    });
+    expect(
+      translated
+        .filter((event) => event.kind === "message.delta" && isRecord(event.payload))
+        .map((event) => (event.payload as Record<string, unknown>)["contentDelta"]),
+    ).toEqual(["残缺流"]);
+    expect(snapshotIndex).toBeLessThan(completedIndex);
+    expect(completedIndex).toBeLessThan(terminalIndex);
+  });
+
+  test("drops thought and tool updates after their terminal events", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: {
+          content_block: { thinking: "", type: "thinking" },
+          index: 0,
+          type: "content_block_start",
+        },
+        type: "stream_event",
+        uuid: "assistant-thought",
+      },
+      {
+        event: {
+          delta: { thinking: "before", type: "thinking_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-thought",
+      },
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "assistant-thought",
+      },
+      {
+        event: {
+          delta: { thinking: "after", type: "thinking_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-thought",
+      },
+      {
+        message: {
+          content: [{ text: "done", type: "text" }],
+        },
+        type: "assistant",
+        uuid: "assistant-thought",
+      },
+      {
+        event: {
+          content_block: { id: "tool-1", input: {}, name: "Read", type: "tool_use" },
+          index: 0,
+          type: "content_block_start",
+        },
+        type: "stream_event",
+        uuid: "assistant-tool",
+      },
+      {
+        message: {
+          content: [
+            {
+              content: "ok",
+              tool_use_id: "tool-1",
+              type: "tool_result",
+            },
+          ],
+        },
+        type: "user",
+        uuid: "user-tool",
+      },
+      {
+        event: {
+          delta: { partial_json: '{"late":true}', type: "input_json_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-tool",
+      },
+      {
+        result: "done",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const translated = events();
+    const thoughtCompletedIndex = translated.findIndex(
+      (event) => event.kind === "thought.completed",
+    );
+    const thoughtDeltas = translated
+      .map((event, index) => ({ event, index }))
+      .filter(({ event }) => event.kind === "thought.delta");
+    expect(thoughtDeltas).toHaveLength(1);
+    expect(thoughtDeltas[0]!.index).toBeLessThan(thoughtCompletedIndex);
+    const toolUpdates = translated.filter(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        isRecord(event.payload) &&
+        event.payload["toolCallId"] === "tool-1",
+    );
+    const toolCompletedIndex = toolUpdates.findIndex(
+      (event) => (event.payload as Record<string, unknown>)["status"] === "completed",
+    );
+    expect(toolCompletedIndex).toBeGreaterThan(0);
+    expect(toolCompletedIndex).toBe(toolUpdates.length - 1);
+    expect(JSON.stringify(toolUpdates)).not.toContain('{"late":true}');
+  });
+
+  test("ignores streamed text arriving after its assistant message completed", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [{ text: "complete", type: "text" }],
+        },
+        type: "assistant",
+        uuid: "assistant-final",
+      },
+      {
+        event: {
+          delta: { text: "-late", type: "text_delta" },
+          index: 0,
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "assistant-final",
+      },
+      {
+        result: "complete",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const translated = events();
+    const completed = translated.find((event) => event.kind === "message.completed");
+    const messageId =
+      completed !== undefined && isRecord(completed.payload)
+        ? completed.payload["messageId"]
+        : undefined;
+    const completedIndex = translated.indexOf(completed!);
+    expect(typeof messageId).toBe("string");
+    expect(
+      translated
+        .slice(completedIndex + 1)
+        .filter(
+          (event) =>
+            event.kind === "message.delta" &&
+            isRecord(event.payload) &&
+            event.payload["messageId"] === messageId,
+        ),
+    ).toEqual([]);
+    expect(translated.find((event) => event.kind === "run.completed")).toMatchObject({
+      payload: expect.objectContaining({ finalMessageText: "complete" }),
     });
   });
 

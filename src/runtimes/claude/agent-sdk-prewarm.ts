@@ -5,12 +5,15 @@ import { raceWithAbort } from "../../utils/async";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
 import type { createClaudeQueryOptions } from "./agent-sdk-query-options";
+import { drainClaudeTasks } from "./agent-sdk-tasks";
 
 const CLAUDE_PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 
 interface ClaudePrewarmState {
   readonly abortController: AbortController;
   readonly detach: () => void;
+  readonly permissionTasks: Set<Promise<unknown>>;
+  readonly processTasks: Set<Promise<void>>;
   query: WarmQuery | null;
 }
 
@@ -25,6 +28,8 @@ export interface ClaudeAgentSdkPrewarmOptions {
 
 export interface ClaudePrewarmTake {
   readonly abortController: AbortController;
+  readonly permissionTasks: Set<Promise<unknown>>;
+  readonly processTasks: Set<Promise<void>>;
   readonly warmQuery: WarmQuery | null;
 }
 
@@ -37,6 +42,7 @@ export class ClaudeAgentSdkPrewarm {
   readonly #getNativeSessionId: () => string | null;
   readonly #payload: DriverStartInput;
   readonly #startup: ClaudeAgentSdkPrewarmOptions["startup"];
+  #failure: { readonly error: unknown } | null = null;
   #state: ClaudePrewarmState | null = null;
   #stopped = false;
   #task: Promise<void> | null = null;
@@ -60,10 +66,17 @@ export class ClaudeAgentSdkPrewarm {
         this.#task = null;
       }
     };
-    void task.then(release, release);
+    void task.then(release, (error) => {
+      this.#failure ??= { error };
+      release();
+    });
   }
 
   take(): ClaudePrewarmTake {
+    if (this.#failure !== null) {
+      throw this.#failure.error;
+    }
+
     const state = this.#state;
     this.#state = null;
     state?.detach();
@@ -71,6 +84,8 @@ export class ClaudeAgentSdkPrewarm {
     if (state?.query) {
       return {
         abortController: state.abortController,
+        permissionTasks: state.permissionTasks,
+        processTasks: state.processTasks,
         warmQuery: state.query,
       };
     }
@@ -78,6 +93,8 @@ export class ClaudeAgentSdkPrewarm {
     state?.abortController.abort("driver.claude.prewarm.superseded");
     return {
       abortController: new AbortController(),
+      permissionTasks: new Set(),
+      processTasks: new Set(),
       warmQuery: null,
     };
   }
@@ -86,12 +103,15 @@ export class ClaudeAgentSdkPrewarm {
     this.#stopped = true;
     const state = this.#state;
     const task = this.#task;
-    this.#state = null;
     state?.detach();
     state?.abortController.abort(reason);
+    const warmQuery = state?.query;
+    if (state !== null) {
+      state.query = null;
+    }
 
     try {
-      state?.query?.close();
+      warmQuery?.close();
     } catch (error) {
       context.logger.debug("driver.claude.prewarm.close_failed", {
         message: toErrorMessage(error, "prewarm close failed"),
@@ -99,12 +119,23 @@ export class ClaudeAgentSdkPrewarm {
       });
     }
 
-    if (task === null) {
-      signal.throwIfAborted();
-      return;
+    if (task !== null) {
+      await raceWithAbort(task, signal);
     }
-
-    await raceWithAbort(task, signal);
+    if (state !== null && state.processTasks.size > 0) {
+      const retryingFailedCleanup = this.#failure !== null;
+      await raceWithAbort(drainClaudeTasks(state.processTasks), signal);
+      if (retryingFailedCleanup) {
+        this.#failure = null;
+      }
+    }
+    signal.throwIfAborted();
+    if (this.#failure !== null) {
+      throw this.#failure.error;
+    }
+    if (this.#state === state) {
+      this.#state = null;
+    }
   }
 
   async #run(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
@@ -118,6 +149,8 @@ export class ClaudeAgentSdkPrewarm {
     const state: ClaudePrewarmState = {
       abortController,
       detach: () => signal.removeEventListener("abort", onAbort),
+      permissionTasks: new Set(),
+      processTasks: new Set(),
       query: null,
     };
     this.#state = state;
@@ -128,6 +161,8 @@ export class ClaudeAgentSdkPrewarm {
         context,
         nativeSessionId: this.#getNativeSessionId(),
         payload: this.#payload,
+        permissionTasks: state.permissionTasks,
+        processTasks: state.processTasks,
       });
 
       if (this.#stopped || abortController.signal.aborted || this.#state !== state) {
@@ -152,9 +187,15 @@ export class ClaudeAgentSdkPrewarm {
         });
       }
     } finally {
-      state.detach();
-      if (this.#state === state && state.query === null) {
-        this.#state = null;
+      try {
+        if (state.query === null || abortController.signal.aborted || this.#stopped) {
+          await drainClaudeTasks(state.processTasks);
+        }
+      } finally {
+        state.detach();
+        if (this.#state === state && state.query === null && state.processTasks.size === 0) {
+          this.#state = null;
+        }
       }
     }
   }
