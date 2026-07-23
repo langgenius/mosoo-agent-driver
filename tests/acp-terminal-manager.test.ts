@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +8,7 @@ import { join } from "node:path";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId } from "../src/protocol/id";
+import { spawnLinuxProcessTreeWatchdog } from "../src/runtimes/child-process";
 import { AcpTerminalManager } from "../src/runtimes/acp/acp-terminal-manager";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -15,6 +18,7 @@ function createHarness(
   onPush: ((reason: string, events: DriverEventInput[]) => Promise<void>) | undefined = undefined,
   maxTerminals?: number,
   recordAfterPush = false,
+  spawnWatchdog?: typeof spawnLinuxProcessTreeWatchdog,
 ) {
   const events: DriverEventInput[] = [];
   const logger = createBufferedSinkLogger({
@@ -42,9 +46,48 @@ function createHarness(
         await onPush?.(_reason, next);
       }
     },
+    ...(spawnWatchdog === undefined ? {} : { spawnWatchdog }),
   });
 
   return { context, events, logger, manager };
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function fakeWatchdog(cleanup: Promise<void>): typeof spawnLinuxProcessTreeWatchdog {
+  return () => ({ cleanup, process: {} as ChildProcess });
+}
+
+async function waitForPidFile(path: string): Promise<number> {
+  const deadline = Date.now() + 3_000;
+
+  for (;;) {
+    try {
+      return Number.parseInt(await Bun.file(path).text(), 10);
+    } catch {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for ${path}.`);
+      }
+      await Bun.sleep(20);
+    }
+  }
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 3_000;
+
+  while (isProcessRunning(pid) && Date.now() < deadline) {
+    await Bun.sleep(20);
+  }
+
+  expect(isProcessRunning(pid)).toBe(false);
 }
 
 describe("ACP terminal manager", () => {
@@ -72,6 +115,266 @@ describe("ACP terminal manager", () => {
       await harness.logger.destroy();
     }
   });
+
+  test("keeps terminal exit behind the watchdog cleanup barrier", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      while (harness.manager.output(terminal).output !== "ready") {
+        await Bun.sleep(10);
+      }
+      const killed = harness.manager.kill(harness.context, terminal);
+      let settled = false;
+      void killed.then(() => {
+        settled = true;
+      });
+      await Bun.sleep(100);
+
+      expect(settled).toBe(false);
+      expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+      expect(harness.events.some((event) => event.kind === "terminal.killed")).toBe(false);
+
+      cleanup.resolve();
+      await expect(killed).resolves.toEqual({});
+      expect(harness.events.map((event) => event.kind).slice(-2)).toEqual([
+        "terminal.exited",
+        "terminal.killed",
+      ]);
+      await harness.manager.release(harness.context, terminal);
+    } finally {
+      cleanup.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await harness.logger.destroy();
+    }
+  });
+
+  test.each(["completed", "failed"] as const)(
+    "fails closed when the watchdog %s while the terminal root is active",
+    async (outcome) => {
+      const directory = await mkdtemp(join(tmpdir(), "mosoo-acp-watchdog-"));
+      const pidPath = join(directory, "terminal.pid");
+      const cleanup = Promise.withResolvers<void>();
+      const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+      let pid = 0;
+
+      try {
+        const terminal = await harness.manager.create(harness.context, {
+          args: [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));process.stdout.write("ready");setInterval(() => {}, 1000);`,
+          ],
+          command: process.execPath,
+        });
+        while (harness.manager.output(terminal).output !== "ready") {
+          await Bun.sleep(10);
+        }
+        pid = await waitForPidFile(pidPath);
+
+        if (outcome === "completed") {
+          cleanup.resolve();
+        } else {
+          cleanup.reject(new Error("test watchdog failure"));
+        }
+
+        await expect(harness.manager.waitForExit(terminal)).rejects.toThrow("watchdog");
+        expect(isProcessRunning(pid)).toBe(false);
+        expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+      } finally {
+        cleanup.resolve();
+        await harness.manager.stopAll(harness.context).catch(() => {});
+        if (pid > 0 && isProcessRunning(pid)) {
+          process.kill(pid, "SIGKILL");
+        }
+        await harness.logger.destroy();
+        await rm(directory, { force: true, recursive: true });
+      }
+    },
+  );
+
+  test.each(["release", "stopAll"] as const)(
+    "%s retries cleanup after the watchdog lease rejects",
+    async (action) => {
+      const cleanup = Promise.withResolvers<void>();
+      const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+
+      try {
+        const terminal = await harness.manager.create(harness.context, {
+          args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+          command: process.execPath,
+        });
+        while (harness.manager.output(terminal).output !== "ready") {
+          await Bun.sleep(10);
+        }
+
+        cleanup.reject(new Error("test watchdog cleanup failed"));
+        await expect(harness.manager.waitForExit(terminal)).rejects.toThrow("watchdog failed");
+        expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+
+        await expect(
+          action === "release"
+            ? harness.manager.release(harness.context, terminal).then(() => {})
+            : harness.manager.stopAll(harness.context),
+        ).resolves.toBeUndefined();
+        expect(harness.events.map((event) => event.kind).slice(-2)).toEqual([
+          "terminal.exited",
+          "terminal.released",
+        ]);
+        expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+      } finally {
+        await harness.manager.stopAll(harness.context).catch(() => {});
+        await harness.logger.destroy();
+      }
+    },
+  );
+
+  test("cleans the marked tree when watchdog creation throws and allows a later create", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mosoo-acp-watchdog-create-"));
+    const shellPidPath = join(directory, "shell.pid");
+    const workerPidPath = join(directory, "worker.pid");
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    let factoryCalls = 0;
+    let rootPid = 0;
+    let shellPid = 0;
+    let workerPid = 0;
+    const harness = createHarness(undefined, undefined, false, (pid, marker) => {
+      if (factoryCalls++ === 0) {
+        rootPid = pid;
+        const deadline = Date.now() + 3_000;
+        while (!existsSync(workerPidPath) && Date.now() < deadline) {
+          Atomics.wait(sleeper, 0, 0, 10);
+        }
+        throw new Error("test watchdog creation failed");
+      }
+
+      const watchdog = spawnLinuxProcessTreeWatchdog(pid, marker);
+      if (watchdog === null) {
+        throw new Error("Test process supervision could not start.");
+      }
+      return watchdog;
+    });
+    const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
+    const source = `
+const { spawn } = require("node:child_process");
+spawn("/usr/bin/setsid", ["/bin/sh", "-c", ${JSON.stringify(nested)}], { stdio: "ignore" });
+setInterval(() => {}, 1_000);
+`;
+
+    try {
+      await expect(
+        harness.manager.create(harness.context, {
+          args: ["-e", source],
+          command: process.execPath,
+        }),
+      ).rejects.toThrow("test watchdog creation failed");
+      [shellPid, workerPid] = await Promise.all([
+        waitForPidFile(shellPidPath),
+        waitForPidFile(workerPidPath),
+      ]);
+      await Promise.all([rootPid, shellPid, workerPid].map(waitForProcessExit));
+      expect(harness.events.some((event) => event.kind === "terminal.created")).toBe(false);
+      expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await expect(harness.manager.waitForExit(terminal)).resolves.toEqual({
+        exitCode: 0,
+        signal: null,
+      });
+      await expect(harness.manager.release(harness.context, terminal)).resolves.toEqual({});
+    } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      for (const pid of [rootPid, shellPid, workerPid]) {
+        if (pid > 0 && isProcessRunning(pid)) {
+          process.kill(pid, "SIGKILL");
+        }
+      }
+      await harness.logger.destroy();
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 7_000);
+
+  test("cleans a nested session when the terminal root exits immediately", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mosoo-acp-fast-terminal-"));
+    const shellPidPath = join(directory, "shell.pid");
+    const workerPidPath = join(directory, "worker.pid");
+    const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
+    const source = `
+const { spawn } = require("node:child_process");
+const child = spawn("/usr/bin/setsid", ["/bin/sh", "-c", ${JSON.stringify(nested)}], { stdio: "ignore" });
+child.unref();
+`;
+    const harness = createHarness();
+    let shellPid = 0;
+    let workerPid = 0;
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", source],
+        command: process.execPath,
+      });
+      [shellPid, workerPid] = await Promise.all([
+        waitForPidFile(shellPidPath),
+        waitForPidFile(workerPidPath),
+      ]);
+
+      await expect(harness.manager.waitForExit(terminal)).resolves.toEqual({
+        exitCode: 0,
+        signal: null,
+      });
+      expect(isProcessRunning(shellPid)).toBe(false);
+      expect(isProcessRunning(workerPid)).toBe(false);
+      await harness.manager.release(harness.context, terminal);
+    } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      for (const pid of [shellPid, workerPid]) {
+        if (pid > 0 && isProcessRunning(pid)) {
+          process.kill(pid, "SIGKILL");
+        }
+      }
+      await harness.logger.destroy();
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("reuses one supervisor across the full terminal capacity", async () => {
+    const supervisors = new Set<ChildProcess>();
+    let leaseCount = 0;
+    const harness = createHarness(undefined, 32, false, (pid, marker) => {
+      const lease = spawnLinuxProcessTreeWatchdog(pid, marker);
+      if (lease === null) {
+        throw new Error("Test process supervision could not start.");
+      }
+      leaseCount += 1;
+      supervisors.add(lease.process);
+      return lease;
+    });
+
+    try {
+      await Promise.all(
+        Array.from({ length: 32 }, () =>
+          harness.manager.create(harness.context, {
+            args: ["-e", "setInterval(() => {}, 1_000)"],
+            command: process.execPath,
+          }),
+        ),
+      );
+
+      expect(leaseCount).toBe(32);
+      expect(supervisors.size).toBe(1);
+      expect([...supervisors][0]?.pid).toBeGreaterThan(1);
+      await harness.manager.stopAll(harness.context);
+    } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await harness.logger.destroy();
+    }
+  }, 10_000);
 
   test("rejects terminal buffers above the deployment hard limit", async () => {
     const harness = createHarness();
@@ -483,36 +786,25 @@ describe("ACP terminal manager", () => {
   });
 
   test("retains a terminal for shutdown retry when failed creation cleanup cannot confirm exit", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "mosoo-acp-terminal-"));
-    const pidPath = join(directory, "pid");
-    const nativeKill = process.kill;
-    let childPid = 0;
-    let suppressGroupKill = true;
-    const harness = createHarness(async (reason) => {
-      if (reason === "driver.acp.terminal.created") {
-        throw new Error("event sink unavailable");
-      }
-    });
+    const cleanup = Promise.withResolvers<void>();
+    const harness = createHarness(
+      async (reason) => {
+        if (reason === "driver.acp.terminal.created") {
+          throw new Error("event sink unavailable");
+        }
+      },
+      undefined,
+      false,
+      fakeWatchdog(cleanup.promise),
+    );
 
     try {
-      process.kill = ((pid, signal) => {
-        if (suppressGroupKill && typeof pid === "number" && pid < 0) {
-          return true;
-        }
-
-        return nativeKill(pid, signal);
-      }) as typeof process.kill;
-
       await expect(
         harness.manager.create(harness.context, {
-          args: [
-            "-e",
-            `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));setInterval(() => {}, 1000);`,
-          ],
+          args: ["-e", "setInterval(() => {}, 1000);"],
           command: process.execPath,
         }),
       ).rejects.toThrow();
-      childPid = Number(await Bun.file(pidPath).text());
       const terminalId = (
         harness.events.find((event) => event.kind === "terminal.created")?.payload as
           | Record<string, unknown>
@@ -522,22 +814,12 @@ describe("ACP terminal manager", () => {
       expect(terminalId).toBeString();
       expect(() => harness.manager.output({ terminalId })).not.toThrow();
 
-      suppressGroupKill = false;
       await expect(harness.manager.stopAll(harness.context)).resolves.toBeUndefined();
       expect(() => harness.manager.output({ terminalId })).toThrow("does not exist");
     } finally {
-      suppressGroupKill = false;
-      process.kill = nativeKill;
+      cleanup.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-
-      if (childPid > 0) {
-        try {
-          nativeKill(-childPid, "SIGKILL");
-        } catch {}
-      }
-
       await harness.logger.destroy();
-      await rm(directory, { force: true, recursive: true });
     }
   }, 5_000);
 

@@ -6,6 +6,8 @@ import {
   isRecord,
   readNonEmptyString,
   readNullableString,
+  readNumber,
+  readRecord,
   readString,
   stringifyForDisplay,
 } from "./acp-types";
@@ -31,8 +33,16 @@ function readToolContentString(value: unknown): string | undefined {
   return readToolDisplayString(value);
 }
 
+function hasNonzeroExecuteExit(kind: unknown, update: JsonObject | null): boolean {
+  const metadata = readRecord(readRecord(update, "rawOutput"), "metadata");
+  const exitCode = readNumber(metadata, "exit");
+
+  return kind === "execute" && exitCode !== null && exitCode !== 0;
+}
+
 export class AcpToolEventState {
   readonly #completed = new Set<string>();
+  readonly #nonzeroExecuteExits = new Set<string>();
   readonly #snapshots = new Map<string, JsonObject>();
   readonly #started = new Set<string>();
 
@@ -46,6 +56,7 @@ export class AcpToolEventState {
 
   clear(): void {
     this.#completed.clear();
+    this.#nonzeroExecuteExits.clear();
     this.#snapshots.clear();
     this.#started.clear();
   }
@@ -58,10 +69,19 @@ export class AcpToolEventState {
   }): { changed: boolean; payload: JsonObject; status: RuntimeToolStatus } {
     const previous = this.#snapshots.get(input.toolCallId);
     const previousStatus = previous?.["status"];
+    const kind = readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool";
+    const nextStatus = input.status ?? "running";
+
+    if (hasNonzeroExecuteExit(kind, input.update)) {
+      this.#nonzeroExecuteExits.add(input.toolCallId);
+    }
+
     const status =
       previousStatus === "completed" || previousStatus === "failed"
         ? previousStatus
-        : (input.status ?? "running");
+        : nextStatus === "completed" && this.#nonzeroExecuteExits.has(input.toolCallId)
+          ? "failed"
+          : nextStatus;
     // The projection layer links tool calls to their assistant message via
     // parentMessageId; keep the first observed parent for the call's lifetime.
     const parentMessageId =
@@ -71,7 +91,7 @@ export class AcpToolEventState {
     const payload = {
       ...previous,
       ...toToolCallPayload(input.toolCallId, status, input.update),
-      kind: readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool",
+      kind,
       ...(parentMessageId === undefined ? {} : { parentMessageId }),
       status,
       title: readNullableString(input.update, "title") ?? previous?.["title"] ?? null,
@@ -123,6 +143,15 @@ export class AcpToolEventState {
       }
 
       this.#completed.add(itemId);
+      events.push({
+        kind: "tool.call.updated",
+        payload: {
+          ...this.#snapshots.get(itemId),
+          status: input.status,
+          toolCallId: itemId,
+        },
+        runId: input.runId,
+      });
       events.push({
         kind: "item.completed",
         payload: {

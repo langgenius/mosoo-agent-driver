@@ -296,6 +296,12 @@ export class AcpAssistantTranscriptState {
       return translation;
     }
 
+    this.#tools.patch({
+      status: toRuntimeToolStatus(readString(translation.toolCall, "status")),
+      toolCallId: translation.targetItemId,
+      update: translation.toolCall,
+    });
+
     return {
       ...translation,
       events: [

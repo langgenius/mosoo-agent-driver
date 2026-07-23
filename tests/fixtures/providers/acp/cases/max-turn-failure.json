@@ -58,6 +58,17 @@
       "runId": "run-1"
     },
     {
+      "kind": "tool.call.updated",
+      "payload": {
+        "kind": "tool",
+        "parentMessageId": "assistant-message-1",
+        "status": "completed",
+        "title": "Run command",
+        "toolCallId": "tool-1"
+      },
+      "runId": "run-1"
+    },
+    {
       "kind": "item.completed",
       "payload": {
         "itemId": "tool-1",

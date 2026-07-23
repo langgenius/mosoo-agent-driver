@@ -44,8 +44,11 @@ export class AcpClientRequestHandler {
   readonly #fileSystem: AcpFileSystem;
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
+  readonly #pendingPermissions = new Set<Promise<unknown>>();
   readonly #push: AcpClientRequestHandlerOptions["push"];
+  #permissionIngressClosed = false;
   #stopping = false;
+  #turnUpdateIngressClosed = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
   readonly #turnEvents: AcpTurnEventState;
@@ -78,6 +81,10 @@ export class AcpClientRequestHandler {
   }
 
   enqueueUpdate(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
+    if (this.#turnUpdateIngressClosed) {
+      return Promise.resolve();
+    }
+
     return this.#updateInbox.enqueue(context, notification);
   }
 
@@ -105,27 +112,52 @@ export class AcpClientRequestHandler {
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
     this.#assertSession("session/request_permission", params);
-
-    if (this.#stopping || this.#isCancelling() || signal?.aborted) {
+    if (this.#permissionUnavailable(signal)) {
       return { outcome: { outcome: "cancelled" } };
     }
+
+    const lease = Promise.withResolvers<void>();
+    const pending: Promise<unknown>[] = [];
+    const track = <T>(task: Promise<T>): Promise<T> => {
+      pending.push(task);
+      void task.catch(() => {});
+      return task;
+    };
+    this.#pendingPermissions.add(lease.promise);
+    void lease.promise.catch(() => {});
 
     try {
       if (!this.#updateInbox.isSuppressed()) {
         await raceWithAbort(this.drainUpdates(), signal);
       }
 
-      if (this.#stopping || this.#isCancelling() || signal?.aborted) {
+      if (this.#permissionUnavailable(signal)) {
         return { outcome: { outcome: "cancelled" } };
       }
 
-      return await this.#requestPermission(context, this.#requestKey(requestId), params, signal);
+      return await this.#requestPermission(
+        context,
+        this.#requestKey(requestId),
+        params,
+        track,
+        signal,
+      );
     } catch (error) {
       if (signal?.aborted) {
         return { outcome: { outcome: "cancelled" } };
       }
 
       throw error;
+    } finally {
+      void Promise.allSettled(pending).then((results) => {
+        const failure = results.find((result) => result.status === "rejected");
+
+        if (failure?.status === "rejected") {
+          lease.reject(failure.reason);
+        } else {
+          lease.resolve();
+        }
+      });
     }
   }
 
@@ -179,8 +211,39 @@ export class AcpClientRequestHandler {
     await this.#updateInbox.close();
   }
 
+  closePermissionIngress(): void {
+    this.#permissionIngressClosed = true;
+  }
+
+  closeTurnUpdateIngress(): void {
+    this.#turnUpdateIngressClosed = true;
+  }
+
   async drainUpdates(): Promise<void> {
     await this.#updateInbox.drain();
+  }
+
+  async drainPermissions(signal?: AbortSignal): Promise<void> {
+    while (this.#pendingPermissions.size > 0) {
+      const pending = [...this.#pendingPermissions];
+      const results = await raceWithAbort(Promise.allSettled(pending), signal);
+      for (const permission of pending) {
+        this.#pendingPermissions.delete(permission);
+      }
+      const failure = results.find((result) => result.status === "rejected");
+
+      if (failure?.status === "rejected") {
+        throw failure.reason;
+      }
+    }
+  }
+
+  openPermissionIngress(): void {
+    this.#permissionIngressClosed = false;
+  }
+
+  openTurnUpdateIngress(): void {
+    this.#turnUpdateIngressClosed = false;
   }
 
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
@@ -191,10 +254,21 @@ export class AcpClientRequestHandler {
     return this.#updateInbox.suppress(operation);
   }
 
+  #permissionUnavailable(signal?: AbortSignal): boolean {
+    return (
+      this.#permissionIngressClosed ||
+      this.#stopping ||
+      this.#isCancelling() ||
+      signal?.aborted === true ||
+      this.#turnEvents.activeRunId() === null
+    );
+  }
+
   async #requestPermission(
     context: AgentDriverContext,
     requestId: string,
     params: RequestPermissionRequest,
+    track: <T>(task: Promise<T>) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
     if (this.#updateInbox.isSuppressed()) {
@@ -208,16 +282,20 @@ export class AcpClientRequestHandler {
     const toolEvents = translation.events.filter((event) => event.kind !== "permission.requested");
 
     if (toolEvents.length > 0) {
-      await raceWithAbort(this.#push(context, "driver.acp.permission.tool", toolEvents), signal);
+      await raceWithAbort(
+        track(this.#push(context, "driver.acp.permission.tool", toolEvents)),
+        signal,
+      );
     }
 
-    const chosen =
-      this.#isCancelling() || signal?.aborted
-        ? null
-        : await raceWithAbort(
-            this.#resolvePermission(context, requestId, translation.options, params, signal),
-            signal,
-          );
+    let chosen: AcpPermissionOption | null = null;
+
+    if (!this.#isCancelling() && !signal?.aborted) {
+      const permission = track(
+        this.#resolvePermission(context, requestId, translation.options, params, signal),
+      );
+      chosen = await raceWithAbort(permission, signal);
+    }
     const resolvedOption = this.#isCancelling() || signal?.aborted ? null : chosen;
 
     if (resolvedOption === null) {
