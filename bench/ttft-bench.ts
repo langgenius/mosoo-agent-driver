@@ -1,8 +1,8 @@
 /**
  * Driver-level TTFT + streaming-cadence benchmark.
  *
- * Drives the REAL driver kernel + provider registry (same code path as the
- * live tests) against live provider APIs and measures, per provider runtime:
+ * Drives the REAL driver kernel + provider registry directly against live
+ * provider APIs and measures, per provider runtime:
  *   - bootMs         kernel.start() cost (runtime/CLI/SDK init)
  *   - ttftMs         dispatch -> first message.delta event (time to first token)
  *   - firstTextMs    dispatch -> first NON-EMPTY text delta
@@ -15,7 +15,7 @@
  * full-access ("yolo") vs the current supervised/reject default on a
  * tool-requiring task, without needing the eventual code changes in place.
  *
- * Run (from apps/driver):
+ * Run (from the repository root):
  *   ANTHROPIC_API_KEY=... OPENAI_API_KEY=... vp run bench
  * Flags (env):
  *   TTFT_TRIALS=5            trials per cell (default 5) + 1 discarded warmup
@@ -36,7 +36,6 @@ import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
 import { driverBootPayload } from "../tests/driver-boot-payload-fixture";
 import { DRIVER_TEST_IDS, bootPayload } from "../tests/driver-runtime-boundary-fixtures";
-import { textDeltaFrom } from "../tests/live-driver-events";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(HERE, "outputs");
@@ -363,7 +362,14 @@ async function runTrial(input: {
           ttftMs = now - dispatchStart;
         }
         deltaTimestamps.push(now);
-        const text = textDeltaFrom(event);
+        const payload = event.payload;
+        const text =
+          typeof payload === "object" &&
+          payload !== null &&
+          "contentDelta" in payload &&
+          typeof payload.contentDelta === "string"
+            ? payload.contentDelta
+            : "";
         if (text.length > 0) {
           if (firstTextMs === null) {
             firstTextMs = now - dispatchStart;
@@ -472,11 +478,10 @@ async function main(): Promise<void> {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean) as RuntimeId[];
-  const anthropicKey =
-    readEnv("ANTHROPIC_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_API_KEY");
-  const openaiKey = readEnv("OPENAI_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_OPENAI_API_KEY");
-  const claudeModel = readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_MODEL") ?? "claude-sonnet-4-5";
-  const openaiModel = readEnv("AGENT_DRIVER_LIVE_OPENAI_MODEL") ?? "gpt-5.4";
+  const anthropicKey = readEnv("ANTHROPIC_API_KEY");
+  const openaiKey = readEnv("OPENAI_API_KEY");
+  const claudeModel = readEnv("TTFT_CLAUDE_MODEL") ?? "claude-sonnet-4-5";
+  const openaiModel = readEnv("TTFT_OPENAI_MODEL") ?? "gpt-5.4";
   const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as
     | "openai"
     | "anthropic";
