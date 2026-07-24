@@ -241,16 +241,16 @@ describe("OpenAi app-server event bridge", () => {
         },
       },
       {
-        kind: "run.completed",
-        payload: {
-          stopReason: "end_turn",
-        },
-      },
-      {
         kind: "runtime.resume.updated",
         payload: {
           resumePointer: "thread-1",
           threadId: "thread-1",
+        },
+      },
+      {
+        kind: "run.completed",
+        payload: {
+          stopReason: "end_turn",
         },
       },
     ]);

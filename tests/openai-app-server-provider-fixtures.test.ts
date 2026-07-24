@@ -43,6 +43,7 @@ const providerFixtureNames = [
   "agent-message-completed",
   "command-output-stream",
   "error-before-tracked-turn",
+  "reasoning-empty-summary",
   "turn-completed-with-final-agent-message",
   "turn-plan-updated",
   "unknown-notification-ignored",

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import { createBufferedSinkLogger } from "../src/observability";
 import { OpenAiAppServerRequestHandler } from "../src/runtimes/openai/app-server-request-handler";
 import { driverStartInput } from "./driver-boot-payload-fixture";
@@ -51,8 +52,7 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
       itemId: "tool-1",
     });
     await permissionStarted.promise;
-    handler.abortAll(new Error("turn cancelled"));
-    await Promise.resolve();
+    await handler.abortAll(new Error("turn cancelled"));
 
     expect(responses).toHaveLength(1);
     expect(responses[0]).toMatchObject({ id: 1, result: { currentTimeAt: expect.any(Number) } });
@@ -64,7 +64,70 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
     expect(rejections.some((response) => response.id === 3)).toBe(false);
     expect(errors).toEqual([]);
   } finally {
-    handler.abortAll(new Error("test complete"));
+    await handler.abortAll(new Error("test complete"));
+    await logger.destroy();
+  }
+});
+
+test("OpenAI server request cancellation propagates permission delivery failures", async () => {
+  const permissionStarted = Promise.withResolvers<void>();
+  const deliveryGate = Promise.withResolvers<void>();
+  const deliveryError = new PermissionEventDeliveryError(
+    "item/commandExecution/requestApproval:3",
+    "resolved",
+    new Error("event sink unavailable"),
+  );
+  const handledErrors: Error[] = [];
+  const logger = createBufferedSinkLogger({
+    level: "error",
+    service: "openai-request-handler-test",
+    sink: async () => {},
+  });
+  const context = createAgentDriverContext({
+    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    logger,
+    payload: driverStartInput,
+    permission: {
+      request: async (_input, signal) => {
+        const requestSignal = signal ?? new AbortController().signal;
+        permissionStarted.resolve();
+        await new Promise<void>((resolve) => {
+          if (requestSignal.aborted) {
+            resolve();
+            return;
+          }
+          requestSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await deliveryGate.promise;
+        throw deliveryError;
+      },
+    },
+  });
+  const handler = new OpenAiAppServerRequestHandler({
+    context,
+    handleError: async (error) => {
+      handledErrors.push(error);
+    },
+    isStopped: () => false,
+    respond: () => {},
+    respondError: () => {},
+  });
+
+  try {
+    handler.dispatch("item/commandExecution/requestApproval", 3, {
+      command: "pwd",
+      itemId: "tool-1",
+    });
+    await permissionStarted.promise;
+    const cancellation = handler.abortAll(new Error("turn cancelled"));
+    void cancellation.catch(() => {});
+    deliveryGate.resolve();
+
+    await expect(cancellation).rejects.toBe(deliveryError);
+    expect(handledErrors).toEqual([deliveryError]);
+  } finally {
+    deliveryGate.resolve();
+    await handler.abortAll(new Error("test complete"));
     await logger.destroy();
   }
 });

@@ -235,7 +235,7 @@ export class OpenAiMessageState {
   }
 
   markReasoningEnded(messageId: string): boolean {
-    if (this.#reasoningEnded.has(messageId)) {
+    if (this.#reasoningEnded.has(messageId) || !this.#reasoningStarted.has(messageId)) {
       return false;
     }
 

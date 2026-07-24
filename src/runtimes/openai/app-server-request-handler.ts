@@ -1,3 +1,4 @@
+import { PermissionEventDeliveryError } from "../../core/driver-permission-broker";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { isRecord, readRecord, readString, stringifyForDisplay } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
@@ -16,6 +17,11 @@ interface OpenAiAppServerRequestHandlerOptions {
   readonly isStopped: () => boolean;
   readonly respond: (id: RequestId, result: unknown) => void;
   readonly respondError: (id: RequestId, message: string) => void;
+}
+
+interface PendingServerRequest {
+  readonly controller: AbortController;
+  task: Promise<void>;
 }
 
 function toApprovalDecision(
@@ -41,7 +47,7 @@ export class OpenAiAppServerRequestHandler {
   readonly #context: AgentDriverContext;
   readonly #handleError: OpenAiAppServerRequestHandlerOptions["handleError"];
   readonly #isStopped: () => boolean;
-  readonly #pending = new Map<RequestId, AbortController>();
+  readonly #pending = new Map<RequestId, PendingServerRequest>();
   readonly #respond: OpenAiAppServerRequestHandlerOptions["respond"];
   readonly #respondError: OpenAiAppServerRequestHandlerOptions["respondError"];
 
@@ -58,31 +64,54 @@ export class OpenAiAppServerRequestHandler {
       throw new Error(`OpenAi app-server request ${String(id)} is already pending.`);
     }
 
-    const controller = new AbortController();
-    this.#pending.set(id, controller);
-    void this.#handle(method, id, params, controller.signal).catch(async (error: unknown) => {
-      if (controller.signal.aborted) {
-        return;
-      }
+    const pending: PendingServerRequest = {
+      controller: new AbortController(),
+      task: Promise.resolve(),
+    };
+    this.#pending.set(id, pending);
+    pending.task = this.#handle(method, id, params, pending.controller.signal).catch(
+      async (error: unknown) => {
+        if (pending.controller.signal.aborted && !(error instanceof PermissionEventDeliveryError)) {
+          return;
+        }
 
-      const failure =
-        error instanceof Error ? error : new Error("OpenAi app-server request failed.");
-      this.#context.logger.error("driver.openai.server_request.failed", failure, { method });
-      await this.#handleError(failure, method);
-      this.#replyError(id, failure.message);
-    });
+        const failure =
+          error instanceof Error ? error : new Error("OpenAi app-server request failed.");
+        this.#context.logger.error("driver.openai.server_request.failed", failure, { method });
+        await this.#handleError(failure, method);
+        this.#replyError(id, failure.message);
+        throw failure;
+      },
+    );
+    void pending.task.catch(() => {});
   }
 
-  resolveElsewhere(id: RequestId): void {
-    this.#pending.get(id)?.abort(new Error("OpenAi app-server request was resolved elsewhere."));
-    this.#pending.delete(id);
-  }
+  async resolveElsewhere(id: RequestId): Promise<void> {
+    const pending = this.#pending.get(id);
 
-  abortAll(reason: Error): void {
-    for (const request of this.#pending.values()) {
-      request.abort(reason);
+    if (pending === undefined) {
+      return;
     }
+
+    this.#pending.delete(id);
+    pending.controller.abort(new Error("OpenAi app-server request was resolved elsewhere."));
+    await pending.task;
+  }
+
+  async abortAll(reason: Error): Promise<void> {
+    const pending = [...this.#pending.values()];
     this.#pending.clear();
+
+    for (const request of pending) {
+      request.controller.abort(reason);
+    }
+
+    const results = await Promise.allSettled(pending.map((request) => request.task));
+    const failure = results.find((result) => result.status === "rejected");
+
+    if (failure?.status === "rejected") {
+      throw failure.reason;
+    }
   }
 
   async #handle(

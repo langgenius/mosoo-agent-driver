@@ -6,7 +6,7 @@ import { isDriverId } from "../src/protocol/id";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
+import { DRIVER_TEST_IDS, driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 interface EventBatch {
   events: DriverEventInput[];
@@ -87,6 +87,60 @@ function createHarness(options: { failNativeResumePublish?: boolean; holdReason?
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test("fails an active turn exactly once when the provider exits", async () => {
+    const { bridge, context, events, logger } = createHarness();
+    const failure = new Error("app-server exited");
+    const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+    void completion.catch(() => {});
+
+    await bridge.publishRunStarted(context, {
+      runId: DRIVER_TEST_IDS.runId,
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/started", {
+      item: {
+        id: "tool-1",
+        type: "commandExecution",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(true);
+    await expect(completion).rejects.toBe(failure);
+    await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(false);
+    await logger.destroy();
+
+    expect(
+      events().filter((event) =>
+        ["item.completed", "run.failed", "tool.call.updated"].includes(event.kind),
+      ),
+    ).toMatchObject([
+      {
+        kind: "tool.call.updated",
+        payload: { status: "running", toolCallId: "tool-1" },
+      },
+      {
+        kind: "tool.call.updated",
+        payload: { status: "failed", toolCallId: "tool-1" },
+      },
+      {
+        kind: "item.completed",
+        payload: { itemId: "tool-1", status: "failed" },
+      },
+      {
+        kind: "run.failed",
+        payload: {
+          error: {
+            code: "openai.provider_failed",
+            message: "app-server exited",
+          },
+          recoverable: false,
+        },
+      },
+    ]);
+  });
+
   test("final turn items do not duplicate already completed messages", async () => {
     const { bridge, context, events, logger } = createHarness();
 
@@ -147,16 +201,16 @@ describe("OpenAi app-server event bridge", () => {
         },
       },
       {
-        kind: "run.completed",
-        payload: {
-          stopReason: "end_turn",
-        },
-      },
-      {
         kind: "runtime.resume.updated",
         payload: {
           resumePointer: "thread-1",
           threadId: "thread-1",
+        },
+      },
+      {
+        kind: "run.completed",
+        payload: {
+          stopReason: "end_turn",
         },
       },
     ]);

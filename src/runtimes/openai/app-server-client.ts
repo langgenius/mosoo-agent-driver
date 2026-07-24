@@ -13,7 +13,15 @@ import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
 import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
-import { killProcessGroup } from "../child-process";
+import {
+  bindSpawnedProcess,
+  createProcessTreeEnvironment,
+  signalBoundProcessTree,
+  signalLinuxProcessMarker,
+  spawnLinuxProcessTreeWatchdog,
+  waitForLinuxProcessMarkerExit,
+} from "../child-process";
+import type { BoundSpawnedProcess } from "../child-process";
 import { summarizeOpenAiProxyEnv } from "./app-server-env";
 import {
   isRecord,
@@ -45,7 +53,7 @@ import { buildOpenAiMcpServerConfig } from "./mcp-config";
 import { OpenAiAppServerRequestHandler } from "./app-server-request-handler";
 
 interface PendingJsonRpcRequest {
-  method: ClientRequestMethod;
+  method: string;
   reject(error: Error): void;
   resolve(value: unknown): void;
 }
@@ -157,16 +165,39 @@ function readRuntimeExecutable(): string {
   return executable && executable.length > 0 ? executable : DEFAULT_OPENAI_RUNTIME_EXECUTABLE;
 }
 
+function signalAppServerSession(
+  target: BoundSpawnedProcess,
+  processTreeMarker: string,
+  signal: NodeJS.Signals,
+): void {
+  signalBoundProcessTree(target, processTreeMarker, signal);
+}
+
+async function awaitProcessTreeCleanup(cleanup: Promise<void>, marker: string): Promise<void> {
+  try {
+    await cleanup;
+    await waitForLinuxProcessMarkerExit(marker);
+  } catch (error) {
+    signalLinuxProcessMarker(marker, "SIGKILL");
+    await waitForLinuxProcessMarkerExit(marker);
+    throw error;
+  }
+}
+
 export class OpenAiAppServerClient {
   readonly #context: OpenAiClientContext;
   readonly #pendingRequests = new Map<RequestId, PendingJsonRpcRequest>();
   readonly #payload: DriverStartInput;
   readonly #requestHandler: OpenAiAppServerRequestHandler;
+  #fatalError: Error | null = null;
   #nextId = 1;
   #pendingServerMessageBytes = 0;
   #pendingServerMessages = 0;
   #process: ChildProcessWithoutNullStreams | null = null;
+  #processCleanupFailureReported = false;
+  #processTarget: BoundSpawnedProcess | null = null;
   #processClosed: Promise<void> | null = null;
+  #processTreeMarker: string | null = null;
   #readline: ReadlineInterface | null = null;
   #serverMessageQueue: Promise<void> = Promise.resolve();
   #startRequested = false;
@@ -178,7 +209,7 @@ export class OpenAiAppServerClient {
     this.#context = context;
     this.#requestHandler = new OpenAiAppServerRequestHandler({
       context,
-      handleError: async (error) => this.#notifyProtocolError(error),
+      handleError: async (error) => this.#failProtocol(error),
       isStopped: () => this.#stopRequested,
       respond: (id, result) => this.respond(id, result),
       respondError: (id, message) => this.respondError(id, message),
@@ -192,12 +223,25 @@ export class OpenAiAppServerClient {
     }
     this.#startRequested = true;
 
+    const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
+    const processTree = createProcessTreeEnvironment(
+      buildRuntimeChildProcessEnv(this.#payload.execution.environment.paths, {
+        ...process.env,
+        ...this.#payload.execution.environment.variables,
+        ...mcpConfig.env,
+        [OPENAI_RUNTIME_HOME_ENV_NAME]: this.#payload.execution.session.homePath,
+        LOG_FORMAT: "json",
+      }),
+    );
+    const env = processTree.env;
+    this.#processTreeMarker = processTree.marker;
     const onAbort = () => {
       this.#stopRequested = true;
       const child = this.#process;
+      const target = this.#processTarget;
 
-      if (child !== null && child.exitCode === null && child.signalCode === null) {
-        killProcessGroup(child, "SIGKILL");
+      if (child !== null && target !== null) {
+        signalAppServerSession(target, processTree.marker, "SIGKILL");
       }
     };
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -220,14 +264,6 @@ export class OpenAiAppServerClient {
     const runtimeHome = homePath;
     await measure("app_server.home.mkdir", () => mkdir(runtimeHome, { recursive: true }));
 
-    const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
-    const env = buildRuntimeChildProcessEnv(this.#payload.execution.environment.paths, {
-      ...process.env,
-      ...this.#payload.execution.environment.variables,
-      ...mcpConfig.env,
-      [OPENAI_RUNTIME_HOME_ENV_NAME]: runtimeHome,
-      LOG_FORMAT: "json",
-    });
     const authState = await measure("app_server.auth_state", () =>
       materializeOpenAiApiKeyAuthState({
         runtimeHome,
@@ -259,7 +295,7 @@ export class OpenAiAppServerClient {
 
     if (this.#stopRequested) {
       signal?.throwIfAborted();
-      throw new Error("OpenAi app-server client stopped during startup.");
+      throw this.#fatalError ?? new Error("OpenAi app-server client stopped during startup.");
     }
 
     await measure("app_server.spawn", async () => {
@@ -270,10 +306,34 @@ export class OpenAiAppServerClient {
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
+      const target = bindSpawnedProcess(child);
 
       this.#process = child;
-      const processClosed = Promise.withResolvers<void>();
-      this.#processClosed = processClosed.promise;
+      this.#processTarget = target;
+      const leaderClosed = Promise.withResolvers<void>();
+      const supervisionReady = Promise.withResolvers<{ cleanup: Promise<void> }>();
+      let supervisionRegistered = false;
+      const registerSupervision = (cleanup: Promise<void>) => {
+        if (supervisionRegistered) {
+          return;
+        }
+        supervisionRegistered = true;
+        void cleanup.catch(() => {});
+        supervisionReady.resolve({ cleanup });
+      };
+      const processClosed = (async () => {
+        await leaderClosed.promise;
+        const supervision = await supervisionReady.promise;
+        await awaitProcessTreeCleanup(supervision.cleanup, processTree.marker);
+      })();
+      void processClosed.catch(() => {});
+      this.#processClosed = processClosed;
+      const clearProcessClosed = () => {
+        if (this.#processClosed === processClosed) {
+          this.#processClosed = null;
+        }
+      };
+      void processClosed.then(clearProcessClosed, clearProcessClosed);
       const limitedStdout = child.stdout.pipe(limitNdjsonLines());
       const reader = createInterface({ input: limitedStdout });
       this.#readline = reader;
@@ -295,13 +355,13 @@ export class OpenAiAppServerClient {
       });
       child.once("close", (code, exitSignal) => {
         signal?.removeEventListener("abort", onAbort);
-        killProcessGroup(child, "SIGKILL");
-        processClosed.resolve();
+        signalLinuxProcessMarker(processTree.marker, "SIGKILL");
+        leaderClosed.resolve();
         reader.close();
 
         if (this.#process === child) {
           this.#process = null;
-          this.#processClosed = null;
+          this.#processTarget = null;
           this.#readline = null;
         }
 
@@ -312,10 +372,75 @@ export class OpenAiAppServerClient {
         const error = new Error(
           `OpenAi app-server exited with ${code === null ? `signal ${exitSignal ?? "unknown"}` : `code ${code}`}.`,
         );
-        void this.#failAfterDrain(error);
+        void (async () => {
+          let failure = error;
+          try {
+            await processClosed;
+          } catch (cleanupError) {
+            failure =
+              cleanupError instanceof Error
+                ? cleanupError
+                : new Error("OpenAi app-server process-tree cleanup failed.");
+          }
+          await this.#failAfterDrain(failure);
+        })();
       });
 
-      await once(child, "spawn");
+      try {
+        await once(child, "spawn");
+        if (process.platform === "linux") {
+          const watchdog =
+            child.pid === undefined
+              ? null
+              : spawnLinuxProcessTreeWatchdog(child.pid, processTree.marker);
+          if (watchdog === null) {
+            const error = new Error("OpenAi app-server process-tree watchdog could not start.");
+            registerSupervision(
+              (async () => {
+                signalLinuxProcessMarker(processTree.marker, "SIGKILL");
+                await waitForLinuxProcessMarkerExit(processTree.marker);
+              })(),
+            );
+            this.#failProtocol(error);
+            throw error;
+          }
+
+          registerSupervision(watchdog.cleanup);
+          const failSupervision = (error: Error) => {
+            if (this.#process !== child) {
+              return;
+            }
+            signalLinuxProcessMarker(processTree.marker, "SIGKILL");
+            this.#failProtocol(error);
+          };
+          void watchdog.cleanup.then(
+            () =>
+              failSupervision(
+                new Error(
+                  "OpenAi app-server process-tree watchdog exited while provider was live.",
+                ),
+              ),
+            (watchdogError: unknown) =>
+              failSupervision(
+                new Error("OpenAi app-server process-tree watchdog failed.", {
+                  cause: watchdogError,
+                }),
+              ),
+          );
+        } else {
+          registerSupervision(Promise.resolve());
+        }
+      } catch (error) {
+        if (!supervisionRegistered) {
+          registerSupervision(
+            (async () => {
+              signalLinuxProcessMarker(processTree.marker, "SIGKILL");
+              await waitForLinuxProcessMarkerExit(processTree.marker);
+            })(),
+          );
+        }
+        throw error;
+      }
       child.on("error", (error) => {
         this.#failProtocol(error);
       });
@@ -323,7 +448,7 @@ export class OpenAiAppServerClient {
 
     if (this.#stopRequested) {
       signal?.throwIfAborted();
-      throw new Error("OpenAi app-server client stopped during startup.");
+      throw this.#fatalError ?? new Error("OpenAi app-server client stopped during startup.");
     }
 
     await measure("app_server.initialize", async () => {
@@ -331,7 +456,7 @@ export class OpenAiAppServerClient {
         "initialize",
         {
           capabilities: {
-            experimentalApi: false,
+            experimentalApi: true,
             requestAttestation: false,
           },
           clientInfo: {
@@ -353,12 +478,33 @@ export class OpenAiAppServerClient {
     params: ClientRequestParams[M],
     signal?: AbortSignal,
   ): Promise<ClientRequestResult[M]> {
+    return this.#request(method, params, CLIENT_REQUEST_RESULT_PARSERS[method], signal);
+  }
+
+  async cleanBackgroundTerminals(threadId: string, signal?: AbortSignal): Promise<void> {
+    await this.#request(
+      "thread/backgroundTerminals/clean",
+      { threadId },
+      (value) => {
+        if (!isRecord(value ?? {})) {
+          throw new Error("thread/backgroundTerminals/clean result must be an object.");
+        }
+      },
+      signal,
+    );
+  }
+
+  async #request<T>(
+    method: string,
+    params: unknown,
+    parseResult: (value: unknown) => T,
+    signal?: AbortSignal,
+  ): Promise<T> {
     signal?.throwIfAborted();
     const id = this.#nextId;
     this.#nextId += 1;
 
-    const response = Promise.withResolvers<ClientRequestResult[M]>();
-    const parseResult = CLIENT_REQUEST_RESULT_PARSERS[method];
+    const response = Promise.withResolvers<T>();
     this.#pendingRequests.set(id, {
       method,
       reject: response.reject,
@@ -435,8 +581,8 @@ export class OpenAiAppServerClient {
     });
   }
 
-  abortServerRequests(reason: Error): void {
-    this.#requestHandler.abortAll(reason);
+  abortServerRequests(reason: Error): Promise<void> {
+    return this.#requestHandler.abortAll(reason);
   }
 
   stop(signal?: AbortSignal): Promise<void> {
@@ -456,10 +602,14 @@ export class OpenAiAppServerClient {
 
   async #performStop(signal?: AbortSignal): Promise<void> {
     const child = this.#process;
+    const target = this.#processTarget;
     const processClosed = this.#processClosed;
+    const processTreeMarker = this.#processTreeMarker ?? "";
     const onAbort = () => {
-      if (child !== null && child.exitCode === null && child.signalCode === null) {
-        killProcessGroup(child, "SIGKILL");
+      if (child === null || target === null) {
+        signalLinuxProcessMarker(processTreeMarker, "SIGKILL");
+      } else {
+        signalAppServerSession(target, processTreeMarker, "SIGKILL");
       }
     };
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -470,15 +620,16 @@ export class OpenAiAppServerClient {
     try {
       this.#readline?.close();
       this.#rejectPending(new Error("OpenAi app-server stopped."));
-      this.abortServerRequests(new Error("OpenAi app-server stopped."));
+      void this.abortServerRequests(new Error("OpenAi app-server stopped.")).catch(() => {});
 
-      if (child === null || processClosed === null) {
-        signal?.throwIfAborted();
+      if (processClosed === null) {
+        signalLinuxProcessMarker(processTreeMarker, "SIGKILL");
+        await waitForLinuxProcessMarkerExit(processTreeMarker, APP_SERVER_KILL_TIMEOUT_MS);
         return;
       }
 
-      if (!signal?.aborted && child.exitCode === null && child.signalCode === null) {
-        killProcessGroup(child, "SIGTERM");
+      if (target !== null && !signal?.aborted) {
+        signalAppServerSession(target, processTreeMarker, "SIGTERM");
       }
 
       const terminated = await settlePromiseWithTimeout(processClosed, {
@@ -491,13 +642,28 @@ export class OpenAiAppServerClient {
         return;
       }
 
-      if (child.exitCode === null && child.signalCode === null) {
-        killProcessGroup(child, "SIGKILL");
+      if (child === null || target === null) {
+        signalLinuxProcessMarker(processTreeMarker, "SIGKILL");
+      } else {
+        signalAppServerSession(target, processTreeMarker, "SIGKILL");
+      }
+
+      if (process.platform === "linux") {
+        try {
+          await waitForLinuxProcessMarkerExit(processTreeMarker, APP_SERVER_KILL_TIMEOUT_MS);
+        } catch (error) {
+          this.#processCleanupFailureReported = true;
+          throw error;
+        }
+        if (terminated.status === "failed" && !this.#processCleanupFailureReported) {
+          this.#processCleanupFailureReported = true;
+          throw terminated.error;
+        }
+        return;
       }
 
       const killed = await settlePromiseWithTimeout(processClosed, {
         label: "OpenAi app-server forced termination",
-        ...(signal === undefined ? {} : { signal }),
         timeoutMs: APP_SERVER_KILL_TIMEOUT_MS,
       });
 
@@ -587,6 +753,7 @@ export class OpenAiAppServerClient {
       return;
     }
 
+    this.#fatalError = error;
     this.#rejectPending(error);
     void this.#notifyProtocolError(error);
     void this.stop().catch(() => {});
@@ -630,9 +797,11 @@ export class OpenAiAppServerClient {
       this.#context.logger.error("driver.openai.server_message.failed", error, {
         method,
       });
-      await this.#notifyProtocolError(
-        error instanceof Error ? error : new Error("OpenAi app-server protocol message failed."),
-      );
+      if (!this.#stopRequested) {
+        await this.#notifyProtocolError(
+          error instanceof Error ? error : new Error("OpenAi app-server protocol message failed."),
+        );
+      }
 
       if (id !== null && !this.#stopRequested) {
         try {
@@ -695,7 +864,7 @@ export class OpenAiAppServerClient {
 
       if (method === "serverRequest/resolved") {
         const parsed = parseServerNotificationParams(method, params);
-        this.#requestHandler.resolveElsewhere(parsed.requestId);
+        await this.#requestHandler.resolveElsewhere(parsed.requestId);
         await this.#context.handleNotification(method, parsed);
         return;
       }

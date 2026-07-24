@@ -100,6 +100,18 @@ describe("OpenAi app-server event bridge", () => {
     expect(tracker.markTurnStarted("turn-1")).toBe(false);
   });
 
+  test("rejects active waiters when teardown interrupts terminal settlement", async () => {
+    const tracker = new OpenAiTurnTracker();
+    const tracked = tracker.track("turn-1", DRIVER_TEST_IDS.runId);
+
+    expect(tracker.beginSettlement("turn-1")).toBe(true);
+    expect(tracker.activeRunId("turn-1")).toBeNull();
+    tracker.rejectActiveTurns(new Error("driver stopped"));
+
+    await expect(tracked).rejects.toThrow("driver stopped");
+    expect(tracker.hasTerminal("turn-1")).toBe(true);
+  });
+
   test("shares duplicate turn tracking without orphaning the first waiter", async () => {
     const tracker = new OpenAiTurnTracker();
     const first = tracker.track("turn-1", DRIVER_TEST_IDS.runId);

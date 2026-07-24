@@ -19,6 +19,7 @@ import type {
 } from "./generated/app-server-protocol";
 
 interface OpenAiAppServerEventBridgeOptions {
+  beforeInterruptedTurn?(context: AgentDriverContext, turnId: string): Promise<void>;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
   requireThreadId(): string;
 }
@@ -117,6 +118,41 @@ export class OpenAiAppServerEventBridge {
   rejectActiveTurns(error: Error): void {
     this.#turns.rejectActiveTurns(error);
     this.#itemEvents.reset();
+  }
+
+  async failActiveTurns(context: AgentDriverContext, error: Error): Promise<boolean> {
+    let failed = false;
+
+    for (const turnId of this.#turns.activeTurnIds()) {
+      const runId = this.#turns.activeRunId(turnId);
+      if (runId === null || !this.#turns.beginSettlement(turnId)) {
+        continue;
+      }
+
+      try {
+        await this.#push(context, "driver.openai.provider.failed", [
+          ...this.#itemEvents.finishOpen(),
+          {
+            ...turnEventFields({ eventName: "provider.failed", runId, turnId }),
+            kind: "run.failed",
+            payload: {
+              error: {
+                code: "openai.provider_failed",
+                message: error.message,
+              },
+              recoverable: false,
+            },
+          },
+        ]);
+        this.#finishSettlement(turnId, { error, kind: "failed" });
+        failed = true;
+      } catch (pushError) {
+        this.#turns.cancelSettlement(turnId);
+        throw pushError;
+      }
+    }
+
+    return failed;
   }
 
   releaseTurnState(): void {
@@ -372,6 +408,7 @@ export class OpenAiAppServerEventBridge {
     const error = turn ? readRecord(turn, "error") : null;
     try {
       if (status === "interrupted") {
+        await this.#options.beforeInterruptedTurn?.(context, turnId);
         await this.#push(context, "driver.openai.turn.interrupted", [
           ...this.#itemEvents.finishOpen(),
           {
@@ -420,6 +457,20 @@ export class OpenAiAppServerEventBridge {
         return;
       }
 
+      // A fresh app-server thread may not have a rollout until its first successful
+      // turn is materialized. Resume metadata must never turn that successful turn
+      // into a failure.
+      try {
+        await this.publishNativeResumeRef(context);
+      } catch (publishError) {
+        context.logger.warn("driver.openai.native_resume_ref.publish_failed", {
+          message:
+            publishError instanceof Error
+              ? publishError.message
+              : "Native resume ref publish failed.",
+        });
+      }
+
       await this.#push(context, "driver.openai.turn.completed", [
         ...this.#itemEvents.finishOpen(),
         {
@@ -440,20 +491,6 @@ export class OpenAiAppServerEventBridge {
           },
         },
       ]);
-
-      // A fresh app-server thread may not have a rollout until its first successful
-      // turn is materialized. Resume metadata must never turn that successful turn
-      // into a failure, so publish it only after the canonical completion settles.
-      try {
-        await this.publishNativeResumeRef(context);
-      } catch (publishError) {
-        context.logger.warn("driver.openai.native_resume_ref.publish_failed", {
-          message:
-            publishError instanceof Error
-              ? publishError.message
-              : "Native resume ref publish failed.",
-        });
-      }
       this.#finishSettlement(turnId, { kind: "completed" });
     } catch (pushError) {
       this.#turns.cancelSettlement(turnId);
@@ -468,6 +505,11 @@ export class OpenAiAppServerEventBridge {
     if (turnId === null || diff === null) {
       return;
     }
+    const runId = this.#turns.activeRunId(turnId);
+
+    if (runId === null) {
+      return;
+    }
 
     await this.#push(context, "driver.openai.turn.diff.updated", [
       {
@@ -478,6 +520,7 @@ export class OpenAiAppServerEventBridge {
           severity: "info",
           turnId,
         },
+        runId,
         visibility: "owner_debug",
       },
     ]);
@@ -497,10 +540,18 @@ export class OpenAiAppServerEventBridge {
   }
 
   async #onUsage(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    const turnId = readNonEmptyString(params, "turnId");
+    const runId = turnId === null ? null : this.#turns.activeRunId(turnId);
+
+    if (runId === null) {
+      return;
+    }
+
     await this.#push(context, "driver.openai.usage.updated", [
       {
         kind: "usage.updated",
         payload: toOpenAiSessionUsageSummary(params),
+        runId,
       },
     ]);
   }

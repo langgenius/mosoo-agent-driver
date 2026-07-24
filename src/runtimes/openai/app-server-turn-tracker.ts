@@ -34,7 +34,15 @@ export class OpenAiTurnTracker {
   readonly #startedTurnIds = new Map<string, true>();
 
   activeRunId(turnId: string): RunId | null {
+    if (this.hasTerminal(turnId)) {
+      return null;
+    }
+
     return this.#activeTurns.get(turnId)?.runId ?? null;
+  }
+
+  activeCompletion(turnId: string): Promise<void> | null {
+    return this.#activeTurns.get(turnId)?.promise ?? null;
   }
 
   activeTurnIds(): string[] {
@@ -67,6 +75,7 @@ export class OpenAiTurnTracker {
 
   rejectActiveTurns(error: Error): void {
     for (const turnId of this.activeTurnIds()) {
+      this.#settlingTurnIds.delete(turnId);
       this.rejectTurn(turnId, error);
     }
   }
