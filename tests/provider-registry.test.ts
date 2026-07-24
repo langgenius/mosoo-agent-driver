@@ -123,6 +123,78 @@ describe("provider registry", () => {
     ).toThrow("Runtime claude-agent-sdk does not match transport openai-app-server.");
   });
 
+  test.each(["openai-app-server", "acp-fallback"] as const)(
+    "rejects built-in tool restrictions unsupported by %s",
+    (transport) => {
+      const input = startInputFor(transport);
+
+      expect(() =>
+        AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
+          ...input,
+          execution: {
+            ...input.execution,
+            builtInTools: input.execution.builtInTools.map((tool) =>
+              tool.name === "bash" ? { ...tool, enabled: false } : tool,
+            ),
+          },
+        }),
+      ).toThrow(`Runtime ${input.runtime} does not support built-in tool restrictions.`);
+    },
+  );
+
+  test("accepts Claude built-in tool restrictions", () => {
+    const input = startInputFor("claude-agent-sdk");
+
+    expect(
+      AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
+        ...input,
+        execution: {
+          ...input.execution,
+          builtInTools: input.execution.builtInTools.map((tool) =>
+            tool.name === "bash" ? { ...tool, enabled: false } : tool,
+          ),
+        },
+      }).runtime,
+    ).toBe("claude-agent-sdk");
+  });
+
+  test("rejects OpenAI additional directories", () => {
+    const input = startInputFor("openai-app-server");
+
+    expect(() =>
+      AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
+        ...input,
+        execution: {
+          ...input.execution,
+          session: {
+            ...input.execution.session,
+            additionalDirectories: ["/tmp/shared"],
+          },
+        },
+      }),
+    ).toThrow("Runtime openai-runtime does not support additional directories.");
+  });
+
+  test.each(["claude-agent-sdk", "acp-fallback"] as const)(
+    "accepts additional directories supported by %s",
+    (transport) => {
+      const input = startInputFor(transport);
+
+      expect(
+        AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
+          ...input,
+          execution: {
+            ...input.execution,
+            session: {
+              ...input.execution.session,
+              additionalDirectories: ["/tmp/shared"],
+            },
+          },
+        }).runtime,
+      ).toBe(input.runtime);
+    },
+  );
+
   test("rejects duplicate provider transports", () => {
     const [provider] = AGENT_DRIVER_PROVIDER_REGISTRY.list();
 

@@ -135,6 +135,20 @@ function resolveProviderForStartInput(
     throw new Error(`Runtime ${input.runtime} does not match transport ${input.runtimeTransport}.`);
   }
 
+  if (
+    provider.runtime !== "claude-agent-sdk" &&
+    input.execution.builtInTools.some((tool) => !tool.enabled)
+  ) {
+    throw new Error(`Runtime ${provider.runtime} does not support built-in tool restrictions.`);
+  }
+
+  if (
+    provider.runtime === "openai-runtime" &&
+    input.execution.session.additionalDirectories.length > 0
+  ) {
+    throw new Error("Runtime openai-runtime does not support additional directories.");
+  }
+
   return provider;
 }
 
