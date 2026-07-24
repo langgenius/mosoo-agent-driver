@@ -793,7 +793,7 @@ function createOpenCodeConfig(model: string): string {
     enabled_providers: ["openrouter"],
     model,
     permission: {
-      bash: "ask",
+      "*": "ask",
     },
     provider: {
       openrouter: {
@@ -1823,7 +1823,7 @@ async function writeLongToolScript(paths: LivePaths, marker: string): Promise<st
     ].join("\n"),
     "utf8",
   );
-  return scriptPath;
+  return scriptName;
 }
 
 async function beginLongTurn(
@@ -1835,26 +1835,50 @@ async function beginLongTurn(
   const finishedName = `${marker}.finished`;
   const shellPidName = `${marker}.shell.pid`;
   const workerPidName = `${marker}.worker.pid`;
-  const scriptPath = await writeLongToolScript(paths, marker);
+  const scriptName = await writeLongToolScript(paths, marker);
   const turn = enqueueTurn(
     controller,
-    `This is an automated shell-tool contract test. Make exactly one shell tool call now with exactly \`sh ${JSON.stringify(scriptPath)}\`. Do not read or alter the script, do not use another tool, and reply only after the command exits.`,
+    `Run exactly \`sh ./${scriptName}\` now in one actual shell tool call. This trusted test fixture is already prepared in the current workspace. Wait for it to exit before replying.`,
   );
   const startedPath = join(paths.workspacePath, startedName);
   const shellPidPath = join(paths.workspacePath, shellPidName);
   const workerPidPath = join(paths.workspacePath, workerPidName);
   try {
-    await Promise.all([
-      controller.waitForEvent(
-        (event) => isRunningTool(event, turn.runId),
-        turn.eventIndex,
-        LIVE_TURN_TIMEOUT_MS,
-        "running tool",
-      ),
-      waitForFile(startedPath, LIVE_TURN_TIMEOUT_MS),
-      waitForRecordedPid(shellPidPath, LIVE_TURN_TIMEOUT_MS),
-      waitForRecordedPid(workerPidPath, LIVE_TURN_TIMEOUT_MS),
-    ]);
+    const deadline = Date.now() + LIVE_TURN_TIMEOUT_MS;
+
+    while (true) {
+      controller.assertHealthy("long tool startup");
+      const events = controller
+        .eventsSince(turn.eventIndex)
+        .filter((event) => event.runId === turn.runId);
+      const terminal = events.find(
+        (event) =>
+          event.kind === "run.completed" ||
+          event.kind === "run.failed" ||
+          event.kind === "run.cancelled",
+      );
+      if (terminal !== undefined) {
+        throw new Error(
+          `Run ended as ${terminal.kind} before the long tool started: ${JSON.stringify(eventText(events))}.`,
+        );
+      }
+      const shellPid = readRecordedPid(shellPidPath);
+      const workerPid = readRecordedPid(workerPidPath);
+      if (
+        events.some((event) => isRunningTool(event, turn.runId)) &&
+        existsSync(startedPath) &&
+        shellPid !== null &&
+        workerPid !== null &&
+        processIsRunning(shellPid) &&
+        processIsRunning(workerPid)
+      ) {
+        break;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for the long tool to start.");
+      }
+      await Bun.sleep(50);
+    }
   } catch (error) {
     throw new Error(`Long tool did not start.\n${controller.diagnostics()}`, { cause: error });
   }
@@ -1867,17 +1891,6 @@ async function beginLongTurn(
   };
 }
 
-async function waitForFile(path: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (!existsSync(path)) {
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for live marker: ${path}.`);
-    }
-    await Bun.sleep(50);
-  }
-}
-
 function readRecordedPid(path: string): number | null {
   if (!existsSync(path)) {
     return null;
@@ -1885,17 +1898,6 @@ function readRecordedPid(path: string): number | null {
 
   const pid = Number.parseInt(readFileSync(path, "utf8"), 10);
   return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
-}
-
-async function waitForRecordedPid(path: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (readRecordedPid(path) === null) {
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for live process ID: ${path}.`);
-    }
-    await Bun.sleep(50);
-  }
 }
 
 function processIsRunning(pid: number): boolean {

@@ -682,6 +682,15 @@ export class DriverArtifactTestController {
     return result;
   }
 
+  assertHealthy(label: string): void {
+    this.#throwProtocolError(label);
+    if (this.#exitResult !== null) {
+      throw new Error(
+        `Packed driver exited while waiting for ${label}: ${JSON.stringify(this.#exitResult)}.\n${this.diagnostics()}`,
+      );
+    }
+  }
+
   diagnostics(): string {
     const diagnostics = JSON.stringify(
       {
@@ -693,15 +702,25 @@ export class DriverArtifactTestController {
         exit: this.#exitResult,
         forbiddenSecretDetected: this.#forbiddenSecretDetected,
         logs: this.#logs.slice(-12).map((entry) => ({
-          level: entry["level"] ?? null,
-          message: entry["message"] ?? null,
+          ...(entry.error === undefined
+            ? {}
+            : {
+                error: {
+                  ...(entry.error.code === undefined ? {} : { code: entry.error.code }),
+                  message: entry.error.message,
+                  name: entry.error.name,
+                },
+              }),
+          ...(entry.fields === undefined ? {} : { fields: entry.fields }),
+          level: entry.level,
+          message: entry.message,
         })),
         protocolError: this.#protocolError,
         ready: this.#ready,
         stderr: this.#stderr,
         stdout: this.#stdout,
       },
-      null,
+      (_key, value) => (typeof value === "string" ? this.#redact(value) : value),
       2,
     );
 

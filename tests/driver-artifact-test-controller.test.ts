@@ -43,11 +43,36 @@ await rpc("/driver/hello", {
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
+if (process.env.TEST_MODE === "log") {
+  await rpc("/driver/pushLogs", {
+    driverInstanceId: payload.driverInstanceId,
+    logs: [{
+      error: {
+        code: "EPIPE",
+        message: process.env.TEST_LOG_MESSAGE ?? "transport exploded",
+        name: "Error",
+      },
+      fields: { stage: "session/new" },
+      level: "error",
+      message: "driver.acp.transport.failed",
+      seq: 0,
+      timestamp: new Date().toISOString(),
+    }],
+  });
+}
 await rpc("/driver/ready", {
   at: process.env.TEST_MODE === "raw" ? process.env.TEST_SECRET : new Date().toISOString(),
   driverInstanceId: payload.driverInstanceId,
   pid: process.pid,
 });
+if (process.env.TEST_MODE === "terminal") {
+  await rpc("/driver/commandUpdate", {
+    commandId: "command-1",
+    driverInstanceId: payload.driverInstanceId,
+    result: null,
+    status: "completed",
+  });
+}
 await Bun.sleep(100);
 process.stdout.write(process.env.TEST_SECRET.slice(0, 9));
 await Bun.sleep(100);
@@ -78,6 +103,67 @@ afterEach(async () => {
 });
 
 describe("driver artifact test controller", () => {
+  test("returns an accepted terminal after the driver exits", async () => {
+    temporaryRoot = await mkdtemp(join(tmpdir(), "driver-controller-test-"));
+    const organizationPath = join(temporaryRoot, "workspace");
+    const artifactPath = join(temporaryRoot, "fake-driver.ts");
+    await mkdir(organizationPath);
+    await writeFile(artifactPath, FAKE_DRIVER);
+    const controller = await DriverArtifactTestController.start({
+      artifactPath,
+      bootPayload: {
+        bootToken: "boot-token",
+        driverInstanceId: "driver-test",
+        execution: { configRevision: { sessionId: "session-test" } },
+        runtime: "acp-fallback",
+      },
+      env: { TEST_MODE: "terminal", TEST_SECRET: "unused" },
+      organizationPath,
+      rootPath: temporaryRoot,
+      startTimeoutMs: 2_000,
+    });
+
+    await controller.waitForExit(2_000);
+    await expect(controller.waitForCommandTerminal("command-1", 100)).resolves.toMatchObject({
+      status: "completed",
+    });
+    await controller.dispose();
+  });
+
+  test("includes structured log failures in diagnostics", async () => {
+    const secret = 'credential"\\\nvalue';
+    temporaryRoot = await mkdtemp(join(tmpdir(), "driver-controller-test-"));
+    const organizationPath = join(temporaryRoot, "workspace");
+    const artifactPath = join(temporaryRoot, "fake-driver.ts");
+    await mkdir(organizationPath);
+    await writeFile(artifactPath, FAKE_DRIVER);
+    const controller = await DriverArtifactTestController.start({
+      artifactPath,
+      bootPayload: {
+        bootToken: "boot-token",
+        driverInstanceId: "driver-test",
+        execution: { configRevision: { sessionId: "session-test" } },
+        runtime: "acp-fallback",
+      },
+      env: {
+        TEST_LOG_MESSAGE: `transport exploded: ${secret}`,
+        TEST_MODE: "log",
+        TEST_SECRET: "unused",
+      },
+      forbiddenSecrets: [secret],
+      organizationPath,
+      rootPath: temporaryRoot,
+      startTimeoutMs: 2_000,
+    });
+
+    const diagnostics = controller.diagnostics();
+    expect(diagnostics).toContain('"message": "transport exploded: [redacted]"');
+    expect(diagnostics).toContain('"stage": "session/new"');
+    expect(diagnostics).not.toContain(secret);
+    expect(diagnostics).not.toContain(JSON.stringify(secret).slice(1, -1));
+    await controller.dispose();
+  });
+
   test("rejects unexpected hello capabilities", async () => {
     temporaryRoot = await mkdtemp(join(tmpdir(), "driver-controller-test-"));
     const organizationPath = join(temporaryRoot, "workspace");
