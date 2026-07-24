@@ -182,11 +182,29 @@ vp run clean
 
 Every live test launches `dist/driver.mjs` as a child process and talks to it only through the production boot payload and control protocol.
 
-The compatibility tier runs sequential turns, workspace operations, and command-failure recovery against every configured model.
+The default matrix exercises all three runtime integrations through OpenRouter and does not claim separate certification of each provider's first-party endpoint.
 
-The lifecycle tier runs native resume, crash resume, stale resume, cancellation and replay, supervised permissions, active stop, and `SIGTERM` against one representative model per runtime.
+The test controller implements the production wire contract locally, so CMA, Durable Object persistence, database recovery, and deployment networking remain system-test responsibilities.
 
-The control tier runs changed-command replay, heartbeat failure, and active socket disconnection once because those paths are runtime-neutral.
+The compatibility tier validates context continuity, canonical event lifecycles, workspace operations, and command-failure recovery against every configured model.
+
+The lifecycle tier runs native resume, active-turn crash resume, stale resume, start-boundary and active cancellation with replay, permission cancellation/rejection/approval, active stop, `SIGTERM`, active control disconnection, and active heartbeat failure against one representative model per runtime.
+
+Delayed filesystem markers plus shell and worker PIDs prove that cancellation and shutdown stop the supervised real tool tree before reporting completion.
+
+Linux crash supervision requires readable `/proc` and covers same-UID descendants that retain the private supervision environment; it is not a security or isolation boundary.
+
+Environment-clearing or UID-changing descendants require sandbox or container teardown as the authoritative cleanup layer.
+
+The control tier runs the runtime-neutral changed-command replay failure once.
+
+A provider-free packed-artifact test uses a local Streamable HTTP MCP server to cover authenticated setup, argument rejection, text and structured results, failure recovery, cancellation, and replay idempotency.
+
+One representative model per runtime also calls an authenticated local MCP marker tool through its native provider configuration path.
+
+Live startup pins and verifies the project-local OpenAI app-server and OpenCode executable versions before making network calls.
+
+Protocol-only races such as ACP load replay barriers, burst updates, and event-delivery backpressure remain in deterministic tests.
 
 - `vp run test:live` builds the artifact and runs the complete matrix.
 - `vp run test:live:openai` runs the OpenAI runtime slice.
