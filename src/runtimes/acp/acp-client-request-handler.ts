@@ -88,6 +88,10 @@ export class AcpClientRequestHandler {
     return this.#updateInbox.enqueue(context, notification);
   }
 
+  deferUpdates(): { commit(): void; discard(): void } {
+    return this.#updateInbox.defer();
+  }
+
   async readTextFile(
     params: ReadTextFileRequest,
     signal?: AbortSignal,

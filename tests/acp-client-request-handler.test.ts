@@ -132,6 +132,41 @@ describe("ACP client request handler", () => {
     expect(pushedReasons).toEqual([]);
   });
 
+  test("discards deferred updates and permits a later gate", async () => {
+    const pushedReasons: string[] = [];
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async (_context, reason) => {
+        pushedReasons.push(reason);
+      },
+      turnEvents: new AcpTurnEventState(),
+    });
+    const notification = {
+      sessionId: "native-session-1",
+      update: {
+        availableCommands: [{ description: "Early command", name: "early" }],
+        sessionUpdate: "available_commands_update" as const,
+      },
+    };
+
+    const discarded = handler.deferUpdates();
+    const droppedUpdate = handler.enqueueUpdate({} as never, notification);
+    discarded.discard();
+    await droppedUpdate;
+
+    const committed = handler.deferUpdates();
+    const appliedUpdate = handler.enqueueUpdate({} as never, notification);
+    committed.commit();
+    await appliedUpdate;
+
+    expect(pushedReasons).toEqual(["driver.acp.session.update"]);
+  });
+
   test("passes the runtime environment to terminal child processes", async () => {
     const handler = new AcpClientRequestHandler({
       allowedRoots: [],

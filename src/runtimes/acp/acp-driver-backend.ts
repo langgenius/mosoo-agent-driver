@@ -42,6 +42,7 @@ import {
   readResumeId,
   resolveAuthMethod,
   supportsSessionClose,
+  supportsSessionLoad,
   supportsSessionResume,
 } from "./acp-configuration";
 import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-event-translator";
@@ -74,6 +75,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #payload: DriverStartInput;
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
+  #started = false;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
   readonly #turnController: AcpTurnController;
@@ -142,6 +144,11 @@ export class AcpDriverBackend implements AgentDriverBackend {
           signal,
         );
       }
+      if (this.#connection === null) {
+        throw new Error("ACP driver backend connection closed during startup.");
+      }
+      this.#connection.signal.throwIfAborted();
+      this.#started = true;
 
       context.logger.info("driver.acp.runtime.started", {
         bootstrapArtifacts,
@@ -251,8 +258,14 @@ export class AcpDriverBackend implements AgentDriverBackend {
       );
       connection = app.connect(ndJsonStream(output, input));
       this.#connection = connection;
+      let connectionReady = false;
       void connection.closed.then(() => {
-        if (this.#stopRequested || this.#connection !== connection) {
+        if (
+          !this.#started ||
+          !connectionReady ||
+          this.#stopRequested ||
+          this.#connection !== connection
+        ) {
           return;
         }
 
@@ -354,6 +367,8 @@ export class AcpDriverBackend implements AgentDriverBackend {
       if (this.#stopRequested) {
         throw new Error("ACP driver backend stopped while connecting.");
       }
+      connection.signal.throwIfAborted();
+      connectionReady = true;
 
       return setup;
     } catch (error) {
@@ -707,21 +722,34 @@ export class AcpDriverBackend implements AgentDriverBackend {
   async #setupSession(signal: AbortSignal): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
     const hostSnapshot = this.#requireHostSnapshot();
     signal.throwIfAborted();
-    const setup = await raceWithAbort(
-      setupAcpSession({
-        agentCapabilities: this.#agentCapabilities,
-        connection: this.#requireConnection(),
-        currentSessionId: this.#nativeSessionId,
-        payload: this.#payload,
-        sessionContext: hostSnapshot.sessionContext,
-        replaySession: async (operation) => this.#clientRequests.withSessionReplay(operation),
-      }),
-      signal,
-    );
-    signal.throwIfAborted();
-    this.#nativeSessionId = setup.sessionId;
-    await raceWithAbort(this.#clientRequests.drainUpdates(), signal);
+    const deferredUpdates =
+      this.#nativeSessionId === null ||
+      (!supportsSessionResume(this.#agentCapabilities) &&
+        !supportsSessionLoad(this.#agentCapabilities))
+        ? this.#clientRequests.deferUpdates()
+        : null;
 
-    return setup;
+    try {
+      const setup = await raceWithAbort(
+        setupAcpSession({
+          agentCapabilities: this.#agentCapabilities,
+          connection: this.#requireConnection(),
+          currentSessionId: this.#nativeSessionId,
+          payload: this.#payload,
+          sessionContext: hostSnapshot.sessionContext,
+          replaySession: async (operation) => this.#clientRequests.withSessionReplay(operation),
+        }),
+        signal,
+      );
+      signal.throwIfAborted();
+      this.#nativeSessionId = setup.sessionId;
+      deferredUpdates?.commit();
+      await raceWithAbort(this.#clientRequests.drainUpdates(), signal);
+
+      return setup;
+    } catch (error) {
+      deferredUpdates?.discard();
+      throw error;
+    }
   }
 }

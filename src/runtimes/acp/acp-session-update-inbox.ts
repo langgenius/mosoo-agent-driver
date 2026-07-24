@@ -29,6 +29,10 @@ export class AcpSessionUpdateInbox {
   #replaying = false;
   #suppressed = false;
   #tail: Promise<void> = Promise.resolve();
+  #updateGate: {
+    readonly decision: Promise<boolean>;
+    decide(apply: boolean): void;
+  } | null = null;
 
   constructor(options: AcpSessionUpdateInboxOptions) {
     this.#apply = options.apply;
@@ -37,6 +41,27 @@ export class AcpSessionUpdateInbox {
 
   isSuppressed(): boolean {
     return this.#suppressed;
+  }
+
+  defer(): { commit(): void; discard(): void } {
+    if (this.#updateGate !== null) {
+      throw new Error("ACP session updates are already deferred.");
+    }
+
+    const decision = Promise.withResolvers<boolean>();
+    const gate = { decision: decision.promise, decide: decision.resolve };
+    this.#updateGate = gate;
+    const settle = (apply: boolean) => {
+      if (this.#updateGate === gate) {
+        this.#updateGate = null;
+      }
+      gate.decide(apply);
+    };
+
+    return {
+      commit: () => settle(true),
+      discard: () => settle(false),
+    };
   }
 
   enqueue(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
@@ -61,14 +86,18 @@ export class AcpSessionUpdateInbox {
 
     this.#pendingBytes += bytes;
     this.#pendingCount += 1;
+    const gate = this.#updateGate;
     const scope = { replaying: this.#replaying, suppressed: this.#suppressed };
     const update = this.#tail
-      .then(() => {
+      .then(async () => {
         if (this.#failure !== null) {
           throw this.#failure;
         }
+        if (gate !== null && !(await gate.decision)) {
+          return;
+        }
 
-        return this.#apply(context, notification, scope);
+        await this.#apply(context, notification, scope);
       })
       .finally(() => {
         this.#pendingBytes -= bytes;
@@ -98,6 +127,7 @@ export class AcpSessionUpdateInbox {
 
   async close(): Promise<void> {
     this.#closed = true;
+    this.#updateGate?.decide(false);
     await this.drain();
   }
 

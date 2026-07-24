@@ -97,6 +97,19 @@ const handle = (message) => {
       result = {};
       break;
     case "session/new":
+      if (process.env.TEST_UPDATE_BEFORE_SESSION_RESPONSE === "1") {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              availableCommands: [{ description: "Early command", name: "early" }],
+              sessionUpdate: "available_commands_update",
+            },
+          },
+        });
+      }
       sessionReady = true;
       result = { sessionId: "native-session-1" };
       break;
@@ -309,6 +322,7 @@ async function createHarness(
     onEvents?(events: readonly DriverEventInput[]): void;
     readonly permission?: AgentDriverPermissionPort["request"];
     readonly spawnLateChild?: boolean;
+    readonly updateBeforeSessionResponse?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "driver-acp-backend-"));
@@ -332,6 +346,7 @@ async function createHarness(
           TEST_FAIL_RESUME: options.failResume ? "1" : "0",
           TEST_HANG_CLOSE: options.hangClose ? "1" : "0",
           TEST_SPAWN_LATE_CHILD: options.spawnLateChild ? "1" : "0",
+          TEST_UPDATE_BEFORE_SESSION_RESPONSE: options.updateBeforeSessionResponse ? "1" : "0",
           ...(options.authenticate ? { MOSOO_ACP_AUTH_METHOD_ID: "test-auth" } : {}),
         },
       },
@@ -459,6 +474,30 @@ async function createHarness(
 }
 
 describe("ACP driver backend lifecycle", () => {
+  test("buffers an update sent before the new-session response", async () => {
+    const harness = await createHarness({ updateBeforeSessionResponse: true });
+
+    try {
+      expect(harness.lifecycleFailures).toEqual([]);
+      expect(harness.events).toContainEqual(
+        expect.objectContaining({
+          kind: "session.commands.updated",
+          payload: {
+            commands: [
+              {
+                description: "Early command",
+                input: null,
+                name: "early",
+              },
+            ],
+          },
+        }),
+      );
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("projects an active transport loss as a failed turn", async () => {
     const harness = await createHarness();
 
