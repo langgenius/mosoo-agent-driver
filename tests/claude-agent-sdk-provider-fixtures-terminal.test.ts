@@ -551,55 +551,64 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(payload).not.toHaveProperty("finalMessageText");
   });
 
-  test("isolates interleaved tool and thought streams by message UUID", async () => {
+  test("isolates parallel tool blocks by index and thought streams by message boundary", async () => {
+    // Envelope uuids are per-frame on the real wire, so identity within a
+    // scope comes from the burst anchor: parallel tool blocks of one message
+    // are told apart by content-block index, and a message_stop boundary
+    // separates one message's thought stream from the next.
     const { context, events, logger, translator } = createHarness();
     const stream = (uuid: string, event: Record<string, unknown>) =>
       ({ event, type: "stream_event", uuid }) as unknown as SDKMessage;
     const messages = [
-      stream("tool-message-a", {
+      stream("frame-1", {
         content_block: { id: "tool-a", name: "Bash", type: "tool_use" },
         index: 0,
         type: "content_block_start",
       }),
-      stream("tool-message-b", {
+      stream("frame-2", {
         content_block: { id: "tool-b", name: "Bash", type: "tool_use" },
-        index: 0,
+        index: 1,
         type: "content_block_start",
       }),
-      stream("tool-message-a", {
+      stream("frame-3", {
         delta: { partial_json: '{"a":', type: "input_json_delta" },
         index: 0,
         type: "content_block_delta",
       }),
-      stream("tool-message-b", { type: "message_stop" }),
-      stream("tool-message-a", {
+      stream("frame-4", {
+        delta: { partial_json: '{"b":1}', type: "input_json_delta" },
+        index: 1,
+        type: "content_block_delta",
+      }),
+      stream("frame-5", {
         delta: { partial_json: "1}", type: "input_json_delta" },
         index: 0,
         type: "content_block_delta",
       }),
-      stream("thought-message-a", {
+      stream("frame-6", { type: "message_stop" }),
+      stream("frame-7", {
         content_block: { thinking: "", type: "thinking" },
         index: 0,
         type: "content_block_start",
       }),
-      stream("thought-message-b", {
-        content_block: { thinking: "", type: "thinking" },
-        index: 0,
-        type: "content_block_start",
-      }),
-      stream("thought-message-a", {
+      stream("frame-8", {
         delta: { thinking: "A1", type: "thinking_delta" },
         index: 0,
         type: "content_block_delta",
       }),
-      stream("thought-message-b", {
-        delta: { thinking: "B1", type: "thinking_delta" },
+      stream("frame-9", {
+        delta: { thinking: "A2", type: "thinking_delta" },
         index: 0,
         type: "content_block_delta",
       }),
-      stream("thought-message-b", { type: "message_stop" }),
-      stream("thought-message-a", {
-        delta: { thinking: "A2", type: "thinking_delta" },
+      stream("frame-10", { type: "message_stop" }),
+      stream("frame-11", {
+        content_block: { thinking: "", type: "thinking" },
+        index: 0,
+        type: "content_block_start",
+      }),
+      stream("frame-12", {
+        delta: { thinking: "B1", type: "thinking_delta" },
         index: 0,
         type: "content_block_delta",
       }),
@@ -638,6 +647,7 @@ describe("Claude Agent SDK provider fixtures", () => {
 
     expect(toolArguments).toEqual([
       { rawInput: '{"a":', toolCallId: "tool-a" },
+      { rawInput: '{"b":1}', toolCallId: "tool-b" },
       { rawInput: "1}", toolCallId: "tool-a" },
     ]);
     expect(thoughts["A1"]).toBe(thoughts["A2"]);

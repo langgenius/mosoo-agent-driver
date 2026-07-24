@@ -122,7 +122,10 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const messageId = this.#state.assistantMessageId(
       runId,
-      this.#state.readNativeMessageId(message),
+      this.#state.resolveAssistantMessageNativeId(
+        this.#state.streamScopeKey(runId, message),
+        this.#state.readNativeMessageId(message),
+      ),
     );
     const content = Array.isArray(message.message.content) ? message.message.content : [];
     const authoritativeText: string[] = [];
@@ -205,10 +208,20 @@ export class ClaudeAgentSdkMessageTranslator {
       return;
     }
 
+    // Content frames pin the scope to one message even when message_start was
+    // lost; boundary frames only read the anchor so a bare message_stop does
+    // not mint a message from its own envelope uuid.
+    const isContentFrame =
+      eventType === "content_block_start" || eventType === "content_block_delta";
     const messageId = this.#state.assistantMessageId(
       runId,
-      this.#state.streamingNativeMessageId(streamScopeKey) ??
-        this.#state.readNativeMessageId(message),
+      isContentFrame
+        ? this.#state.anchorStreamingNativeMessageId(
+            streamScopeKey,
+            this.#state.readNativeMessageId(message),
+          )
+        : (this.#state.streamingNativeMessageId(streamScopeKey) ??
+            this.#state.readNativeMessageId(message)),
     );
 
     if (eventType === "content_block_start") {
