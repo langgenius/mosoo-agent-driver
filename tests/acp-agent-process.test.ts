@@ -63,13 +63,6 @@ async function startTestAgentProcess(
   const root = await mkdtemp(join(tmpdir(), "driver-acp-stop-"));
   const payload = createPayload(root);
   const readyPath = join(root, "ready");
-  const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-  const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
-  process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
-  process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify([
-    "-e",
-    `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");${source}`,
-  ]);
 
   try {
     const child = await startAcpAgentProcess(
@@ -77,7 +70,14 @@ async function startTestAgentProcess(
       payload,
       buildChildEnv(payload),
       new AbortController().signal,
-      spawnWatchdog === undefined ? {} : { spawnWatchdog },
+      {
+        args: [
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");${source}`,
+        ],
+        command: process.execPath,
+        ...(spawnWatchdog === undefined ? {} : { spawnWatchdog }),
+      },
     );
     while (!(await Bun.file(readyPath).exists())) {
       await Bun.sleep(5);
@@ -88,30 +88,10 @@ async function startTestAgentProcess(
         if (child.exitCode === null && child.signalCode === null) {
           await stopAcpAgentProcess(harness.context, child, "test.cleanup").catch(() => {});
         }
-        if (previousCommand === undefined) {
-          delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-        } else {
-          process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-        }
-        if (previousArgs === undefined) {
-          delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-        } else {
-          process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
-        }
         await rm(root, { force: true, recursive: true });
       },
     };
   } catch (error) {
-    if (previousCommand === undefined) {
-      delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-    } else {
-      process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-    }
-    if (previousArgs === undefined) {
-      delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-    } else {
-      process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
-    }
     await rm(root, { force: true, recursive: true });
     throw error;
   }
@@ -207,13 +187,6 @@ describe("ACP agent process lifecycle", () => {
       const payload = createPayload(root);
       const readyPath = join(root, "ready");
       const cleanup = Promise.withResolvers<void>();
-      const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-      const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
-      process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
-      process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify([
-        "-e",
-        `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");setInterval(() => {}, 1000);`,
-      ]);
       let child: AcpAgentProcess | undefined;
 
       try {
@@ -222,7 +195,14 @@ describe("ACP agent process lifecycle", () => {
           payload,
           buildChildEnv(payload),
           new AbortController().signal,
-          { spawnWatchdog: fakeWatchdog(cleanup.promise) },
+          {
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(readyPath)}, "ready");setInterval(() => {}, 1000);`,
+            ],
+            command: process.execPath,
+            spawnWatchdog: fakeWatchdog(cleanup.promise),
+          },
         );
         while (!(await Bun.file(readyPath).exists())) {
           await Bun.sleep(10);
@@ -244,16 +224,6 @@ describe("ACP agent process lifecycle", () => {
         cleanup.resolve();
         if (child !== undefined && child.exitCode === null && child.signalCode === null) {
           child.kill("SIGKILL");
-        }
-        if (previousCommand === undefined) {
-          delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-        } else {
-          process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-        }
-        if (previousArgs === undefined) {
-          delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-        } else {
-          process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
         }
         await rm(root, { force: true, recursive: true });
         await harness.logger.destroy();
@@ -395,8 +365,6 @@ setInterval(() => {}, 1_000);
     const payload = createPayload(root);
     const shellPidPath = join(root, "shell.pid");
     const workerPidPath = join(root, "worker.pid");
-    const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-    const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
     const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
     const script = `
 const { spawn } = require("node:child_process");
@@ -410,8 +378,6 @@ setInterval(() => {}, 1_000);
     let rootPid = 0;
     let shellPid = 0;
     let workerPid = 0;
-    process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
-    process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["-e", script]);
 
     const starting = startAcpAgentProcess(
       harness.context,
@@ -419,6 +385,8 @@ setInterval(() => {}, 1_000);
       buildChildEnv(payload),
       controller.signal,
       {
+        args: ["-e", script],
+        command: process.execPath,
         spawnWatchdog: (pid, marker) => {
           rootPid = pid;
           const deadline = Date.now() + 3_000;
@@ -470,16 +438,6 @@ setInterval(() => {}, 1_000);
       ).toBe(true);
     } finally {
       cleanup.resolve();
-      if (previousCommand === undefined) {
-        delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-      } else {
-        process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-      }
-      if (previousArgs === undefined) {
-        delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-      } else {
-        process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
-      }
       for (const pid of [rootPid, shellPid, workerPid]) {
         if (pid > 0 && isProcessRunning(pid)) {
           process.kill(pid, "SIGKILL");
@@ -496,8 +454,6 @@ setInterval(() => {}, 1_000);
     const payload = createPayload(root);
     const shellPidPath = join(root, "shell.pid");
     const workerPidPath = join(root, "worker.pid");
-    const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-    const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
     const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
     const script = [
       'const { spawn } = require("node:child_process");',
@@ -505,8 +461,6 @@ setInterval(() => {}, 1_000);
       '  { stdio: "ignore" });',
       "child.unref();",
     ].join("\n");
-    process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
-    process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["-e", script]);
     let child: AcpAgentProcess | undefined;
     let shellPid = 0;
     let workerPid = 0;
@@ -517,6 +471,7 @@ setInterval(() => {}, 1_000);
         payload,
         buildChildEnv(payload),
         new AbortController().signal,
+        { args: ["-e", script], command: process.execPath },
       );
       [shellPid, workerPid] = await Promise.all([
         waitForPidFile(shellPidPath),
@@ -542,19 +497,6 @@ setInterval(() => {}, 1_000);
           new AbortController().signal,
         ).catch(() => {});
       }
-
-      if (previousCommand === undefined) {
-        delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-      } else {
-        process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-      }
-
-      if (previousArgs === undefined) {
-        delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-      } else {
-        process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
-      }
-
       for (const pid of [shellPid, workerPid]) {
         if (pid > 0 && isProcessRunning(pid)) {
           process.kill(pid, "SIGKILL");

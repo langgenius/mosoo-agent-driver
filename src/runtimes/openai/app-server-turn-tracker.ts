@@ -41,10 +41,6 @@ export class OpenAiTurnTracker {
     return this.#activeTurns.get(turnId)?.runId ?? null;
   }
 
-  activeCompletion(turnId: string): Promise<void> | null {
-    return this.#activeTurns.get(turnId)?.promise ?? null;
-  }
-
   activeTurnIds(): string[] {
     return [...this.#activeTurns.keys()];
   }

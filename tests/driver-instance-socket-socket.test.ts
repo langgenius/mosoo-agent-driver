@@ -163,6 +163,15 @@ class RpcWebSocket extends OpenWebSocket {
   }
 }
 
+const connectRpcSocket = async () => {
+  globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+  const socket = new DriverInstanceSocket(driverBootPayload, {
+    onClose: () => {},
+  });
+  await socket.connect();
+  return socket;
+};
+
 afterEach(() => {
   globalThis.WebSocket = nativeWebSocket;
   AbortSignal.timeout = nativeAbortSignalTimeout;
@@ -194,11 +203,7 @@ describe("DriverInstanceSocket lifecycle", () => {
     ["unknown", { commandId: "command-1", kind: "unknown" }, "Unsupported runtime command kind"],
   ] as const)("rejects a %s command from the wire", async (_name, command, message) => {
     RpcWebSocket.nextCommand = command;
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
 
     await expect(socket.nextCommand(new AbortController().signal)).rejects.toThrow(message);
   });
@@ -435,11 +440,7 @@ describe("DriverInstanceSocket lifecycle", () => {
     ["completeRun", "/driver/completeRun", "/driver/failRun"],
     ["failRun", "/driver/failRun", "/driver/completeRun"],
   ] as const)("keeps a claimed %s run terminal monotonic", async (first, sent, skipped) => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     socket.beginRun(DRIVER_TEST_IDS.runId);
     const failure = {
       code: "test.failure",
@@ -467,11 +468,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   ] as const)(
     "retries a failed %s send without changing the selected terminal",
     async (selected, sent, skipped) => {
-      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-      const socket = new DriverInstanceSocket(driverBootPayload, {
-        onClose: () => {},
-      });
-      await socket.connect();
+      const socket = await connectRpcSocket();
       socket.beginRun(DRIVER_TEST_IDS.runId);
       const failure = {
         code: "test.failure",
@@ -502,11 +499,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   ] as const)(
     "shares an in-flight %s task and retries after a lost response",
     async (selected, path) => {
-      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-      const socket = new DriverInstanceSocket(driverBootPayload, {
-        onClose: () => {},
-      });
-      await socket.connect();
+      const socket = await connectRpcSocket();
       socket.beginRun(DRIVER_TEST_IDS.runId);
       const failure = {
         code: "test.failure",
@@ -537,11 +530,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   );
 
   test("freezes a failed run payload across failed delivery attempts", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     socket.beginRun(DRIVER_TEST_IDS.runId);
     const failure = {
       code: "test.failure",
@@ -607,11 +596,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   });
 
   test("splits event delivery at the negotiated batch limit", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     await socket.hello({
       capabilities: [],
       driverVersion: "test",
@@ -646,11 +631,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   test("drains a partially accepted event batch before returning", async () => {
     RpcWebSocket.eventBatchMaxSize = 3;
     RpcWebSocket.acceptedEventCounts = [1, 2];
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     await socket.hello({
       capabilities: [],
       driverVersion: "test",
@@ -677,11 +658,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   test("does not retry an unaccepted best-effort suffix", async () => {
     RpcWebSocket.eventBatchMaxSize = 2;
     RpcWebSocket.acceptedEventCounts = [1];
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     await socket.hello({
       capabilities: [],
       driverVersion: "test",
@@ -707,11 +684,7 @@ describe("DriverInstanceSocket lifecycle", () => {
   });
 
   test("rejects a mixed delivery batch before sending it", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const socket = new DriverInstanceSocket(driverBootPayload, {
-      onClose: () => {},
-    });
-    await socket.connect();
+    const socket = await connectRpcSocket();
     await socket.hello({
       capabilities: [],
       driverVersion: "test",

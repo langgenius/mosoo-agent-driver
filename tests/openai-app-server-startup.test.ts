@@ -43,6 +43,11 @@ afterEach(async () => {
   );
 });
 
+async function readFirstLaunchPid(processLog: string): Promise<number> {
+  const firstLine = (await readFile(processLog, "utf8")).trim().split("\n")[0] ?? "{}";
+  return (JSON.parse(firstLine) as { pid: number }).pid;
+}
+
 async function createHarness(
   resumeErrorMessage: string,
   recoveryMessages = [
@@ -410,13 +415,7 @@ describe("OpenAI app-server startup", () => {
 
       try {
         await harness.backend.start(harness.context, new AbortController().signal);
-        const firstPid = (
-          JSON.parse(
-            (await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}",
-          ) as {
-            pid: number;
-          }
-        ).pid;
+        const firstPid = await readFirstLaunchPid(harness.processLog);
 
         await expect(
           settlePromiseWithTimeout(
@@ -531,11 +530,7 @@ describe("OpenAI app-server startup", () => {
       await expect(
         harness.backend.start(harness.context, new AbortController().signal),
       ).rejects.toThrow("initial thread start failed");
-      const childPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      const childPid = await readFirstLaunchPid(harness.processLog);
       expect(() => process.kill(childPid, 0)).toThrow();
     } finally {
       await harness.backend
@@ -579,13 +574,7 @@ describe("OpenAI app-server startup", () => {
           status: "failed",
         });
 
-        const firstPid = (
-          JSON.parse(
-            (await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}",
-          ) as {
-            pid: number;
-          }
-        ).pid;
+        const firstPid = await readFirstLaunchPid(harness.processLog);
         expect(() => process.kill(firstPid, 0)).toThrow();
       } finally {
         harness.releaseTurnTiming();
@@ -818,11 +807,7 @@ describe("OpenAI app-server startup", () => {
         "run.cancelled",
       ]);
 
-      const firstPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      const firstPid = await readFirstLaunchPid(harness.processLog);
       expect(() => process.kill(firstPid, 0)).toThrow();
 
       await expect(
@@ -883,11 +868,7 @@ describe("OpenAI app-server startup", () => {
       );
       void input.catch(() => {});
       await harness.runCancellationEntered;
-      const firstPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      const firstPid = await readFirstLaunchPid(harness.processLog);
       expect(() => process.kill(firstPid, 0)).toThrow();
 
       const cancellation = harness.backend.cancelActiveTurn(harness.context, "test.cancel");
@@ -924,11 +905,7 @@ describe("OpenAI app-server startup", () => {
       while (!(await Bun.file(harness.turnStartHeldMarker).exists())) {
         await Bun.sleep(1);
       }
-      const providerPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      const providerPid = await readFirstLaunchPid(harness.processLog);
       process.kill(providerPid, "SIGKILL");
 
       await expect(input).rejects.toThrow("OpenAi app-server exited");
@@ -1023,11 +1000,7 @@ describe("OpenAI app-server startup", () => {
       const cancellation = harness.backend.cancelActiveTurn(harness.context, "test.cancel");
       void cancellation.catch(() => {});
       await harness.cancellationRequestEntered;
-      const firstPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      const firstPid = await readFirstLaunchPid(harness.processLog);
       expect(() => process.kill(firstPid, 0)).toThrow();
       await expect(
         settlePromiseWithTimeout(cancellation, {
@@ -1091,11 +1064,7 @@ describe("OpenAI app-server startup", () => {
           { label: "OpenAI turn before failed cancellation cleanup", timeoutMs: 250 },
         ),
       ).resolves.toMatchObject({ status: "completed" });
-      childPid = (
-        JSON.parse((await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}") as {
-          pid: number;
-        }
-      ).pid;
+      childPid = await readFirstLaunchPid(harness.processLog);
       failNextStop = true;
 
       await expect(
