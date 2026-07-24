@@ -11,7 +11,9 @@ import {
   toModelEvents,
 } from "./acp-session-update-events";
 
-const ACP_USAGE_CONTRACT = "openai_total_with_cached_breakdown";
+// OpenCode's ACP usage reports fresh input tokens with cache read/write as
+// separate buckets (Anthropic-style), not an input total that includes them.
+const ACP_USAGE_CONTRACT = "anthropic_bucketed";
 
 export function toInitializeEvents(result: InitializeResponse): DriverEventInput[] {
   const events: DriverEventInput[] = [
@@ -152,26 +154,38 @@ export function normalizePromptUsage(raw: unknown): JsonObject | null {
     return null;
   }
 
-  const rawTotal = readNumber(raw, "totalTokens") ?? readNumber(raw, "total_tokens");
-  const rawInput = readNumber(raw, "inputTokens") ?? readNumber(raw, "input_tokens");
-  const rawOutput = readNumber(raw, "outputTokens") ?? readNumber(raw, "output_tokens");
-  const totalTokens =
-    rawTotal !== null && Number.isSafeInteger(rawTotal) && rawTotal >= 0 ? rawTotal : null;
-  const inputTokens =
-    rawInput !== null && Number.isSafeInteger(rawInput) && rawInput >= 0 ? rawInput : null;
-  const outputTokens =
-    rawOutput !== null && Number.isSafeInteger(rawOutput) && rawOutput >= 0 ? rawOutput : null;
+  const totalTokens = readTokenCount(raw, "totalTokens", "total_tokens");
+  const inputTokens = readTokenCount(raw, "inputTokens", "input_tokens");
+  const outputTokens = readTokenCount(raw, "outputTokens", "output_tokens");
+  const cachedReadTokens = readTokenCount(raw, "cachedReadTokens", "cached_read_tokens");
+  const cachedWriteTokens = readTokenCount(raw, "cachedWriteTokens", "cached_write_tokens");
+  const thoughtTokens = readTokenCount(raw, "thoughtTokens", "thought_tokens");
 
-  if (totalTokens === null && inputTokens === null && outputTokens === null) {
+  if (
+    totalTokens === null &&
+    inputTokens === null &&
+    outputTokens === null &&
+    cachedReadTokens === null &&
+    cachedWriteTokens === null
+  ) {
     return null;
   }
 
   return {
+    ...(cachedReadTokens === null ? {} : { cachedReadTokens }),
+    ...(cachedWriteTokens === null ? {} : { cachedWriteTokens }),
     ...(inputTokens === null ? {} : { inputTokens }),
     ...(outputTokens === null ? {} : { outputTokens }),
     raw,
     source: "prompt_response",
+    ...(thoughtTokens === null ? {} : { thoughtTokens }),
     ...(totalTokens === null ? {} : { totalTokens }),
     usageContract: ACP_USAGE_CONTRACT,
   };
+}
+
+function readTokenCount(raw: JsonObject, key: string, snakeCaseKey: string): number | null {
+  const value = readNumber(raw, key) ?? readNumber(raw, snakeCaseKey);
+
+  return value !== null && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
