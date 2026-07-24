@@ -76,7 +76,7 @@
     "test": "bun test",
     "test:coverage": "bun test --coverage",
     "test:live": "vp run build && vp run test:live:artifact",
-    "test:live:artifact": "AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=all bun test tests/driver-artifact-live.test.ts",
+    "test:live:artifact": "AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=all bun test tests/driver-artifact-live.test.ts tests/driver-artifact-mcp.test.ts",
     "test:live:anthropic": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=anthropic bun test tests/driver-artifact-live.test.ts",
     "test:live:openai": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=openai bun test tests/driver-artifact-live.test.ts",
     "test:live:opencode": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=opencode bun test tests/driver-artifact-live.test.ts",

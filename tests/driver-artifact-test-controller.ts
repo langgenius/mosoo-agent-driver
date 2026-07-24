@@ -1,13 +1,42 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-export interface DriverArtifactTestEvent {
-  readonly kind: string;
-  readonly payload: unknown;
-  readonly runId?: string;
-  readonly [key: string]: unknown;
+import type { DriverEvent } from "../src/protocol/events";
+import {
+  parseDriverCommandUpdateInput,
+  parseDriverCompletionInput,
+  parseDriverEventBatchInput,
+  parseDriverFailureInput,
+  parseDriverHeartbeatInput,
+  parseDriverHelloInput,
+  parseDriverLogBatchInput,
+  parseDriverNextCommandInput,
+  parseDriverReadyInput,
+  type DriverLogEntry,
+} from "../src/protocol/orpc";
+import type { DriverCapability } from "../src/runtime-command";
+import { PROCESS_TREE_OWNER_ENV } from "../src/runtimes/child-process";
+import {
+  AGENT_DRIVER_PROVIDER_REGISTRY,
+  createAgentDriverProviderCapabilities,
+} from "../src/runtimes/provider-registry";
+
+export type DriverArtifactTestEvent = DriverEvent;
+
+export function expectedDriverCapabilities(runtime: string): readonly DriverCapability[] {
+  const provider = AGENT_DRIVER_PROVIDER_REGISTRY.list().find(
+    (candidate) => candidate.runtime === runtime,
+  );
+  if (provider === undefined) {
+    throw new Error(`Missing provider descriptor for ${runtime}.`);
+  }
+  return createAgentDriverProviderCapabilities({
+    permissionRequestStatus: "supported",
+    provider,
+  });
 }
 
 export interface DriverArtifactTestCommandUpdate {
@@ -23,19 +52,35 @@ export interface DriverArtifactTestCommand {
   readonly [key: string]: unknown;
 }
 
+export interface DriverArtifactEventIngressGate {
+  readonly entered: Promise<DriverArtifactTestEvent>;
+  release(): void;
+}
+
 export interface DriverArtifactBootPayload extends Record<string, unknown> {
   readonly bootToken: string;
   readonly driverInstanceId: string;
+  readonly execution: {
+    readonly configRevision: {
+      readonly runId?: string | null | undefined;
+      readonly sessionId: string;
+      readonly [key: string]: unknown;
+    };
+    readonly [key: string]: unknown;
+  };
+  readonly runtime: string;
 }
 
 interface DriverArtifactTestControllerOptions {
   readonly artifactPath: string;
   readonly bootPayload: DriverArtifactBootPayload;
   readonly env?: NodeJS.ProcessEnv;
+  readonly expectedCapabilities?: readonly DriverCapability[] | undefined;
+  readonly forbiddenSecrets?: readonly string[] | undefined;
   readonly heartbeatIntervalMs?: number | undefined;
   readonly organizationPath: string;
   readonly rootPath: string;
-  readonly secret: string;
+  readonly secret?: string | undefined;
   readonly startTimeoutMs: number;
 }
 
@@ -43,6 +88,19 @@ interface DriverExit {
   readonly code: number | null;
   readonly error?: string;
   readonly signal: NodeJS.Signals | null;
+}
+
+interface DriverRunTerminal {
+  readonly error?: unknown;
+  readonly status: "completed" | "failed";
+}
+
+interface EventIngressGateState {
+  entered: boolean;
+  readonly enter: (event: DriverArtifactTestEvent) => void;
+  readonly predicate: (event: DriverArtifactTestEvent) => boolean;
+  readonly release: () => void;
+  readonly released: Promise<void>;
 }
 
 interface RpcRequest {
@@ -53,6 +111,29 @@ interface RpcRequest {
 
 const TERMINAL_COMMAND_STATUSES = new Set(["cancelled", "completed", "failed"]);
 const OUTPUT_LIMIT = 24_000;
+const FORBIDDEN_SECRET_ERROR = "Forbidden secret detected in packed driver traffic or output.";
+
+export class ForbiddenSecretScanner {
+  readonly #maxTailLength: number;
+  readonly #secrets: readonly string[];
+  #tail = "";
+
+  constructor(secrets: readonly string[]) {
+    this.#secrets = secrets;
+    this.#maxTailLength = Math.max(0, ...secrets.map((secret) => secret.length - 1));
+  }
+
+  scan(chunk: string): boolean {
+    const value = `${this.#tail}${chunk}`;
+    this.#tail = this.#maxTailLength === 0 ? "" : value.slice(-this.#maxTailLength);
+    return this.#secrets.some((secret) => value.includes(secret));
+  }
+}
+
+interface LinuxProcessIdentity {
+  readonly startTime: string;
+  readonly state: string;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -102,33 +183,167 @@ function timeoutAfter(timeoutMs: number): Promise<"timeout"> {
   return new Promise((resolve) => setTimeout(() => resolve("timeout"), timeoutMs));
 }
 
+function directChildProcessIds(parentPid: number): number[] {
+  const result = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8" });
+
+  if (result.error !== undefined || result.status !== 0) {
+    throw new Error(
+      `Failed to inspect packed driver children: ${result.error?.message ?? result.stderr}`,
+    );
+  }
+
+  return result.stdout.split("\n").flatMap((line) => {
+    const [pidText, parentText] = line.trim().split(/\s+/);
+    const pid = Number(pidText);
+    const candidateParentPid = Number(parentText);
+    return candidateParentPid === parentPid && Number.isSafeInteger(pid) && pid > 0 ? [pid] : [];
+  });
+}
+
+function readLinuxProcessIdentity(pid: number): LinuxProcessIdentity | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const state = fields[0];
+    const startTime = fields[19];
+
+    if (state === undefined || state.length !== 1 || startTime === undefined) {
+      throw new Error(`Malformed /proc/${pid}/stat.`);
+    }
+
+    return { startTime, state };
+  } catch {
+    if (!existsSync(`/proc/${pid}`)) {
+      return null;
+    }
+    throw new Error(`Could not inspect live process ${pid}.`);
+  }
+}
+
+function readLinuxProcessUid(pid: number, identity: LinuxProcessIdentity): number | null {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    if (/^Kthread:\s+1$/m.test(status)) {
+      return null;
+    }
+    const match = /^Uid:\s+(\d+)/m.exec(status);
+    if (match === null) {
+      throw new Error(`Missing UID in /proc/${pid}/status.`);
+    }
+    const uid = Number(match[1]);
+    if (!Number.isSafeInteger(uid) || uid < 0) {
+      throw new Error(`Invalid UID in /proc/${pid}/status.`);
+    }
+    return uid;
+  } catch {
+    const current = readLinuxProcessIdentity(pid);
+    if (current === null || current.startTime !== identity.startTime) {
+      return null;
+    }
+    throw new Error(`Could not inspect the UID of live process ${pid}.`);
+  }
+}
+
+function readProcessFile(
+  pid: number,
+  identity: LinuxProcessIdentity,
+  file: "cmdline" | "environ",
+): string | null {
+  let value: string;
+
+  try {
+    value = readFileSync(`/proc/${pid}/${file}`, "utf8");
+  } catch {
+    const current = readLinuxProcessIdentity(pid);
+    if (current === null || current.startTime !== identity.startTime) {
+      return null;
+    }
+    throw new Error(`Could not inspect /proc/${pid}/${file} for a live process.`);
+  }
+
+  const current = readLinuxProcessIdentity(pid);
+  return current !== null && current.startTime === identity.startTime ? value : null;
+}
+
+function readProcessEnvironmentVariable(
+  pid: number,
+  identity: LinuxProcessIdentity,
+  name: string,
+): string | null {
+  const environment = readProcessFile(pid, identity, "environ");
+  if (environment === null) {
+    return null;
+  }
+  const entry = environment.split("\0").find((candidate) => candidate.startsWith(`${name}=`));
+  const value = entry?.slice(name.length + 1) ?? "";
+  return value.length > 0 ? value : null;
+}
+
+function readSameUserLinuxIdentity(pid: number): LinuxProcessIdentity | null {
+  const identity = readLinuxProcessIdentity(pid);
+  if (identity === null || identity.state === "Z" || identity.state === "X") {
+    return null;
+  }
+  const currentUid = process.getuid?.();
+  if (currentUid === undefined) {
+    throw new Error("Linux process inspection requires a POSIX user ID.");
+  }
+  return readLinuxProcessUid(pid, identity) === currentUid ? identity : null;
+}
+
 export class DriverArtifactTestController {
   readonly #bootPayload: DriverArtifactBootPayload;
   readonly #commands: DriverArtifactTestCommand[] = [];
   readonly #commandUpdates: DriverArtifactTestCommandUpdate[] = [];
+  readonly #eventIngressGates = new Set<EventIngressGateState>();
+  readonly #eventIngressObservers = new Set<(event: DriverArtifactTestEvent) => void>();
   readonly #events: DriverArtifactTestEvent[] = [];
+  readonly #expectedCapabilities: readonly DriverCapability[] | undefined;
+  readonly #forbiddenSecrets: readonly string[];
   readonly #heartbeatIntervalMs: number;
-  readonly #logs: Record<string, unknown>[] = [];
+  readonly #logs: DriverLogEntry[] = [];
+  readonly #knownRunIds = new Set<string>();
   readonly #organizationPath: string;
-  readonly #runTerminals: { error?: unknown; status: "completed" | "failed" }[] = [];
-  readonly #secret: string;
+  readonly #runTerminalIngressObservers = new Set<(terminal: DriverRunTerminal) => void>();
+  readonly #runTerminals: DriverRunTerminal[] = [];
+  readonly #runtimeId: string;
   readonly #server: Bun.Server<undefined>;
+  readonly #sessionId: string;
+  readonly #stderrSecretScanner: ForbiddenSecretScanner;
+  readonly #stdoutSecretScanner: ForbiddenSecretScanner;
   #child: ChildProcess | null = null;
   #exitPromise: Promise<DriverExit> | null = null;
   #exitResult: DriverExit | null = null;
+  #forbiddenSecretDetected = false;
   #heartbeatsFail = false;
+  #hello = false;
   #nextEventSeq = 0;
   #protocolError: string | null = null;
   #ready = false;
   #stderr = "";
   #stdout = "";
   #socket: Bun.ServerWebSocket<undefined> | null = null;
+  readonly #terminalRunIds = new Set<string>();
 
   private constructor(options: DriverArtifactTestControllerOptions) {
     this.#bootPayload = structuredClone(options.bootPayload);
+    this.#expectedCapabilities =
+      options.expectedCapabilities === undefined
+        ? undefined
+        : structuredClone(options.expectedCapabilities);
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60_000;
     this.#organizationPath = options.organizationPath;
-    this.#secret = options.secret;
+    this.#runtimeId = options.bootPayload.runtime;
+    this.#forbiddenSecrets = [
+      ...new Set([options.secret, ...(options.forbiddenSecrets ?? [])].filter(Boolean)),
+    ] as string[];
+    this.#stderrSecretScanner = new ForbiddenSecretScanner(this.#forbiddenSecrets);
+    this.#stdoutSecretScanner = new ForbiddenSecretScanner(this.#forbiddenSecrets);
+    this.#sessionId = options.bootPayload.execution.configRevision.sessionId;
+    const bootRunId = options.bootPayload.execution.configRevision.runId;
+    if (typeof bootRunId === "string" && bootRunId.length > 0) {
+      this.#knownRunIds.add(bootRunId);
+    }
 
     this.#server = Bun.serve({
       hostname: "127.0.0.1",
@@ -153,7 +368,9 @@ export class DriverArtifactTestController {
             this.#socket = null;
           }
         },
-        message: (socket, message) => this.#handleMessage(socket, message),
+        message: (socket, message) => {
+          void this.#handleMessage(socket, message);
+        },
         open: (socket) => {
           this.#socket = socket;
         },
@@ -172,7 +389,7 @@ export class DriverArtifactTestController {
       return controller;
     } catch (error) {
       const diagnostics = controller.diagnostics();
-      await controller.dispose();
+      await controller.dispose().catch(() => {});
       throw new Error(
         `Packed driver failed to become ready: ${error instanceof Error ? error.message : String(error)}\n${diagnostics}`,
         { cause: error },
@@ -188,7 +405,48 @@ export class DriverArtifactTestController {
     return this.#commandUpdates;
   }
 
+  gateEventIngress(
+    predicate: (event: DriverArtifactTestEvent) => boolean,
+  ): DriverArtifactEventIngressGate {
+    const entered = Promise.withResolvers<DriverArtifactTestEvent>();
+    const released = Promise.withResolvers<void>();
+    let active = true;
+    const gate: EventIngressGateState = {
+      entered: false,
+      enter: entered.resolve,
+      predicate,
+      release: () => {
+        if (!active) {
+          return;
+        }
+        active = false;
+        this.#eventIngressGates.delete(gate);
+        released.resolve();
+      },
+      released: released.promise,
+    };
+    this.#eventIngressGates.add(gate);
+    return { entered: entered.promise, release: gate.release };
+  }
+
+  observeEventIngress(observer: (event: DriverArtifactTestEvent) => void): () => void {
+    this.#eventIngressObservers.add(observer);
+    return () => this.#eventIngressObservers.delete(observer);
+  }
+
+  observeRunTerminalIngress(observer: (terminal: DriverRunTerminal) => void): () => void {
+    this.#runTerminalIngressObservers.add(observer);
+    return () => this.#runTerminalIngressObservers.delete(observer);
+  }
+
   enqueue(command: DriverArtifactTestCommand): void {
+    if (command.kind === "input.start") {
+      const runId = command["runId"];
+      if (typeof runId !== "string" || runId.length === 0) {
+        throw new TypeError("input.start runId must be a non-empty string.");
+      }
+      this.#knownRunIds.add(runId);
+    }
     this.#commands.push(structuredClone(command));
   }
 
@@ -197,15 +455,90 @@ export class DriverArtifactTestController {
       throw new Error("Packed driver control socket is not connected.");
     }
 
-    this.#socket.close(1011, "live.control.disconnected");
+    void this.#server.stop(true);
   }
 
   failHeartbeats(): void {
     this.#heartbeatsFail = true;
   }
 
+  directChildProcessIds(): number[] {
+    const pid = this.#child?.pid;
+
+    if (pid === undefined) {
+      throw new Error("Packed driver process ID is unavailable.");
+    }
+
+    return directChildProcessIds(pid);
+  }
+
+  providerProcessIds(): number[] {
+    return this.providerProcessIdsForOwners(this.providerOwnerIds());
+  }
+
+  providerOwnerIds(): string[] {
+    if (process.platform !== "linux") {
+      throw new Error("Provider process ownership checks require Linux /proc.");
+    }
+
+    return [
+      ...new Set(
+        this.directChildProcessIds().flatMap((pid) => {
+          const identity = readSameUserLinuxIdentity(pid);
+          if (identity === null) {
+            return [];
+          }
+          const ownerId = readProcessEnvironmentVariable(pid, identity, PROCESS_TREE_OWNER_ENV);
+          return ownerId === null ? [] : [ownerId];
+        }),
+      ),
+    ];
+  }
+
+  providerProcessIdsForOwners(ownerIds: readonly string[]): number[] {
+    if (process.platform !== "linux") {
+      throw new Error("Provider process ownership checks require Linux /proc.");
+    }
+
+    const owners = new Set(ownerIds);
+    return readdirSync("/proc").flatMap((entry) => {
+      const pid = Number(entry);
+      if (!Number.isSafeInteger(pid) || pid < 1) {
+        return [];
+      }
+      const identity = readSameUserLinuxIdentity(pid);
+      if (identity === null) {
+        return [];
+      }
+      const ownerId = readProcessEnvironmentVariable(pid, identity, PROCESS_TREE_OWNER_ENV);
+      return ownerId !== null && owners.has(ownerId) ? [pid] : [];
+    });
+  }
+
+  markedProcessIds(environmentName: string, value: string): number[] {
+    if (process.platform !== "linux") {
+      throw new Error("Marked process checks require Linux /proc.");
+    }
+
+    return readdirSync("/proc").flatMap((entry) => {
+      const pid = Number(entry);
+      if (!Number.isSafeInteger(pid) || pid < 1) {
+        return [];
+      }
+
+      const identity = readSameUserLinuxIdentity(pid);
+      if (identity === null) {
+        return [];
+      }
+      const environmentMatches =
+        readProcessEnvironmentVariable(pid, identity, environmentName) === value;
+      const commandMatches = readProcessFile(pid, identity, "cmdline")?.includes(value) ?? false;
+      return environmentMatches || commandMatches ? [pid] : [];
+    });
+  }
+
   crashDriver(): void {
-    this.#signalDriver("SIGKILL", true);
+    this.#signalDriver("SIGKILL", false);
   }
 
   signalDriver(signal: NodeJS.Signals): void {
@@ -269,10 +602,11 @@ export class DriverArtifactTestController {
   }
 
   async stopDriver(commandId: string, timeoutMs: number): Promise<void> {
+    const terminalIndex = this.#runTerminals.length;
     this.enqueue({ commandId, kind: "session.stop", reason: "live.test.completed" });
     const [update, terminal] = await Promise.all([
       this.waitForCommandTerminal(commandId, timeoutMs),
-      this.waitForRunTerminal(timeoutMs),
+      this.waitForRunTerminal(timeoutMs, terminalIndex),
     ]);
 
     if (update.status !== "completed" || terminal.status !== "completed") {
@@ -329,19 +663,22 @@ export class DriverArtifactTestController {
   }
 
   async waitForExit(timeoutMs: number): Promise<DriverExit> {
-    if (this.#exitResult !== null) {
-      return this.#exitResult;
-    }
+    const deadline = Date.now() + timeoutMs;
+    this.#throwProtocolError("packed driver exit");
     if (this.#exitPromise === null) {
       throw new Error("Packed driver has not started.");
     }
 
-    const result = await Promise.race([this.#exitPromise, timeoutAfter(timeoutMs)]);
+    const result =
+      this.#exitResult ??
+      (await Promise.race([this.#exitPromise, timeoutAfter(Math.max(0, deadline - Date.now()))]));
 
     if (result === "timeout") {
       throw new Error(`Timed out waiting for packed driver exit.\n${this.diagnostics()}`);
     }
 
+    await this.#waitForSocketDrain(deadline);
+    this.#throwProtocolError("packed driver exit");
     return result;
   }
 
@@ -354,6 +691,7 @@ export class DriverArtifactTestController {
           runId: event.runId ?? null,
         })),
         exit: this.#exitResult,
+        forbiddenSecretDetected: this.#forbiddenSecretDetected,
         logs: this.#logs.slice(-12).map((entry) => ({
           level: entry["level"] ?? null,
           message: entry["message"] ?? null,
@@ -367,25 +705,30 @@ export class DriverArtifactTestController {
       2,
     );
 
-    return this.#secret.length === 0
-      ? diagnostics
-      : diagnostics.replaceAll(this.#secret, "[redacted]");
+    return this.#redact(diagnostics);
   }
 
   async dispose(): Promise<void> {
+    for (const gate of this.#eventIngressGates) {
+      gate.release();
+    }
+    this.#eventIngressObservers.clear();
+    this.#runTerminalIngressObservers.clear();
+
     const child = this.#child;
 
     if (child !== null && this.#exitResult === null) {
       child.kill("SIGTERM");
-      await this.waitForExit(5_000).catch(() => undefined);
+      await this.#waitForChildExit(5_000);
 
       if (this.#exitResult === null) {
         this.#signalDriver("SIGKILL", true);
-        await this.waitForExit(5_000).catch(() => undefined);
+        await this.#waitForChildExit(5_000);
       }
     }
 
     await this.#server.stop(true);
+    this.#throwProtocolError("packed driver disposal");
   }
 
   async waitUntilReady(timeoutMs: number): Promise<void> {
@@ -424,26 +767,44 @@ export class DriverArtifactTestController {
       };
 
       child.once("error", (error) => finish({ code: null, error: error.message, signal: null }));
-      child.once("exit", (code, signal) => finish({ code, signal }));
+      child.once("close", (code, signal) => finish({ code, signal }));
     });
     child.stdout?.on("data", (chunk: Buffer) => {
-      this.#stdout = this.#appendOutput(this.#stdout, chunk.toString("utf8"));
+      this.#stdout = this.#appendOutput(
+        this.#stdout,
+        chunk.toString("utf8"),
+        this.#stdoutSecretScanner,
+      );
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      this.#stderr = this.#appendOutput(this.#stderr, chunk.toString("utf8"));
+      this.#stderr = this.#appendOutput(
+        this.#stderr,
+        chunk.toString("utf8"),
+        this.#stderrSecretScanner,
+      );
     });
   }
 
-  #appendOutput(current: string, chunk: string): string {
-    const redacted =
-      this.#secret.length === 0 ? chunk : chunk.replaceAll(this.#secret, "[redacted]");
-    return `${current}${redacted}`.slice(-OUTPUT_LIMIT);
+  #appendOutput(current: string, chunk: string, scanner: ForbiddenSecretScanner): string {
+    if (scanner.scan(chunk)) {
+      this.#recordForbiddenSecret();
+    }
+    return this.#redact(`${current}${chunk}`).slice(-OUTPUT_LIMIT);
   }
 
-  #handleMessage(socket: Bun.ServerWebSocket<undefined>, message: string | Buffer): void {
+  async #handleMessage(
+    socket: Bun.ServerWebSocket<undefined>,
+    message: string | Buffer,
+  ): Promise<void> {
     let requestId: number | string | null = null;
 
     try {
+      const rawMessage = message.toString();
+      if (this.#containsForbiddenSecret(rawMessage)) {
+        this.#recordForbiddenSecret();
+        throw new Error(FORBIDDEN_SECRET_ERROR);
+      }
+
       const request = readRpcRequest(message);
 
       if (request === null) {
@@ -453,6 +814,8 @@ export class DriverArtifactTestController {
       requestId = request.id;
 
       if (request.path === "/driver/heartbeat" && this.#heartbeatsFail) {
+        const heartbeat = parseDriverHeartbeatInput(request.input);
+        this.#assertDriverPid(heartbeat.pid);
         socket.send(
           JSON.stringify({
             i: request.id,
@@ -462,29 +825,52 @@ export class DriverArtifactTestController {
         return;
       }
 
-      const output = this.#handleRpc(request.path, request.input);
+      const output = await this.#handleRpc(request.path, request.input);
       socket.send(JSON.stringify({ i: request.id, p: { b: { json: output } } }));
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      this.#protocolError = messageText;
+      this.#protocolError ??= messageText;
 
       if (requestId !== null) {
-        socket.send(
-          JSON.stringify({
-            i: requestId,
-            p: { b: { json: { message: messageText } }, s: 500 },
-          }),
-        );
+        try {
+          socket.send(
+            JSON.stringify({
+              i: requestId,
+              p: { b: { json: { message: messageText } }, s: 500 },
+            }),
+          );
+        } catch {
+          // The request already failed; a closed test socket cannot accept its error response.
+        }
       }
     }
   }
 
-  #handleRpc(path: string, input: Record<string, unknown>): unknown {
+  async #handleRpc(path: string, input: Record<string, unknown>): Promise<unknown> {
     switch (path) {
       case "/driver/hello": {
-        const capabilities = Array.isArray(input["capabilities"]) ? input["capabilities"] : [];
+        const hello = parseDriverHelloInput(input);
+        this.#assertDriverPid(hello.pid);
+        if (hello.runtime !== this.#runtimeId) {
+          throw new Error(`Driver hello used unexpected runtime ${hello.runtime}.`);
+        }
+        if (
+          this.#expectedCapabilities !== undefined &&
+          JSON.stringify(
+            hello.capabilities.toSorted((left, right) => left.id.localeCompare(right.id)),
+          ) !==
+            JSON.stringify(
+              this.#expectedCapabilities.toSorted((left, right) => left.id.localeCompare(right.id)),
+            )
+        ) {
+          throw new Error("Driver hello capabilities did not match the expected runtime contract.");
+        }
+        if (this.#hello) {
+          throw new Error("Driver emitted more than one hello request.");
+        }
+        this.#hello = true;
         return {
-          acceptedCapabilities: capabilities,
+          acceptedCapabilities: hello.capabilities,
           connectionId: "artifact-test-connection",
           driverInstanceId: this.#bootPayload.driverInstanceId,
           heartbeatIntervalMs: this.#heartbeatIntervalMs,
@@ -498,61 +884,128 @@ export class DriverArtifactTestController {
         };
       }
       case "/driver/ready": {
+        const ready = parseDriverReadyInput(input);
+        this.#assertDriverInstanceId(ready.driverInstanceId);
+        this.#assertDriverPid(ready.pid);
+        if (!this.#hello) {
+          throw new Error("Driver emitted ready before hello.");
+        }
+        if (this.#ready) {
+          throw new Error("Driver emitted more than one ready request.");
+        }
         this.#ready = true;
         return { ok: true };
       }
       case "/driver/heartbeat": {
+        const heartbeat = parseDriverHeartbeatInput(input);
+        this.#assertDriverPid(heartbeat.pid);
         return { heartbeatCount: 1, ok: true };
       }
       case "/driver/pushEvents": {
-        const envelopes = input["events"];
+        const batch = parseDriverEventBatchInput(input);
+        this.#assertDriverInstanceId(batch.driverInstanceId);
 
-        if (!Array.isArray(envelopes)) {
-          throw new TypeError("driver.pushEvents events must be an array.");
-        }
-
-        const accepted = envelopes.map((value) => {
-          const envelope = readRecord(value, "driver event envelope");
-          const event = readRecord(envelope["event"], "driver event");
-          const kind = readString(event, "kind", "driver event");
-          this.#events.push(event as DriverArtifactTestEvent);
+        const ingressWaits = new Set<Promise<void>>();
+        const accepted = batch.events.map((envelope) => {
+          const { event } = envelope;
+          if (event.driverInstanceId !== this.#bootPayload.driverInstanceId) {
+            throw new Error(
+              `Driver event ${event.kind} used unexpected driver instance ${String(event.driverInstanceId)}.`,
+            );
+          }
+          if (event.sessionId !== this.#sessionId) {
+            throw new Error(
+              `Driver event ${event.kind} used unexpected session ${event.sessionId}.`,
+            );
+          }
+          if (event.runtimeId !== this.#runtimeId) {
+            throw new Error(
+              `Driver event ${event.kind} used unexpected runtime ${String(event.runtimeId)}.`,
+            );
+          }
+          if (event.runId !== undefined && !this.#knownRunIds.has(event.runId)) {
+            throw new Error(`Driver event ${event.kind} used unknown run ${event.runId}.`);
+          }
+          if (event.runId !== undefined && this.#terminalRunIds.has(event.runId)) {
+            throw new Error(
+              `Driver emitted ${event.kind} after the terminal event for run ${event.runId}.`,
+            );
+          }
+          this.#events.push(envelope.event);
+          for (const observer of this.#eventIngressObservers) {
+            observer(envelope.event);
+          }
+          for (const gate of this.#eventIngressGates) {
+            if (!gate.entered && gate.predicate(envelope.event)) {
+              gate.entered = true;
+              gate.enter(envelope.event);
+              ingressWaits.add(gate.released);
+            }
+          }
+          if (
+            event.runId !== undefined &&
+            (event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed")
+          ) {
+            this.#terminalRunIds.add(event.runId);
+          }
           this.#nextEventSeq += 1;
           return {
-            eventId: typeof envelope["eventId"] === "string" ? envelope["eventId"] : undefined,
+            eventId: envelope.eventId,
             seq: this.#nextEventSeq,
-            type: kind,
+            type: envelope.event.kind,
           };
         });
+        await Promise.all(ingressWaits);
         return { accepted };
       }
       case "/driver/pushLogs": {
-        const logs = input["logs"];
-
-        if (!Array.isArray(logs)) {
-          throw new TypeError("driver.pushLogs logs must be an array.");
-        }
-
-        this.#logs.push(...logs.filter(isRecord));
+        const batch = parseDriverLogBatchInput(input);
+        this.#assertDriverInstanceId(batch.driverInstanceId);
+        this.#logs.push(...batch.logs);
         return { ok: true };
       }
       case "/driver/commandUpdate": {
+        const update = parseDriverCommandUpdateInput(input);
+        this.#assertDriverInstanceId(update.driverInstanceId);
         this.#commandUpdates.push({
-          commandId: readString(input, "commandId", "driver command update"),
-          ...(input["error"] === undefined ? {} : { error: input["error"] }),
-          ...(input["result"] === undefined ? {} : { result: input["result"] }),
-          status: readString(input, "status", "driver command update"),
+          commandId: update.commandId,
+          ...(update.error === undefined ? {} : { error: update.error }),
+          ...(update.result === undefined ? {} : { result: update.result }),
+          status: update.status,
         });
         return { ok: true };
       }
       case "/driver/completeRun": {
-        this.#runTerminals.push({ status: "completed" });
+        const completion = parseDriverCompletionInput(input);
+        this.#assertDriverInstanceId(completion.driverInstanceId);
+        if (this.#runTerminals.length > 0) {
+          throw new Error("Driver emitted more than one control-plane run terminal.");
+        }
+        const terminal = { status: "completed" } as const;
+        this.#runTerminals.push(terminal);
+        for (const observer of this.#runTerminalIngressObservers) {
+          observer(terminal);
+        }
         return { ok: true };
       }
       case "/driver/failRun": {
-        this.#runTerminals.push({ error: input["error"], status: "failed" });
+        const failure = parseDriverFailureInput(input);
+        this.#assertDriverInstanceId(failure.driverInstanceId);
+        if (this.#runTerminals.length > 0) {
+          throw new Error("Driver emitted more than one control-plane run terminal.");
+        }
+        const terminal = { error: failure.error, status: "failed" } as const;
+        this.#runTerminals.push(terminal);
+        for (const observer of this.#runTerminalIngressObservers) {
+          observer(terminal);
+        }
         return { ok: true };
       }
       case "/driverInstance/nextCommand": {
+        const request = parseDriverNextCommandInput(input);
+        this.#assertDriverInstanceId(request.driverInstanceId);
         return { command: this.#commands.shift() ?? null };
       }
       default: {
@@ -561,19 +1014,46 @@ export class DriverArtifactTestController {
     }
   }
 
+  #assertDriverInstanceId(driverInstanceId: string): void {
+    if (driverInstanceId !== this.#bootPayload.driverInstanceId) {
+      throw new Error(`Driver RPC used unexpected driver instance ${driverInstanceId}.`);
+    }
+  }
+
+  #assertDriverPid(pid: number): void {
+    if (pid !== this.#child?.pid) {
+      throw new Error(`Driver RPC used unexpected process id ${pid}.`);
+    }
+  }
+
+  #containsForbiddenSecret(value: string): boolean {
+    return this.#forbiddenSecrets.some((secret) => value.includes(secret));
+  }
+
+  #recordForbiddenSecret(): void {
+    this.#forbiddenSecretDetected = true;
+    this.#protocolError ??= FORBIDDEN_SECRET_ERROR;
+  }
+
+  #redact(value: string): string {
+    let redacted = value;
+    for (const secret of this.#forbiddenSecrets.toSorted(
+      (left, right) => right.length - left.length,
+    )) {
+      redacted = redacted.replaceAll(secret, "[redacted]");
+    }
+    return redacted;
+  }
+
   async #waitFor<T>(probe: () => T | undefined, label: string, timeoutMs: number): Promise<T> {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
+      this.#throwProtocolError(label);
       const value = probe();
 
       if (value !== undefined) {
         return value;
-      }
-      if (this.#protocolError !== null) {
-        throw new Error(
-          `Driver protocol failed while waiting for ${label}: ${this.#protocolError}.`,
-        );
       }
       if (this.#exitResult !== null) {
         throw new Error(
@@ -585,6 +1065,37 @@ export class DriverArtifactTestController {
     }
 
     throw new Error(`Timed out waiting for ${label}.\n${this.diagnostics()}`);
+  }
+
+  #throwProtocolError(label: string): void {
+    if (this.#protocolError !== null) {
+      throw new Error(`Driver protocol failed while waiting for ${label}: ${this.#protocolError}.`);
+    }
+  }
+
+  async #waitForChildExit(timeoutMs: number): Promise<void> {
+    if (this.#exitResult !== null || this.#exitPromise === null) {
+      return;
+    }
+    await Promise.race([this.#exitPromise, timeoutAfter(timeoutMs)]);
+  }
+
+  async #waitForSocketDrain(deadline: number): Promise<void> {
+    while (true) {
+      this.#throwProtocolError("packed driver control socket drain");
+      if (this.#socket === null) {
+        await Bun.sleep(0);
+        if (this.#socket === null) {
+          return;
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting for packed driver control socket drain.\n${this.diagnostics()}`,
+        );
+      }
+      await Bun.sleep(Math.min(10, deadline - Date.now()));
+    }
   }
 
   waitForRunTerminal(
