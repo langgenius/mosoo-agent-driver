@@ -16,6 +16,7 @@ import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
+  releaseLinuxProcessMarker,
   signalBoundProcessTree,
   signalLinuxProcessMarker,
   spawnLinuxProcessTreeWatchdog,
@@ -306,7 +307,7 @@ export class OpenAiAppServerClient {
         env,
         stdio: ["pipe", "pipe", "pipe"],
       });
-      const target = bindSpawnedProcess(child);
+      const target = bindSpawnedProcess(child, process.platform, processTree);
 
       this.#process = child;
       this.#processTarget = target;
@@ -325,6 +326,7 @@ export class OpenAiAppServerClient {
         await leaderClosed.promise;
         const supervision = await supervisionReady.promise;
         await awaitProcessTreeCleanup(supervision.cleanup, processTree.marker);
+        this.#releaseProcessTreeMarker(processTree.marker);
       })();
       void processClosed.catch(() => {});
       this.#processClosed = processClosed;
@@ -625,6 +627,7 @@ export class OpenAiAppServerClient {
       if (processClosed === null) {
         signalLinuxProcessMarker(processTreeMarker, "SIGKILL");
         await waitForLinuxProcessMarkerExit(processTreeMarker, APP_SERVER_KILL_TIMEOUT_MS);
+        this.#releaseProcessTreeMarker(processTreeMarker);
         return;
       }
 
@@ -659,6 +662,7 @@ export class OpenAiAppServerClient {
           this.#processCleanupFailureReported = true;
           throw terminated.error;
         }
+        this.#releaseProcessTreeMarker(processTreeMarker);
         return;
       }
 
@@ -672,6 +676,13 @@ export class OpenAiAppServerClient {
       }
     } finally {
       signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  #releaseProcessTreeMarker(marker: string): void {
+    releaseLinuxProcessMarker(marker);
+    if (this.#processTreeMarker === marker) {
+      this.#processTreeMarker = null;
     }
   }
 

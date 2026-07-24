@@ -12,6 +12,7 @@ import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
   hasBoundProcessRootExited,
+  releaseLinuxProcessMarker,
   signalBoundProcessTree,
   signalLinuxProcessMarker,
   spawnLinuxProcessTreeWatchdog,
@@ -76,7 +77,7 @@ export async function startAcpAgentProcess(
     env: processTree.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  const target = bindSpawnedProcess(agentProcess);
+  const target = bindSpawnedProcess(agentProcess, process.platform, processTree);
   const supervision: AcpAgentProcessSupervision = {
     cleanupFailureReported: false,
     failure: null,
@@ -201,32 +202,39 @@ export async function stopAcpAgentProcess(
     const exitTimeoutMs = Math.min(ACP_AGENT_EXIT_TIMEOUT_MS, remainingMs(deadline));
     const exited = await waitForChildProcessExit(agentProcess, exitTimeoutMs);
 
-    if (exited) {
-      signalAcpAgentMarker(agentProcess, "SIGKILL");
-      await waitForAcpAgentCleanup(agentProcess, deadline);
-      return;
-    }
-
-    context.logger.warn("driver.acp.agent.exit.timed_out", {
-      reason,
-      timeoutMs: exitTimeoutMs,
-    });
-    signalAcpAgentProcess(agentProcess, "SIGKILL");
-    const forceKillTimeoutMs = Math.min(ACP_AGENT_FORCE_KILL_TIMEOUT_MS, remainingMs(deadline));
-    const forceExited = await waitForChildProcessExit(agentProcess, forceKillTimeoutMs);
-
-    if (!forceExited) {
-      context.logger.warn("driver.acp.agent.force_exit.timed_out", {
+    if (!exited) {
+      context.logger.warn("driver.acp.agent.exit.timed_out", {
         reason,
-        timeoutMs: forceKillTimeoutMs,
+        timeoutMs: exitTimeoutMs,
       });
-      throw new Error("ACP agent process did not exit after force kill.");
+      signalAcpAgentProcess(agentProcess, "SIGKILL");
+      const forceKillTimeoutMs = Math.min(ACP_AGENT_FORCE_KILL_TIMEOUT_MS, remainingMs(deadline));
+      const forceExited = await waitForChildProcessExit(agentProcess, forceKillTimeoutMs);
+
+      if (!forceExited) {
+        context.logger.warn("driver.acp.agent.force_exit.timed_out", {
+          reason,
+          timeoutMs: forceKillTimeoutMs,
+        });
+        throw new Error("ACP agent process did not exit after force kill.");
+      }
     }
     signalAcpAgentMarker(agentProcess, "SIGKILL");
     await waitForAcpAgentCleanup(agentProcess, deadline);
+    releaseAcpAgentProcessSupervision(agentProcess);
   } finally {
     signal?.removeEventListener("abort", onAbort);
   }
+}
+
+function releaseAcpAgentProcessSupervision(agentProcess: AcpAgentProcess): void {
+  const supervision = agentProcessSupervision.get(agentProcess);
+  if (supervision === undefined) {
+    return;
+  }
+  releaseLinuxProcessMarker(supervision.marker);
+  agentProcessCloseTasks.delete(agentProcess);
+  agentProcessSupervision.delete(agentProcess);
 }
 
 function signalAcpAgentProcess(agentProcess: AcpAgentProcess, signal: NodeJS.Signals): boolean {

@@ -43,7 +43,7 @@ function readSessionId(pid: number): number {
 }
 
 describe.skipIf(process.platform !== "linux")("ACP process supervision", () => {
-  test("kills agent and terminal trees across nested sessions when the driver is SIGKILLed", async () => {
+  test("kills agent and terminal trees after a provider clears its environment and the driver is SIGKILLed", async () => {
     const directory = await mkdtemp(join(tmpdir(), "driver-acp-supervision-"));
     const paths = {
       agentRoot: join(directory, "agent-root.pid"),
@@ -55,13 +55,7 @@ describe.skipIf(process.platform !== "linux")("ACP process supervision", () => {
     };
     const agentNested = `echo $$ > ${paths.agentShell}; sleep 30 & echo $! > ${paths.agentWorker}; wait`;
     const terminalNested = `echo $$ > ${paths.terminalShell}; sleep 30 & echo $! > ${paths.terminalWorker}; wait`;
-    const agentSource = `
-import { spawn } from "node:child_process";
-spawn("/usr/bin/setsid", ["/bin/sh", "-c", ${JSON.stringify(agentNested)}], {
-  stdio: "ignore",
-});
-setInterval(() => {}, 1_000);
-`;
+    const agentSource = `exec /usr/bin/env -i PATH=/usr/bin:/bin /bin/sh -c '${agentNested}'`;
     const terminalSource = `
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
@@ -85,8 +79,8 @@ const payload = {
     },
   },
 };
-process.env.MOSOO_ACP_FALLBACK_COMMAND = process.execPath;
-process.env.MOSOO_ACP_FALLBACK_ARGS = JSON.stringify(["-e", ${JSON.stringify(agentSource)}]);
+process.env.MOSOO_ACP_FALLBACK_COMMAND = "/bin/sh";
+process.env.MOSOO_ACP_FALLBACK_ARGS = JSON.stringify(["-c", ${JSON.stringify(agentSource)}]);
 const agent = await startAcpAgentProcess(
   context,
   payload,
@@ -130,11 +124,20 @@ setInterval(() => {}, 1_000);
         (pid) => pids.add(pid),
       );
 
+      expect(agentShell).toBe(agentRoot);
       expect(readSessionId(agentShell)).toBe(agentShell);
-      expect(readSessionId(agentShell)).not.toBe(readSessionId(agentRoot));
       expect(readSessionId(terminalShell)).toBe(terminalShell);
       expect(readSessionId(terminalShell)).not.toBe(readSessionId(terminalRoot));
-      await Bun.sleep(100);
+      const clearedDeadline = Date.now() + 3_000;
+      let agentEnvironment = readFileSync(`/proc/${agentRoot}/environ`, "utf8");
+      while (
+        agentEnvironment.includes("MOSOO_PROCESS_TREE_OWNER_ID=") &&
+        Date.now() < clearedDeadline
+      ) {
+        await Bun.sleep(20);
+        agentEnvironment = readFileSync(`/proc/${agentRoot}/environ`, "utf8");
+      }
+      expect(agentEnvironment).not.toContain("MOSOO_PROCESS_TREE_OWNER_ID=");
 
       process.kill(-helperPid!, "SIGKILL");
       await Promise.all([...pids].map(expectExited));

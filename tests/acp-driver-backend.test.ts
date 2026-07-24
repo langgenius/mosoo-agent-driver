@@ -69,7 +69,6 @@ const handle = (message) => {
 
   appendFileSync(logPath, message.method + "\n");
   if (message.method === "session/cancel" && pendingPromptId !== null) {
-    send({ id: pendingPromptId, jsonrpc: "2.0", result: { stopReason: "cancelled" } });
     if (latePidPath && process.env.TEST_SPAWN_LATE_CHILD === "1") {
       const child = spawn("/usr/bin/setsid", [process.execPath, "-e", "setInterval(() => {}, 1000)"], {
         detached: true,
@@ -78,6 +77,7 @@ const handle = (message) => {
       appendFileSync(latePidPath, String(child.pid) + "\n");
       child.unref();
     }
+    send({ id: pendingPromptId, jsonrpc: "2.0", result: { stopReason: "cancelled" } });
     pendingPromptId = null;
     return;
   }

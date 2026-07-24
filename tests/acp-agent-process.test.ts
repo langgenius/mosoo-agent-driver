@@ -457,9 +457,12 @@ setInterval(() => {}, 1_000);
     const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
     const script = [
       'const { spawn } = require("node:child_process");',
+      'const { existsSync } = require("node:fs");',
       `const child = spawn("/usr/bin/setsid", ["/bin/sh", "-c", ${JSON.stringify(nested)}],`,
       '  { stdio: "ignore" });',
       "child.unref();",
+      "const sleeper = new Int32Array(new SharedArrayBuffer(4));",
+      `while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0, 10);`,
     ].join("\n");
     let child: AcpAgentProcess | undefined;
     let shellPid = 0;

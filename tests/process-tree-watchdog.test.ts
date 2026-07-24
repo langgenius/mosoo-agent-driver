@@ -8,13 +8,29 @@ import { join } from "node:path";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
+  PROCESS_TREE_MARKER_ENV,
   PROCESS_TREE_OWNER_ENV,
+  releaseLinuxProcessMarker,
   signalBoundProcessTree,
+  signalLinuxProcessMarker,
   spawnLinuxProcessTreeWatchdog,
+  waitForLinuxProcessMarkerExit,
 } from "../src/runtimes/child-process";
 
 const directories = new Set<string>();
 const processIds = new Set<number>();
+const NON_DUMPABLE_PROCESS_SOURCE = String.raw`
+import { dlopen, FFIType } from "bun:ffi";
+const libc = dlopen("libc.so.6", {
+  prctl: {
+    args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64],
+    returns: FFIType.i32,
+  },
+});
+if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) process.exit(1);
+process.stdout.write("ready\n");
+setInterval(() => {}, 1_000);
+`;
 
 afterEach(async () => {
   for (const pid of processIds) {
@@ -68,6 +84,24 @@ async function expectExited(pid: number): Promise<void> {
   processIds.delete(pid);
 }
 
+async function spawnNonDumpableProcess() {
+  const child = spawn(process.execPath, ["-e", NON_DUMPABLE_PROCESS_SOURCE], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  expect(child.pid).toBeDefined();
+  processIds.add(child.pid!);
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      reject(new Error(`Non-dumpable process exited with code ${code}.`));
+    });
+    child.stdout!.once("data", () => {
+      resolve();
+    });
+  });
+  return child;
+}
+
 function spawnMarkedRoot(source: string) {
   const processTree = createProcessTreeEnvironment(process.env);
   const child = spawn(process.execPath, ["-e", source], {
@@ -77,10 +111,80 @@ function spawnMarkedRoot(source: string) {
   });
   expect(child.pid).toBeDefined();
   processIds.add(child.pid!);
+  bindSpawnedProcess(child, process.platform, processTree);
   return { child, marker: processTree.marker };
 }
 
 describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () => {
+  test.skipIf(process.getuid?.() === 0)(
+    "ignores an older non-dumpable process outside the marked tree",
+    async () => {
+      const unrelated = await spawnNonDumpableProcess();
+      expect(() => readFileSync(`/proc/${unrelated.pid}/environ`)).toThrow();
+      await Bun.sleep(25);
+      const { child, marker } = spawnMarkedRoot("setInterval(() => {}, 1_000);");
+      const watchdog = spawnLinuxProcessTreeWatchdog(child.pid!, marker);
+      expect(watchdog).not.toBeNull();
+
+      process.kill(child.pid!, "SIGKILL");
+      await watchdog!.cleanup;
+      await expectExited(child.pid!);
+      process.kill(unrelated.pid!, "SIGKILL");
+      await expectExited(unrelated.pid!);
+    },
+  );
+
+  test.skipIf(process.getuid?.() === 0)(
+    "keeps a newer unreadable process indeterminate",
+    async () => {
+      const marker = createProcessTreeEnvironment(process.env).marker;
+      const unreadable = await spawnNonDumpableProcess();
+      expect(() => readFileSync(`/proc/${unreadable.pid}/environ`)).toThrow();
+
+      await expect(waitForLinuxProcessMarkerExit(marker, 100)).rejects.toThrow(
+        "Supervised process tree did not exit",
+      );
+      process.kill(unreadable.pid!, "SIGKILL");
+      await expectExited(unreadable.pid!);
+      await expect(waitForLinuxProcessMarkerExit(marker)).resolves.toBeUndefined();
+    },
+  );
+
+  test("keeps a confirmed process after it clears the marker environment", async () => {
+    const processTree = createProcessTreeEnvironment(process.env);
+    const child = spawn("/bin/sh", ["-c", "kill -STOP $$; exec env -i /bin/sleep 30"], {
+      detached: true,
+      env: processTree.env,
+      stdio: "ignore",
+    });
+    expect(child.pid).toBeDefined();
+    processIds.add(child.pid!);
+    const stoppedDeadline = Date.now() + 3_000;
+    let stopped = false;
+    while (Date.now() < stoppedDeadline) {
+      const stat = readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      stopped = stat.slice(stat.lastIndexOf(")") + 2).startsWith("T ");
+      if (stopped) break;
+      await Bun.sleep(20);
+    }
+    expect(stopped).toBe(true);
+    expect(signalLinuxProcessMarker(processTree.marker, 0)).toBe(true);
+
+    process.kill(child.pid!, "SIGCONT");
+    const clearedDeadline = Date.now() + 3_000;
+    let markerPresent = true;
+    while (markerPresent && Date.now() < clearedDeadline) {
+      markerPresent = readFileSync(`/proc/${child.pid}/environ`, "utf8")
+        .split("\0")
+        .includes(`${PROCESS_TREE_MARKER_ENV}=${processTree.marker}`);
+      if (markerPresent) await Bun.sleep(20);
+    }
+    expect(markerPresent).toBe(false);
+    expect(signalLinuxProcessMarker(processTree.marker, "SIGKILL")).toBe(true);
+    await waitForLinuxProcessMarkerExit(processTree.marker);
+    await expectExited(child.pid!);
+  });
+
   test("rejects raw signals after the bound root identity changes", async () => {
     const child = spawn("sleep", ["30"], {
       detached: true,
@@ -105,6 +209,37 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
     await expectExited(child.pid!);
   });
 
+  test("does not trust a watchdog root without the marker", async () => {
+    const marker = createProcessTreeEnvironment(process.env).marker;
+    const child = spawn("sleep", ["30"]);
+    expect(child.pid).toBeDefined();
+    processIds.add(child.pid!);
+    const watchdog = spawnLinuxProcessTreeWatchdog(child.pid!, marker);
+
+    expect(watchdog).not.toBeNull();
+    expect(signalLinuxProcessMarker(marker, 0)).toBe(false);
+    expect(isRunning(child.pid!)).toBe(true);
+    child.kill("SIGKILL");
+    await watchdog!.cleanup;
+    await expectExited(child.pid!);
+  });
+
+  test("keeps marker state until its watchdog lease ends", async () => {
+    const { child, marker } = spawnMarkedRoot("setInterval(() => {}, 1_000);");
+    const watchdog = spawnLinuxProcessTreeWatchdog(child.pid!, marker);
+    expect(watchdog).not.toBeNull();
+
+    releaseLinuxProcessMarker(marker);
+    await expect(waitForLinuxProcessMarkerExit(marker, 100)).rejects.toThrow(
+      "Supervised process tree did not exit",
+    );
+
+    child.kill("SIGKILL");
+    await watchdog!.cleanup;
+    await expectExited(child.pid!);
+    await expect(waitForLinuxProcessMarkerExit(marker, 100)).resolves.toBeUndefined();
+  });
+
   test("reuses one crash supervisor for independent process trees", async () => {
     const firstTree = createProcessTreeEnvironment(process.env);
     const secondTree = createProcessTreeEnvironment(process.env);
@@ -114,6 +249,8 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
     expect(second.pid).toBeDefined();
     processIds.add(first.pid!);
     processIds.add(second.pid!);
+    bindSpawnedProcess(first, process.platform, firstTree);
+    bindSpawnedProcess(second, process.platform, secondTree);
     const firstLease = spawnLinuxProcessTreeWatchdog(first.pid!, firstTree.marker);
     const secondLease = spawnLinuxProcessTreeWatchdog(second.pid!, secondTree.marker);
 
@@ -141,6 +278,26 @@ const child = spawn("/usr/bin/setsid", [
   env: process.env,
   stdio: "ignore",
 });
+child.unref();
+`;
+    const { child, marker } = spawnMarkedRoot(source);
+    const watchdog = spawnLinuxProcessTreeWatchdog(child.pid!, marker);
+    expect(watchdog).not.toBeNull();
+    const workerPid = await waitForPid(workerPidPath);
+
+    await watchdog!.cleanup;
+    await Promise.all([expectExited(child.pid!), expectExited(workerPid)]);
+  });
+
+  test("cleans an unmarked process-group member after its root exits", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "process-watchdog-unmarked-child-"));
+    directories.add(directory);
+    const workerPidPath = join(directory, "worker.pid");
+    const source = `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const child = spawn("sleep", ["30"], { env: {}, stdio: "ignore" });
+writeFileSync(${JSON.stringify(workerPidPath)}, String(child.pid));
 child.unref();
 `;
     const { child, marker } = spawnMarkedRoot(source);

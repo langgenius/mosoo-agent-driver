@@ -9,6 +9,7 @@ import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
+  releaseLinuxProcessMarker,
   signalBoundProcessTree,
   signalLinuxProcessMarker,
   spawnLinuxProcessTreeWatchdog,
@@ -27,8 +28,11 @@ import type { JsonObject } from "./acp-types";
 import { AcpPathScope } from "./acp-path-scope";
 
 interface AcpTerminalState {
+  readonly closed: Promise<void>;
   closedStatus: AcpTerminalExitStatus | null;
   committed: boolean;
+  cleanupTakenOver: boolean;
+  completionTask: Promise<void> | null;
   readonly exited: Promise<AcpTerminalExitStatus>;
   exitEventTask: Promise<void> | null;
   exitStatus: AcpTerminalExitStatus | null;
@@ -160,8 +164,9 @@ export class AcpTerminalManager {
       env: processTree.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const target = bindSpawnedProcess(child);
+    const target = bindSpawnedProcess(child, process.platform, processTree);
     const spawned = once(child, "spawn");
+    const { promise: closed, resolve: resolveClosed } = Promise.withResolvers<void>();
     const {
       promise: exited,
       reject: rejectExit,
@@ -169,8 +174,11 @@ export class AcpTerminalManager {
     } = Promise.withResolvers<AcpTerminalExitStatus>();
     void exited.catch(() => {});
     const terminal: AcpTerminalState = {
+      closed,
       closedStatus: null,
       committed: false,
+      cleanupTakenOver: false,
+      completionTask: null,
       exited,
       exitEventTask: null,
       exitStatus: null,
@@ -194,7 +202,8 @@ export class AcpTerminalManager {
       const status = { exitCode: exitCode ?? null, signal: signal ?? null };
       terminal.closedStatus = status;
       signalLinuxProcessMarker(terminal.marker, "SIGKILL");
-      void this.#completeExit(context, terminal, status);
+      terminal.completionTask = this.#completeExit(context, terminal, status);
+      resolveClosed();
     });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -317,6 +326,7 @@ export class AcpTerminalManager {
         }
       }
 
+      releaseLinuxProcessMarker(terminal.marker);
       this.#terminals.delete(terminalId);
       throw error;
     }
@@ -425,7 +435,7 @@ export class AcpTerminalManager {
 
     if (wasRunning) {
       signalAcpTerminalProcess(terminal, "SIGTERM");
-      const exited = await this.#waitForExit(terminal, TERMINAL_EXIT_TIMEOUT_MS);
+      const exited = await this.#waitForClose(terminal, TERMINAL_EXIT_TIMEOUT_MS);
 
       if (!exited) {
         context.logger.warn("driver.acp.terminal.exit.timed_out", {
@@ -433,7 +443,7 @@ export class AcpTerminalManager {
           timeoutMs: TERMINAL_EXIT_TIMEOUT_MS,
         });
         signalAcpTerminalProcess(terminal, "SIGKILL");
-        const forceExited = await this.#waitForExit(terminal, TERMINAL_FORCE_KILL_TIMEOUT_MS);
+        const forceExited = await this.#waitForClose(terminal, TERMINAL_FORCE_KILL_TIMEOUT_MS);
 
         if (!forceExited) {
           context.logger.warn("driver.acp.terminal.force_exit.timed_out", {
@@ -445,6 +455,22 @@ export class AcpTerminalManager {
       }
     }
 
+    if (terminal.completionTask !== null) {
+      const completion = await settlePromiseWithTimeout(terminal.completionTask, {
+        label: "ACP terminal process-tree cleanup",
+        timeoutMs: TERMINAL_FORCE_KILL_TIMEOUT_MS,
+      });
+      if (completion.status === "failed") {
+        throw completion.error;
+      }
+      if (completion.status === "timed_out") {
+        if (terminal.exitStatus === null) {
+          terminal.cleanupTakenOver = true;
+        } else {
+          await terminal.completionTask;
+        }
+      }
+    }
     if (terminal.exitStatus === null) {
       signalAcpTerminalProcess(terminal, "SIGKILL");
       await waitForLinuxProcessMarkerExit(
@@ -455,8 +481,9 @@ export class AcpTerminalManager {
         throw new Error(`ACP terminal ${terminal.id} exit status is unavailable.`);
       }
       terminal.exitStatus = terminal.closedStatus;
-      await this.#publishExit(context, terminal);
     }
+    await this.#publishExit(context, terminal);
+    terminal.resolveExit(terminal.exitStatus);
 
     if (terminal.committed) {
       await this.#push(context, "driver.acp.terminal.released", [
@@ -470,6 +497,7 @@ export class AcpTerminalManager {
     }
 
     if (this.#terminals.get(terminal.id) === terminal) {
+      releaseLinuxProcessMarker(terminal.marker);
       this.#terminals.delete(terminal.id);
     }
   }
@@ -479,26 +507,21 @@ export class AcpTerminalManager {
     terminal: AcpTerminalState,
     status: AcpTerminalExitStatus,
   ): Promise<void> {
-    let watchdogFailure: unknown = null;
-    if (terminal.watchdog !== null) {
-      try {
-        await terminal.watchdog.cleanup;
-      } catch (error) {
-        watchdogFailure = error;
-      }
-    }
-
-    let markerFailure: unknown = null;
-    try {
-      await waitForLinuxProcessMarkerExit(
+    const cleanupResults = await Promise.allSettled([
+      ...(terminal.watchdog === null ? [] : [terminal.watchdog.cleanup]),
+      waitForLinuxProcessMarkerExit(
         terminal.marker,
         TERMINAL_EXIT_TIMEOUT_MS + TERMINAL_FORCE_KILL_TIMEOUT_MS,
-      );
-    } catch (error) {
-      markerFailure = error;
-    }
+      ),
+    ]);
+    const cleanupFailure = cleanupResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    )?.reason;
 
-    const failure = terminal.supervisionFailure ?? watchdogFailure ?? markerFailure;
+    if (terminal.cleanupTakenOver) {
+      return;
+    }
+    const failure = terminal.supervisionFailure ?? cleanupFailure ?? null;
     if (failure !== null) {
       const error =
         failure instanceof Error
@@ -570,15 +593,24 @@ export class AcpTerminalManager {
       timeoutMs,
     });
 
-    if (result.status === "completed") {
-      return true;
+    if (result.status === "failed") {
+      throw result.error;
     }
 
-    if (result.status === "timed_out") {
-      return false;
+    return result.status === "completed";
+  }
+
+  async #waitForClose(terminal: AcpTerminalState, timeoutMs: number): Promise<boolean> {
+    const result = await settlePromiseWithTimeout(terminal.closed, {
+      label: "ACP terminal process close",
+      timeoutMs,
+    });
+
+    if (result.status === "failed") {
+      throw result.error;
     }
 
-    throw result.error;
+    return result.status === "completed";
   }
 
   #readTerminalEnv(record: JsonObject): Record<string, string> {

@@ -153,6 +153,89 @@ describe("ACP terminal manager", () => {
     }
   });
 
+  test("keeps terminal release behind the watchdog cleanup barrier", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      while (harness.manager.output(terminal).output !== "ready") {
+        await Bun.sleep(10);
+      }
+      const released = harness.manager.release(harness.context, terminal);
+      const pending = await settlePromiseWithTimeout(released, {
+        label: "terminal release cleanup barrier",
+        timeoutMs: 100,
+      });
+
+      expect(pending.status).toBe("timed_out");
+      expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+      expect(harness.events.some((event) => event.kind === "terminal.released")).toBe(false);
+
+      cleanup.resolve();
+      await expect(released).resolves.toEqual({});
+      expect(harness.events.map((event) => event.kind).slice(-2)).toEqual([
+        "terminal.exited",
+        "terminal.released",
+      ]);
+    } finally {
+      cleanup.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await harness.logger.destroy();
+    }
+  });
+
+  test("publishes terminal exit before release after cleanup takeover", async () => {
+    const exitPublishing = Promise.withResolvers<void>();
+    const allowExit = Promise.withResolvers<void>();
+    const harness = createHarness(async (reason) => {
+      if (reason === "driver.acp.terminal.exited") {
+        exitPublishing.resolve();
+        await allowExit.promise;
+      }
+    });
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.stdout.write(String(process.pid));setInterval(() => {}, 1000)"],
+        command: process.execPath,
+      });
+      while (harness.manager.output(terminal).output === "") {
+        await Bun.sleep(10);
+      }
+      const exited = harness.manager.waitForExit(terminal);
+      void exited.catch(() => {});
+      process.kill(Number.parseInt(harness.manager.output(terminal).output, 10), "SIGTERM");
+      await exitPublishing.promise;
+      const released = harness.manager.release(harness.context, terminal);
+
+      await expect(
+        settlePromiseWithTimeout(released, {
+          label: "terminal release exit publication",
+          timeoutMs: 1_100,
+        }),
+      ).resolves.toMatchObject({ status: "timed_out" });
+      expect(harness.events.some((event) => event.kind === "terminal.released")).toBe(false);
+
+      allowExit.resolve();
+      await expect(Promise.all([exited, released])).resolves.toEqual([
+        { exitCode: null, signal: "SIGTERM" },
+        {},
+      ]);
+      expect(harness.events.map((event) => event.kind).slice(-2)).toEqual([
+        "terminal.exited",
+        "terminal.released",
+      ]);
+    } finally {
+      allowExit.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await harness.logger.destroy();
+    }
+  });
+
   test.each(["completed", "failed"] as const)(
     "fails closed when the watchdog %s while the terminal root is active",
     async (outcome) => {
@@ -307,8 +390,11 @@ setInterval(() => {}, 1_000);
     const nested = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
     const source = `
 const { spawn } = require("node:child_process");
+const { existsSync } = require("node:fs");
 const child = spawn("/usr/bin/setsid", ["/bin/sh", "-c", ${JSON.stringify(nested)}], { stdio: "ignore" });
 child.unref();
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0, 10);
 `;
     const harness = createHarness();
     let shellPid = 0;

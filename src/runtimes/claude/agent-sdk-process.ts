@@ -8,6 +8,7 @@ import type {
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
+  releaseLinuxProcessMarker,
   signalBoundProcessTree,
   signalLinuxProcessMarker,
   spawnLinuxProcessTreeWatchdog,
@@ -37,7 +38,7 @@ export function spawnClaudeCodeProcess(
     env: processTree.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  const target = bindSpawnedProcess(child, runtimePlatform);
+  const target = bindSpawnedProcess(child, runtimePlatform, processTree);
   let killRequested = child.killed;
   const spawnedProcess = {
     get exitCode() {
@@ -66,6 +67,7 @@ export function spawnClaudeCodeProcess(
   const sessionId = child.pid;
 
   if (sessionId === undefined) {
+    releaseLinuxProcessMarker(processTree.marker);
     return spawnedProcess;
   }
 
@@ -87,6 +89,7 @@ export function spawnClaudeCodeProcess(
     await exited.promise;
     signalLinuxProcessMarker(processTree.marker, "SIGKILL");
     await (supervision.waitForMarkerExit ?? waitForLinuxProcessMarkerExit)(processTree.marker);
+    releaseLinuxProcessMarker(processTree.marker);
   };
   const processTask = (async () => {
     await exited.promise;
@@ -103,6 +106,7 @@ export function spawnClaudeCodeProcess(
       if (failure !== undefined) {
         throw failure.reason;
       }
+      releaseLinuxProcessMarker(processTree.marker);
     }
   })();
   processTasks.add(processTask);

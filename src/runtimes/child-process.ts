@@ -8,17 +8,20 @@ export const PROCESS_TREE_OWNER_ENV = "MOSOO_PROCESS_TREE_OWNER_ID";
 
 const PROCESS_TREE_SUPERVISOR_SOURCE = String.raw`
 const { readdirSync, readFileSync } = require("node:fs");
+const { createInterface } = require("node:readline");
 const ownerEntry = "MOSOO_PROCESS_TREE_OWNER_ID=" + process.argv[1];
 const ownerUid = Number(process.argv[2]);
+const tracked = new Map();
 const readStat = (pid) => {
   try {
     const stat = readFileSync("/proc/" + pid + "/stat", "utf8");
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    return { startTime: fields[19], state: fields[0] };
+    return { parentPid: Number(fields[1]), startTime: fields[19], state: fields[0] };
   } catch {
     return null;
   }
 };
+const supervisorStartTime = readStat(process.pid)?.startTime;
 const readUid = (pid, startTime) => {
   try {
     const status = readFileSync("/proc/" + pid + "/status", "utf8");
@@ -30,10 +33,13 @@ const readUid = (pid, startTime) => {
   }
 };
 const hasOwner = (pid, startTime) => {
+  if (tracked.get(pid) === startTime) return true;
   try {
-    return readFileSync("/proc/" + pid + "/environ", "utf8")
+    const matches = readFileSync("/proc/" + pid + "/environ", "utf8")
       .split("\0")
       .includes(ownerEntry);
+    if (matches) tracked.set(pid, startTime);
+    return matches;
   } catch {
     return readStat(pid)?.startTime === startTime ? null : false;
   }
@@ -46,7 +52,8 @@ const snapshot = () => {
     return null;
   }
 
-  const owned = [];
+  const processes = new Map();
+  const targets = new Set();
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const stat = readStat(entry);
@@ -59,14 +66,51 @@ const snapshot = () => {
       }
     }
     if (stat.state === "Z" || stat.state === "X") continue;
+    if (
+      supervisorStartTime !== undefined &&
+      Number(stat.startTime) < Number(supervisorStartTime)
+    ) continue;
     const uid = readUid(entry, stat.startTime);
     if (uid === null) return null;
     if (uid === false || uid !== ownerUid) continue;
-    const matches = hasOwner(entry, stat.startTime);
-    if (matches === null) return null;
-    if (matches) owned.push([Number(entry), stat.startTime]);
+    const pid = Number(entry);
+    processes.set(pid, stat);
+    if (tracked.get(pid) === stat.startTime) targets.add(pid);
   }
-  return owned;
+  const includeDescendants = () => {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [pid, stat] of processes) {
+        if (!targets.has(pid) && targets.has(stat.parentPid)) {
+          targets.add(pid);
+          changed = true;
+        }
+      }
+    }
+  };
+  includeDescendants();
+  for (const [pid, stat] of processes) {
+    if (targets.has(pid)) continue;
+    const matches = hasOwner(pid, stat.startTime);
+    if (matches === null) return null;
+    if (matches) targets.add(pid);
+  }
+  includeDescendants();
+  const depth = (pid) => {
+    let value = 0;
+    let current = processes.get(pid);
+    const seen = new Set();
+    while (current !== undefined && targets.has(current.parentPid) && !seen.has(current.parentPid)) {
+      seen.add(current.parentPid);
+      value += 1;
+      current = processes.get(current.parentPid);
+    }
+    return value;
+  };
+  return [...targets]
+    .sort((left, right) => depth(right) - depth(left))
+    .map((pid) => [pid, processes.get(pid).startTime]);
 };
 let cleaning = false;
 const beginCleanup = () => {
@@ -79,7 +123,7 @@ const beginCleanup = () => {
       emptyTicks = 0;
     } else {
       for (const [pid, startTime] of owned) {
-        if (readStat(pid)?.startTime !== startTime || hasOwner(pid, startTime) !== true) continue;
+        if (readStat(pid)?.startTime !== startTime) continue;
         try { process.kill(pid, "SIGKILL"); } catch {}
       }
       emptyTicks = owned.length === 0 ? emptyTicks + 1 : 0;
@@ -90,7 +134,15 @@ const beginCleanup = () => {
     }
   }, 50);
 };
-process.stdin.resume();
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const match = /^(\d+) (\d+)$/.exec(line);
+  if (match === null) return;
+  const pid = Number(match[1]);
+  const stat = readStat(pid);
+  if (Number.isSafeInteger(pid) && pid > 1 && stat?.startTime === match[2]) {
+    tracked.set(pid, stat.startTime);
+  }
+});
 process.stdin.once("end", beginCleanup);
 process.stdin.once("close", beginCleanup);
 process.stdin.once("error", beginCleanup);
@@ -100,9 +152,18 @@ interface LinuxProcessTreeSupervisor {
   readonly failure: Promise<never>;
   readonly ownerId: string;
   readonly process: ChildProcess;
+  readonly startTime: string;
+}
+
+interface LinuxMarkedProcessState {
+  cutoff: number | null;
+  leases: number;
+  readonly processes: Map<number, string>;
+  released: boolean;
 }
 
 let linuxProcessTreeSupervisor: LinuxProcessTreeSupervisor | null = null;
+const linuxMarkedProcessStates = new Map<string, LinuxMarkedProcessState>();
 
 export interface LinuxProcessTreeWatchdog {
   readonly cleanup: Promise<void>;
@@ -192,6 +253,7 @@ function ensureLinuxProcessTreeSupervisor(): LinuxProcessTreeSupervisor | null {
   });
   const failure = new Promise<never>((_resolve, reject) => {
     supervisorProcess.once("error", reject);
+    supervisorProcess.stdin?.once("error", reject);
     supervisorProcess.once("exit", (code, signal) => {
       reject(
         new Error(
@@ -208,6 +270,11 @@ function ensureLinuxProcessTreeSupervisor(): LinuxProcessTreeSupervisor | null {
     supervisorProcess.kill("SIGKILL");
     throw new Error("Process-tree supervisor failed to start.");
   }
+  const startTime = readLinuxProcessStat(supervisorProcess.pid)?.startTime;
+  if (startTime === undefined) {
+    supervisorProcess.kill("SIGKILL");
+    throw new Error("Process-tree supervisor identity is unavailable.");
+  }
 
   supervisorProcess.unref();
   (
@@ -219,6 +286,7 @@ function ensureLinuxProcessTreeSupervisor(): LinuxProcessTreeSupervisor | null {
     failure,
     ownerId,
     process: supervisorProcess,
+    startTime,
   };
   return linuxProcessTreeSupervisor;
 }
@@ -261,20 +329,50 @@ function processMatchesCurrentUid(pid: number, startTime: string): boolean | nul
   }
 }
 
-function processHasMarker(pid: number, marker: string, startTime: string): boolean | null {
+function linuxMarkedProcessState(marker: string): LinuxMarkedProcessState {
+  let state = linuxMarkedProcessStates.get(marker);
+  if (state === undefined) {
+    state = {
+      cutoff: null,
+      leases: 0,
+      processes: new Map(),
+      released: false,
+    };
+    linuxMarkedProcessStates.set(marker, state);
+  }
+  return state;
+}
+
+function processHasMarker(
+  pid: number,
+  marker: string,
+  startTime: string,
+  state: LinuxMarkedProcessState,
+): boolean | null {
+  if (state.processes.get(pid) === startTime) {
+    return true;
+  }
+
   try {
-    return readFileSync(`/proc/${pid}/environ`, "utf8")
+    const matches = readFileSync(`/proc/${pid}/environ`, "utf8")
       .split("\0")
       .includes(`${PROCESS_TREE_MARKER_ENV}=${marker}`);
+    if (matches) {
+      state.processes.set(pid, startTime);
+    }
+    return matches;
   } catch {
     return readLinuxProcessStat(pid)?.startTime === startTime ? null : false;
   }
 }
 
-function readLinuxMarkedProcessSnapshot(marker: string): {
-  readonly processes: ReadonlyMap<number, LinuxProcessStat>;
-  readonly targets: number[];
-} | null {
+function readLinuxMarkedProcessSnapshot(
+  marker: string,
+): ReadonlyMap<number, LinuxProcessStat> | null {
+  const state = linuxMarkedProcessStates.get(marker);
+  if (state === undefined) {
+    return new Map();
+  }
   let entries: string[];
   try {
     entries = readdirSync("/proc");
@@ -283,7 +381,6 @@ function readLinuxMarkedProcessSnapshot(marker: string): {
   }
 
   const processes = new Map<number, LinuxProcessStat>();
-  const targets: number[] = [];
   for (const entry of entries) {
     const pid = Number(entry);
     if (!Number.isSafeInteger(pid) || pid < 1) {
@@ -300,6 +397,9 @@ function readLinuxMarkedProcessSnapshot(marker: string): {
     if (stat.state === "Z" || stat.state === "X") {
       continue;
     }
+    if (state.cutoff !== null && Number(stat.startTime) < state.cutoff) {
+      continue;
+    }
     const matchesUid = processMatchesCurrentUid(pid, stat.startTime);
     if (matchesUid === null) {
       return null;
@@ -308,24 +408,26 @@ function readLinuxMarkedProcessSnapshot(marker: string): {
       continue;
     }
 
-    const matchesMarker = processHasMarker(pid, marker, stat.startTime);
+    const matchesMarker = processHasMarker(pid, marker, stat.startTime, state);
     if (matchesMarker === null) {
       return null;
     }
     if (matchesMarker) {
       processes.set(pid, stat);
-      targets.push(pid);
     }
   }
 
-  return { processes, targets };
+  return processes;
 }
 
 export function createProcessTreeEnvironment(
   env: Readonly<NodeJS.ProcessEnv>,
 ): ProcessTreeEnvironment {
-  const marker = randomUUID();
   const supervisor = ensureLinuxProcessTreeSupervisor();
+  const marker = randomUUID();
+  if (supervisor !== null) {
+    linuxMarkedProcessState(marker).cutoff = Number(supervisor.startTime);
+  }
   return {
     env: {
       ...env,
@@ -382,9 +484,33 @@ function processDepth(
 export function bindSpawnedProcess(
   child: ChildProcess,
   platform: NodeJS.Platform = process.platform,
+  processTree?: ProcessTreeEnvironment,
 ): BoundSpawnedProcess {
   const pid = child.pid;
   const stat = platform === "linux" && pid !== undefined ? readLinuxProcessStat(pid) : null;
+  if (pid !== undefined && stat !== null && processTree !== undefined) {
+    const state = linuxMarkedProcessStates.get(processTree.marker);
+    const stdin = linuxProcessTreeSupervisor?.process.stdin;
+    if (state !== undefined) {
+      state.cutoff = Number(stat.startTime);
+      state.processes.set(pid, stat.startTime);
+    }
+    if (
+      state === undefined ||
+      stdin === null ||
+      stdin === undefined ||
+      stdin.destroyed ||
+      stdin.writableEnded
+    ) {
+      child.kill("SIGKILL");
+    } else {
+      try {
+        stdin.write(`${pid} ${stat.startTime}\n`);
+      } catch {
+        child.kill("SIGKILL");
+      }
+    }
+  }
 
   return {
     killRoot: child.kill.bind(child),
@@ -489,22 +615,17 @@ export function signalLinuxProcessMarker(marker: string, signal: NodeJS.Signals 
     return false;
   }
 
-  const tree = new Set(snapshot.targets);
-  const targets = [...snapshot.targets];
+  const tree = new Set(snapshot.keys());
+  const targets = [...snapshot.keys()];
   targets.sort(
     (leftPid, rightPid) =>
-      processDepth(snapshot.processes, tree, rightPid) -
-      processDepth(snapshot.processes, tree, leftPid),
+      processDepth(snapshot, tree, rightPid) - processDepth(snapshot, tree, leftPid),
   );
   let signalled = false;
 
   for (const pid of targets) {
-    const startTime = snapshot.processes.get(pid)?.startTime;
-    if (
-      startTime === undefined ||
-      readLinuxProcessStat(pid)?.startTime !== startTime ||
-      processHasMarker(pid, marker, startTime) !== true
-    ) {
+    const startTime = snapshot.get(pid)?.startTime;
+    if (startTime === undefined || readLinuxProcessStat(pid)?.startTime !== startTime) {
       continue;
     }
     try {
@@ -524,19 +645,42 @@ export async function waitForLinuxProcessMarkerExit(
     return;
   }
 
+  const state = linuxMarkedProcessStates.get(marker);
+  if (state === undefined) {
+    return;
+  }
+  state.leases += 1;
   const deadline = Date.now() + timeoutMs;
   let emptySnapshots = 0;
 
-  for (;;) {
-    const snapshot = readLinuxMarkedProcessSnapshot(marker);
-    emptySnapshots = snapshot !== null && snapshot.targets.length === 0 ? emptySnapshots + 1 : 0;
-    if (emptySnapshots >= 2) {
-      return;
+  try {
+    for (;;) {
+      const snapshot = readLinuxMarkedProcessSnapshot(marker);
+      emptySnapshots = snapshot !== null && snapshot.size === 0 ? emptySnapshots + 1 : 0;
+      if (emptySnapshots >= 2) {
+        return;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Supervised process tree did not exit within ${timeoutMs}ms.`);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
-    if (Date.now() >= deadline) {
-      throw new Error(`Supervised process tree did not exit within ${timeoutMs}ms.`);
+  } finally {
+    state.leases -= 1;
+    if (state.released && state.leases === 0) {
+      linuxMarkedProcessStates.delete(marker);
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+export function releaseLinuxProcessMarker(marker: string): void {
+  const state = linuxMarkedProcessStates.get(marker);
+  if (state === undefined) {
+    return;
+  }
+  state.released = true;
+  if (state.leases === 0) {
+    linuxMarkedProcessStates.delete(marker);
   }
 }
 
@@ -632,19 +776,39 @@ export function spawnLinuxProcessTreeWatchdog(
   if (rootStartTime === "" && marker === "") {
     return null;
   }
+  const markerState = marker === "" ? undefined : linuxMarkedProcessStates.get(marker);
+  if (marker !== "" && markerState === undefined) {
+    return null;
+  }
+  if (markerState !== undefined) {
+    markerState.leases += 1;
+  }
   const localCleanup = (async () => {
-    while (rootStartTime !== "" && linuxProcessIdentityState(rootPid, rootStartTime) !== "exited") {
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    }
-    if (marker !== "") {
-      const retry = setInterval(() => {
-        signalLinuxProcessMarker(marker, "SIGKILL");
-      }, 50);
-      try {
-        signalLinuxProcessMarker(marker, "SIGKILL");
-        await waitForLinuxProcessMarkerExit(marker);
-      } finally {
-        clearInterval(retry);
+    try {
+      while (
+        rootStartTime !== "" &&
+        linuxProcessIdentityState(rootPid, rootStartTime) !== "exited"
+      ) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+      if (marker !== "") {
+        const retry = setInterval(() => {
+          signalLinuxProcessMarker(marker, "SIGKILL");
+        }, 50);
+        try {
+          signalProcessGroup(rootPid, "SIGKILL", "linux");
+          signalLinuxProcessMarker(marker, "SIGKILL");
+          await waitForLinuxProcessMarkerExit(marker);
+        } finally {
+          clearInterval(retry);
+        }
+      }
+    } finally {
+      if (markerState !== undefined) {
+        markerState.leases -= 1;
+        if (markerState.released && markerState.leases === 0) {
+          linuxMarkedProcessStates.delete(marker);
+        }
       }
     }
   })();
