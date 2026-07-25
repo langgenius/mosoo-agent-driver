@@ -23,6 +23,7 @@ import type { JsonObject } from "./acp-types";
 export type AcpSessionSetupMode = "created" | "loaded" | "resumed";
 
 export interface AcpSessionSetup {
+  readonly droppedAdditionalDirectories: readonly string[];
   readonly mode: AcpSessionSetupMode;
   readonly raw: JsonObject;
   readonly sessionId: string;
@@ -41,11 +42,16 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   const mcpServers = buildMcpServers(input.payload);
   assertMcpSupport(input.agentCapabilities, mcpServers);
   const existingSessionId = input.currentSessionId;
-  const additionalDirectories = input.payload.execution.session.additionalDirectories;
+  const requestedAdditionalDirectories = input.payload.execution.session.additionalDirectories;
 
-  if (additionalDirectories.length > 0 && !supportsAdditionalDirs(input.agentCapabilities)) {
-    throw new Error("ACP agent does not advertise additional directory support.");
-  }
+  // Agents that do not advertise sessionCapabilities.additionalDirectories
+  // (OpenCode never has) used to receive the field anyway and silently ignore
+  // it. Failing the whole session here turns that long-standing silent
+  // degradation into an outage, so drop the directories instead and let the
+  // caller surface the degradation.
+  const supportsDirs = supportsAdditionalDirs(input.agentCapabilities);
+  const additionalDirectories = supportsDirs ? requestedAdditionalDirectories : [];
+  const droppedAdditionalDirectories = supportsDirs ? [] : requestedAdditionalDirectories;
 
   const baseParams = {
     _meta: toRequestMeta({
@@ -60,6 +66,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
     const params = { ...baseParams, sessionId: existingSessionId } satisfies ResumeSessionRequest;
     const result = await input.connection.request(acpMethods.agent.session.resume, params);
     return {
+      droppedAdditionalDirectories,
       mode: "resumed",
       raw: isRecord(result) ? result : {},
       sessionId: existingSessionId,
@@ -71,6 +78,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
       const params = { ...baseParams, sessionId: existingSessionId } satisfies LoadSessionRequest;
       const result = await input.connection.request(acpMethods.agent.session.load, params);
       return {
+        droppedAdditionalDirectories,
         mode: "loaded",
         raw: isRecord(result) ? result : {},
         sessionId: existingSessionId,
@@ -85,6 +93,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   }
 
   return {
+    droppedAdditionalDirectories,
     mode: "created",
     raw: isRecord(result) ? result : {},
     sessionId: result.sessionId,

@@ -229,6 +229,13 @@ export class AcpDriverBackend implements AgentDriverBackend {
         signal,
       );
 
+      if (setup.droppedAdditionalDirectories.length > 0) {
+        context.logger.warn("driver.acp.session.additional_directories_dropped", {
+          count: setup.droppedAdditionalDirectories.length,
+          reason: "agent_capability_missing",
+        });
+      }
+
       await withAcpStartupStage(
         "ACP session ready event push",
         () =>
