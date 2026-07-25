@@ -35,11 +35,19 @@
   },
   "expectedEvents": [
     {
+      "kind": "message.started",
+      "payload": {
+        "messageId": "assistant-message-1",
+        "role": "agent"
+      },
+      "runId": "run-1"
+    },
+    {
       "kind": "item.started",
       "payload": {
         "itemId": "tool-1",
         "itemType": "tool_call",
-        "parentMessageId": "message-1",
+        "parentMessageId": "assistant-message-1",
         "title": "Run command"
       },
       "runId": "run-1"
@@ -82,6 +90,14 @@
           "title": "Run command",
           "toolCallId": "tool-1"
         }
+      },
+      "runId": "run-1"
+    },
+    {
+      "kind": "message.completed",
+      "payload": {
+        "messageId": "assistant-message-1",
+        "role": "agent"
       },
       "runId": "run-1"
     },
