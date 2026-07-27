@@ -1,12 +1,8 @@
 import type { RuntimeCommand, RuntimeCommandInput, RuntimeCommandResult } from "../runtime-command";
-import { digestText, summarizeTextDigest } from "./driver-debug-paths";
+import { summarizeTextDigest } from "./driver-debug-paths";
 
 export function summarizeRuntimeCommandInput(input: RuntimeCommandInput): Record<string, unknown> {
-  const attachmentIds = [...(input.attachmentIds ?? [])].toSorted();
-
   return {
-    attachmentCount: attachmentIds.length,
-    attachmentFingerprint: attachmentIds.length > 0 ? digestText(attachmentIds.join("\n")) : null,
     text: summarizeTextDigest(input.text),
   };
 }

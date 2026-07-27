@@ -1,4 +1,4 @@
-import { methods as acpMethods } from "@agentclientprotocol/sdk";
+import { methods as acpMethods, RequestError } from "@agentclientprotocol/sdk";
 import type {
   AgentCapabilities,
   ClientContext,
@@ -13,6 +13,7 @@ import {
   buildMcpServers,
   assertMcpSupport,
   supportsAdditionalDirs,
+  supportsSessionClose,
   supportsSessionLoad,
   supportsSessionResume,
   toRequestMeta,
@@ -36,6 +37,43 @@ interface AcpSessionSetupInput {
   readonly payload: DriverStartInput;
   readonly sessionContext: DriverExecutionSessionContext;
   replaySession<T>(operation: () => Promise<T>): Promise<T>;
+}
+
+type AcpSessionRestoreOperation = "close" | "load" | "resume";
+
+function restoreFailureCategory(error: unknown): string {
+  if (!(error instanceof RequestError)) {
+    return "native_session_restore_failed";
+  }
+
+  switch (error.code) {
+    case -32_002:
+    case -32_602: {
+      return "native_session_unavailable";
+    }
+    case -32_800: {
+      return "native_session_restore_cancelled";
+    }
+    default: {
+      return "native_session_restore_failed";
+    }
+  }
+}
+
+async function restoreAcpSession<T>(
+  operation: AcpSessionRestoreOperation,
+  sessionId: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "ACP agent rejected session restore.";
+    throw new Error(
+      `ACP native session pointer ${JSON.stringify(sessionId)} ${operation} failed [category=${restoreFailureCategory(error)}]: ${message}`,
+      { cause: error },
+    );
+  }
 }
 
 export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpSessionSetup> {
@@ -64,7 +102,23 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
 
   if (existingSessionId !== null && supportsSessionResume(input.agentCapabilities)) {
     const params = { ...baseParams, sessionId: existingSessionId } satisfies ResumeSessionRequest;
-    const result = await input.connection.request(acpMethods.agent.session.resume, params);
+    const resume = () =>
+      restoreAcpSession("resume", existingSessionId, () =>
+        input.connection.request(acpMethods.agent.session.resume, params),
+      );
+    let result = await resume();
+
+    if (supportsSessionClose(input.agentCapabilities)) {
+      // A crashed client can leave provider work orphaned. Close waits for its
+      // cancellation before the second resume hands the session to this driver.
+      await restoreAcpSession("close", existingSessionId, () =>
+        input.connection.request(acpMethods.agent.session.close, {
+          sessionId: existingSessionId,
+        }),
+      );
+      result = await resume();
+    }
+
     return {
       droppedAdditionalDirectories,
       mode: "resumed",
@@ -76,7 +130,9 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
   if (existingSessionId !== null && supportsSessionLoad(input.agentCapabilities)) {
     return input.replaySession(async () => {
       const params = { ...baseParams, sessionId: existingSessionId } satisfies LoadSessionRequest;
-      const result = await input.connection.request(acpMethods.agent.session.load, params);
+      const result = await restoreAcpSession("load", existingSessionId, () =>
+        input.connection.request(acpMethods.agent.session.load, params),
+      );
       return {
         droppedAdditionalDirectories,
         mode: "loaded",

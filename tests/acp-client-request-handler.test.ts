@@ -1,9 +1,98 @@
 import { describe, expect, test } from "bun:test";
 
+import {
+  DriverPermissionBroker,
+  PermissionEventDeliveryError,
+  type DriverPermissionRequest,
+} from "../src/core/driver-permission-broker";
+import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
 import { AcpTurnEventState } from "../src/runtimes/acp/acp-event-translator";
 
 describe("ACP client request handler", () => {
+  test("rejects permission requests outside an active turn", async () => {
+    let permissionRequests = 0;
+    let pushes = 0;
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {
+        pushes += 1;
+      },
+      turnEvents: new AcpTurnEventState(),
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => {
+            permissionRequests += 1;
+            return "allow_once" as const;
+          },
+        },
+      },
+    } as never;
+
+    await expect(
+      handler.requestPermission(context, 1, {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        sessionId: "native-session-1",
+        toolCall: { title: "Run command", toolCallId: "tool-1" },
+      }),
+    ).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    await handler.drainPermissions();
+
+    expect(permissionRequests).toBe(0);
+    expect(pushes).toBe(0);
+  });
+
+  test("closes permission ingress before a turn terminal and reopens it for the next turn", async () => {
+    const turnEvents = new AcpTurnEventState();
+    let permissionRequests = 0;
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: "run-1" as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => {
+            permissionRequests += 1;
+            return "allow_once" as const;
+          },
+        },
+      },
+    } as never;
+    const request = () =>
+      handler.requestPermission(context, 1, {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        sessionId: "native-session-1",
+        toolCall: { title: "Run command", toolCallId: "tool-1" },
+      });
+
+    handler.closePermissionIngress();
+    await expect(request()).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    handler.openPermissionIngress();
+    await expect(request()).resolves.toEqual({
+      outcome: { optionId: "allow", outcome: "selected" },
+    });
+    expect(permissionRequests).toBe(1);
+  });
+
   test("suppresses turn-scoped session updates before a turn is active", async () => {
     const pushedReasons: string[] = [];
     const handler = new AcpClientRequestHandler({
@@ -41,6 +130,41 @@ describe("ACP client request handler", () => {
     }
 
     expect(pushedReasons).toEqual([]);
+  });
+
+  test("discards deferred updates and permits a later gate", async () => {
+    const pushedReasons: string[] = [];
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async (_context, reason) => {
+        pushedReasons.push(reason);
+      },
+      turnEvents: new AcpTurnEventState(),
+    });
+    const notification = {
+      sessionId: "native-session-1",
+      update: {
+        availableCommands: [{ description: "Early command", name: "early" }],
+        sessionUpdate: "available_commands_update" as const,
+      },
+    };
+
+    const discarded = handler.deferUpdates();
+    const droppedUpdate = handler.enqueueUpdate({} as never, notification);
+    discarded.discard();
+    await droppedUpdate;
+
+    const committed = handler.deferUpdates();
+    const appliedUpdate = handler.enqueueUpdate({} as never, notification);
+    committed.commit();
+    await appliedUpdate;
+
+    expect(pushedReasons).toEqual(["driver.acp.session.update"]);
   });
 
   test("passes the runtime environment to terminal child processes", async () => {
@@ -249,6 +373,65 @@ describe("ACP client request handler", () => {
     },
   );
 
+  test("rejects a permission when its turn ends during the update drain", async () => {
+    const updatePublishing = Promise.withResolvers<void>();
+    const releaseUpdate = Promise.withResolvers<void>();
+    const turnEvents = new AcpTurnEventState();
+    let permissionRequests = 0;
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: "run-1" as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async (_context, reason) => {
+        if (reason === "driver.acp.session.update") {
+          updatePublishing.resolve();
+          await releaseUpdate.promise;
+        }
+      },
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => {
+            permissionRequests += 1;
+            return "allow_once" as const;
+          },
+        },
+      },
+    } as never;
+    const update = handler.enqueueUpdate(context, {
+      sessionId: "native-session-1",
+      update: {
+        content: { text: "before permission", type: "text" },
+        messageId: "message-1",
+        sessionUpdate: "agent_message_chunk",
+      },
+    });
+    const permission = handler.requestPermission(context, 1, {
+      options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+      sessionId: "native-session-1",
+      toolCall: { title: "Run command", toolCallId: "tool-1" },
+    });
+
+    await updatePublishing.promise;
+    turnEvents.clear();
+    releaseUpdate.resolve();
+
+    await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+    await update;
+    await handler.drainPermissions();
+    expect(permissionRequests).toBe(0);
+  });
+
   test("leaves permission lifecycle events to the host port and keeps typed RPC IDs distinct", async () => {
     const eventKinds: string[] = [];
     const requestIds: string[] = [];
@@ -383,6 +566,199 @@ describe("ACP client request handler", () => {
     controller.abort();
 
     await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+  });
+
+  test("drains a permission tool publication abandoned by request cancellation", async () => {
+    const toolPublishing = Promise.withResolvers<void>();
+    const releaseTool = Promise.withResolvers<void>();
+    const controller = new AbortController();
+    const turnEvents = new AcpTurnEventState();
+    let permissionRequests = 0;
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: "run-1" as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async (_context, reason) => {
+        if (reason === "driver.acp.permission.tool") {
+          toolPublishing.resolve();
+          await releaseTool.promise;
+        }
+      },
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => {
+            permissionRequests += 1;
+            return "allow_once" as const;
+          },
+        },
+      },
+    } as never;
+    const permission = handler.requestPermission(
+      context,
+      1,
+      {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        sessionId: "native-session-1",
+        toolCall: { title: "Run command", toolCallId: "tool-1" },
+      },
+      controller.signal,
+    );
+
+    await toolPublishing.promise;
+    controller.abort();
+    await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+
+    const drainCancellation = new AbortController();
+    const interruptedDrain = handler.drainPermissions(drainCancellation.signal);
+    drainCancellation.abort(new Error("cancelled drain"));
+    await expect(interruptedDrain).rejects.toThrow("cancelled drain");
+    const drained = handler.drainPermissions();
+    expect(await Promise.race([drained.then(() => true), Bun.sleep(10).then(() => false)])).toBe(
+      false,
+    );
+    releaseTool.resolve();
+    await drained;
+    expect(permissionRequests).toBe(0);
+  });
+
+  test("retains a settled permission delivery failure until a drain consumes it", async () => {
+    const deliveryFailure = new PermissionEventDeliveryError(
+      "number:1",
+      "resolved",
+      new Error("permission transport unavailable"),
+    );
+    const turnEvents = new AcpTurnEventState();
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: "run-1" as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => {
+            throw deliveryFailure;
+          },
+        },
+      },
+    } as never;
+
+    await expect(
+      handler.requestPermission(context, 1, {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        sessionId: "native-session-1",
+        toolCall: { title: "Run command", toolCallId: "tool-1" },
+      }),
+    ).rejects.toBe(deliveryFailure);
+    await Promise.resolve();
+
+    await expect(handler.drainPermissions()).rejects.toBe(deliveryFailure);
+    await expect(handler.drainPermissions()).resolves.toBeUndefined();
+  });
+
+  test("keeps a late cancelled permission resolution on its originating run", async () => {
+    const requestedPublishing = Promise.withResolvers<void>();
+    const releaseRequested = Promise.withResolvers<void>();
+    let activeRunId = "run-1";
+    let resolvedRunId: string | null = null;
+    const order: string[] = [];
+    const socket: DriverRuntimeEventPort = {
+      currentRunId: () => activeRunId as never,
+      pushEvents: async ({ events }) => {
+        if (events.some((event) => event.kind === "permission.requested")) {
+          requestedPublishing.resolve();
+          await releaseRequested.promise;
+        }
+        const resolved = events.find((event) => event.kind === "permission.resolved");
+        if (resolved !== undefined) {
+          resolvedRunId = resolved.runId ?? activeRunId;
+          order.push("permission.resolved");
+        }
+
+        return {
+          accepted: events.map((event, index) => ({
+            seq: index + 1,
+            type: event.kind,
+          })),
+        };
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 1_000,
+    });
+    const turnEvents = new AcpTurnEventState();
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: activeRunId as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: (input: DriverPermissionRequest, signal?: AbortSignal) =>
+            broker.request(socket, input, signal),
+        },
+      },
+    } as never;
+    const controller = new AbortController();
+    const permission = handler.requestPermission(
+      context,
+      1,
+      {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        sessionId: "native-session-1",
+        toolCall: { title: "Run command", toolCallId: "tool-1" },
+      },
+      controller.signal,
+    );
+
+    await requestedPublishing.promise;
+    controller.abort();
+    await expect(permission).resolves.toEqual({ outcome: { outcome: "cancelled" } });
+
+    const drained = handler.drainPermissions().then(() => {
+      order.push("run.cancelled");
+    });
+    expect(await Promise.race([drained.then(() => true), Bun.sleep(10).then(() => false)])).toBe(
+      false,
+    );
+    activeRunId = "run-2";
+    releaseRequested.resolve();
+    await drained;
+
+    expect(resolvedRunId).toBe("run-1");
+    expect(order).toEqual(["permission.resolved", "run.cancelled"]);
   });
 
   test("closes update ingress and drains accepted work before stopping", async () => {

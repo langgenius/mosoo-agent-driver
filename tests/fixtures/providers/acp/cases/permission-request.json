@@ -102,6 +102,17 @@
       "runId": "run-1"
     },
     {
+      "kind": "tool.call.updated",
+      "payload": {
+        "kind": "shell",
+        "rawInput": "{\"command\":\"pwd\"}",
+        "status": "completed",
+        "title": "Run command",
+        "toolCallId": "tool-1"
+      },
+      "runId": "run-1"
+    },
+    {
       "kind": "item.completed",
       "payload": {
         "itemId": "tool-1",

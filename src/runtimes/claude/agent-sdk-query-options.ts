@@ -18,6 +18,7 @@ import { toMcpServerKey } from "../mcp/server-key";
 import { mergeProviderOptions } from "../provider-options";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
+import { spawnClaudeCodeProcess } from "./agent-sdk-process";
 
 export const CLAUDE_CODE_EXECUTABLE_ENV = "MOSOO_CLAUDE_CODE_EXECUTABLE";
 
@@ -49,50 +50,57 @@ const CLAUDE_PROVIDER_OPTION_KEYS = new Set<string>([
   "title",
 ] satisfies readonly (keyof ClaudeQueryOptions)[]);
 
-function createCanUseTool(context: AgentDriverContext): CanUseTool {
-  return async (toolName, input, options): Promise<PermissionResult> => {
-    if (options.signal.aborted) {
+function createCanUseTool(
+  context: AgentDriverContext,
+  permissionTasks: Set<Promise<unknown>>,
+): CanUseTool {
+  return (toolName, input, options): Promise<PermissionResult> => {
+    const task = (async () => {
+      if (options.signal.aborted) {
+        return {
+          behavior: "deny",
+          interrupt: true,
+          message: "Permission request was aborted.",
+          toolUseID: options.toolUseID,
+        } satisfies PermissionResult;
+      }
+
+      const decision = await context.ports.permission.request(
+        {
+          rawInput: stringifyForDisplay(input),
+          requestId: options.requestId,
+          title: options.title ?? options.displayName ?? `Approve ${toolName}`,
+          toolCallId: options.toolUseID,
+          toolKind: toolName,
+        },
+        options.signal,
+      );
+
+      if (options.signal.aborted) {
+        return {
+          behavior: "deny",
+          interrupt: true,
+          message: "Permission request was aborted.",
+          toolUseID: options.toolUseID,
+        } satisfies PermissionResult;
+      }
+
+      if (decision === "allow_once") {
+        return {
+          behavior: "allow",
+          toolUseID: options.toolUseID,
+          updatedInput: input,
+        } satisfies PermissionResult;
+      }
+
       return {
         behavior: "deny",
-        interrupt: true,
-        message: "Permission request was aborted.",
+        message: "Rejected by mosoo permission review.",
         toolUseID: options.toolUseID,
-      };
-    }
-
-    const decision = await context.ports.permission.request(
-      {
-        rawInput: stringifyForDisplay(input),
-        requestId: options.requestId,
-        title: options.title ?? options.displayName ?? `Approve ${toolName}`,
-        toolCallId: options.toolUseID,
-        toolKind: toolName,
-      },
-      options.signal,
-    );
-
-    if (options.signal.aborted) {
-      return {
-        behavior: "deny",
-        interrupt: true,
-        message: "Permission request was aborted.",
-        toolUseID: options.toolUseID,
-      };
-    }
-
-    if (decision === "allow_once") {
-      return {
-        behavior: "allow",
-        toolUseID: options.toolUseID,
-        updatedInput: input,
-      };
-    }
-
-    return {
-      behavior: "deny",
-      message: "Rejected by mosoo permission review.",
-      toolUseID: options.toolUseID,
-    };
+      } satisfies PermissionResult;
+    })();
+    permissionTasks.add(task);
+    return task;
   };
 }
 
@@ -155,6 +163,8 @@ export async function createClaudeQueryOptions(input: {
   context: AgentDriverContext;
   nativeSessionId: string | null;
   payload: DriverStartInput;
+  permissionTasks?: Set<Promise<unknown>>;
+  processTasks?: Set<Promise<void>>;
 }): Promise<ClaudeQueryOptions> {
   const claudeConfigDir = resolveClaudeConfigDir(input.payload);
   await mkdir(claudeConfigDir, { recursive: true });
@@ -164,19 +174,31 @@ export async function createClaudeQueryOptions(input: {
   const options: ClaudeQueryOptions = {
     abortController: input.abortController,
     additionalDirectories: input.payload.execution.session.additionalDirectories,
-    canUseTool: createCanUseTool(input.context),
+    canUseTool: createCanUseTool(input.context, input.permissionTasks ?? new Set()),
     cwd: input.payload.execution.session.cwd,
     env: toClaudeEnv(input.payload, claudeConfigDir),
     includePartialMessages: true,
     model: input.payload.execution.model,
     permissionMode: "default",
     persistSession: true,
+    strictMcpConfig: true,
     stderr: (data) => {
       input.context.logger.debug("driver.claude.stderr", {
         chunk: data,
       });
     },
   };
+  if (process.platform !== "win32") {
+    options.spawnClaudeCodeProcess = (spawnOptions) =>
+      spawnClaudeCodeProcess(
+        spawnOptions,
+        (chunk) => {
+          input.context.logger.debug("driver.claude.stderr", { chunk });
+        },
+        input.abortController.signal,
+        input.processTasks,
+      );
+  }
   const builtInTools = toClaudeBuiltInTools(input.payload);
   options.tools = builtInTools;
 

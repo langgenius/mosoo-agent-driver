@@ -9,7 +9,7 @@ import {
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
 import type { DriverStartInput } from "../../protocol/start";
-import type { McpExecuteCommand } from "../../runtime-command";
+import type { McpExecuteCommand, McpExecuteCommandResult } from "../../runtime-command";
 import { settlePromiseWithTimeout } from "../../utils/async";
 import { AGENT_DRIVER_VERSION } from "../../core/version";
 
@@ -71,7 +71,7 @@ function resolveActiveMcpServer(
 function normalizeCallToolResult(
   result: CallToolResult,
   command: McpExecuteCommand,
-): { outputText: string; requestId: string; serverId: string; toolName: string } {
+): McpExecuteCommandResult {
   const textContent = result.content
     .flatMap((block) => (block.type === "text" ? [block.text] : []))
     .map((text) => text.trim())
@@ -89,6 +89,7 @@ function normalizeCallToolResult(
             : "";
 
   return {
+    ...(result.isError === undefined ? {} : { isError: result.isError }),
     outputText,
     requestId: command.requestId,
     serverId: command.serverId,
@@ -183,7 +184,7 @@ export async function executeRemoteHttpMcpCommand(
   payload: DriverStartInput,
   command: McpExecuteCommand,
   signal: AbortSignal,
-): Promise<{ outputText: string; requestId: string; serverId: string; toolName: string }> {
+): Promise<McpExecuteCommandResult> {
   signal.throwIfAborted();
   const server = resolveActiveMcpServer(payload, command);
   const argumentsObject = parseToolArguments(command);

@@ -257,7 +257,6 @@ describe("driver runtime boundary", () => {
       {
         commandId: "input-1",
         input: {
-          attachmentIds: ["file-1"],
           text: "hello",
         },
         kind: "input.start",

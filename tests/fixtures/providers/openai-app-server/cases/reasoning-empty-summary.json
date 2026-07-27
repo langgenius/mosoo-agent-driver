@@ -1,0 +1,17 @@
+{
+  "notifications": [
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "id": "reasoning-empty",
+          "summary": [],
+          "type": "reasoning"
+        },
+        "threadId": "thread-1",
+        "turnId": "turn-1"
+      }
+    }
+  ],
+  "expectedEvents": []
+}

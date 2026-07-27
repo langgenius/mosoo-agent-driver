@@ -18,7 +18,6 @@ export type RuntimeCommandStatus =
   | "queued";
 
 export interface RuntimeCommandInput {
-  readonly attachmentIds?: string[] | undefined;
   readonly text: string;
 }
 
@@ -70,6 +69,7 @@ export interface InputStartCommandResult {
 }
 
 export interface McpExecuteCommandResult {
+  readonly isError?: boolean | undefined;
   readonly outputText: string;
   readonly requestId: string;
   readonly serverId: string;
@@ -146,26 +146,14 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
   return value;
 }
 
-function readStringArray(record: Record<string, unknown>, field: string): string[] | undefined {
-  const value = record[field];
-
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
-    throw new TypeError(`${field} must be an array of strings.`);
-  }
-
-  return [...value];
-}
-
 function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
   const record = readRecord(value, "input");
-  const attachmentIds = readStringArray(record, "attachmentIds");
+
+  if ("attachmentIds" in record) {
+    throw new TypeError("input.attachmentIds is unsupported.");
+  }
 
   return {
-    ...(attachmentIds === undefined ? {} : { attachmentIds }),
     text: readNonEmptyString(record, "text"),
   };
 }

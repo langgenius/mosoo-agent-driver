@@ -1,8 +1,7 @@
 # Driver TTFT / streaming benchmark
 
-`ttft-bench.ts` drives the **real driver kernel + provider registry** (the same
-code path as the `*-live.test.ts` suites) against live provider APIs and
-measures, per provider runtime and per scenario:
+`ttft-bench.ts` drives the **real driver kernel + provider registry** directly
+against live provider APIs and measures each provider runtime and scenario:
 
 | metric              | meaning                                                              |
 | ------------------- | -------------------------------------------------------------------- |
@@ -29,7 +28,7 @@ honest success signal.
 ## Run
 
 ```sh
-# from apps/driver
+# from the repository root
 ANTHROPIC_API_KEY=... OPENAI_API_KEY=... vp run bench
 ```
 
@@ -39,7 +38,7 @@ Env knobs:
 - `TTFT_RUNTIMES=claude,openai,opencode` subset to run.
 - `TTFT_SCENARIOS=no_tool,long_output,tool_write_allow,tool_write_reject`.
 - `TTFT_OPENCODE_PROVIDER=openai|anthropic` backing provider for the opencode/ACP runtime.
-- `AGENT_DRIVER_LIVE_ANTHROPIC_MODEL` / `AGENT_DRIVER_LIVE_OPENAI_MODEL` model overrides.
+- `TTFT_CLAUDE_MODEL` / `TTFT_OPENAI_MODEL` model overrides.
 - `TTFT_BOOT_TIMEOUT_MS=100000` guard against a hung runtime spawn.
 - `TTFT_UPDATE_BASELINE=1` writes `outputs/baseline.json` (committed as the regression baseline).
 - `TTFT_STAMP=<name>` labels the run's output files.

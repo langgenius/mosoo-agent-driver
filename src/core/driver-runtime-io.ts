@@ -16,6 +16,7 @@ export interface DriverRuntimeEventPort {
     events: DriverEventInput[];
     signal?: AbortSignal;
   }): Promise<DriverEventBatchOutput>;
+  runEventTerminal?(runId: RunId): "cancelled" | "completed" | "failed" | null;
 }
 
 export const DRIVER_EVENT_DELIVERY_TIMEOUT_MS = 10_000;

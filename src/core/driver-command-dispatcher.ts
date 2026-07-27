@@ -14,13 +14,18 @@ import {
 } from "./driver-permission-broker";
 import type { DriverRuntimeIo } from "./driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "./driver-runtime-state";
-import { DriverTurnCancelledError, isDriverTurnCancelledError } from "./driver-runtime-state";
+import {
+  DriverTurnCancellationCleanupError,
+  DriverTurnCancelledError,
+  isDriverTurnCancelledError,
+} from "./driver-runtime-state";
 
 interface DriverCommandDispatcherOptions {
   backend: AgentDriverBackend;
   driverInstanceId: string;
   isShuttingDown(): boolean;
   permissionRequests: DriverPermissionBroker;
+  rememberRunFailure(error: RunError): void;
   runtimeContextFactory(socket: DriverRuntimeIo, logger: Logger): AgentDriverContext;
   runtimeState: DriverRuntimeStateMachine;
   sandboxId: string;
@@ -29,8 +34,8 @@ interface DriverCommandDispatcherOptions {
 }
 
 const COMMAND_POLL_INTERVAL_MS = 250;
-const ACTIVE_INPUT_SETTLE_GRACE_MS = 2_000;
-const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
+const ACTIVE_INPUT_SETTLE_GRACE_MS = 5_000;
+export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
 interface ActiveMcpCommand {
@@ -74,6 +79,7 @@ export class DriverCommandDispatcher {
   readonly #driverInstanceId: string;
   readonly #isShuttingDown: () => boolean;
   readonly #permissionRequests: DriverPermissionBroker;
+  readonly #rememberRunFailure: (error: RunError) => void;
   readonly #runtimeContextFactory: (socket: DriverRuntimeIo, logger: Logger) => AgentDriverContext;
   readonly #runtimeState: DriverRuntimeStateMachine;
   readonly #sandboxId: string;
@@ -85,12 +91,15 @@ export class DriverCommandDispatcher {
   readonly #activeMcpCommands = new Map<string, ActiveMcpCommand>();
   #activeRunGeneration = 0;
   #activeRunTask: Promise<void> | null = null;
+  #shutdownCompleted = false;
+  #shutdownPermissionTask: Promise<void> | null = null;
 
   constructor(options: DriverCommandDispatcherOptions) {
     this.#backend = options.backend;
     this.#driverInstanceId = options.driverInstanceId;
     this.#isShuttingDown = options.isShuttingDown;
     this.#permissionRequests = options.permissionRequests;
+    this.#rememberRunFailure = options.rememberRunFailure;
     this.#runtimeContextFactory = options.runtimeContextFactory;
     this.#runtimeState = options.runtimeState;
     this.#sandboxId = options.sandboxId;
@@ -103,6 +112,8 @@ export class DriverCommandDispatcher {
     const runtimeContext = this.#runtimeContextFactory(socket, logger);
     let joiningActiveWork = false;
     const onShutdown = () => {
+      this.#shutdownPermissionTask = this.#permissionRequests.rejectAllAndWait();
+      void this.#shutdownPermissionTask.catch(() => {});
       this.#abortActiveWork(
         toErrorMessage(this.#shutdownSignal.reason, "driver.command_loop.stopped"),
       );
@@ -221,6 +232,13 @@ export class DriverCommandDispatcher {
       logger.error("driver.runtime.command-loop-failed", failure, {
         driverInstanceId: this.#driverInstanceId,
       });
+      const runFailure = {
+        code: "driver.command_loop_failed",
+        details: {},
+        message: toErrorMessage(failure, "Command loop failed."),
+        retryable: false,
+      } satisfies RunError;
+      this.#rememberRunFailure(runFailure);
 
       try {
         logger.debug("driver.runtime.run.failing", {
@@ -240,30 +258,25 @@ export class DriverCommandDispatcher {
           },
           logger,
         );
-        await this.#commandDelivery.claimRunTerminal(socket, "failed", {
-          code: "driver.command_loop_failed",
-          details: {},
-          message: toErrorMessage(failure, "Command loop failed."),
-          retryable: false,
-        });
-        logger.debug("driver.runtime.run.failed", {
-          code: "driver.command_loop_failed",
-          driverInstanceId: this.#driverInstanceId,
-        });
       } catch {
         /* Ignore runtime error propagation failures */
       }
 
-      await this.#shutdown(socket, "driver.command_loop_failed").catch((shutdownError: unknown) => {
+      try {
+        await this.#shutdown(socket, "driver.command_loop_failed");
+        this.#shutdownCompleted = true;
+      } catch (shutdownError) {
         logger.error("driver.runtime.shutdown.failed", shutdownError, {
           driverInstanceId: this.#driverInstanceId,
         });
-      });
-      await this.#joinActiveWork().catch((settleError: unknown) => {
+      }
+      try {
+        await this.#joinActiveWork();
+      } catch (settleError) {
         logger.warn("driver.runtime.active-work.settle-failed", {
           message: toErrorMessage(settleError, "Active driver work did not settle."),
         });
-      });
+      }
 
       throw failure;
     } finally {
@@ -289,6 +302,11 @@ export class DriverCommandDispatcher {
       return;
     }
 
+    const eagerCancellation =
+      command.kind === "turn.cancel"
+        ? this.#cancelActiveWork(runtimeContext, command.reason ?? "turn.cancelled")
+        : null;
+    void eagerCancellation?.catch(() => {});
     await this.#commandDelivery.accept(runtimeContext, command, receipt.tracked);
 
     try {
@@ -357,8 +375,7 @@ export class DriverCommandDispatcher {
       }
 
       if (command.kind === "turn.cancel") {
-        const reason = command.reason ?? "turn.cancelled";
-        await this.#cancelActiveWork(runtimeContext, reason);
+        await eagerCancellation;
         await this.#commandDelivery.finish(runtimeContext, command, {
           status: "completed",
         });
@@ -368,7 +385,14 @@ export class DriverCommandDispatcher {
       if (command.kind === "session.stop") {
         const reason = command.reason;
         this.#runtimeState.enter("stopping");
-        await this.#cancelActiveWork(runtimeContext, reason);
+        await this.#cancelActiveWork(
+          runtimeContext,
+          reason,
+          this.#permissionRequests.rejectAllAndWait(),
+        );
+
+        await this.#shutdown(socket, reason);
+        this.#shutdownCompleted = true;
 
         runtimeContext.logger.debug("driver.runtime.run.completing", {
           commandId: command.commandId,
@@ -379,7 +403,6 @@ export class DriverCommandDispatcher {
           commandId: command.commandId,
           reason,
         });
-        await this.#shutdown(socket, reason);
 
         if (this.#runtimeState.status() === "stopping") {
           this.#runtimeState.enter("stopped");
@@ -414,17 +437,35 @@ export class DriverCommandDispatcher {
     this.#abortMcpCommands(reason);
   }
 
-  async #cancelActiveWork(runtimeContext: AgentDriverContext, reason: string): Promise<void> {
+  async #cancelActiveWork(
+    runtimeContext: AgentDriverContext,
+    reason: string,
+    permissionCancellation?: Promise<void>,
+  ): Promise<void> {
     this.#abortActiveWork(reason);
-    const results = await Promise.allSettled([
-      promiseWithTimeout(this.#backend.cancelActiveTurn(runtimeContext, reason), {
+    let permissionFailure: { error: unknown } | null = null;
+
+    if (permissionCancellation !== undefined) {
+      try {
+        await permissionCancellation;
+      } catch (error) {
+        permissionFailure = { error };
+      }
+    }
+
+    const backendCancellation = promiseWithTimeout(
+      this.#backend.cancelActiveTurn(runtimeContext, reason),
+      {
         label: "Active driver turn cancellation",
         timeoutMs: ACTIVE_TURN_CANCEL_GRACE_MS,
-      }),
-      this.#joinActiveWork(),
-    ]);
+      },
+    );
+    const results = await Promise.allSettled([backendCancellation, this.#joinActiveWork()]);
     const failure = results.find((result) => result.status === "rejected");
 
+    if (permissionFailure !== null) {
+      throw permissionFailure.error;
+    }
     if (failure?.status === "rejected") {
       throw failure.reason;
     }
@@ -434,6 +475,15 @@ export class DriverCommandDispatcher {
   }
 
   async #joinActiveWork(): Promise<void> {
+    let permissionFailure: { error: unknown } | null = null;
+
+    if (this.#shutdownPermissionTask !== null) {
+      try {
+        await this.#shutdownPermissionTask;
+      } catch (error) {
+        permissionFailure = { error };
+      }
+    }
     const tasks: Promise<unknown>[] = [];
 
     if (this.#activeRunTask !== null) {
@@ -455,6 +505,9 @@ export class DriverCommandDispatcher {
     const results = await Promise.allSettled(tasks);
     const failure = results.find((result) => result.status === "rejected");
 
+    if (permissionFailure !== null) {
+      throw permissionFailure.error;
+    }
     if (failure?.status === "rejected") {
       throw failure.reason;
     }
@@ -473,6 +526,12 @@ export class DriverCommandDispatcher {
     const task = this.#runMcpCommand(runtimeContext, socket, command, controller)
       .catch(async (error: unknown) => {
         this.#activeWorkFailure ??= { error };
+        this.#rememberRunFailure({
+          code: "driver.mcp_task_failed",
+          details: { commandId: command.commandId },
+          message: toErrorMessage(error, "Driver MCP task failed."),
+          retryable: false,
+        });
         runtimeContext.logger.error("driver.runtime.mcp-command.failed", error, {
           commandId: command.commandId,
           driverInstanceId: this.#driverInstanceId,
@@ -543,11 +602,19 @@ export class DriverCommandDispatcher {
         this.#runtimeState.enter("failed");
       }
 
-      await this.#shutdown(socket, command.reason).catch((shutdownError: unknown) => {
-        runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
-          commandId: command.commandId,
-        });
-      });
+      if (!this.#shutdownCompleted) {
+        await this.#shutdown(socket, command.reason).then(
+          () => {
+            this.#shutdownCompleted = true;
+          },
+          (shutdownError: unknown) => {
+            runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
+              commandId: command.commandId,
+            });
+          },
+        );
+      }
+      this.#rememberRunFailure(commandFailure);
     }
 
     await this.#commandDelivery.finish(runtimeContext, command, {
@@ -589,7 +656,7 @@ export class DriverCommandDispatcher {
   ): Promise<void> {
     try {
       cancellation.signal.throwIfAborted();
-      await this.#backend.handleInput(runtimeContext, command.input, runId);
+      await this.#backend.handleInput(runtimeContext, command.input, runId, cancellation.signal);
       cancellation.signal.throwIfAborted();
       await this.#commandDelivery.finish(runtimeContext, command, {
         result: {
@@ -604,7 +671,9 @@ export class DriverCommandDispatcher {
 
       if (
         isDriverTurnCancelledError(error) ||
-        (cancellation.signal.aborted && !(error instanceof PermissionEventDeliveryError))
+        (cancellation.signal.aborted &&
+          !(error instanceof DriverTurnCancellationCleanupError) &&
+          !(error instanceof PermissionEventDeliveryError))
       ) {
         await this.#commandDelivery.finish(runtimeContext, command, {
           status: "cancelled",
@@ -625,42 +694,31 @@ export class DriverCommandDispatcher {
         error: commandFailure,
         status: "failed",
       });
-      await pushDriverDiagnosticEvent(
-        socket,
-        {
-          code: "driver.command_failed",
-          details: {
-            commandId: command.commandId,
-            commandKind: command.kind,
+      if (socket.runEventTerminal?.(runId) == null) {
+        await pushDriverDiagnosticEvent(
+          socket,
+          {
+            code: "driver.command_failed",
+            details: {
+              commandId: command.commandId,
+              commandKind: command.kind,
+            },
+            message: commandFailure.message,
+            severity: "error",
+            source: "core",
           },
-          message: commandFailure.message,
-          severity: "error",
-          source: "core",
-        },
-        runtimeContext.logger,
-      );
+          runtimeContext.logger,
+        );
+      }
       runtimeContext.logger.error("driver.runtime.command.failed", error, {
         commandId: command.commandId,
         commandKind: command.kind,
         driverInstanceId: this.#driverInstanceId,
         fatal: true,
       });
-
-      try {
-        runtimeContext.logger.debug("driver.runtime.run.failing", {
-          code: commandFailure.code,
-          driverInstanceId: this.#driverInstanceId,
-        });
-        await this.#commandDelivery.claimRunTerminal(socket, "failed", commandFailure);
-        runtimeContext.logger.debug("driver.runtime.run.failed", {
-          code: commandFailure.code,
-          driverInstanceId: this.#driverInstanceId,
-        });
-      } catch {
-        /* Ignore runtime error propagation failures */
-      }
-
+      this.#rememberRunFailure(commandFailure);
       await this.#shutdown(socket, commandFailure.code);
+      this.#shutdownCompleted = true;
     }
   }
 

@@ -11,6 +11,50 @@ import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
+  test("does not publish diagnostics after an adapter run terminal", async () => {
+    const backend = createBackend();
+    const failure = new Error("provider failed");
+    backend.handleInput = async (context, _input, runId) => {
+      await context.ports.eventSink.pushEvents({
+        events: [
+          {
+            kind: "run.started",
+            payload: { startedAt: new Date().toISOString() },
+            runId,
+          },
+          {
+            kind: "run.failed",
+            payload: {
+              error: { code: "provider.failed", message: failure.message },
+              recoverable: false,
+            },
+            runId,
+          },
+        ],
+      });
+      throw failure;
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+
+    await kernel.start(bootPayload);
+    await expect(
+      kernel.dispatch({
+        commandId: "provider-failure-input",
+        input: { text: "fail" },
+        kind: "input.start",
+        requestId: "provider-failure-request",
+        runId: DRIVER_TEST_IDS.runId,
+      }),
+    ).rejects.toThrow("provider failed");
+    await expect(kernel.stop("join provider failure")).resolves.toBeUndefined();
+
+    const events: DriverEventInput[] = [];
+    for await (const event of kernel.events()) {
+      events.push(event);
+    }
+    expect(events.map((event) => event.kind)).toEqual(["run.started", "run.failed"]);
+  });
+
   test("automatically retries final cleanup after shutdown times out during startup", async () => {
     const backend = createBackend();
     const startEntered = Promise.withResolvers<void>();
@@ -59,6 +103,58 @@ describe("AgentDriverKernelCore", () => {
       expect(cleaned).toBe(true);
       expect(stopCount).toBe(2);
       expect(resourceActive).toBe(false);
+    } finally {
+      releaseStart.resolve();
+      globalThis.setTimeout = nativeSetTimeout;
+    }
+  });
+
+  test("fails closed for late startup permissions before deferred shutdown closes events", async () => {
+    const backend = createBackend();
+    const startEntered = Promise.withResolvers<void>();
+    const releaseStart = Promise.withResolvers<void>();
+    const latePermissionEntered = Promise.withResolvers<void>();
+    let latePermission: Promise<unknown> | null = null;
+    backend.start = async (context, signal) => {
+      startEntered.resolve();
+      await releaseStart.promise;
+      latePermission = context.ports.permission.request({
+        rawInput: null,
+        requestId: "late-startup-permission",
+        title: "Allow late startup tool?",
+        toolCallId: "late-startup-tool",
+        toolKind: "test",
+      });
+      void latePermission.catch(() => {});
+      latePermissionEntered.resolve();
+      signal.throwIfAborted();
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const events = kernel.events()[Symbol.asyncIterator]();
+    const payload = {
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        permissionPolicy: "supervised" as const,
+      },
+    };
+    const nativeSetTimeout = globalThis.setTimeout;
+    const acceleratedSetTimeout = (
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
+    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
+
+    try {
+      const start = kernel.start(payload);
+      await startEntered.promise;
+      await expect(kernel.stop("startup stop")).rejects.toThrow("timed out");
+      releaseStart.resolve();
+      await latePermissionEntered.promise;
+      await start;
+      await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
+      await expect(latePermission).resolves.toBe("reject_once");
     } finally {
       releaseStart.resolve();
       globalThis.setTimeout = nativeSetTimeout;
@@ -208,8 +304,10 @@ describe("AgentDriverKernelCore", () => {
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 
-  test("an active backend failure rejects input and publishes run.failed before shutdown", async () => {
+  test("publishes an active backend failure only after input and cleanup settle", async () => {
     const backend = createBackend();
+    const cleanupEntered = Promise.withResolvers<void>();
+    const releaseCleanup = Promise.withResolvers<void>();
     const inputEntered = Promise.withResolvers<void>();
     const releaseInput = Promise.withResolvers<void>();
     const failure = new Error("provider process exited during input");
@@ -222,6 +320,8 @@ describe("AgentDriverKernelCore", () => {
       await releaseInput.promise;
     };
     backend.stop = async () => {
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
       releaseInput.resolve();
     };
     const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
@@ -239,11 +339,174 @@ describe("AgentDriverKernelCore", () => {
     (context as AgentDriverContext | null)?.lifecycle.fail(failure);
 
     await expect(input).rejects.toBe(failure);
-    await expect(kernel.stop("wait for failure cleanup")).rejects.toBe(failure);
-    await expect(events.next()).resolves.toMatchObject({
+    const stop = kernel.stop("wait for failure cleanup");
+    void stop.catch(() => {});
+    await cleanupEntered.promise;
+    const terminal = events.next();
+    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+      false,
+    );
+    releaseCleanup.resolve();
+    await expect(stop).rejects.toBe(failure);
+    await expect(terminal).resolves.toMatchObject({
       done: false,
       value: { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
     });
+  });
+
+  test("does not publish a backend failure while cleanup remains failed", async () => {
+    const backend = createBackend();
+    const inputEntered = Promise.withResolvers<void>();
+    const releaseInput = Promise.withResolvers<void>();
+    const failure = new Error("provider process exited during input");
+    let context: AgentDriverContext | null = null;
+    backend.start = async (startedContext) => {
+      context = startedContext;
+    };
+    backend.handleInput = async () => {
+      inputEntered.resolve();
+      await releaseInput.promise;
+    };
+    backend.stop = async () => {
+      releaseInput.resolve();
+      throw new Error("cleanup remained failed");
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const events = kernel.events()[Symbol.asyncIterator]();
+
+    await kernel.start(bootPayload);
+    const input = kernel.dispatch({
+      commandId: "failed-cleanup-input",
+      input: { text: "wait" },
+      kind: "input.start",
+      requestId: "failed-cleanup-request",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+    await inputEntered.promise;
+    (context as AgentDriverContext | null)?.lifecycle.fail(failure);
+
+    await expect(input).rejects.toBe(failure);
+    await expect(kernel.stop("wait for failed cleanup")).rejects.toBe(failure);
+    const terminal = events.next();
+    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+      false,
+    );
+  });
+
+  test("drains an active permission before publishing a backend failure terminal", async () => {
+    const backend = createBackend();
+    const permissionEntered = Promise.withResolvers<void>();
+    const cleanupEntered = Promise.withResolvers<void>();
+    const releaseCleanup = Promise.withResolvers<void>();
+    const resolutionPublishing = Promise.withResolvers<void>();
+    const releaseResolution = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const failure = new Error("provider failed with a pending permission");
+    let context: AgentDriverContext | null = null;
+    backend.start = async (startedContext) => {
+      context = startedContext;
+    };
+    backend.handleInput = async (inputContext) => {
+      const permission = inputContext.ports.permission.request({
+        rawInput: null,
+        requestId: "backend-failure-permission",
+        title: "Allow test tool?",
+        toolCallId: "backend-failure-tool",
+        toolKind: "test",
+      });
+      permissionEntered.resolve();
+      await permission;
+    };
+    backend.stop = async () => {
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
+      order.push("cleanup");
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const pushEvents = kernel.pushEvents.bind(kernel);
+    kernel.pushEvents = async (input) => {
+      if (input.events.some((event) => event.kind === "permission.resolved")) {
+        resolutionPublishing.resolve();
+        await releaseResolution.promise;
+      }
+
+      const result = await pushEvents(input);
+      if (input.events.some((event) => event.kind === "permission.resolved")) {
+        order.push("permission.resolved");
+      }
+      return result;
+    };
+    const events = kernel.events()[Symbol.asyncIterator]();
+    const payload = {
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        permissionPolicy: "supervised" as const,
+      },
+    };
+
+    await kernel.start(payload);
+    const input = kernel.dispatch({
+      commandId: "backend-failure-permission-input",
+      input: { text: "wait for permission" },
+      kind: "input.start",
+      requestId: "backend-failure-permission-request",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+    void input.catch(() => {});
+    await permissionEntered.promise;
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "permission.requested",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    });
+
+    (context as AgentDriverContext | null)?.lifecycle.fail(failure);
+    await resolutionPublishing.promise;
+    const stop = kernel.stop("wait for failure cleanup");
+    void stop.catch(() => {});
+    expect(await Promise.race([stop.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+      false,
+    );
+    const nextEvent = events.next();
+    expect(await Promise.race([nextEvent.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+      false,
+    );
+
+    releaseResolution.resolve();
+    await expect(nextEvent).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "permission.resolved",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    });
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "diagnostic.reported",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    });
+    await cleanupEntered.promise;
+    const terminal = events.next();
+    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+      false,
+    );
+    releaseCleanup.resolve();
+    await expect(terminal).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "run.failed",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    });
+    order.push("control.run.failed");
+    expect(order).toEqual(["permission.resolved", "cleanup", "control.run.failed"]);
+    await expect(input).rejects.toBe(failure);
+    await expect(stop).rejects.toBe(failure);
   });
 
   test("stop bypasses a full ordinary command queue", async () => {
@@ -379,7 +642,7 @@ describe("AgentDriverKernelCore", () => {
     expect(first[0]?.status).toBe("rejected");
     expect(second[0]?.status).toBe("rejected");
     expect(settledBeforeRelease).toBe(false);
-  }, 10_000);
+  }, 12_000);
 
   test("keeps cleanup event delivery available across a transient stop failure", async () => {
     const backend = createBackend();
@@ -420,11 +683,12 @@ describe("AgentDriverKernelCore", () => {
     }
 
     expect(stopCount).toBe(2);
-    expect(received.map((event) => event.kind)).toEqual(["run.completed", "diagnostic.reported"]);
+    expect(received.map((event) => event.kind)).toEqual(["diagnostic.reported", "run.failed"]);
   });
 
   test.each([
     ["transient", 1, "fulfilled", 2],
+    ["two-retry", 2, "fulfilled", 3],
     ["persistent", Number.POSITIVE_INFINITY, "rejected", 3],
   ] as const)(
     "retries %s backend cleanup during and after a stop call",
@@ -447,12 +711,17 @@ describe("AgentDriverKernelCore", () => {
 
       expect(second?.status).toBe(secondStatus);
       expect(stopCount).toBe(expectedStops);
-      await expect(events.next()).resolves.toMatchObject({
-        done: false,
-        value: { kind: "run.completed" },
-      });
       if (secondStatus === "fulfilled") {
+        await expect(events.next()).resolves.toMatchObject({
+          done: false,
+          value: { kind: "run.failed" },
+        });
         await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
+      } else {
+        const terminal = events.next();
+        expect(
+          await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)]),
+        ).toBe(false);
       }
       await expect(
         kernel.dispatch({

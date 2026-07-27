@@ -47,6 +47,7 @@ export interface ClaudeToolResultEvent {
 
 export class ClaudeAgentSdkEventWriter {
   readonly #messageEnded = new Set<string>();
+  readonly #messageSealed = new Set<string>();
   readonly #messageStarted = new Set<string>();
   readonly #options: ClaudeAgentSdkEventWriterOptions;
   readonly #thoughtEnded = new Set<string>();
@@ -65,6 +66,7 @@ export class ClaudeAgentSdkEventWriter {
 
   resetTurnState(): void {
     this.#messageEnded.clear();
+    this.#messageSealed.clear();
     this.#messageStarted.clear();
     this.#thoughtEnded.clear();
     this.#thoughtStarted.clear();
@@ -213,7 +215,11 @@ export class ClaudeAgentSdkEventWriter {
     context: AgentDriverContext,
     messageId: string,
     text: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    if (this.#messageEnded.has(messageId)) {
+      return false;
+    }
+
     await this.ensureMessageStarted(context, messageId);
     await this.#push(context, "driver.claude.message.snapshot", [
       {
@@ -225,6 +231,11 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    return true;
+  }
+
+  sealMessage(messageId: string): void {
+    this.#messageSealed.add(messageId);
   }
 
   async pushSessionInfoUpdated(context: AgentDriverContext): Promise<void> {
@@ -238,7 +249,16 @@ export class ClaudeAgentSdkEventWriter {
     ]);
   }
 
-  async pushTextDelta({ context, delta, messageId, reason }: ClaudeTextDeltaEvent): Promise<void> {
+  async pushTextDelta({
+    context,
+    delta,
+    messageId,
+    reason,
+  }: ClaudeTextDeltaEvent): Promise<boolean> {
+    if (this.#messageEnded.has(messageId) || this.#messageSealed.has(messageId)) {
+      return false;
+    }
+
     await this.ensureMessageStarted(context, messageId);
     await this.#push(context, reason, [
       {
@@ -251,6 +271,7 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    return true;
   }
 
   async ensureThoughtStarted(context: AgentDriverContext, thoughtId: string): Promise<void> {
@@ -271,6 +292,10 @@ export class ClaudeAgentSdkEventWriter {
   }
 
   async pushThoughtDelta({ context, delta, thoughtId }: ClaudeThoughtDeltaEvent): Promise<void> {
+    if (this.#thoughtEnded.has(thoughtId)) {
+      return;
+    }
+
     await this.ensureThoughtStarted(context, thoughtId);
     await this.#push(context, "driver.claude.thought.delta", [
       {
@@ -308,6 +333,10 @@ export class ClaudeAgentSdkEventWriter {
     reason,
     toolCallId,
   }: ClaudeToolArgumentsEvent): Promise<void> {
+    if (this.#toolEnded.has(toolCallId)) {
+      return;
+    }
+
     await this.#push(context, reason, [
       {
         delivery: "best_effort",
@@ -326,6 +355,10 @@ export class ClaudeAgentSdkEventWriter {
     toolCallId: string,
     rawInput: string,
   ): Promise<void> {
+    if (this.#toolEnded.has(toolCallId)) {
+      return;
+    }
+
     await this.#push(context, "driver.claude.tool.snapshot", [
       {
         kind: "tool.call.updated",
@@ -372,6 +405,10 @@ export class ClaudeAgentSdkEventWriter {
     status,
     toolCallId,
   }: ClaudeToolResultEvent): Promise<void> {
+    if (this.#toolEnded.has(toolCallId)) {
+      return;
+    }
+
     const events: DriverEventInput[] = [
       {
         kind: "tool.call.updated",
@@ -385,17 +422,15 @@ export class ClaudeAgentSdkEventWriter {
       },
     ];
 
-    if (!this.#toolEnded.has(toolCallId)) {
-      this.#toolEnded.add(toolCallId);
-      events.push({
-        kind: "item.completed",
-        payload: {
-          itemId: toolCallId,
-          itemType: "tool_call",
-          status,
-        },
-      });
-    }
+    this.#toolEnded.add(toolCallId);
+    events.push({
+      kind: "item.completed",
+      payload: {
+        itemId: toolCallId,
+        itemType: "tool_call",
+        status,
+      },
+    });
 
     await this.#push(context, "driver.claude.tool.result", events);
   }

@@ -146,14 +146,16 @@ export class ClaudeAgentSdkMessageTranslator {
         const isDuplicateStreamedText = text === null || this.#state.hasStreamedText(messageId);
 
         if (text && !isDuplicateStreamedText) {
-          this.#state.appendAssistantText(messageId, text);
           // Claude content blocks are protocol-ordered; push each derived event before reading the next block.
-          await this.#events.pushTextDelta({
+          const pushed = await this.#events.pushTextDelta({
             context,
             delta: text,
             messageId,
             reason: "driver.claude.message.text",
           });
+          if (pushed) {
+            this.#state.appendAssistantText(messageId, text);
+          }
         }
         continue;
       }
@@ -178,8 +180,9 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (authoritativeText.length > 0) {
       const text = authoritativeText.join("");
-      this.#state.markAuthoritative(messageId, text);
-      await this.#events.pushMessageSnapshot(context, messageId, text);
+      if (await this.#events.pushMessageSnapshot(context, messageId, text)) {
+        this.#state.markAuthoritative(messageId, text);
+      }
     }
 
     await this.#endAssistantMessage(context, runId, messageId);
@@ -245,7 +248,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (eventType === "message_stop") {
       await this.#endThought(context, messageId);
-      await this.#endAssistantMessage(context, runId, messageId);
+      this.#events.sealMessage(messageId);
       this.#state.clearStreamingNativeMessageId(streamScopeKey);
       this.#state.clearToolCallIds(messageId);
       return;
@@ -274,14 +277,16 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (blockType === "text") {
       const text = readString(block, "text");
-      if (text) {
-        this.#state.appendStreamedText(messageId, text);
-        await this.#events.pushTextDelta({
+      if (
+        text &&
+        (await this.#events.pushTextDelta({
           context,
           delta: text,
           messageId,
           reason: "driver.claude.message.text",
-        });
+        }))
+      ) {
+        this.#state.appendStreamedText(messageId, text);
       }
       return;
     }
@@ -338,13 +343,15 @@ export class ClaudeAgentSdkMessageTranslator {
         return;
       }
 
-      this.#state.appendStreamedText(messageId, text);
-      await this.#events.pushTextDelta({
+      const pushed = await this.#events.pushTextDelta({
         context,
         delta: text,
         messageId,
         reason: "driver.claude.message.delta",
       });
+      if (pushed) {
+        this.#state.appendStreamedText(messageId, text);
+      }
       return;
     }
 
@@ -471,9 +478,17 @@ export class ClaudeAgentSdkMessageTranslator {
 
     if (message.subtype === "success") {
       const resultText = isRecord(message) ? readString(message, "result") : null;
+      if (resultText !== null && resultText.length > 0 && !this.#state.hasAssistantText(runId)) {
+        const messageId = this.#state.assistantMessageId(runId, null);
+        if (await this.#events.pushMessageSnapshot(context, messageId, resultText)) {
+          this.#state.markAuthoritative(messageId, resultText);
+          await this.#endAssistantMessage(context, runId, messageId);
+        }
+      }
       // SDKResultSuccess.result is the provider's terminal text. Bind it only
-      // to a complete assistant snapshot with identical bytes; arrival order
-      // alone cannot distinguish a late replayed progress frame from final.
+      // to a complete assistant snapshot with identical bytes. Native crash
+      // resume can omit every assistant frame, so the result is materialized
+      // above only when no competing text candidate exists.
       const finalMessage =
         resultText === null ? null : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
 

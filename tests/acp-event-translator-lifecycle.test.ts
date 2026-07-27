@@ -315,6 +315,84 @@ describe("ACP runtime event translation", () => {
     expect(kinds.every((kind) => kind.includes("."))).toBe(true);
   });
 
+  test("projects an execute tool with a nonzero raw exit as failed", () => {
+    const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    state.translateUpdate({
+      update: {
+        kind: "execute",
+        sessionUpdate: "tool_call",
+        status: "in_progress",
+        toolCallId: "tool-1",
+      },
+    });
+
+    const events = state.translateUpdate({
+      update: {
+        rawOutput: {
+          metadata: { exit: 7, output: "stdoutstderr", truncated: false },
+          output: "stdoutstderr",
+        },
+        sessionUpdate: "tool_call_update",
+        status: "completed",
+        toolCallId: "tool-1",
+      },
+    });
+
+    expect(eventPayload(requireEvent(events, "tool.call.updated"))).toMatchObject({
+      kind: "execute",
+      status: "failed",
+      toolCallId: "tool-1",
+    });
+    expect(eventPayload(requireEvent(events, "item.completed"))).toMatchObject({
+      itemId: "tool-1",
+      result: { metadata: { exit: 7 } },
+      status: "failed",
+    });
+  });
+
+  test("keeps a nonzero execute exit across partial updates", () => {
+    const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    state.translateUpdate({
+      update: {
+        kind: "execute",
+        sessionUpdate: "tool_call",
+        status: "in_progress",
+        toolCallId: "tool-1",
+      },
+    });
+    state.translateUpdate({
+      update: {
+        rawOutput: {
+          metadata: { exit: 7, output: "stderr", truncated: false },
+          output: "stderr",
+        },
+        sessionUpdate: "tool_call_update",
+        status: "in_progress",
+        toolCallId: "tool-1",
+      },
+    });
+
+    const events = state.translateUpdate({
+      update: {
+        sessionUpdate: "tool_call_update",
+        status: "completed",
+        toolCallId: "tool-1",
+      },
+    });
+
+    expect(eventPayload(requireEvent(events, "tool.call.updated"))).toMatchObject({
+      kind: "execute",
+      status: "failed",
+      toolCallId: "tool-1",
+    });
+    expect(eventPayload(requireEvent(events, "item.completed"))).toMatchObject({
+      itemId: "tool-1",
+      status: "failed",
+    });
+  });
+
   test("does not reset tool identity fields omitted by a partial update", () => {
     const state = new AcpTurnEventState();
     state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });

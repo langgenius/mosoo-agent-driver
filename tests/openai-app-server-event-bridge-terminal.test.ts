@@ -6,6 +6,7 @@ import { isDriverId } from "../src/protocol/id";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
+import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 interface EventBatch {
@@ -87,6 +88,118 @@ function createHarness(options: { failNativeResumePublish?: boolean; holdReason?
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test.each([
+    ["completed", "run.completed", true],
+    ["failed", "run.failed", false],
+    ["cancelled", "run.cancelled", false],
+  ] as const)(
+    "%s turns never emit resume metadata after the terminal event",
+    async (outcome, terminalKind, publishesResume) => {
+      const { bridge, context, events, logger } = createHarness();
+      const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+      void trackedTurn.catch(() => {});
+
+      if (outcome === "cancelled") {
+        await bridge.cancelTurn(context, "turn-1", "test.cancel");
+      } else {
+        await bridge.handleNotification(context, "turn/completed", {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-1",
+            status: outcome,
+          },
+        });
+      }
+
+      if (outcome === "completed") {
+        await expect(trackedTurn).resolves.toBeUndefined();
+      } else {
+        await expect(trackedTurn).rejects.toBeInstanceOf(Error);
+      }
+
+      const allEvents = events();
+      const terminalIndex = allEvents.findIndex((event) => event.kind === terminalKind);
+      const resumeIndexes = allEvents
+        .map((event, index) => (event.kind === "runtime.resume.updated" ? index : -1))
+        .filter((index) => index >= 0);
+
+      expect(terminalIndex).toBeGreaterThanOrEqual(0);
+      expect(resumeIndexes).toHaveLength(publishesResume ? 1 : 0);
+      expect(resumeIndexes.every((index) => index < terminalIndex)).toBe(true);
+      expect(allEvents.slice(terminalIndex + 1)).toEqual([]);
+      await logger.destroy();
+    },
+  );
+
+  test("drops reordered usage and diagnostics once terminal settlement starts", async () => {
+    const harness = createHarness({
+      holdReason: "driver.openai.native_resume_ref.updated",
+    });
+    const trackedTurn = harness.bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+    const usage = {
+      threadId: "thread-1",
+      tokenUsage: {
+        last: {
+          cachedInputTokens: 2,
+          inputTokens: 10,
+          outputTokens: 4,
+          reasoningOutputTokens: 1,
+          totalTokens: 14,
+        },
+        modelContextWindow: 200_000,
+        total: {
+          cachedInputTokens: 2,
+          inputTokens: 10,
+          outputTokens: 4,
+          reasoningOutputTokens: 1,
+          totalTokens: 14,
+        },
+      },
+      turnId: "turn-1",
+    } as const;
+    const diff = {
+      diff: "diff --git a/file b/file",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    };
+
+    await harness.bridge.handleNotification(harness.context, "thread/tokenUsage/updated", usage);
+    await harness.bridge.handleNotification(harness.context, "turn/diff/updated", diff);
+
+    const completion = harness.bridge.handleNotification(harness.context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [],
+        itemsView: "notLoaded",
+        status: "completed",
+      },
+    });
+    await harness.heldPush;
+
+    await harness.bridge.handleNotification(harness.context, "thread/tokenUsage/updated", usage);
+    await harness.bridge.handleNotification(harness.context, "turn/diff/updated", diff);
+    harness.releasePush();
+    await completion;
+    await trackedTurn;
+
+    await harness.bridge.handleNotification(harness.context, "thread/tokenUsage/updated", usage);
+    await harness.bridge.handleNotification(harness.context, "turn/diff/updated", diff);
+
+    expect(
+      harness
+        .events()
+        .filter((event) =>
+          ["usage.updated", "diagnostic.reported", "run.completed"].includes(event.kind),
+        ),
+    ).toMatchObject([
+      { kind: "usage.updated", runId: DRIVER_TEST_IDS.runId },
+      { kind: "diagnostic.reported", runId: DRIVER_TEST_IDS.runId },
+      { kind: "run.completed", runId: DRIVER_TEST_IDS.runId },
+    ]);
+    await harness.logger.destroy();
+  });
+
   test("removes OpenAI private citation markup from streamed and final assistant text", async () => {
     const { bridge, context, events, logger } = createHarness();
     const privateCitation = "\uE200cite\uE202turn7search12\uE202turn8view0\uE201";
@@ -414,16 +527,16 @@ describe("OpenAi app-server event bridge", () => {
         },
       },
       {
-        kind: "run.completed",
-        payload: {
-          stopReason: "end_turn",
-        },
-      },
-      {
         kind: "runtime.resume.updated",
         payload: {
           resumePointer: "thread-1",
           threadId: "thread-1",
+        },
+      },
+      {
+        kind: "run.completed",
+        payload: {
+          stopReason: "end_turn",
         },
       },
     ]);

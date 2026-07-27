@@ -66,6 +66,7 @@ describe("ACP runtime event translation", () => {
       "tool.call.updated",
       "permission.requested",
       "message.completed",
+      "tool.call.updated",
       "item.completed",
       "run.completed",
     ]);
@@ -97,10 +98,15 @@ describe("ACP runtime event translation", () => {
       "item.started",
       "tool.call.updated",
       "message.completed",
+      "tool.call.updated",
       "item.completed",
       "run.completed",
     ]);
     expect(eventPayload(events[4]!)).toMatchObject({
+      status: "completed",
+      toolCallId: "tool-1",
+    });
+    expect(eventPayload(events[5]!)).toMatchObject({
       itemId: "tool-1",
       status: "completed",
     });
@@ -132,14 +138,19 @@ describe("ACP runtime event translation", () => {
       "item.started",
       "tool.call.updated",
       "message.completed",
+      "tool.call.updated",
       "item.completed",
       "run.completed",
     ]);
     expect(eventPayload(events[4]!)).toMatchObject({
+      status: "completed",
+      toolCallId: "tool-1",
+    });
+    expect(eventPayload(events[5]!)).toMatchObject({
       itemId: "tool-1",
       status: "completed",
     });
-    expect(eventPayload(events[5]!)).toMatchObject({
+    expect(eventPayload(events[6]!)).toMatchObject({
       stopReason: "max_turn_requests",
     });
   });
@@ -385,6 +396,7 @@ describe("ACP runtime event translation", () => {
       "item.started",
       "tool.call.updated",
       "message.completed",
+      "tool.call.updated",
       "item.completed",
       "run.failed",
     ]);

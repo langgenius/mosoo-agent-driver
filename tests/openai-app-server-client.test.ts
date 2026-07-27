@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +11,8 @@ import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverExecutionEnvironment } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
+import * as childProcessHelpers from "../src/runtimes/child-process";
 import { OpenAiAppServerClient, limitNdjsonLines } from "../src/runtimes/openai/app-server-client";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/generated/app-server-protocol";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -109,7 +113,7 @@ setInterval(() => {}, 1000);
       ) as { params: { capabilities: unknown } };
 
       expect(request.params.capabilities).toEqual({
-        experimentalApi: false,
+        experimentalApi: true,
         requestAttestation: false,
       });
     } finally {
@@ -150,6 +154,70 @@ setInterval(() => {}, 1000);
     }
   });
 
+  test.each(["unavailable", "error"] as const)(
+    "fails closed when the process-tree watchdog is %s",
+    async (failure) => {
+      const watchdogProcess = new EventEmitter() as ChildProcess;
+      const watchdogCleanup = Promise.withResolvers<void>();
+      const watchdogCreated = Promise.withResolvers<void>();
+      let childPid = 0;
+      const watchdogSpy = spyOn(
+        childProcessHelpers,
+        "spawnLinuxProcessTreeWatchdog",
+      ).mockImplementation((rootPid) => {
+        childPid = rootPid;
+        watchdogCreated.resolve();
+        return failure === "unavailable"
+          ? null
+          : { cleanup: watchdogCleanup.promise, process: watchdogProcess };
+      });
+      const harness = await createClientHarness(
+        () => `
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`,
+      );
+
+      try {
+        const start = harness.client.start();
+        void start.catch(() => {});
+        await watchdogCreated.promise;
+        if (failure === "error") {
+          watchdogCleanup.reject(new Error("watchdog lease failed"));
+        }
+
+        await expect(start).rejects.toThrow("process-tree watchdog");
+        await expect(
+          settlePromiseWithTimeout(
+            (async () => {
+              for (;;) {
+                try {
+                  process.kill(childPid, 0);
+                  await Bun.sleep(5);
+                } catch {
+                  return;
+                }
+              }
+            })(),
+            { label: "unsupervised app-server exit", timeoutMs: 250 },
+          ),
+        ).resolves.toMatchObject({ status: "completed" });
+        expect(harness.protocolErrors.some((error) => error.message.includes("watchdog"))).toBe(
+          true,
+        );
+      } finally {
+        watchdogSpy.mockRestore();
+        if (childPid > 0) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {}
+        }
+        await harness.client.stop().catch(() => {});
+        await harness.logger.destroy();
+      }
+    },
+  );
+
   test("does not spawn after stop wins a startup race", async () => {
     const harness = await createClientHarness(
       (directory) => `
@@ -160,6 +228,7 @@ setInterval(() => {}, 1000);
 
     try {
       const start = harness.client.start();
+      void start.catch(() => {});
       const stop = harness.client.stop();
 
       await expect(stop).resolves.toBeUndefined();
@@ -294,13 +363,12 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test.each(["resolved terminal", "process close"] as const)(
-    "does not let a pending approval block %s",
-    async (outcome) => {
-      const permissionAborted = Promise.withResolvers<void>();
-      const terminal = Promise.withResolvers<void>();
-      const harness = await createClientHarness(
-        () => `
+  test("drains a resolved approval before accepting the following terminal", async () => {
+    const permissionAborted = Promise.withResolvers<void>();
+    const permissionGate = Promise.withResolvers<void>();
+    const terminal = Promise.withResolvers<void>();
+    const harness = await createClientHarness(
+      () => `
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -317,71 +385,218 @@ process.stdin.on("data", (chunk) => {
         method: "item/commandExecution/requestApproval",
         params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
       }) + "\\n");
-      if (${JSON.stringify(outcome)} === "resolved terminal") {
-        process.stdout.write(JSON.stringify({
-          method: "serverRequest/resolved",
-          params: { requestId: 41, threadId: "thread-1" },
-        }) + "\\n");
-        process.stdout.write(JSON.stringify({
-          method: "turn/completed",
-          params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
-        }) + "\\n");
-      } else {
-        setTimeout(() => process.exit(17), 10);
-      }
+      process.stdout.write(JSON.stringify({
+        method: "serverRequest/resolved",
+        params: { requestId: 41, threadId: "thread-1" },
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        method: "turn/completed",
+        params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+      }) + "\\n");
     }
   }
 });
 setInterval(() => {}, 1000);
 `,
-        async (method) => {
-          if (method === "turn/completed") {
-            terminal.resolve();
+      async (method) => {
+        if (method === "turn/completed") {
+          terminal.resolve();
+        }
+      },
+      async (_input, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
           }
-        },
-        async (_input, signal) => {
-          await new Promise<void>((resolve) => {
-            if (signal?.aborted) {
-              resolve();
-              return;
-            }
 
-            signal?.addEventListener("abort", () => resolve(), { once: true });
-          });
-          permissionAborted.resolve();
-          return "reject_once";
-        },
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        permissionAborted.resolve();
+        await permissionGate.promise;
+        return "reject_once";
+      },
+    );
+
+    try {
+      await harness.client.start();
+      await permissionAborted.promise;
+      await expect(
+        settlePromiseWithTimeout(terminal.promise, {
+          label: "terminal before permission resolution delivery",
+          timeoutMs: 50,
+        }),
+      ).resolves.toMatchObject({ status: "timed_out" });
+
+      permissionGate.resolve();
+      await expect(
+        settlePromiseWithTimeout(terminal.promise, {
+          label: "terminal after permission resolution delivery",
+          timeoutMs: 250,
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+      expect(harness.protocolErrors).toEqual([]);
+    } finally {
+      permissionGate.resolve();
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("fails closed when resolved approval event delivery rejects", async () => {
+    const permissionAborted = Promise.withResolvers<void>();
+    const permissionGate = Promise.withResolvers<void>();
+    const terminal = Promise.withResolvers<void>();
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+    } else if (message.method === "initialized") {
+      process.stdout.write(JSON.stringify({
+        id: 41,
+        method: "item/commandExecution/requestApproval",
+        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        method: "serverRequest/resolved",
+        params: { requestId: 41, threadId: "thread-1" },
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        method: "turn/completed",
+        params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+      }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      async (method) => {
+        if (method === "turn/completed") {
+          terminal.resolve();
+        }
+      },
+      async (_input, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        permissionAborted.resolve();
+        await permissionGate.promise;
+        throw new PermissionEventDeliveryError(
+          "item/commandExecution/requestApproval:41",
+          "resolved",
+          new Error("event sink unavailable"),
+        );
+      },
+    );
+
+    try {
+      await harness.client.start();
+      await permissionAborted.promise;
+      await expect(
+        settlePromiseWithTimeout(terminal.promise, {
+          label: "terminal before failed permission resolution delivery",
+          timeoutMs: 50,
+        }),
+      ).resolves.toMatchObject({ status: "timed_out" });
+
+      permissionGate.resolve();
+      for (let attempt = 0; attempt < 50 && harness.protocolErrors.length === 0; attempt += 1) {
+        await Bun.sleep(5);
+      }
+
+      expect(harness.protocolErrors).toHaveLength(1);
+      expect(harness.protocolErrors[0]).toBeInstanceOf(PermissionEventDeliveryError);
+      await expect(
+        settlePromiseWithTimeout(terminal.promise, {
+          label: "terminal after failed permission resolution delivery",
+          timeoutMs: 100,
+        }),
+      ).resolves.toMatchObject({ status: "timed_out" });
+    } finally {
+      permissionGate.resolve();
+      await harness.client.stop().catch(() => {});
+      await harness.logger.destroy();
+    }
+  });
+
+  test("does not let a pending approval block process close", async () => {
+    const permissionAborted = Promise.withResolvers<void>();
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+    } else if (message.method === "initialized") {
+      process.stdout.write(JSON.stringify({
+        id: 41,
+        method: "item/commandExecution/requestApproval",
+        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+      }) + "\\n");
+      setTimeout(() => process.exit(17), 10);
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      async (_input, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        permissionAborted.resolve();
+        return "reject_once";
+      },
+    );
+
+    try {
+      await harness.client.start();
+      const settled = await settlePromiseWithTimeout(
+        (async () => {
+          while (harness.protocolErrors.length === 0) {
+            await Bun.sleep(5);
+          }
+        })(),
+        { label: "process close", timeoutMs: 250 },
       );
 
-      try {
-        await harness.client.start();
-        const settled = await settlePromiseWithTimeout(
-          outcome === "resolved terminal"
-            ? terminal.promise
-            : (async () => {
-                while (harness.protocolErrors.length === 0) {
-                  await Bun.sleep(5);
-                }
-              })(),
-          { label: outcome, timeoutMs: 250 },
-        );
-
-        expect(settled.status).toBe("completed");
-        await expect(
-          settlePromiseWithTimeout(permissionAborted.promise, {
-            label: "permission abort",
-            timeoutMs: 250,
-          }),
-        ).resolves.toMatchObject({ status: "completed" });
-        if (outcome === "process close") {
-          expect(harness.protocolErrors[0]?.message).toContain("code 17");
-        }
-      } finally {
-        await harness.client.stop();
-        await harness.logger.destroy();
-      }
-    },
-  );
+      expect(settled.status).toBe("completed");
+      await expect(
+        settlePromiseWithTimeout(permissionAborted.promise, {
+          label: "permission abort",
+          timeoutMs: 250,
+        }),
+      ).resolves.toMatchObject({ status: "completed" });
+      expect(harness.protocolErrors[0]?.message).toContain("code 17");
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
 
   test("aborts pending server requests without sending a late response", async () => {
     const permissionStarted = Promise.withResolvers<void>();
@@ -472,7 +687,7 @@ process.stdin.on("data", (chunk) => {
     try {
       await harness.client.start();
       await terminalEntered.promise;
-      await Bun.sleep(25);
+      await Bun.sleep(650);
       expect(harness.protocolErrors).toEqual([]);
 
       terminalGate.resolve();
@@ -487,6 +702,72 @@ process.stdin.on("data", (chunk) => {
       await harness.logger.destroy();
     }
   });
+
+  test.each(["delayed", "failed"] as const)(
+    "%s watchdog cleanup after leader close remains a stop barrier",
+    async (outcome) => {
+      const watchdogProcess = new EventEmitter() as ChildProcess;
+      const watchdogCleanup = Promise.withResolvers<void>();
+      const watchdogSpy = spyOn(
+        childProcessHelpers,
+        "spawnLinuxProcessTreeWatchdog",
+      ).mockImplementation(() => ({
+        cleanup: watchdogCleanup.promise,
+        process: watchdogProcess,
+      }));
+      const harness = await createClientHarness(
+        (directory) => `
+import { writeFileSync } from "node:fs";
+process.on("exit", () => writeFileSync(${JSON.stringify(join(directory, "leader-exited"))}, "exited"));
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+    } else if (message.method === "initialized") {
+      setTimeout(() => process.exit(0), 5);
+    }
+  }
+});
+`,
+      );
+
+      try {
+        await harness.client.start();
+        while (!(await Bun.file(join(harness.directory, "leader-exited")).exists())) {
+          await Bun.sleep(5);
+        }
+        await Bun.sleep(25);
+
+        const stop = harness.client.stop();
+        void stop.catch(() => {});
+        if (outcome === "delayed") {
+          await expect(
+            settlePromiseWithTimeout(stop, {
+              label: "leader-closed process-tree cleanup",
+              timeoutMs: 100,
+            }),
+          ).resolves.toMatchObject({ status: "timed_out" });
+          watchdogCleanup.resolve();
+          await expect(stop).resolves.toBeUndefined();
+        } else {
+          watchdogCleanup.reject(new Error("watchdog cleanup failed"));
+          await expect(stop).rejects.toThrow("watchdog cleanup failed");
+          await expect(harness.client.stop()).resolves.toBeUndefined();
+        }
+      } finally {
+        watchdogCleanup.resolve();
+        watchdogSpy.mockRestore();
+        await harness.client.stop().catch(() => {});
+        await harness.logger.destroy();
+      }
+    },
+  );
 
   test("turns stdin EPIPE into a bounded protocol failure", async () => {
     const closedInput = Promise.withResolvers<void>();
@@ -676,9 +957,217 @@ setInterval(() => {}, 1000);
     }
   });
 
+  test("force kills the process group after the leader exits with inherited stdio open", async () => {
+    const harness = await createClientHarness((directory) => {
+      const descendantReadyPath = join(directory, "descendant-ready");
+      const descendantTermPath = join(directory, "descendant-term");
+      const descendantScript = `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(descendantReadyPath)}, "ready");
+process.on("SIGTERM", () => writeFileSync(${JSON.stringify(descendantTermPath)}, "ignored"));
+setInterval(() => {}, 1000);
+`;
+
+      return `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], {
+  stdio: ["ignore", "inherit", "inherit"],
+});
+await Bun.write(${JSON.stringify(join(directory, "descendant-pid"))}, String(descendant.pid));
+while (!(await Bun.file(${JSON.stringify(descendantReadyPath)}).exists())) {
+  await Bun.sleep(5);
+}
+process.on("exit", () => writeFileSync(${JSON.stringify(join(directory, "leader-exited"))}, "exited"));
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const newline = buffer.indexOf("\\n");
+  if (newline < 0) return;
+  const request = JSON.parse(buffer.slice(0, newline));
+  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n", () => process.exit(0));
+});
+`;
+    });
+    let descendantPid = 0;
+
+    try {
+      await harness.client.start();
+      descendantPid = Number(await Bun.file(join(harness.directory, "descendant-pid")).text());
+      while (!(await Bun.file(join(harness.directory, "leader-exited")).exists())) {
+        await Bun.sleep(5);
+      }
+
+      await expect(harness.client.stop()).resolves.toBeUndefined();
+      expect(await Bun.file(join(harness.directory, "descendant-term")).exists()).toBe(true);
+    } finally {
+      if (descendantPid > 0) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {}
+      }
+
+      await harness.client.stop().catch(() => {});
+      await harness.logger.destroy();
+    }
+  }, 10_000);
+
+  test("signals app-server session members outside the leader process group", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+
+    const harness = await createClientHarness((directory) => {
+      const descendantPath = join(directory, "descendant.ts");
+      const descendantScript = `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(join(directory, "descendant-ready"))}, "ready");
+process.on("SIGTERM", () => writeFileSync(${JSON.stringify(join(directory, "descendant-term"))}, "term"));
+setInterval(() => {}, 1000);
+`;
+      const shellCommand = `set -m; ${JSON.stringify(process.execPath)} ${JSON.stringify(descendantPath)} & echo $! > ${JSON.stringify(join(directory, "descendant-pid"))}; wait`;
+
+      return `
+import { spawn } from "node:child_process";
+await Bun.write(${JSON.stringify(descendantPath)}, ${JSON.stringify(descendantScript)});
+spawn("/bin/bash", ["-c", ${JSON.stringify(shellCommand)}], {
+  stdio: ["ignore", "ignore", "ignore"],
+});
+await Bun.write(${JSON.stringify(join(directory, "leader-pid"))}, String(process.pid));
+while (!(await Bun.file(${JSON.stringify(join(directory, "descendant-ready"))}).exists())) {
+  await Bun.sleep(5);
+}
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const newline = buffer.indexOf("\\n");
+  if (newline < 0) return;
+  const request = JSON.parse(buffer.slice(0, newline));
+  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+});
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+    });
+    let descendantPid = 0;
+
+    try {
+      await harness.client.start();
+      const leaderPid = Number(await Bun.file(join(harness.directory, "leader-pid")).text());
+      descendantPid = Number(await Bun.file(join(harness.directory, "descendant-pid")).text());
+      const stat = await Bun.file(`/proc/${descendantPid}/stat`).text();
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      expect(Number(fields[2])).not.toBe(leaderPid);
+      expect(Number(fields[3])).toBe(leaderPid);
+
+      await harness.client.stop();
+      expect(await Bun.file(join(harness.directory, "descendant-term")).exists()).toBe(true);
+    } finally {
+      if (descendantPid > 0) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {}
+      }
+
+      await harness.client.stop().catch(() => {});
+      await harness.logger.destroy();
+    }
+  }, 10_000);
+
+  test("waits for stubborn nested setsid descendants before resolving stop", async () => {
+    if (process.platform !== "linux") {
+      return;
+    }
+
+    const harness = await createClientHarness((directory) => {
+      const descendantPath = join(directory, "nested-descendant.ts");
+      const descendantScript = `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(join(directory, "nested-ready"))}, "ready");
+process.on("SIGTERM", () => {
+  writeFileSync(${JSON.stringify(join(directory, "nested-term"))}, "ignored");
+});
+setInterval(() => {}, 1000);
+`;
+      const shellCommand = `setsid ${JSON.stringify(process.execPath)} ${JSON.stringify(descendantPath)} & echo $! > ${JSON.stringify(join(directory, "nested-pid"))}; wait`;
+
+      return `
+import { spawn } from "node:child_process";
+await Bun.write(${JSON.stringify(descendantPath)}, ${JSON.stringify(descendantScript)});
+spawn("/bin/bash", ["-c", ${JSON.stringify(shellCommand)}], {
+  stdio: ["ignore", "ignore", "ignore"],
+});
+await Bun.write(${JSON.stringify(join(directory, "leader-pid"))}, String(process.pid));
+while (!(await Bun.file(${JSON.stringify(join(directory, "nested-ready"))}).exists())) {
+  await Bun.sleep(5);
+}
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const newline = buffer.indexOf("\\n");
+  if (newline < 0) return;
+  const request = JSON.parse(buffer.slice(0, newline));
+  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+});
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`;
+    });
+    let descendantPid = 0;
+
+    try {
+      await harness.client.start();
+      const leaderPid = Number(await Bun.file(join(harness.directory, "leader-pid")).text());
+      descendantPid = Number(await Bun.file(join(harness.directory, "nested-pid")).text());
+      const stat = await Bun.file(`/proc/${descendantPid}/stat`).text();
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      expect(Number(fields[3])).toBe(descendantPid);
+      expect(Number(fields[3])).not.toBe(leaderPid);
+
+      await harness.client.stop();
+      expect(await Bun.file(join(harness.directory, "nested-term")).exists()).toBe(true);
+      await expect(
+        settlePromiseWithTimeout(
+          (async () => {
+            for (;;) {
+              try {
+                process.kill(descendantPid, 0);
+                await Bun.sleep(5);
+              } catch {
+                return;
+              }
+            }
+          })(),
+          { label: "nested app-server descendant exit", timeoutMs: 250 },
+        ),
+      ).resolves.toMatchObject({ status: "completed" });
+    } finally {
+      if (descendantPid > 0) {
+        try {
+          process.kill(descendantPid, "SIGKILL");
+        } catch {}
+      }
+
+      await harness.client.stop().catch(() => {});
+      await harness.logger.destroy();
+    }
+  }, 10_000);
+
   test("retries process cleanup after a failed force kill", async () => {
     const harness = await createClientHarness(
       (directory) => `
+import { spawn } from "node:child_process";
+const descendant = spawn("/usr/bin/setsid", [
+  process.execPath,
+  "-e",
+  "setInterval(() => {}, 1000)",
+], {
+  stdio: "ignore",
+});
+await Bun.write(${JSON.stringify(join(directory, "descendant-pid"))}, String(descendant.pid));
 await Bun.write(${JSON.stringify(join(directory, "pid"))}, String(process.pid));
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -695,20 +1184,22 @@ setInterval(() => {}, 1000);
     );
     const nativeKill = process.kill;
     let childPid = 0;
+    let descendantPid = 0;
     let suppressKill = true;
 
     try {
       await harness.client.start();
       childPid = Number(await Bun.file(join(harness.directory, "pid")).text());
+      descendantPid = Number(await Bun.file(join(harness.directory, "descendant-pid")).text());
       process.kill = ((pid, signal) => {
-        if (suppressKill && pid === -childPid) {
+        if (suppressKill && Math.abs(Number(pid)) === descendantPid) {
           return true;
         }
 
         return nativeKill(pid, signal);
       }) as typeof process.kill;
 
-      await expect(harness.client.stop()).rejects.toThrow("timed out");
+      await expect(harness.client.stop()).rejects.toThrow("process tree did not exit");
       suppressKill = false;
       await expect(harness.client.stop()).resolves.toBeUndefined();
     } finally {
@@ -717,6 +1208,11 @@ setInterval(() => {}, 1000);
       if (childPid > 0) {
         try {
           nativeKill(-childPid, "SIGKILL");
+        } catch {}
+      }
+      if (descendantPid > 0) {
+        try {
+          nativeKill(descendantPid, "SIGKILL");
         } catch {}
       }
 

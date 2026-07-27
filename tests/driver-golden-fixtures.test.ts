@@ -47,6 +47,19 @@ describe("Driver golden fixtures", () => {
     expect(parseRuntimeCommand(fixture)).toEqual(fixture);
   });
 
+  test("rejects unsupported input attachments", () => {
+    const fixture = readJsonFixture("./fixtures/driver/commands/input-start.json") as {
+      readonly input: Record<string, unknown>;
+    };
+
+    expect(() =>
+      parseRuntimeCommand({
+        ...fixture,
+        input: { ...fixture.input, attachmentIds: [] },
+      }),
+    ).toThrow("input.attachmentIds is unsupported.");
+  });
+
   test.each(runtimeEventFixtures)("ingests runtime event fixture %s", (name) => {
     const outcome = ingestRuntimeEventInput(
       createRuntimeEventContext(),

@@ -164,7 +164,7 @@ describe("driver runtime boundary", () => {
       expect(acceptedSignal?.reason).toMatchObject({
         message: expect.stringContaining("accepted status delivery timed out"),
       });
-      expect(backend.cancelledReasons).toEqual([]);
+      expect(backend.cancelledReasons).toEqual(["must not run"]);
       expect(runtimeState.status()).toBe("failed");
       expect(socket.failedRuns).toHaveLength(1);
       expect(shutdownCalls).toEqual(["driver.command_loop_failed"]);

@@ -59,6 +59,14 @@
       }
     },
     {
+      "kind": "runtime.resume.updated",
+      "payload": {
+        "resumePointer": "thread-1",
+        "threadId": "thread-1"
+      },
+      "visibility": "owner_debug"
+    },
+    {
       "kind": "run.completed",
       "native": {
         "eventName": "turn.completed",
@@ -71,14 +79,6 @@
         "stopReason": "end_turn"
       },
       "sourceEventId": "openai.turn.completed:turn-1"
-    },
-    {
-      "kind": "runtime.resume.updated",
-      "payload": {
-        "resumePointer": "thread-1",
-        "threadId": "thread-1"
-      },
-      "visibility": "owner_debug"
     }
   ]
 }

@@ -7,7 +7,6 @@ describe("CMA projection", () => {
   test("projects user messages to input.start commands", () => {
     expect(
       projectCmaInboundToDriverCommand({
-        attachmentIds: ["file-1"],
         commandId: "command-1",
         requestId: "request-1",
         runId: "run-1",
@@ -17,7 +16,6 @@ describe("CMA projection", () => {
     ).toEqual({
       commandId: "command-1",
       input: {
-        attachmentIds: ["file-1"],
         text: "hello",
       },
       kind: "input.start",
@@ -73,13 +71,11 @@ describe("CMA projection", () => {
     });
   });
 
-  test("rejects unsupported inbound fields instead of silently dropping them", () => {
+  test("rejects unsupported attachments instead of silently dropping them", () => {
     expect(() =>
       projectCmaInboundToDriverCommand({
+        attachmentIds: ["file-1"],
         commandId: "command-1",
-        metadata: {
-          unsupported: true,
-        },
         requestId: "request-1",
         runId: "run-1",
         text: "hello",

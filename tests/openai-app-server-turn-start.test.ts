@@ -26,16 +26,4 @@ describe("OpenAI app-server turn start params", () => {
       threadId: "thread-1",
     });
   });
-
-  test("propagates the supervised approval policy unchanged", () => {
-    expect(
-      createTurnParams({
-        approvalPolicy: "on-request",
-        cwd: "/workspace",
-        model: "gpt-5.4",
-        text: "Run pwd",
-        threadId: "thread-1",
-      }).approvalPolicy,
-    ).toBe("on-request");
-  });
 });

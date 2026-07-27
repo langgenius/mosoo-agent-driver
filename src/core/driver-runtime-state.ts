@@ -98,6 +98,7 @@ export class DriverRuntimeStateMachine {
 }
 
 export {
+  DriverTurnCancellationCleanupError,
   DriverTurnCancelledError,
   isDriverTurnCancelledError,
 } from "./driver-turn-cancelled-error";
