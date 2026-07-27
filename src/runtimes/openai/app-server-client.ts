@@ -474,6 +474,10 @@ export class OpenAiAppServerClient {
         },
         signal,
       );
+      if (this.#stopRequested) {
+        return;
+      }
+
       this.notify("initialized", {});
     });
 
