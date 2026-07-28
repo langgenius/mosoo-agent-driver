@@ -3,6 +3,7 @@
 import { readDriverBootPayload } from "../boot/read-driver-boot-payload";
 import { DriverProcess } from "./driver-process";
 import { logDriverFatal } from "../infrastructure/logging/driver-logger";
+import { captureDriverRuntimeIdentity } from "../infrastructure/runtime/driver-runtime-identity";
 import { isSupportedDriverRuntime, isSupportedDriverRuntimeTransport } from "../protocol/runtime";
 
 async function main(): Promise<void> {
@@ -16,7 +17,13 @@ async function main(): Promise<void> {
     throw new Error(`Unsupported runtime transport: ${String(payload.runtimeTransport)}.`);
   }
 
-  const driver = new DriverProcess(payload);
+  const driver = new DriverProcess(
+    payload,
+    undefined,
+    captureDriverRuntimeIdentity({
+      bundlePath: process.argv[1] ?? "",
+    }),
+  );
   await driver.run();
 }
 

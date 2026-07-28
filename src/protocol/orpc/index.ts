@@ -16,7 +16,17 @@ export interface DriverHelloInput {
   readonly pid: number;
   readonly protocolVersion: DriverBootPayload["protocolVersion"];
   readonly runtime: DriverRuntime;
+  readonly runtimeIdentity?: DriverRuntimeIdentity | undefined;
   readonly startedAt: string;
+}
+
+export interface DriverRuntimeIdentity {
+  readonly containerApplicationId: string;
+  readonly containerDeploymentId: string;
+  readonly containerDurableObjectId: string;
+  readonly containerPlacementId: string;
+  readonly driverBundleSha256: string;
+  readonly observedAt: string;
 }
 
 export interface DriverHelloOutput {
@@ -241,6 +251,22 @@ function readDriverRuntime(record: Record<string, unknown>): DriverRuntime {
   return runtime;
 }
 
+function readDriverRuntimeIdentity(value: unknown): DriverRuntimeIdentity | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const record = readRecord(value, "driver runtime identity");
+  return {
+    containerApplicationId: readNonEmptyString(record, "containerApplicationId"),
+    containerDeploymentId: readNonEmptyString(record, "containerDeploymentId"),
+    containerDurableObjectId: readNonEmptyString(record, "containerDurableObjectId"),
+    containerPlacementId: readNonEmptyString(record, "containerPlacementId"),
+    driverBundleSha256: readNonEmptyString(record, "driverBundleSha256"),
+    observedAt: readNonEmptyString(record, "observedAt"),
+  };
+}
+
 function readHeartbeatReason(value: unknown): DriverHeartbeatInput["reason"] {
   if (value === "interval" || value === "ping") {
     return value;
@@ -313,6 +339,7 @@ function readDriverCapabilities(record: Record<string, unknown>): DriverCapabili
 
 export function parseDriverHelloInput(value: unknown): DriverHelloInput {
   const record = readRecord(value, "driver hello input");
+  const runtimeIdentity = readDriverRuntimeIdentity(record["runtimeIdentity"]);
 
   return {
     capabilities: readDriverCapabilities(record),
@@ -320,6 +347,7 @@ export function parseDriverHelloInput(value: unknown): DriverHelloInput {
     pid: readNumber(record, "pid"),
     protocolVersion: readProtocolVersion(record),
     runtime: readDriverRuntime(record),
+    ...(runtimeIdentity === undefined ? {} : { runtimeIdentity }),
     startedAt: readString(record, "startedAt"),
   };
 }

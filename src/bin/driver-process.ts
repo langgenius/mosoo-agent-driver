@@ -12,6 +12,7 @@ import { createDriverHostIntegrationSnapshotFromBootExecution } from "../protoco
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
 import { parseDriverId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
+import type { DriverRuntimeIdentity } from "../protocol/orpc";
 import { createDriverStartInputFromBootPayload } from "../protocol/start";
 import type { DriverStartInput } from "../protocol/start";
 import type { AgentDriverBackendFactory, AgentDriverContext } from "../core/agent-driver-backend";
@@ -54,6 +55,7 @@ export class DriverProcess {
   readonly #shutdownController = new AbortController();
   readonly #hostSnapshot: DriverHostIntegrationSnapshot;
   readonly #runtimeState = new DriverRuntimeStateMachine("created");
+  readonly #runtimeIdentity: Promise<DriverRuntimeIdentity | undefined>;
   readonly #startInput: DriverStartInput;
   #shutdownReason: string | null = null;
   #shutdownTask: Promise<void> | null = null;
@@ -64,10 +66,12 @@ export class DriverProcess {
     payload: DriverBootPayload,
     backendFactory: AgentDriverBackendFactory = (input) =>
       AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(input),
+    runtimeIdentity?: DriverRuntimeIdentity | PromiseLike<DriverRuntimeIdentity | undefined>,
   ) {
     this.#backendFactory = backendFactory;
     this.payload = payload;
     this.#hostSnapshot = createDriverHostIntegrationSnapshotFromBootExecution(payload.execution);
+    this.#runtimeIdentity = Promise.resolve(runtimeIdentity);
     this.#startInput = createDriverStartInputFromBootPayload(payload);
     this.#permissionBroker = new DriverPermissionBroker(() => this.#logger);
     this.#heartbeatLoop = new DriverHeartbeatLoop({
@@ -99,6 +103,7 @@ export class DriverProcess {
     try {
       await socket.connect();
       this.#shutdownController.signal.throwIfAborted();
+      const runtimeIdentity = await this.#runtimeIdentity;
 
       const { logger, uplink } = createDriverLogger(this.payload, socket);
       this.#logger = logger;
@@ -124,6 +129,7 @@ export class DriverProcess {
             capabilities: [...capabilities],
             driverVersion: AGENT_DRIVER_VERSION,
             protocolVersion: DRIVER_PROTOCOL_VERSION,
+            ...(runtimeIdentity === undefined ? {} : { runtimeIdentity }),
             startedAt: this.#startedAt,
           }),
         );

@@ -83,11 +83,20 @@ describe("public API", () => {
         pid: 1,
         protocolVersion: 1,
         runtime: "openai-runtime",
+        runtimeIdentity: {
+          containerApplicationId: "application-1",
+          containerDeploymentId: "deployment-1",
+          containerDurableObjectId: "do-1",
+          containerPlacementId: "placement-1",
+          driverBundleSha256: "a".repeat(64),
+          observedAt: "2026-07-19T00:00:00.000Z",
+        },
         startedAt: "now",
       }),
     ).toMatchObject({
       driverVersion: "0.1.0",
       runtime: "openai-runtime",
+      runtimeIdentity: { containerDeploymentId: "deployment-1" },
     });
     expect(
       parseDriverReadyInputFromOrpcSubpath({

@@ -260,6 +260,34 @@ describe("DriverInstanceSocket lifecycle", () => {
       }),
     ).rejects.toThrow(message);
   });
+
+  test("forwards runtime identity in the hello handshake", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    const runtimeIdentity = {
+      containerApplicationId: "application-1",
+      containerDeploymentId: "deployment-1",
+      containerDurableObjectId: "do-1",
+      containerPlacementId: "placement-1",
+      driverBundleSha256: "a".repeat(64),
+      observedAt: "2026-07-19T00:00:00.000Z",
+    };
+    await socket.connect();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      runtimeIdentity,
+      startedAt: new Date(0).toISOString(),
+    });
+
+    expect((PendingWebSocket.instances[0] as RpcWebSocket).requests[0]).toEqual({
+      input: expect.objectContaining({ runtimeIdentity }),
+      path: "/driver/hello",
+    });
+  });
 });
 
 describe("DriverProcess lifecycle", () => {

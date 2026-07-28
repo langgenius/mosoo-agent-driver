@@ -195,6 +195,7 @@ export class DriverInstanceSocket {
         pid: process.pid,
         protocolVersion: input.protocolVersion,
         runtime: this.payload.runtime,
+        ...(input.runtimeIdentity === undefined ? {} : { runtimeIdentity: input.runtimeIdentity }),
         startedAt: input.startedAt,
       },
       this.#rpcOptions(),
