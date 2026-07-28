@@ -23,9 +23,11 @@
  *   TTFT_UPDATE_BASELINE=1   write baseline.json from this run
  *   TTFT_OPENCODE_PROVIDER=openai|anthropic   backing provider for opencode
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
@@ -37,6 +39,7 @@ import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registr
 import { driverBootPayload } from "../tests/driver-boot-payload-fixture";
 import { DRIVER_TEST_IDS, bootPayload } from "../tests/driver-runtime-boundary-fixtures";
 import { textDeltaFrom } from "../tests/live-driver-events";
+import { percentile, readOutputTokens, summarizeStreaming } from "./ttft-metrics";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(HERE, "outputs");
@@ -58,7 +61,7 @@ async function withTimeout<T>(label: string, ms: number, task: Promise<T>): Prom
 }
 
 type RuntimeId = "claude" | "openai" | "opencode";
-type ScenarioId = "no_tool" | "long_output" | "tool_write_allow" | "tool_write_reject";
+type ScenarioId = "custom" | "no_tool" | "long_output" | "tool_write_allow" | "tool_write_reject";
 
 interface Scenario {
   readonly id: ScenarioId;
@@ -68,6 +71,7 @@ interface Scenario {
   readonly permission: PermissionDecision;
   /** substring the final output must contain for ok=true */
   readonly expect: string;
+  readonly exact?: boolean;
   /** when set, ok additionally requires cwd/<marker> to contain the value */
   readonly marker?: { file: string; content: string };
 }
@@ -79,34 +83,36 @@ interface TrialMetrics {
   readonly totalMs: number | null;
   readonly deltaCount: number;
   readonly outputChars: number;
+  readonly outputTokens: number | null;
+  readonly outputTokensPerSecond: number | null;
   readonly interChunkP50: number | null;
   readonly interChunkP95: number | null;
   readonly interChunkMax: number | null;
+  readonly pauseOver250MsCount: number;
+  readonly pauseOver500MsCount: number;
+  readonly timePerOutputTokenMs: number | null;
   readonly fileCreated: boolean | null;
   readonly ok: boolean;
   readonly error: string | null;
 }
 
 interface CellResult {
-  readonly runtime: RuntimeId;
-  readonly scenario: ScenarioId;
-  readonly model: string;
-  readonly trials: TrialMetrics[];
   readonly agg: ReturnType<typeof aggregate>;
+  readonly expectedOutputSha256: string;
+  readonly model: string;
+  readonly outputValidation: "contains" | "exact";
+  readonly promptSha256: string;
+  readonly providerId: string;
+  readonly runtime: RuntimeId;
+  readonly runtimeId: string;
+  readonly scenario: ScenarioId;
+  readonly systemPromptSha256: string;
+  readonly trials: TrialMetrics[];
 }
 
 function readEnv(name: string): string | null {
   const value = process.env[name]?.trim();
   return value && value.length > 0 ? value : null;
-}
-
-function percentile(values: number[], p: number): number | null {
-  const clean = values.filter((v) => Number.isFinite(v)).toSorted((a, b) => a - b);
-  if (clean.length === 0) {
-    return null;
-  }
-  const idx = Math.min(clean.length - 1, Math.max(0, Math.ceil((p / 100) * clean.length) - 1));
-  return clean[idx] ?? null;
 }
 
 function aggregate(trials: TrialMetrics[]) {
@@ -130,6 +136,12 @@ function aggregate(trials: TrialMetrics[]) {
     totalP95: percentile(pick("totalMs"), 95),
     interChunkP50: percentile(pick("interChunkP50"), 50),
     interChunkP95: percentile(pick("interChunkP95"), 95),
+    outputTokensP50: percentile(pick("outputTokens"), 50),
+    outputTokensPerSecondP50: percentile(pick("outputTokensPerSecond"), 50),
+    outputTokensPerSecondP95: percentile(pick("outputTokensPerSecond"), 95),
+    pauseOver250MsP50: percentile(pick("pauseOver250MsCount"), 50),
+    pauseOver500MsP50: percentile(pick("pauseOver500MsCount"), 50),
+    timePerOutputTokenP50: percentile(pick("timePerOutputTokenMs"), 50),
     deltaCountP50: percentile(pick("deltaCount"), 50),
   };
 }
@@ -321,18 +333,19 @@ async function runTrial(input: {
   let totalMs: number | null = null;
   let deltaCount = 0;
   let outputChars = 0;
+  let outputTokens: number | null = null;
   let fileCreated: boolean | null = input.scenario.marker ? false : null;
   let ok = false;
   let error: string | null = null;
-  const deltaTimestamps: number[] = [];
+  const textDeltaTimestamps: number[] = [];
   let outputText = "";
 
   try {
-    const bootStart = Date.now();
+    const bootStart = performance.now();
     await withTimeout("boot", BOOT_TIMEOUT_MS, kernel.start(input.startInput(args)));
-    bootMs = Date.now() - bootStart;
+    bootMs = performance.now() - bootStart;
 
-    const dispatchStart = Date.now();
+    const dispatchStart = performance.now();
     const dispatch = kernel.dispatch({
       commandId: `ttft-${input.runtime}-cmd`,
       input: { text: input.scenario.prompt },
@@ -357,14 +370,14 @@ async function runTrial(input: {
         break;
       }
       const event: DriverEventInput = next.value;
-      const now = Date.now();
+      const now = performance.now();
       if (event.kind === "message.delta") {
         if (ttftMs === null) {
           ttftMs = now - dispatchStart;
         }
-        deltaTimestamps.push(now);
         const text = textDeltaFrom(event);
         if (text.length > 0) {
+          textDeltaTimestamps.push(now);
           if (firstTextMs === null) {
             firstTextMs = now - dispatchStart;
           }
@@ -372,6 +385,8 @@ async function runTrial(input: {
           outputText += text;
           deltaCount += 1;
         }
+      } else if (event.kind === "usage.updated") {
+        outputTokens = readOutputTokens(event) ?? outputTokens;
       } else if (event.kind === "run.failed") {
         error = "run_failed";
         done = true;
@@ -392,21 +407,30 @@ async function runTrial(input: {
         fileCreated = false;
       }
     }
+    const normalizedOutput = outputText.trim();
+    const expectedOutput = input.scenario.expect.trim();
     const textOk =
       totalMs !== null &&
-      outputText.trim().toLowerCase().includes(input.scenario.expect.toLowerCase());
+      (input.scenario.exact === true
+        ? normalizedOutput === expectedOutput
+        : normalizedOutput.toLowerCase().includes(expectedOutput.toLowerCase()));
     ok = input.scenario.marker ? textOk && fileCreated === true : textOk;
   } catch (caught) {
-    error = caught instanceof Error ? caught.message : String(caught);
+    error = (caught instanceof Error ? caught.message : String(caught)).replaceAll(
+      input.apiKey,
+      "[REDACTED]",
+    );
   } finally {
     await kernel.stop("bench.stop").catch(() => {});
     await paths.cleanup().catch(() => {});
   }
 
-  const gaps: number[] = [];
-  for (let i = 1; i < deltaTimestamps.length; i += 1) {
-    gaps.push(deltaTimestamps[i]! - deltaTimestamps[i - 1]!);
-  }
+  const streaming = summarizeStreaming({
+    firstTextMs,
+    outputTokens,
+    textDeltaTimestamps,
+    totalMs,
+  });
 
   return {
     bootMs,
@@ -415,9 +439,8 @@ async function runTrial(input: {
     totalMs,
     deltaCount,
     outputChars,
-    interChunkP50: percentile(gaps, 50),
-    interChunkP95: percentile(gaps, 95),
-    interChunkMax: gaps.length > 0 ? Math.max(...gaps) : null,
+    outputTokens,
+    ...streaming,
     fileCreated,
     ok,
     error,
@@ -477,15 +500,46 @@ async function main(): Promise<void> {
   const openaiKey = readEnv("OPENAI_API_KEY") ?? readEnv("AGENT_DRIVER_LIVE_OPENAI_API_KEY");
   const claudeModel = readEnv("AGENT_DRIVER_LIVE_ANTHROPIC_MODEL") ?? "claude-sonnet-4-5";
   const openaiModel = readEnv("AGENT_DRIVER_LIVE_OPENAI_MODEL") ?? "gpt-5.4";
-  const opencodeProvider = (readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai") as
-    | "openai"
-    | "anthropic";
+  const opencodeProvider = readEnv("TTFT_OPENCODE_PROVIDER") ?? "openai";
+  const opencodeApiKeyEnv =
+    readEnv("TTFT_OPENCODE_API_KEY_ENV") ??
+    (opencodeProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+  const opencodeKey =
+    readEnv(opencodeApiKeyEnv) ?? (opencodeProvider === "anthropic" ? anthropicKey : openaiKey);
+  const opencodeModel =
+    readEnv("TTFT_OPENCODE_MODEL") ??
+    (opencodeProvider === "anthropic" ? claudeModel : openaiModel);
+  const customPrompt = readEnv("TTFT_CUSTOM_PROMPT");
+  const customExpectedOutput = readEnv("TTFT_CUSTOM_EXPECT");
+  const customSystemPrompt = readEnv("TTFT_CUSTOM_SYSTEM_PROMPT");
+  const scenarios: Scenario[] =
+    customPrompt === null || customExpectedOutput === null || customSystemPrompt === null
+      ? SCENARIOS
+      : [
+          ...SCENARIOS,
+          {
+            exact: true,
+            expect: customExpectedOutput,
+            id: "custom",
+            permission: "allow_once",
+            prompt: customPrompt,
+            systemPrompt: customSystemPrompt,
+          },
+        ];
   const scenarioFilter = new Set<ScenarioId>(
     (readEnv("TTFT_SCENARIOS") ?? "no_tool,long_output,tool_write_allow,tool_write_reject")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean) as ScenarioId[],
   );
+  if (
+    scenarioFilter.has("custom") &&
+    (customPrompt === null || customExpectedOutput === null || customSystemPrompt === null)
+  ) {
+    throw new Error(
+      "TTFT_SCENARIOS=custom requires TTFT_CUSTOM_PROMPT, TTFT_CUSTOM_EXPECT, and TTFT_CUSTOM_SYSTEM_PROMPT.",
+    );
+  }
 
   const cells: CellResult[] = [];
 
@@ -496,6 +550,8 @@ async function main(): Promise<void> {
     build: (paths: StartInputArgs) => DriverStartInput,
     apiKey: string,
     isOpenCode: boolean,
+    providerId: string,
+    runtimeId: string,
   ): Promise<void> => {
     process.stdout.write(`\n[${runtime}/${scenario.id}] model=${model} warmup...`);
     await runTrial({ runtime, scenario, startInput: build, apiKey, model, isOpenCode }).catch(
@@ -509,10 +565,22 @@ async function main(): Promise<void> {
         ` t${i + 1}=${m.ok ? "ok" : "FAIL"}(ttft=${m.ttftMs ?? "-"},total=${m.totalMs ?? "-"})`,
       );
     }
-    cells.push({ runtime, scenario: scenario.id, model, trials: results, agg: aggregate(results) });
+    cells.push({
+      agg: aggregate(results),
+      expectedOutputSha256: createHash("sha256").update(scenario.expect.trim()).digest("hex"),
+      model,
+      outputValidation: scenario.exact === true ? "exact" : "contains",
+      promptSha256: createHash("sha256").update(scenario.prompt).digest("hex"),
+      providerId,
+      runtime,
+      runtimeId,
+      scenario: scenario.id,
+      systemPromptSha256: createHash("sha256").update(scenario.systemPrompt).digest("hex"),
+      trials: results,
+    });
   };
 
-  for (const scenario of SCENARIOS.filter((s) => scenarioFilter.has(s.id))) {
+  for (const scenario of scenarios.filter((s) => scenarioFilter.has(s.id))) {
     if (requested.includes("claude") && anthropicKey) {
       await runCell(
         "claude",
@@ -521,50 +589,69 @@ async function main(): Promise<void> {
         (p) => claudeStartInput(p),
         anthropicKey,
         false,
+        "anthropic",
+        "claude-agent-sdk",
       );
     }
     if (requested.includes("openai") && openaiKey) {
-      await runCell("openai", scenario, openaiModel, (p) => openaiStartInput(p), openaiKey, false);
+      await runCell(
+        "openai",
+        scenario,
+        openaiModel,
+        (p) => openaiStartInput(p),
+        openaiKey,
+        false,
+        "openai",
+        "openai-runtime",
+      );
     }
-    if (requested.includes("opencode")) {
-      const key = opencodeProvider === "anthropic" ? anthropicKey : openaiKey;
-      const model = opencodeProvider === "anthropic" ? claudeModel : openaiModel;
-      const apiKeyEnv = opencodeProvider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
-      if (key) {
-        process.env["MOSOO_ACP_FALLBACK_COMMAND"] =
-          readEnv("MOSOO_ACP_FALLBACK_COMMAND") ?? "opencode";
-        process.env["MOSOO_ACP_FALLBACK_ARGS"] =
-          readEnv("MOSOO_ACP_FALLBACK_ARGS") ?? JSON.stringify(["acp", "--pure"]);
-        await runCell(
-          "opencode",
-          scenario,
-          model,
-          (p) => opencodeStartInput(p, opencodeProvider, apiKeyEnv),
-          key,
-          true,
-        );
-      }
+    if (requested.includes("opencode") && opencodeKey) {
+      process.env["MOSOO_ACP_FALLBACK_COMMAND"] =
+        readEnv("MOSOO_ACP_FALLBACK_COMMAND") ?? "opencode";
+      process.env["MOSOO_ACP_FALLBACK_ARGS"] =
+        readEnv("MOSOO_ACP_FALLBACK_ARGS") ?? JSON.stringify(["acp", "--pure"]);
+      await runCell(
+        "opencode",
+        scenario,
+        opencodeModel,
+        (p) => opencodeStartInput(p, opencodeProvider, opencodeApiKeyEnv),
+        opencodeKey,
+        true,
+        opencodeProvider,
+        "acp-fallback",
+      );
     }
   }
 
   await mkdir(OUTPUT_DIR, { recursive: true });
   const stamp = readEnv("TTFT_STAMP") ?? "latest";
-  const results = { generatedStamp: stamp, trials, cells };
-  await writeFile(join(OUTPUT_DIR, `results-${stamp}.json`), JSON.stringify(results, null, 2));
+  const results = {
+    cells,
+    failurePolicy: "all recorded trials are retained; any failure invalidates qualification",
+    generatedAt: new Date().toISOString(),
+    generatedStamp: stamp,
+    schemaVersion: "mosoo.driver-ttft.v2",
+    trials,
+    warmupTrialsPerCell: 1,
+  };
+  const resultsPath = readEnv("TTFT_OUTPUT") ?? join(OUTPUT_DIR, `results-${stamp}.json`);
+  await mkdir(dirname(resultsPath), { recursive: true });
+  await writeFile(resultsPath, `${JSON.stringify(results, null, 2)}\n`, { mode: 0o600 });
+  await chmod(resultsPath, 0o600);
 
   const lines: string[] = [
     `# Driver TTFT / streaming benchmark (${stamp})`,
     "",
     `trials per cell: ${trials} (+1 warmup discarded)`,
     "",
-    "| runtime | scenario | model | ok% | file% | boot p50 | ttft p50 | ttft p95 | firstText p50 | total p50 | interChunk p50/p95 | deltas |",
-    "|---|---|---|---|---|---|---|---|---|---|---|---|",
+    "| runtime | scenario | model | ok% | file% | boot p50 | ttft p50 | ttft p95 | firstText p50 | total p50 | interChunk p50/p95 | tok/s p50 | TPOT p50 | pauses >250/>500 | deltas |",
+    "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   const fmt = (v: number | null): string => (v === null ? "-" : `${Math.round(v)}`);
   const pct = (v: number | null): string => (v === null ? "-" : `${Math.round(v * 100)}%`);
   for (const c of cells) {
     lines.push(
-      `| ${c.runtime} | ${c.scenario} | ${c.model} | ${pct(c.agg.okRate)} | ${pct(c.agg.fileCreatedRate)} | ${fmt(c.agg.bootP50)} | ${fmt(c.agg.ttftP50)} | ${fmt(c.agg.ttftP95)} | ${fmt(c.agg.firstTextP50)} | ${fmt(c.agg.totalP50)} | ${fmt(c.agg.interChunkP50)}/${fmt(c.agg.interChunkP95)} | ${fmt(c.agg.deltaCountP50)} |`,
+      `| ${c.runtime} | ${c.scenario} | ${c.model} | ${pct(c.agg.okRate)} | ${pct(c.agg.fileCreatedRate)} | ${fmt(c.agg.bootP50)} | ${fmt(c.agg.ttftP50)} | ${fmt(c.agg.ttftP95)} | ${fmt(c.agg.firstTextP50)} | ${fmt(c.agg.totalP50)} | ${fmt(c.agg.interChunkP50)}/${fmt(c.agg.interChunkP95)} | ${fmt(c.agg.outputTokensPerSecondP50)} | ${fmt(c.agg.timePerOutputTokenP50)} | ${fmt(c.agg.pauseOver250MsP50)}/${fmt(c.agg.pauseOver500MsP50)} | ${fmt(c.agg.deltaCountP50)} |`,
     );
   }
   const summary = lines.join("\n");
@@ -572,9 +659,7 @@ async function main(): Promise<void> {
   if (readEnv("TTFT_UPDATE_BASELINE") === "1") {
     await writeFile(join(OUTPUT_DIR, "baseline.json"), JSON.stringify(results, null, 2));
   }
-  process.stdout.write(
-    `\n\n${summary}\n\nWrote outputs/results-${stamp}.json + summary-${stamp}.md\n`,
-  );
+  process.stdout.write(`\n\n${summary}\n\nWrote ${resultsPath} + summary-${stamp}.md\n`);
 }
 
 await main();
