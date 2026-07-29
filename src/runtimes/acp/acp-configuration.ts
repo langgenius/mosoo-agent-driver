@@ -1,3 +1,5 @@
+import { basename } from "node:path";
+
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type { AgentCapabilities, ClientCapabilities, McpServer } from "@agentclientprotocol/sdk";
 
@@ -28,6 +30,46 @@ export function readFallbackCommand(): string {
   return typeof command === "string" && command.trim().length > 0
     ? command.trim()
     : ACP_DEFAULT_COMMAND;
+}
+
+export function isOpenCodeCommand(command: string): boolean {
+  const executable = basename(command).toLowerCase();
+  return executable === "opencode" || executable === "opencode.exe";
+}
+
+export function appendOpenCodeInstruction(
+  env: Record<string, string>,
+  instructionPath: string,
+): Record<string, string> {
+  const rawConfig = env["OPENCODE_CONFIG_CONTENT"];
+  const parsed: unknown = rawConfig === undefined ? {} : JSON.parse(rawConfig);
+
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("OPENCODE_CONFIG_CONTENT must be a JSON object.");
+  }
+
+  const config = parsed as Record<string, unknown>;
+  const currentInstructions = config["instructions"];
+
+  if (
+    currentInstructions !== undefined &&
+    (!Array.isArray(currentInstructions) ||
+      !currentInstructions.every((entry) => typeof entry === "string"))
+  ) {
+    throw new Error("OPENCODE_CONFIG_CONTENT instructions must be a string array.");
+  }
+
+  const instructions = currentInstructions ?? [];
+
+  return {
+    ...env,
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      ...config,
+      instructions: instructions.includes(instructionPath)
+        ? instructions
+        : [...instructions, instructionPath],
+    }),
+  };
 }
 
 export function readFallbackArgs(): string[] {
