@@ -111,6 +111,7 @@ describe("OpenAI app-server auth state", () => {
     const result = await materializeOpenAiModelProviderConfig({
       env: {
         OPENAI_API_KEY: "openai-key",
+        OPENAI_BASE_URL: "https://proxy.example/v1",
       },
       provider: "openai",
       runtimeHome,
@@ -121,6 +122,7 @@ describe("OpenAI app-server auth state", () => {
 
     expect(config["model_provider"]).toBeUndefined();
     expect(config["model_providers"]).toBeUndefined();
+    expect(config["openai_base_url"]).toBe("https://proxy.example/v1");
     expectDisabledRuntimeFeatures(config);
   });
 
