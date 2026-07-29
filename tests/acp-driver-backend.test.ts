@@ -1,24 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverBootPayload } from "../src/protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverEventInput } from "../src/protocol/events";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
 const FAKE_AGENT = String.raw`
 const { appendFileSync, existsSync } = require("node:fs");
 const logPath = process.env.TEST_LOG_PATH;
+const openCodeConfigPath = process.env.TEST_OPENCODE_CONFIG_PATH;
 const responsePath = process.env.TEST_RESPONSE_PATH;
 const triggerPath = process.env.TEST_TRIGGER_PATH;
+if (openCodeConfigPath) {
+  appendFileSync(openCodeConfigPath, process.env.OPENCODE_CONFIG_CONTENT || "");
+}
 let buffer = "";
 let sessionReady = false;
 let updateSent = false;
@@ -144,23 +148,35 @@ setInterval(() => {
 }, 5);
 `;
 
-async function createHarness(options: { readonly hangClose?: boolean } = {}) {
+async function createHarness(
+  options: { readonly hangClose?: boolean; readonly openCodeInstructions?: boolean } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "driver-acp-backend-"));
   const logPath = join(root, "methods.log");
+  const openCodeConfigPath = join(root, "opencode-config.json");
   const responsePath = join(root, "responses.log");
   const triggerPath = join(root, "send-update");
+  const command = options.openCodeInstructions ? join(root, "opencode") : process.execPath;
+
+  if (options.openCodeInstructions) {
+    await symlink(process.execPath, command);
+  }
+
   const boot = {
     ...driverBootPayload,
     execution: {
       ...driverBootPayload.execution,
       environment: {
         variables: {
+          ...(options.openCodeInstructions ? { OPENCODE_CONFIG_CONTENT: "{}" } : {}),
           TEST_LOG_PATH: logPath,
+          TEST_OPENCODE_CONFIG_PATH: openCodeConfigPath,
           TEST_RESPONSE_PATH: responsePath,
           TEST_TRIGGER_PATH: triggerPath,
           TEST_HANG_CLOSE: options.hangClose ? "1" : "0",
         },
       },
+      profilePrompt: options.openCodeInstructions ? "Always answer concisely." : "",
       session: {
         ...driverBootPayload.execution.session,
         context: {
@@ -224,7 +240,7 @@ async function createHarness(options: { readonly hangClose?: boolean } = {}) {
   const backend = new AcpDriverBackend(payload);
   const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
   const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
-  process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
+  process.env["MOSOO_ACP_FALLBACK_COMMAND"] = command;
   process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["-e", FAKE_AGENT]);
 
   try {
@@ -265,6 +281,11 @@ async function createHarness(options: { readonly hangClose?: boolean } = {}) {
     async methods() {
       return (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean);
     },
+    async openCodeConfig() {
+      return JSON.parse(await readFile(openCodeConfigPath, "utf8")) as {
+        instructions?: unknown;
+      };
+    },
     async responses() {
       return (await readFile(responsePath, "utf8").catch(() => ""))
         .trim()
@@ -277,6 +298,20 @@ async function createHarness(options: { readonly hangClose?: boolean } = {}) {
 }
 
 describe("ACP driver backend lifecycle", () => {
+  test("uses OpenCode native instructions without a hidden bootstrap prompt", async () => {
+    const harness = await createHarness({ openCodeInstructions: true });
+
+    try {
+      expect(await harness.methods()).not.toContain("session/prompt");
+      const config = await harness.openCodeConfig();
+      expect(config.instructions).toEqual([expect.any(String)]);
+      const [instructionPath] = config.instructions as [string];
+      expect(await readFile(instructionPath, "utf8")).toContain("Always answer concisely.");
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("clears turn state when prompt-start publication fails", async () => {
     const harness = await createHarness();
 

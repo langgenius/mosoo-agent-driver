@@ -1,3 +1,5 @@
+import { Readable, Writable } from "node:stream";
+
 import {
   client as createAcpClient,
   methods as acpMethods,
@@ -10,8 +12,9 @@ import type {
   ClientContext,
   InitializeResponse,
 } from "@agentclientprotocol/sdk";
-import { Readable, Writable } from "node:stream";
 
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
 import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
@@ -20,28 +23,30 @@ import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import { AGENT_DRIVER_VERSION } from "../../core/version";
-import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
   computeRuntimeBootstrapDigest,
+  writeNativeRuntimeSystemPrompt,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
-import { limitAcpInput } from "./acp-input-limit";
 import {
   ACP_PROTOCOL_VERSION,
+  appendOpenCodeInstruction,
   buildChildEnv,
   buildClientCapabilities,
   assertProtocolVersion,
+  isOpenCodeCommand,
+  readFallbackCommand,
   readResumeId,
   resolveAuthMethod,
   supportsSessionClose,
 } from "./acp-configuration";
 import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-event-translator";
+import { limitAcpInput } from "./acp-input-limit";
 import { setupAcpSession } from "./acp-session-setup";
 import { withAcpStartupStage } from "./acp-startup";
 import { AcpTurnController } from "./acp-turn-controller";
@@ -115,13 +120,20 @@ export class AcpDriverBackend implements AgentDriverBackend {
       writeSkillBootstrapArtifacts(this.#payload.execution),
       signal,
     );
+    const command = readFallbackCommand();
+    const nativeInstructionPath = isOpenCodeCommand(command)
+      ? await raceWithAbort(writeNativeRuntimeSystemPrompt(this.#payload.execution), signal)
+      : null;
 
     if (this.#stopRequested || signal.aborted) {
       signal.throwIfAborted();
       throw new Error("ACP driver backend stopped during startup.");
     }
 
-    const env = this.#childProcessEnv;
+    const env =
+      nativeInstructionPath === null
+        ? this.#childProcessEnv
+        : appendOpenCodeInstruction(this.#childProcessEnv, nativeInstructionPath);
     const agentProcess = await startAcpAgentProcess(context, this.#payload, env, signal);
     this.#agentProcess = agentProcess;
 
@@ -251,7 +263,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
         signal,
       );
 
-      if (setup.mode === "created") {
+      if (setup.mode === "created" && nativeInstructionPath === null) {
         await withAcpStartupStage(
           "ACP runtime bootstrap",
           () => this.#applyBootstrap(context, signal),
@@ -270,6 +282,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
           homePath: summarizePath(this.#payload.execution.session.homePath),
           sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
         },
+        nativeInstructions: nativeInstructionPath !== null,
         nativeResumeRefPresent: this.#nativeSessionId !== null,
         skillCount: materializedSkills.length,
       });
