@@ -32,6 +32,7 @@ interface OpenAiModelProviderConfigResult {
 const OPENAI_COMPATIBLE_PROVIDER_ID = "openai-compatible";
 const OPENAI_COMPATIBLE_API_KEY_ENV_NAME = "OPENAI_COMPATIBLE_API_KEY";
 const OPENAI_COMPATIBLE_BASE_URL_ENV_NAME = "OPENAI_COMPATIBLE_BASE_URL";
+const OPENAI_BASE_URL_ENV_NAME = "OPENAI_BASE_URL";
 const DISABLED_RUNTIME_FEATURES = ["plugins", "remote_plugin", "tool_suggest"] as const;
 
 function readOpenAiApiKey(env: NodeJS.ProcessEnv): string | null {
@@ -209,6 +210,12 @@ export async function materializeOpenAiModelProviderConfig(
         wire_api: "responses",
       },
     };
+  } else if (input.provider === "openai") {
+    const baseUrl = readEnvVar(input.env, OPENAI_BASE_URL_ENV_NAME);
+
+    if (baseUrl !== null) {
+      generatedConfig["openai_base_url"] = baseUrl;
+    }
   }
 
   if (input.mcpServers !== undefined && Object.keys(input.mcpServers).length > 0) {
