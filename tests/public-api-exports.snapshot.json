@@ -498,7 +498,8 @@
       "DriverNextCommandOutput",
       "DriverReadyInput",
       "DriverRpcOptions",
-      "DriverRuntimeClient"
+      "DriverRuntimeClient",
+      "DriverRuntimeIdentity"
     ],
     "values": ["parseDriverHeartbeatInput", "parseDriverHelloInput", "parseDriverReadyInput"]
   },
