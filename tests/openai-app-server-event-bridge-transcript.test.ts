@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
@@ -391,6 +391,15 @@ describe("OpenAi app-server event bridge", () => {
         kind: "message.delta",
         payload: {
           contentDelta: "pong",
+          messageId: assistantMessageId,
+          role: "agent",
+        },
+      },
+      {
+        delivery: "lossless",
+        kind: "message.added",
+        payload: {
+          content: "pong",
           messageId: assistantMessageId,
           role: "agent",
         },
