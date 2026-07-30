@@ -11,7 +11,7 @@ import type { DriverRuntimeIo } from "./driver-runtime-io";
 
 const MAX_TRACKED_COMMANDS = 1_024;
 const COMMAND_UPDATE_TIMEOUT_MS = 1_000;
-const TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS = 250;
+const RUN_TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS = 250;
 const TERMINAL_UPDATE_MAX_ATTEMPTS = 3;
 
 export interface TerminalCommandUpdate {
@@ -266,13 +266,12 @@ export class DriverCommandDelivery {
         break;
       }
 
-      const timeoutMs = Math.min(remainingMs, TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS);
       const controller = new AbortController();
       const delivery = await settlePromiseWithTimeout(
         sendCommandUpdate(runtimeContext, command, terminal, controller.signal),
         {
           label: `Driver command ${command.commandId} terminal status delivery`,
-          timeoutMs,
+          timeoutMs: remainingMs,
         },
       );
 
@@ -317,7 +316,7 @@ export async function deliverRunTerminal(
       ),
       {
         label: `Driver run ${terminal.status} terminal delivery`,
-        timeoutMs: Math.min(remainingMs, TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS),
+        timeoutMs: Math.min(remainingMs, RUN_TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS),
       },
     );
 
