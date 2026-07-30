@@ -1,5 +1,5 @@
-import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import type { DriverEventInput } from "../../protocol/events";
 import { toOpenAiPlanStatus } from "./app-server-event-mapping";
 import type {
   OpenAiEventPush,
@@ -466,6 +466,15 @@ export class OpenAiAppServerItemEventBridge {
         messageId,
         text: filteredFinalText.text,
         turnId,
+      });
+      events.push({
+        delivery: "lossless",
+        kind: "message.added",
+        payload: {
+          content: filteredFinalText.text,
+          messageId,
+          role: "agent",
+        },
       });
     }
 

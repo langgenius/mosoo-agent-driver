@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import { DRIVER_TEST_IDS, driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
@@ -87,6 +87,41 @@ function createHarness(options: { failNativeResumePublish?: boolean; holdReason?
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test("publishes a lossless completed assistant snapshot", async () => {
+    const { bridge, context, events, logger } = createHarness();
+    const finalText = "I will inspect the files.";
+
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "I",
+      itemId: "message-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-1",
+        text: finalText,
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await logger.destroy();
+
+    const assistantMessageId = readAssistantMessageId(events());
+    const snapshot = events().find((event) => event.kind === "message.added");
+
+    expect(snapshot).toMatchObject({
+      kind: "message.added",
+      payload: {
+        content: finalText,
+        messageId: assistantMessageId,
+        role: "agent",
+      },
+    });
+    expect(snapshot?.delivery).toBe("lossless");
+  });
+
   test("fails an active turn exactly once when the provider exits", async () => {
     const { bridge, context, events, logger } = createHarness();
     const failure = new Error("app-server exited");
@@ -183,6 +218,15 @@ describe("OpenAi app-server event bridge", () => {
         kind: "message.delta",
         payload: {
           contentDelta: "pong",
+          messageId: assistantMessageId,
+          role: "agent",
+        },
+      },
+      {
+        delivery: "lossless",
+        kind: "message.added",
+        payload: {
+          content: "pong",
           messageId: assistantMessageId,
           role: "agent",
         },

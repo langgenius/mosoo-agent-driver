@@ -31,6 +31,15 @@
       }
     },
     {
+      "delivery": "lossless",
+      "kind": "message.added",
+      "payload": {
+        "content": "pong",
+        "messageId": "<driver-id>",
+        "role": "agent"
+      }
+    },
+    {
       "kind": "message.completed",
       "payload": {
         "messageId": "<driver-id>",
