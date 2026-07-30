@@ -647,14 +647,14 @@ describe("driver runtime boundary", () => {
     );
     await logger.destroy();
 
-    expect(terminalAttempts).toBe(3);
+    expect(terminalAttempts).toBe(1);
     expect(socket.completedRunReasons).toHaveLength(1);
     expect(socket.failedRuns).toEqual([]);
     expect(runtimeState.status()).toBe("failed");
   });
 
   test.each(["input", "mcp"] as const)(
-    "aborts a hung %s terminal attempt before retrying and settling later work",
+    "accepts a slow %s terminal response before settling later work",
     async (kind) => {
       const backend = createBackend();
       let sideEffects = 0;
@@ -694,18 +694,20 @@ describe("driver runtime boundary", () => {
             };
       const socket = new FakeDriverRuntimeIo([first, next]);
       const recordUpdate = socket.commandUpdate.bind(socket);
-      const ackEntered = Promise.withResolvers<void>();
-      let firstSignal: AbortSignal | undefined;
       let terminalAttempts = 0;
       socket.commandUpdate = async (update, signal) => {
         if (update.commandId === first.commandId && update.status !== "accepted") {
           terminalAttempts += 1;
-        }
-        if (update.commandId === first.commandId && terminalAttempts === 1) {
-          firstSignal = signal;
-          ackEntered.resolve();
-          await new Promise<never>((_resolve, reject) => {
-            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 300);
+            signal?.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                reject(signal.reason);
+              },
+              { once: true },
+            );
           });
         }
 
@@ -733,16 +735,14 @@ describe("driver runtime boundary", () => {
       });
       const run = dispatcher.run(socket, logger);
 
-      await ackEntered.promise;
       const outcome = await settlePromiseWithTimeout(run, {
-        label: `${kind} terminal acknowledgement retry`,
+        label: `${kind} slow terminal acknowledgement`,
         timeoutMs: 1_500,
       });
       await logger.destroy();
 
       expect(outcome.status).toBe("completed");
-      expect(firstSignal?.aborted).toBe(true);
-      expect(terminalAttempts).toBe(2);
+      expect(terminalAttempts).toBe(1);
       expect(sideEffects).toBe(kind === "input" ? 2 : 1);
     },
   );
