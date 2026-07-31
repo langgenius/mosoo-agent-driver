@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -104,12 +104,13 @@ describe("ACP file system bridge", () => {
       ).resolves.toEqual({});
 
       expect(await readFile(path, "utf8")).toBe("hello");
+      const canonicalPath = await realpath(path);
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         kind: "file.changed",
         payload: {
           change: "upsert",
-          path,
+          path: canonicalPath,
           source: "acp.fs",
         },
       });
