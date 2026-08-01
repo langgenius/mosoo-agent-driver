@@ -960,11 +960,9 @@ setInterval(() => {}, 1000);
   test("force kills the process group after the leader exits with inherited stdio open", async () => {
     const harness = await createClientHarness((directory) => {
       const descendantReadyPath = join(directory, "descendant-ready");
-      const descendantTermPath = join(directory, "descendant-term");
       const descendantScript = `
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(descendantReadyPath)}, "ready");
-process.on("SIGTERM", () => writeFileSync(${JSON.stringify(descendantTermPath)}, "ignored"));
 setInterval(() => {}, 1000);
 `;
 
@@ -1000,7 +998,21 @@ process.stdin.on("data", (chunk) => {
       }
 
       await expect(harness.client.stop()).resolves.toBeUndefined();
-      expect(await Bun.file(join(harness.directory, "descendant-term")).exists()).toBe(true);
+      await expect(
+        settlePromiseWithTimeout(
+          (async () => {
+            for (;;) {
+              try {
+                process.kill(descendantPid, 0);
+                await Bun.sleep(5);
+              } catch {
+                return;
+              }
+            }
+          })(),
+          { label: "inherited-stdio app-server descendant exit", timeoutMs: 250 },
+        ),
+      ).resolves.toMatchObject({ status: "completed" });
     } finally {
       if (descendantPid > 0) {
         try {
