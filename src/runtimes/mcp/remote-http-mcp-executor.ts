@@ -8,10 +8,14 @@ import {
 } from "@modelcontextprotocol/client";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
-import type { DriverStartInput } from "../../protocol/start";
-import type { McpExecuteCommand, McpExecuteCommandResult } from "../../runtime-command";
-import { settlePromiseWithTimeout } from "../../utils/async";
 import { AGENT_DRIVER_VERSION } from "../../core/version";
+import type { DriverStartInput } from "../../protocol/start";
+import type {
+  McpExecuteCommand,
+  McpExternalToolEffectExecution,
+  McpExternalToolExecutionResult,
+} from "../../runtime-command";
+import { settlePromiseWithTimeout } from "../../utils/async";
 
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
 type ActiveMcpServer = Extract<SessionMcpServer, { authorizationState: "active" }>;
@@ -71,7 +75,7 @@ function resolveActiveMcpServer(
 function normalizeCallToolResult(
   result: CallToolResult,
   command: McpExecuteCommand,
-): McpExecuteCommandResult {
+): McpExternalToolExecutionResult {
   const textContent = result.content
     .flatMap((block) => (block.type === "text" ? [block.text] : []))
     .map((text) => text.trim())
@@ -91,6 +95,7 @@ function normalizeCallToolResult(
   return {
     ...(result.isError === undefined ? {} : { isError: result.isError }),
     outputText,
+    providerReceiptJson: result._meta === undefined ? null : JSON.stringify(result._meta),
     requestId: command.requestId,
     serverId: command.serverId,
     toolName: command.toolName,
@@ -184,7 +189,8 @@ export async function executeRemoteHttpMcpCommand(
   payload: DriverStartInput,
   command: McpExecuteCommand,
   signal: AbortSignal,
-): Promise<McpExecuteCommandResult> {
+  effect: McpExternalToolEffectExecution,
+): Promise<McpExternalToolExecutionResult> {
   signal.throwIfAborted();
   const server = resolveActiveMcpServer(payload, command);
   const argumentsObject = parseToolArguments(command);
@@ -207,6 +213,9 @@ export async function executeRemoteHttpMcpCommand(
     });
     const result = await client.callTool(
       {
+        _meta: {
+          "io.mosoo/idempotency-key": effect.idempotencyKey,
+        },
         arguments: argumentsObject,
         name: command.toolName,
       },

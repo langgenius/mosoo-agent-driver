@@ -39,7 +39,7 @@ await rpc("/driver/hello", {
   capabilities: [],
   driverVersion: "test",
   pid: process.pid,
-  protocolVersion: 1,
+  protocolVersion: 2,
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
@@ -260,7 +260,7 @@ describe("driver artifact test controller", () => {
         capabilities: [],
         driverVersion: "test",
         pid: 0,
-        protocolVersion: 1,
+        protocolVersion: 2,
         runtime: "acp-fallback",
         startedAt: "now",
       }),

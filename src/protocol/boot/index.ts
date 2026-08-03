@@ -43,7 +43,12 @@ export type {
   DriverOrigin,
 } from "./host-snapshot";
 
-export const DRIVER_PROTOCOL_VERSION = 1;
+/**
+ * Version 2 requires the durable external-tool-effect RPCs. Refusing an older
+ * Driver is safer than letting it invoke an MCP tool without the persistence
+ * fence during a rolling deployment.
+ */
+export const DRIVER_PROTOCOL_VERSION = 2;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";

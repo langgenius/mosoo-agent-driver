@@ -8,7 +8,13 @@ import type {
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
 } from "../protocol/orpc";
-import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
+import type {
+  McpExecuteCommandResult,
+  McpExternalToolEffectClaim,
+  RunError,
+  RuntimeCommand,
+  RuntimeCommandResult,
+} from "../runtime-command";
 
 export interface DriverRuntimeEventPort {
   currentRunId?(): RunId | null;
@@ -121,6 +127,23 @@ export interface DriverRuntimeCommandPort {
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
 }
 
+/** API-owned durable effect ledger used only for external MCP calls. */
+export interface DriverRuntimeExternalToolEffectPort {
+  claimExternalToolEffect(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectClaim>;
+  completeExternalToolEffect(
+    input: {
+      commandId: string;
+      providerReceiptJson?: string | null | undefined;
+      result: McpExecuteCommandResult;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
+  markExternalToolEffectUnknown(input: { commandId: string }, signal: AbortSignal): Promise<void>;
+}
+
 export interface DriverRuntimeRunPort {
   beginRun(runId: RunId): void;
   completeRun(signal?: AbortSignal): Promise<void>;
@@ -135,6 +158,7 @@ export interface DriverRuntimeHeartbeatPort {
 export interface DriverRuntimeIo
   extends
     DriverRuntimeCommandPort,
+    DriverRuntimeExternalToolEffectPort,
     DriverRuntimeEventPort,
     DriverRuntimeHeartbeatPort,
     DriverRuntimeRunPort {}

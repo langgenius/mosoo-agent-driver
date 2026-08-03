@@ -61,7 +61,7 @@ describe("public API", () => {
   test("imports public subpath entries without process side effects", () => {
     const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
 
-    expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(1);
+    expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(2);
     expect(PROTOCOL_VERSION_FROM_CONTRACT).toBe(2);
     expect(protocolVersionSchemaFromContract.parse(2)).toBe(2);
     expect(sessionSnapshotSchemaFromContract.parse).toBeFunction();
@@ -81,7 +81,7 @@ describe("public API", () => {
         capabilities: [],
         driverVersion: "0.1.0",
         pid: 1,
-        protocolVersion: 1,
+        protocolVersion: 2,
         runtime: "openai-runtime",
         startedAt: "now",
       }),

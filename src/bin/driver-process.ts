@@ -1,31 +1,6 @@
-import { summarizeDriverBootPayload } from "../observability/driver-debug";
-import {
-  createDriverLogger,
-  runWithDriverLogContext,
-} from "../infrastructure/logging/driver-logger";
-import type { DriverLogUplink } from "../infrastructure/logging/driver-logger";
-import { DriverInstanceSocket } from "../infrastructure/runtime/driver-instance-socket";
-import type { Logger } from "../observability";
-import { DRIVER_PROTOCOL_VERSION } from "../protocol/boot";
-import type { DriverBootPayload } from "../protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../protocol/host-integration";
-import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
-import { parseDriverId } from "../protocol/id";
-import type { RunId } from "../protocol/id";
-import { createDriverStartInputFromBootPayload } from "../protocol/start";
-import type { DriverStartInput } from "../protocol/start";
-import type { RunError } from "../runtime-command";
 import type { AgentDriverBackendFactory, AgentDriverContext } from "../core/agent-driver-backend";
 import { createAgentDriverContext } from "../core/agent-driver-backend";
 import { AgentBackendLifecycle } from "../core/agent-backend-lifecycle";
-import { executeRemoteHttpMcpCommand } from "../runtimes/mcp/remote-http-mcp-executor";
-import {
-  AGENT_DRIVER_PROVIDER_REGISTRY,
-  createAgentDriverProviderCapabilities,
-} from "../runtimes/provider-registry";
-import { materializeResolvedSkills } from "../runtimes/skill-materialization";
-import { promiseWithTimeout } from "../utils/async";
-import { AGENT_DRIVER_VERSION } from "../core/version";
 import { DriverCommandDispatcher } from "../core/driver-command-dispatcher";
 import { deliverRunTerminal } from "../core/driver-command-delivery";
 import { pushDriverDiagnosticEvent } from "../core/driver-diagnostics";
@@ -36,6 +11,31 @@ import { pushLosslessEvents } from "../core/driver-runtime-io";
 import type { DriverRuntimeEventPort } from "../core/driver-runtime-io";
 import { DriverRuntimeStateMachine } from "../core/driver-runtime-state";
 import { createTimingEvent, createTimingPhase, toDurationMs } from "../core/driver-runtime-timing";
+import { AGENT_DRIVER_VERSION } from "../core/version";
+import {
+  createDriverLogger,
+  runWithDriverLogContext,
+} from "../infrastructure/logging/driver-logger";
+import type { DriverLogUplink } from "../infrastructure/logging/driver-logger";
+import { DriverInstanceSocket } from "../infrastructure/runtime/driver-instance-socket";
+import type { Logger } from "../observability";
+import { summarizeDriverBootPayload } from "../observability/driver-debug";
+import { DRIVER_PROTOCOL_VERSION } from "../protocol/boot";
+import type { DriverBootPayload } from "../protocol/boot";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../protocol/host-integration";
+import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
+import { parseDriverId } from "../protocol/id";
+import type { RunId } from "../protocol/id";
+import { createDriverStartInputFromBootPayload } from "../protocol/start";
+import type { DriverStartInput } from "../protocol/start";
+import type { RunError } from "../runtime-command";
+import { executeRemoteHttpMcpCommand } from "../runtimes/mcp/remote-http-mcp-executor";
+import {
+  AGENT_DRIVER_PROVIDER_REGISTRY,
+  createAgentDriverProviderCapabilities,
+} from "../runtimes/provider-registry";
+import { materializeResolvedSkills } from "../runtimes/skill-materialization";
+import { promiseWithTimeout } from "../utils/async";
 
 const DRIVER_BACKEND_START_TIMEOUT_MS = 60_000;
 const DRIVER_SHUTDOWN_TIMEOUT_MS = 5_000;
@@ -531,8 +531,13 @@ export class DriverProcess {
       },
       ports: {
         mcp: {
-          execute: async (command, signal) =>
-            executeRemoteHttpMcpCommand(this.#startInput, command, signal),
+          execute: async (command, signal, effect) => {
+            if (effect === undefined) {
+              throw new Error("Driver external tool effect ledger is not configured.");
+            }
+
+            return executeRemoteHttpMcpCommand(this.#startInput, command, signal, effect);
+          },
         },
         hostIntegration: {
           snapshot: async () => this.#hostSnapshot,

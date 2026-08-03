@@ -6,18 +6,18 @@ import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type { DriverStartInput } from "../protocol/start";
 import { parseRuntimeCommand } from "../runtime-command";
 import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
+import { AgentBackendLifecycle } from "./agent-backend-lifecycle";
 import type {
   AgentDriverBackendFactory,
   AgentDriverContext,
   AgentDriverContextPortOverrides,
 } from "./agent-driver-backend";
 import { createAgentDriverContext } from "./agent-driver-backend";
-import { AgentBackendLifecycle } from "./agent-backend-lifecycle";
 import { AsyncValueQueue } from "./async-value-queue";
 import { DriverCommandDispatcher } from "./driver-command-dispatcher";
 import { DriverPermissionBroker } from "./driver-permission-broker";
 import { createDriverPermissionRequestHandler } from "./driver-permission-policy";
-import type { DriverRuntimeIo } from "./driver-runtime-io";
+import type { DriverRuntimeExternalToolEffectPort, DriverRuntimeIo } from "./driver-runtime-io";
 import { DriverRuntimeStateMachine } from "./driver-runtime-state";
 
 export type AgentDriverKernelStartInput = DriverStartInput;
@@ -33,6 +33,12 @@ export interface AgentDriverKernel {
 
 export interface AgentDriverKernelOptions {
   readonly backendFactory: AgentDriverBackendFactory;
+  /**
+   * Required for `mcp.execute` commands. A Kernel has no durable store of its
+   * own, so silently synthesizing an in-memory idempotency key would make a
+   * restart unsafe.
+   */
+  readonly externalToolEffectLedger?: DriverRuntimeExternalToolEffectPort;
   readonly hostPorts?: AgentDriverContextPortOverrides;
   readonly logger?: Logger;
 }
@@ -71,6 +77,7 @@ function toDispatchError(error: RunError | undefined, command: RuntimeCommand): 
 export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo {
   readonly #backendFactory: AgentDriverBackendFactory;
   readonly #commandsById = new Map<string, RuntimeCommand>();
+  readonly #externalToolEffectLedger: DriverRuntimeExternalToolEffectPort | undefined;
   readonly #commandResults = new Map<string, PromiseWithResolvers<KernelCommandResult>>();
   readonly #commands = new AsyncValueQueue<RuntimeCommand>(
     "command",
@@ -111,6 +118,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
 
   constructor(options: AgentDriverKernelOptions) {
     this.#backendFactory = options.backendFactory;
+    this.#externalToolEffectLedger = options.externalToolEffectLedger;
     this.#hostPorts = options.hostPorts;
     this.#logger = options.logger ?? createKernelLogger();
     this.#permissionBroker = new DriverPermissionBroker(() => this.#logger);
@@ -160,6 +168,20 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     }
 
     result.resolve(update.result === undefined ? undefined : update.result);
+  }
+
+  async claimExternalToolEffect(
+    input: Parameters<DriverRuntimeIo["claimExternalToolEffect"]>[0],
+    signal: AbortSignal,
+  ): ReturnType<DriverRuntimeIo["claimExternalToolEffect"]> {
+    return this.#requireExternalToolEffectLedger().claimExternalToolEffect(input, signal);
+  }
+
+  async completeExternalToolEffect(
+    input: Parameters<DriverRuntimeIo["completeExternalToolEffect"]>[0],
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#requireExternalToolEffectLedger().completeExternalToolEffect(input, signal);
   }
 
   async completeRun(): Promise<void> {
@@ -237,6 +259,12 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     return this.#activeRunId;
   }
 
+  async markExternalToolEffectUnknown(
+    input: Parameters<DriverRuntimeIo["markExternalToolEffectUnknown"]>[0],
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#requireExternalToolEffectLedger().markExternalToolEffectUnknown(input, signal);
+  }
   async pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput> {
     const events = structuredClone(input.events);
     for (const event of events) {
@@ -471,6 +499,16 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
         }),
       },
     });
+  }
+
+  #requireExternalToolEffectLedger(): DriverRuntimeExternalToolEffectPort {
+    if (this.#externalToolEffectLedger === undefined) {
+      throw new Error(
+        "Driver kernel requires a durable external tool effect ledger for MCP execution.",
+      );
+    }
+
+    return this.#externalToolEffectLedger;
   }
 
   #ensureStarted(): void {

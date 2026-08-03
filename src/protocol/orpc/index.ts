@@ -1,6 +1,8 @@
 import type {
   DriverCapability,
   DriverCapabilityId,
+  McpExecuteCommandResult,
+  McpExternalToolEffectClaim,
   RuntimeCommand,
   RuntimeCommandResult,
   RuntimeCommandStatus,
@@ -104,6 +106,25 @@ export interface DriverCommandUpdateInput {
   readonly status: RuntimeCommandStatus;
 }
 
+export interface DriverExternalToolEffectClaimInput {
+  readonly commandId: string;
+  readonly driverInstanceId: string;
+}
+
+export type DriverExternalToolEffectClaimOutput = McpExternalToolEffectClaim;
+
+export interface DriverExternalToolEffectCompleteInput {
+  readonly commandId: string;
+  readonly driverInstanceId: string;
+  readonly providerReceiptJson?: string | null | undefined;
+  readonly result: McpExecuteCommandResult;
+}
+
+export interface DriverExternalToolEffectUnknownInput {
+  readonly commandId: string;
+  readonly driverInstanceId: string;
+}
+
 export interface DriverEventBatchInput {
   readonly driverInstanceId: string;
   readonly events: readonly DriverEventEnvelope[];
@@ -141,6 +162,14 @@ export interface DriverRuntimeClient {
       input: DriverCommandUpdateInput,
       options?: DriverRpcOptions,
     ): Promise<{ ok: true }>;
+    claimExternalToolEffect(
+      input: DriverExternalToolEffectClaimInput,
+      options?: DriverRpcOptions,
+    ): Promise<DriverExternalToolEffectClaimOutput>;
+    completeExternalToolEffect(
+      input: DriverExternalToolEffectCompleteInput,
+      options?: DriverRpcOptions,
+    ): Promise<{ ok: true }>;
     completeRun(input: DriverCompletionInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
     failRun(input: DriverFailureInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
     heartbeat(
@@ -154,6 +183,10 @@ export interface DriverRuntimeClient {
     ): Promise<DriverEventBatchOutput>;
     pushLogs(input: DriverLogBatchInput, options?: DriverRpcOptions): Promise<DriverLogBatchOutput>;
     ready(input: DriverReadyInput, options?: DriverRpcOptions): Promise<{ ok: true }>;
+    markExternalToolEffectUnknown(
+      input: DriverExternalToolEffectUnknownInput,
+      options?: DriverRpcOptions,
+    ): Promise<{ ok: true }>;
   };
   readonly driverInstance: {
     nextCommand(
@@ -254,8 +287,8 @@ function readProtocolVersion(
 ): DriverBootPayload["protocolVersion"] {
   const value = record["protocolVersion"];
 
-  if (value !== 1) {
-    throw new TypeError("protocolVersion must be 1.");
+  if (value !== 2) {
+    throw new TypeError("protocolVersion must be 2.");
   }
 
   return value;
