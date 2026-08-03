@@ -33,6 +33,11 @@ interface DriverPackageJson {
   readonly version?: string;
 }
 
+interface EnvironmentPackageManagerManifest {
+  readonly managers?: readonly string[];
+  readonly schemaVersion?: number;
+}
+
 const PUBLIC_EXPORTS = [
   ".",
   "./boot",
@@ -52,6 +57,12 @@ function readText(path: string): string {
 
 function readDriverPackageJson(): DriverPackageJson {
   return JSON.parse(readText("../package.json")) as DriverPackageJson;
+}
+
+function readEnvironmentPackageManagerManifest(): EnvironmentPackageManagerManifest {
+  return JSON.parse(
+    readText("../environment-package-managers.json"),
+  ) as EnvironmentPackageManagerManifest;
 }
 
 describe("driver artifact contract", () => {
@@ -241,7 +252,16 @@ describe("driver artifact contract", () => {
     expect(imageIndex).toBeGreaterThan(liveIndex);
   });
 
-  test("keeps the standalone package out of mosoo workspace dependencies", () => {
+  test("declares writable Environment package managers", () => {
+    const manifest = readEnvironmentPackageManagerManifest();
+
+    expect(manifest).toEqual({
+      managers: ["npm", "pip"],
+      schemaVersion: 1,
+    });
+  });
+
+  test("keeps the standalone package out of Mosoo workspace dependencies", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});
     const tsconfig = readText("../tsconfig.json");
