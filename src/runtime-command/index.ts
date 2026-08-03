@@ -76,6 +76,41 @@ export interface McpExecuteCommandResult {
   readonly toolName: string;
 }
 
+/**
+ * The public command result remains provider-neutral. The optional receipt is
+ * retained solely by the durable effect ledger for post-failure diagnosis.
+ */
+export interface McpExternalToolExecutionResult extends McpExecuteCommandResult {
+  readonly providerReceiptJson?: string | null | undefined;
+}
+
+/**
+ * The API-owned decision made immediately before the Driver invokes an
+ * external MCP provider. The key survives Driver replacement and is conveyed
+ * to providers through MCP request metadata.
+ */
+export interface McpExternalToolEffectExecution {
+  readonly effectId: string;
+  readonly idempotencyKey: string;
+}
+
+export type McpExternalToolEffectClaim =
+  | {
+      readonly attempt: number;
+      readonly effectId: string;
+      readonly idempotencyKey: string;
+      readonly kind: "execute";
+    }
+  | {
+      readonly effectId: string;
+      readonly kind: "completed";
+      readonly result: McpExecuteCommandResult;
+    }
+  | {
+      readonly effectId: string;
+      readonly kind: "unknown";
+    };
+
 export type RuntimeCommandResult = InputStartCommandResult | McpExecuteCommandResult | null;
 
 export type DriverCapabilityId =

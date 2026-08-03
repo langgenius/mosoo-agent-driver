@@ -1,22 +1,51 @@
 import { describe, expect, test } from "bun:test";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RuntimeCommand } from "../src/runtime-command";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
+  test("refuses to synthesize an in-memory MCP effect ledger", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+
+    await expect(
+      kernel.claimExternalToolEffect(
+        { commandId: "mcp-command-without-durable-ledger" },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/durable external tool effect ledger/);
+  });
+
   test.each(["input", "mcp"] as const)(
     "replays a completed %s command without repeating its side effect",
     async (kind) => {
       const backend = createBackend();
       let calls = 0;
+      const effectResults = new Map<
+        string,
+        { outputText: string; requestId: string; serverId: string; toolName: string }
+      >();
       backend.handleInput = async () => {
         calls += 1;
       };
       const kernel = new AgentDriverKernelCore({
         backendFactory: () => backend,
+        externalToolEffectLedger: {
+          claimExternalToolEffect: async ({ commandId }) => {
+            const result = effectResults.get(commandId);
+            const effectId = `test-effect-${commandId}`;
+
+            return result === undefined
+              ? { attempt: 1, effectId, idempotencyKey: effectId, kind: "execute" as const }
+              : { effectId, kind: "completed" as const, result };
+          },
+          completeExternalToolEffect: async ({ commandId, result }) => {
+            effectResults.set(commandId, structuredClone(result));
+          },
+          markExternalToolEffectUnknown: async () => {},
+        },
         hostPorts: {
           mcp: {
             execute: async (command) => {

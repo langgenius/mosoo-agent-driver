@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { Logger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { AcpFileSystem } from "../src/runtimes/acp/acp-file-system";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
 function createFileSystem(cwd = process.cwd()): AcpFileSystem {
@@ -105,11 +105,12 @@ describe("ACP file system bridge", () => {
 
       expect(await readFile(path, "utf8")).toBe("hello");
       expect(events).toHaveLength(1);
+      const resolvedPath = join(await realpath(root), "nested", "note.txt");
       expect(events[0]).toMatchObject({
         kind: "file.changed",
         payload: {
           change: "upsert",
-          path,
+          path: resolvedPath,
           source: "acp.fs",
         },
       });

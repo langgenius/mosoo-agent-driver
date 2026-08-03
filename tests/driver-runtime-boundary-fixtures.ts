@@ -1,13 +1,13 @@
+import type { AgentDriverBackend, AgentDriverContext } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverCommandDispatcher } from "../src/core/driver-command-dispatcher";
 import { DriverPermissionBroker } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeIo } from "../src/core/driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
+import type { AgentDriverMcpPort } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
-import type { AgentDriverMcpPort } from "../src/host-ports";
-import type { AgentDriverBackend, AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 export { DRIVER_TEST_IDS };
@@ -51,6 +51,18 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
     return command;
   }
 
+  async claimExternalToolEffect(
+    input: Parameters<DriverRuntimeIo["claimExternalToolEffect"]>[0],
+    _signal: AbortSignal,
+  ): ReturnType<DriverRuntimeIo["claimExternalToolEffect"]> {
+    return {
+      attempt: 1,
+      effectId: `test-effect-${input.commandId}`,
+      idempotencyKey: `test-effect-${input.commandId}`,
+      kind: "execute",
+    };
+  }
+
   isDrained(): boolean {
     return this.#commandIndex >= this.#commands.length;
   }
@@ -64,6 +76,13 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
 
   async completeRun(_signal?: AbortSignal): Promise<void> {
     this.completedRunReasons.push("completed");
+  }
+
+  async completeExternalToolEffect(
+    _input: Parameters<DriverRuntimeIo["completeExternalToolEffect"]>[0],
+    _signal: AbortSignal,
+  ): Promise<void> {
+    return;
   }
 
   async failRun(
@@ -83,6 +102,13 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
         type: event.kind,
       })),
     };
+  }
+
+  async markExternalToolEffectUnknown(
+    _input: Parameters<DriverRuntimeIo["markExternalToolEffectUnknown"]>[0],
+    _signal: AbortSignal,
+  ): Promise<void> {
+    return;
   }
 }
 

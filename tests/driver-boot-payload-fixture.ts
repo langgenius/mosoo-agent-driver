@@ -85,7 +85,7 @@ export const driverBootPayload = {
     skills: [],
   },
   heartbeatIntervalMs: 1_000,
-  protocolVersion: 1,
+  protocolVersion: 2,
   runtime: "openai-runtime",
   runtimeTransport: "openai-app-server",
   sandboxId: DRIVER_TEST_IDS.sandboxId,

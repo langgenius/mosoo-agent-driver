@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -897,7 +897,7 @@ function createBootPayload(input: {
       skills: [],
     },
     heartbeatIntervalMs: 60_000,
-    protocolVersion: 1,
+    protocolVersion: 2,
     runtime: runtimeCase.runtime,
     runtimeTransport: runtimeCase.transport,
     sandboxId: createTestId(),

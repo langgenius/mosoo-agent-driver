@@ -1,11 +1,11 @@
-import { summarizeRuntimeCommand } from "../observability/driver-debug";
 import { createScopedWideEvent, emitWideEvent } from "../observability";
 import type { Logger } from "../observability";
+import { summarizeRuntimeCommand } from "../observability/driver-debug";
 import { parseDriverId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
 import type { RunError, RuntimeCommand } from "../runtime-command";
-import type { AgentDriverBackend, AgentDriverContext } from "./agent-driver-backend";
 import { promiseWithTimeout, raceWithAbort, sleepPromise } from "../utils/async";
+import type { AgentDriverBackend, AgentDriverContext } from "./agent-driver-backend";
 import { DriverCommandDelivery, TerminalCommandDeliveryError } from "./driver-command-delivery";
 import { pushDriverDiagnosticEvent } from "./driver-diagnostics";
 import {
@@ -36,6 +36,7 @@ interface DriverCommandDispatcherOptions {
 const COMMAND_POLL_INTERVAL_MS = 250;
 const ACTIVE_INPUT_SETTLE_GRACE_MS = 5_000;
 export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
+const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
 interface ActiveMcpCommand {
@@ -61,6 +62,15 @@ function toCommandFailure(command: RuntimeCommand, error: unknown): RunError {
 
 function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
+}
+
+class ExternalToolEffectResolutionRequiredError extends Error {
+  constructor(command: Extract<RuntimeCommand, { kind: "mcp.execute" }>, effectId: string) {
+    super(
+      `External effect ${effectId} for MCP tool ${command.toolName} is unknown. Verify the provider outcome and explicitly decide whether to create a new action; this command will never replay automatically.`,
+    );
+    this.name = "ExternalToolEffectResolutionRequiredError";
+  }
 }
 
 function parseRunId(value: string): RunId {
@@ -557,13 +567,54 @@ export class DriverCommandDispatcher {
     command: Extract<RuntimeCommand, { kind: "mcp.execute" }>,
     controller: AbortController,
   ): Promise<void> {
+    let effectClaimed = false;
+    let effectCompleted = false;
+    const effectLedger = runtimeContext.ports.eventSink;
+
+    if (
+      effectLedger.claimExternalToolEffect === undefined ||
+      effectLedger.completeExternalToolEffect === undefined ||
+      effectLedger.markExternalToolEffectUnknown === undefined
+    ) {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    }
+
     try {
+      const effect = await effectLedger.claimExternalToolEffect(
+        { commandId: command.commandId },
+        controller.signal,
+      );
+
+      if (effect.kind === "completed") {
+        await this.#commandDelivery.finish(runtimeContext, command, {
+          result: effect.result,
+          status: "completed",
+        });
+        return;
+      }
+
+      if (effect.kind === "unknown") {
+        throw new ExternalToolEffectResolutionRequiredError(command, effect.effectId);
+      }
+
+      effectClaimed = true;
       runtimeContext.logger.info("driver.runtime.mcp.execute.started", {
+        effectAttempt: effect.attempt,
         serverId: command.serverId,
         toolName: command.toolName,
       });
-      const result = await runtimeContext.ports.mcp.execute(command, controller.signal);
+      const execution = await runtimeContext.ports.mcp.execute(command, controller.signal, effect);
+      const { providerReceiptJson, ...result } = execution;
       controller.signal.throwIfAborted();
+      await effectLedger.completeExternalToolEffect(
+        {
+          commandId: command.commandId,
+          ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
+          result,
+        },
+        controller.signal,
+      );
+      effectCompleted = true;
       await this.#commandDelivery.finish(runtimeContext, command, {
         result,
         status: "completed",
@@ -574,6 +625,10 @@ export class DriverCommandDispatcher {
         toolName: command.toolName,
       });
     } catch (error) {
+      if (effectClaimed && !effectCompleted) {
+        await this.#markExternalToolEffectUnknown(effectLedger, command.commandId);
+      }
+
       if (this.#commandDelivery.hasTerminal(command.commandId)) {
         throw error;
       }
@@ -587,6 +642,22 @@ export class DriverCommandDispatcher {
 
       await this.#failCommand(runtimeContext, socket, command, error);
     }
+  }
+
+  async #markExternalToolEffectUnknown(
+    effectLedger: AgentDriverContext["ports"]["eventSink"],
+    commandId: string,
+  ): Promise<void> {
+    const markUnknown = effectLedger.markExternalToolEffectUnknown;
+    if (markUnknown === undefined) {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    }
+
+    const signal = AbortSignal.any([
+      this.#shutdownSignal,
+      AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS),
+    ]);
+    await markUnknown.call(effectLedger, { commandId }, signal);
   }
 
   async #failCommand(

@@ -1,6 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
-import { isDeepStrictEqual } from "node:util";
 
 import { assertDriverEventReceiptPrefix } from "../../core/driver-runtime-io";
 import type { DriverBootPayload } from "../../protocol/boot";
@@ -9,6 +10,7 @@ import type { RunId } from "../../protocol/id";
 import type {
   DriverFailureInput,
   DriverEventBatchOutput,
+  DriverExternalToolEffectClaimOutput,
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
   DriverHelloInput,
@@ -18,8 +20,14 @@ import type {
   DriverRpcOptions,
 } from "../../protocol/orpc";
 import type { DriverRuntimeClient } from "../../protocol/orpc";
+import type {
+  McpExecuteCommandResult,
+  McpExternalToolEffectClaim,
+  RunError,
+  RuntimeCommand,
+  RuntimeCommandResult,
+} from "../../runtime-command";
 import { parseRuntimeCommand } from "../../runtime-command";
-import type { RunError, RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
 import { dialDriverControlSocket } from "./driver-control-dial";
 import type { DriverWireSocket } from "./driver-control-dial";
 import { toDriverEventEnvelopes } from "./driver-event-envelope";
@@ -167,6 +175,43 @@ export class DriverInstanceSocket {
         ...(input.error === undefined ? {} : { error: input.error }),
         status: input.status,
         ...(input.result === undefined ? {} : { result: input.result }),
+      },
+      this.#rpcOptions(signal),
+    );
+  }
+
+  async claimExternalToolEffect(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectClaim> {
+    const result: DriverExternalToolEffectClaimOutput =
+      await this.#requireClient().driver.claimExternalToolEffect(
+        {
+          commandId: input.commandId,
+          driverInstanceId: this.payload.driverInstanceId,
+        },
+        this.#rpcOptions(signal),
+      );
+
+    return result;
+  }
+
+  async completeExternalToolEffect(
+    input: {
+      commandId: string;
+      providerReceiptJson?: string | null | undefined;
+      result: McpExecuteCommandResult;
+    },
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#requireClient().driver.completeExternalToolEffect(
+      {
+        commandId: input.commandId,
+        driverInstanceId: this.payload.driverInstanceId,
+        ...(input.providerReceiptJson === undefined
+          ? {}
+          : { providerReceiptJson: input.providerReceiptJson }),
+        result: input.result,
       },
       this.#rpcOptions(signal),
     );
@@ -349,6 +394,19 @@ export class DriverInstanceSocket {
     }
 
     return result.command === null ? null : parseRuntimeCommand(result.command);
+  }
+
+  async markExternalToolEffectUnknown(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#requireClient().driver.markExternalToolEffectUnknown(
+      {
+        commandId: input.commandId,
+        driverInstanceId: this.payload.driverInstanceId,
+      },
+      this.#rpcOptions(signal),
+    );
   }
 
   #deliverRunTerminal(

@@ -1,5 +1,3 @@
-import { pushLosslessEvents } from "./driver-runtime-io";
-import type { DriverRuntimeEventPort } from "./driver-runtime-io";
 import type {
   AgentDriverCommandSource,
   AgentDriverEventSink,
@@ -16,6 +14,8 @@ import type { RunId } from "../protocol/id";
 import type { DriverRuntime } from "../protocol/runtime";
 import type { DriverStartInput } from "../protocol/start";
 import type { RuntimeCommandInput } from "../runtime-command";
+import { pushLosslessEvents } from "./driver-runtime-io";
+import type { DriverRuntimeEventPort } from "./driver-runtime-io";
 
 export interface AgentDriverContext {
   lifecycle: AgentDriverLifecycle;
@@ -68,8 +68,15 @@ function toAgentDriverEventSink(
   const currentRunId = eventSink.currentRunId?.bind(eventSink);
 
   return {
+    claimExternalToolEffect: async () => {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    },
     commandUpdate: async () => {},
+    completeExternalToolEffect: async () => {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    },
     ...(currentRunId === undefined ? {} : { currentRunId }),
+    markExternalToolEffectUnknown: async () => {},
     pushEvents: (input) => eventSink.pushEvents(input),
   };
 }

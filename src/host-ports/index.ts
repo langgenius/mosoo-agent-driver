@@ -3,7 +3,15 @@ import type { DriverExecutionInput } from "../protocol/execution";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
 import type { RunId } from "../protocol/id";
 import type { DriverEventBatchOutput } from "../protocol/orpc";
-import type { McpExecuteCommand, RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
+import type {
+  McpExecuteCommand,
+  McpExecuteCommandResult,
+  McpExternalToolEffectClaim,
+  McpExternalToolEffectExecution,
+  McpExternalToolExecutionResult,
+  RuntimeCommand,
+  RuntimeCommandResult,
+} from "../runtime-command";
 
 export type AgentDriverHostPortName =
   | "command_source"
@@ -19,6 +27,10 @@ export interface AgentDriverCommandSource {
 }
 
 export interface AgentDriverEventSink {
+  claimExternalToolEffect?(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectClaim>;
   commandUpdate(
     input: {
       commandId: string;
@@ -27,7 +39,16 @@ export interface AgentDriverEventSink {
     },
     signal: AbortSignal,
   ): Promise<void>;
+  completeExternalToolEffect?(
+    input: {
+      commandId: string;
+      providerReceiptJson?: string | null | undefined;
+      result: McpExecuteCommandResult;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
   currentRunId?(): RunId | null;
+  markExternalToolEffectUnknown?(input: { commandId: string }, signal: AbortSignal): Promise<void>;
   pushEvents(input: {
     events: DriverEventInput[];
     signal?: AbortSignal;
@@ -51,12 +72,8 @@ export interface AgentDriverMcpPort {
   execute(
     command: McpExecuteCommand,
     signal: AbortSignal,
-  ): Promise<{
-    outputText: string;
-    requestId: string;
-    serverId: string;
-    toolName: string;
-  }>;
+    effect?: McpExternalToolEffectExecution,
+  ): Promise<McpExternalToolExecutionResult>;
 }
 
 export interface AgentDriverMaterializedSkill {
