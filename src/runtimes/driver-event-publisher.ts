@@ -218,7 +218,6 @@ export class DriverEventPublisher {
     const queuedEvents = [...this.#pendingEvents, ...entries.flatMap((entry) => entry.events)];
     const remainingLossless = queuedEvents.filter(({ event }) => isLosslessDriverEvent(event));
     const ownerErrors = new Map<symbol, unknown>();
-    const deadline = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
     const reason =
       entries.length === 0
         ? `driver.events.pending.${wakeReason ?? "retry"}`
@@ -255,6 +254,7 @@ export class DriverEventPublisher {
         const sameDelivery = queuedEvents.slice(index, end);
 
         if (lossless) {
+          const deadline = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
           let remaining = sameDelivery;
 
           while (remaining.length > 0) {
@@ -303,6 +303,7 @@ export class DriverEventPublisher {
             }
           }
         } else {
+          const deadline = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
           try {
             const events = sameDelivery.map(({ event }) => event);
             const result = await context.ports.eventSink.pushEvents({
