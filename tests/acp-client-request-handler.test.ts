@@ -259,6 +259,62 @@ describe("ACP client request handler", () => {
     expect(pushedReasons).toEqual(["driver.acp.session.update"]);
   });
 
+  test("does not hold session update admission behind delivery acknowledgement", async () => {
+    const firstDelivery = Promise.withResolvers<void>();
+    const firstAdmitted = Promise.withResolvers<void>();
+    const failures: Error[] = [];
+    const pending: Promise<void>[] = [];
+    const turnEvents = new AcpTurnEventState();
+    let pushes = 0;
+    turnEvents.begin({
+      messageId: "message-1" as never,
+      runId: "run-1" as never,
+      sessionId: "native-session-1",
+    });
+    const handler = new AcpClientRequestHandler({
+      allowedRoots: [],
+      cwd: "/workspace",
+      env: {},
+      isCancelling: () => false,
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: (error) => failures.push(error),
+      push: async () => {
+        pushes += 1;
+        if (pushes === 1) {
+          firstAdmitted.resolve();
+          await firstDelivery.promise;
+        }
+      },
+      turnEvents,
+    });
+    const update = (text: string) =>
+      handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          content: { text, type: "text" },
+          messageId: text,
+          sessionUpdate: "agent_message_chunk",
+        },
+      });
+    const track = (promise: Promise<void>) => {
+      pending.push(promise);
+      void promise.catch(() => {});
+    };
+
+    track(update("first"));
+    await firstAdmitted.promise;
+    for (let index = 0; index < 1_024; index += 1) {
+      track(update(`queued-${index}`));
+      await Promise.resolve();
+    }
+    firstDelivery.resolve();
+
+    const settled = await Promise.allSettled(pending);
+    expect(settled.every((result) => result.status === "fulfilled")).toBe(true);
+    expect(failures).toEqual([]);
+    expect(pushes).toBe(1_025);
+  });
+
   test("fails every queued update after the first commit failure", async () => {
     const failures: Error[] = [];
     let pushes = 0;
