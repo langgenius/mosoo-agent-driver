@@ -372,17 +372,25 @@ describe("DriverEventPublisher", () => {
     await context.logger.destroy();
   });
 
-  test("shares one overall deadline across a mixed-delivery push", async () => {
+  test("does not let a timed-out best-effort lane poison later lossless delivery", async () => {
     const nativeTimeout = AbortSignal.timeout;
     const signals: (AbortSignal | undefined)[] = [];
-    let timeouts = 0;
+    const controllers: AbortController[] = [];
     AbortSignal.timeout = () => {
-      timeouts += 1;
-      return new AbortController().signal;
+      const controller = new AbortController();
+      controllers.push(controller);
+      return controller.signal;
     };
     const context = createContext({
       pushEvents: async (events, signal) => {
         signals.push(signal);
+        signal?.throwIfAborted();
+
+        if (signals.length === 1) {
+          controllers[0]!.abort(new DOMException("The operation timed out.", "TimeoutError"));
+          signal?.throwIfAborted();
+        }
+
         return {
           accepted: events.map((event, index) => ({
             eventId: event.sourceEventId,
@@ -407,8 +415,8 @@ describe("DriverEventPublisher", () => {
 
     expect(signals).toHaveLength(3);
     expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
-    expect(new Set(signals).size).toBe(1);
-    expect(timeouts).toBe(1);
+    expect(new Set(signals).size).toBe(3);
+    expect(controllers).toHaveLength(3);
   });
 
   test("freezes the active run before a queued partial delivery", async () => {
