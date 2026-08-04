@@ -22,6 +22,7 @@ export interface AcpSessionUpdateInboxOptions {
 export class AcpSessionUpdateInbox {
   readonly #apply: AcpSessionUpdateInboxOptions["apply"];
   #closed = false;
+  readonly #deliveries = new Set<Promise<void>>();
   #failure: Error | null = null;
   readonly #onFailure: AcpSessionUpdateInboxOptions["onFailure"];
   #pendingBytes = 0;
@@ -62,29 +63,35 @@ export class AcpSessionUpdateInbox {
     this.#pendingBytes += bytes;
     this.#pendingCount += 1;
     const scope = { replaying: this.#replaying, suppressed: this.#suppressed };
-    const update = this.#tail
+    let delivery = Promise.resolve();
+    const admission = this.#tail
       .then(() => {
         if (this.#failure !== null) {
           throw this.#failure;
         }
 
-        return this.#apply(context, notification, scope);
+        delivery = this.#apply(context, notification, scope);
+        this.#deliveries.add(delivery);
+        void delivery
+          .catch((error: unknown) => this.#fail(error))
+          .finally(() => this.#deliveries.delete(delivery));
       })
       .finally(() => {
         this.#pendingBytes -= bytes;
         this.#pendingCount -= 1;
       });
-    this.#tail = update.catch((error: unknown) => this.#fail(error));
-    return update;
+    this.#tail = admission.catch((error: unknown) => this.#fail(error));
+    return admission.then(() => delivery);
   }
 
   async drain(): Promise<void> {
     for (;;) {
       const tail = this.#tail;
       await tail;
+      await Promise.allSettled(this.#deliveries);
       await Promise.resolve();
 
-      if (tail !== this.#tail) {
+      if (tail !== this.#tail || this.#deliveries.size > 0) {
         continue;
       }
 
