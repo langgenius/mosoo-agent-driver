@@ -28,6 +28,7 @@ import {
   computeRuntimeBootstrapDigest,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
+import { exposeNativeSkillAliases } from "../skill-materialization";
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
@@ -119,6 +120,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
       context.ports.skill.materialize(this.#payload.execution),
       signal,
     );
+    const nativeSkillAliases = await raceWithAbort(
+      exposeNativeSkillAliases(this.#payload.execution, context.logger, materializedSkills),
+      signal,
+    );
     const bootstrapArtifacts = await raceWithAbort(
       writeSkillBootstrapArtifacts(this.#payload.execution),
       signal,
@@ -162,6 +167,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
           sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
         },
         nativeResumeRefPresent: this.#nativeSessionId !== null,
+        nativeSkillAliasCount: nativeSkillAliases.length,
         skillCount: materializedSkills.length,
       });
     } catch (error) {
