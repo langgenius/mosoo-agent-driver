@@ -30,6 +30,7 @@ import {
   writeNativeRuntimeSystemPrompt,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
+import { exposeNativeSkillAliases } from "../skill-materialization";
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
@@ -114,6 +115,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#hostSnapshot = hostSnapshot;
     const materializedSkills = await raceWithAbort(
       context.ports.skill.materialize(this.#payload.execution),
+      signal,
+    );
+    const nativeSkillAliases = await raceWithAbort(
+      exposeNativeSkillAliases(this.#payload.execution, context.logger, materializedSkills),
       signal,
     );
     const bootstrapArtifacts = await raceWithAbort(
@@ -284,6 +289,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
         },
         nativeInstructions: nativeInstructionPath !== null,
         nativeResumeRefPresent: this.#nativeSessionId !== null,
+        nativeSkillAliasCount: nativeSkillAliases.length,
         skillCount: materializedSkills.length,
       });
     } catch (error) {

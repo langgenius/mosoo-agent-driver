@@ -1,5 +1,16 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  readlink,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 
 import type { AgentDriverMaterializedSkill } from "../host-ports";
@@ -13,6 +24,7 @@ export type MaterializedSkill = AgentDriverMaterializedSkill;
 
 const MAX_SKILL_ENTRY_BYTES = 2 * 1024 * 1024;
 const MAX_SKILL_UNCOMPRESSED_BYTES = 25 * 1024 * 1024;
+const NATIVE_SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SKILL_ARCHIVE_EXTRACT_OPTIONS: SkillArchiveExtractOptions = {
   maxEntryCount: 256,
   maxFileBytes: MAX_SKILL_ENTRY_BYTES,
@@ -55,6 +67,120 @@ function enforceSkillMountPath(sessionOrganizationPath: string, mountPath: strin
   ) {
     throw new Error(`Resolved skill mount path is outside the allowed root: ${mountPath}.`);
   }
+}
+
+async function ensureNativeSkillDirectory(path: string): Promise<void> {
+  try {
+    const stats = await lstat(path);
+
+    if (!stats.isDirectory()) {
+      throw new Error(`Native skill alias root is not a directory: ${path}.`);
+    }
+  } catch (error) {
+    if (isRecord(error) && error["code"] === "ENOENT") {
+      await mkdir(path);
+      return;
+    }
+
+    throw error;
+  }
+}
+
+function isManagedNativeSkillAliasTarget(sharedRootPath: string, target: string): boolean {
+  try {
+    enforceSkillMountPath(sharedRootPath, target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function exposeNativeSkillAliases(
+  execution: DriverExecutionInput,
+  logger: Logger,
+  materializedSkills: readonly MaterializedSkill[],
+): Promise<string[]> {
+  const desired = new Map<string, MaterializedSkill>();
+
+  for (const skill of materializedSkills) {
+    if (skill.skillName.length > 64 || !NATIVE_SKILL_NAME_PATTERN.test(skill.skillName)) {
+      logger.warn("driver.skill.native_alias.skipped", {
+        reason: "invalid_name",
+        skillId: skill.skillId,
+        skillName: skill.skillName,
+      });
+      continue;
+    }
+    if (desired.has(skill.skillName)) {
+      logger.warn("driver.skill.native_alias.skipped", {
+        reason: "duplicate_name",
+        skillId: skill.skillId,
+        skillName: skill.skillName,
+      });
+      continue;
+    }
+
+    enforceSkillMountPath(execution.session.sharedRootPath, skill.mountPath);
+    if (resolve(skill.skillMarkdownPath) !== resolve(skill.mountPath, "SKILL.md")) {
+      throw new Error(`Native skill path mismatch for "${skill.skillName}".`);
+    }
+    desired.set(skill.skillName, skill);
+  }
+
+  for (const skill of desired.values()) {
+    const stats = await lstat(skill.skillMarkdownPath);
+
+    if (!stats.isFile()) {
+      throw new Error(`Native skill "${skill.skillName}" does not contain SKILL.md.`);
+    }
+  }
+
+  const agentsRoot = join(execution.session.sharedRootPath, ".agents");
+  const aliasRoot = join(agentsRoot, "skills");
+  await ensureNativeSkillDirectory(agentsRoot);
+  await ensureNativeSkillDirectory(aliasRoot);
+
+  const staleAliases: string[] = [];
+  const retainedAliases = new Set<string>();
+  const entries = (await readdir(aliasRoot, { withFileTypes: true })).toSorted((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+
+  for (const entry of entries) {
+    const aliasPath = join(aliasRoot, entry.name);
+    const skill = desired.get(entry.name);
+
+    if (entry.isSymbolicLink()) {
+      const target = resolve(aliasRoot, await readlink(aliasPath));
+
+      if (skill !== undefined && target === resolve(skill.mountPath)) {
+        retainedAliases.add(entry.name);
+        continue;
+      }
+      if (isManagedNativeSkillAliasTarget(execution.session.sharedRootPath, target)) {
+        staleAliases.push(aliasPath);
+        continue;
+      }
+    }
+
+    if (skill !== undefined) {
+      throw new Error(`Native skill alias "${entry.name}" collides with an existing path.`);
+    }
+  }
+
+  await Promise.all(staleAliases.map((aliasPath) => unlink(aliasPath)));
+
+  const aliasPaths: string[] = [];
+  for (const [skillName, skill] of desired) {
+    const aliasPath = join(aliasRoot, skillName);
+    aliasPaths.push(aliasPath);
+
+    if (!retainedAliases.has(skillName)) {
+      await symlink(relative(aliasRoot, resolve(skill.mountPath)), aliasPath, "dir");
+    }
+  }
+
+  return aliasPaths;
 }
 
 export async function materializeResolvedSkills(
