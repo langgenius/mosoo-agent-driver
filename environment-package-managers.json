@@ -1,0 +1,4 @@
+{
+  "schemaVersion": 1,
+  "managers": ["npm", "pip"]
+}

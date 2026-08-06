@@ -160,6 +160,8 @@ vp run clean
 
 `vp run build:image` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
+The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run docker:smoke:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
+
 ## Boundaries
 
 - The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, permission flow, diagnostics, and host port contracts.
@@ -174,6 +176,7 @@ vp run clean
 
 - `vp run check`
 - `vp run build:image`
+- `vp run docker:smoke:environment`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live artifact tests are gated by environment credentials
