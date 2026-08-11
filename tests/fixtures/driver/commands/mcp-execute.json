@@ -4,5 +4,6 @@
   "kind": "mcp.execute",
   "requestId": "request-1",
   "serverId": "server-1",
+  "toolCallId": "tool-1",
   "toolName": "complete"
 }

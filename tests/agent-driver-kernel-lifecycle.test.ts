@@ -77,6 +77,7 @@ describe("AgentDriverKernelCore", () => {
               kind: "mcp.execute",
               requestId: "request-replay",
               serverId: "mcp-linear",
+              toolCallId: "tool-replay",
               toolName: "createIssue",
             };
 

@@ -562,6 +562,7 @@ describe("driver runtime boundary", () => {
                 kind: "mcp.execute",
                 requestId: "request-terminal-failure",
                 serverId: "mcp-linear",
+                toolCallId: "tool-terminal-failure",
                 toolName: "createIssue",
               }
             : {
@@ -676,6 +677,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "ack-blocked-request",
               serverId: "mcp-linear",
+              toolCallId: "tool-ack-blocked",
               toolName: "createIssue",
             };
       const next: RuntimeCommand =

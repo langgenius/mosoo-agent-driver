@@ -189,6 +189,7 @@ describe("driver runtime boundary", () => {
         kind: "mcp.execute",
         requestId: "mcp-request-1",
         serverId: "mcp-linear",
+        toolCallId: "tool-mcp-1",
         toolName: "createIssue",
       },
     ]);
@@ -222,6 +223,33 @@ describe("driver runtime boundary", () => {
         status: "completed",
       },
     ]);
+    expect(socket.pushedEvents).toMatchObject([
+      {
+        events: [
+          {
+            kind: "tool.call.updated",
+            payload: {
+              rawInput: '{"issue":"A-1"}',
+              status: "running",
+              title: "createIssue",
+              toolCallId: "tool-mcp-1",
+            },
+          },
+        ],
+      },
+      {
+        events: [
+          {
+            kind: "tool.call.updated",
+            payload: {
+              rawOutput: "ran createIssue",
+              status: "completed",
+              toolCallId: "tool-mcp-1",
+            },
+          },
+        ],
+      },
+    ]);
   });
 
   test("reports remote MCP execute failures as diagnostics", async () => {
@@ -234,6 +262,7 @@ describe("driver runtime boundary", () => {
         kind: "mcp.execute",
         requestId: "mcp-request-1",
         serverId: "mcp-linear",
+        toolCallId: "tool-mcp-1",
         toolName: "createIssue",
       },
     ]);
@@ -268,6 +297,29 @@ describe("driver runtime boundary", () => {
       {
         events: [
           {
+            kind: "tool.call.updated",
+            payload: {
+              status: "running",
+              toolCallId: "tool-mcp-1",
+            },
+          },
+        ],
+      },
+      {
+        events: [
+          {
+            kind: "tool.call.updated",
+            payload: {
+              rawOutput: "MCP upstream failed",
+              status: "failed",
+              toolCallId: "tool-mcp-1",
+            },
+          },
+        ],
+      },
+      {
+        events: [
+          {
             kind: "diagnostic.reported",
             payload: {
               code: "driver.mcp_execute_failed",
@@ -299,6 +351,7 @@ describe("driver runtime boundary", () => {
         kind: "mcp.execute",
         requestId: "mcp-request-stuck",
         serverId: "mcp-linear",
+        toolCallId: "tool-mcp-stuck",
         toolName: "waitForever",
       },
       {
@@ -396,6 +449,7 @@ describe("driver runtime boundary", () => {
         kind: "mcp.execute" as const,
         requestId: `mcp-request-${index}`,
         serverId: "mcp-linear",
+        toolCallId: `tool-mcp-${index}`,
         toolName: "waitForever",
       })),
       {

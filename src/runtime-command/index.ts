@@ -47,6 +47,7 @@ export interface McpExecuteCommand {
   readonly kind: "mcp.execute";
   readonly requestId: string;
   readonly serverId: string;
+  readonly toolCallId: string;
   readonly toolName: string;
 }
 
@@ -222,6 +223,7 @@ export function parseRuntimeCommand(value: unknown): RuntimeCommand {
         kind,
         requestId: readNonEmptyString(record, "requestId"),
         serverId: readNonEmptyString(record, "serverId"),
+        toolCallId: readNonEmptyString(record, "toolCallId"),
         toolName: readNonEmptyString(record, "toolName"),
       };
     case "permission.resolve":

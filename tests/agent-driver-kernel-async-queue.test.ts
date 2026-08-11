@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { AsyncValueQueue } from "../src/core/async-value-queue";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
@@ -379,6 +379,7 @@ describe("AgentDriverKernelCore", () => {
       kind: "mcp.execute",
       requestId: "owned-result-request",
       serverId: "mcp-server",
+      toolCallId: "owned-result-tool",
       toolName: "tool",
     };
     const externalResult = {

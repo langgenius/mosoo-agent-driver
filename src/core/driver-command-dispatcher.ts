@@ -3,7 +3,7 @@ import type { Logger } from "../observability";
 import { summarizeRuntimeCommand } from "../observability/driver-debug";
 import { parseDriverId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
-import type { RunError, RuntimeCommand } from "../runtime-command";
+import type { McpExecuteCommandResult, RunError, RuntimeCommand } from "../runtime-command";
 import { promiseWithTimeout, raceWithAbort, sleepPromise } from "../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "./agent-driver-backend";
 import { DriverCommandDelivery, TerminalCommandDeliveryError } from "./driver-command-delivery";
@@ -12,6 +12,7 @@ import {
   PermissionEventDeliveryError,
   type DriverPermissionBroker,
 } from "./driver-permission-broker";
+import { pushLosslessEvents } from "./driver-runtime-io";
 import type { DriverRuntimeIo } from "./driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "./driver-runtime-state";
 import {
@@ -580,41 +581,69 @@ export class DriverCommandDispatcher {
     }
 
     try {
+      await pushLosslessEvents(socket, [
+        {
+          kind: "tool.call.updated",
+          payload: {
+            kind: "mcp",
+            rawInput: command.argumentsJson,
+            status: "running",
+            title: command.toolName,
+            toolCallId: command.toolCallId,
+          },
+        },
+      ]);
       const effect = await effectLedger.claimExternalToolEffect(
         { commandId: command.commandId },
         controller.signal,
       );
-
-      if (effect.kind === "completed") {
-        await this.#commandDelivery.finish(runtimeContext, command, {
-          result: effect.result,
-          status: "completed",
-        });
-        return;
-      }
-
       if (effect.kind === "unknown") {
         throw new ExternalToolEffectResolutionRequiredError(command, effect.effectId);
       }
 
-      effectClaimed = true;
-      runtimeContext.logger.info("driver.runtime.mcp.execute.started", {
-        effectAttempt: effect.attempt,
-        serverId: command.serverId,
-        toolName: command.toolName,
-      });
-      const execution = await runtimeContext.ports.mcp.execute(command, controller.signal, effect);
-      const { providerReceiptJson, ...result } = execution;
-      controller.signal.throwIfAborted();
-      await effectLedger.completeExternalToolEffect(
+      let result: McpExecuteCommandResult;
+
+      if (effect.kind === "completed") {
+        result = effect.result;
+      } else {
+        effectClaimed = true;
+        runtimeContext.logger.info("driver.runtime.mcp.execute.started", {
+          effectAttempt: effect.attempt,
+          serverId: command.serverId,
+          toolName: command.toolName,
+        });
+        const execution = await runtimeContext.ports.mcp.execute(
+          command,
+          controller.signal,
+          effect,
+        );
+        const { providerReceiptJson, ...executionResult } = execution;
+        result = executionResult;
+        controller.signal.throwIfAborted();
+        await effectLedger.completeExternalToolEffect(
+          {
+            commandId: command.commandId,
+            ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
+            result,
+          },
+          controller.signal,
+        );
+        effectCompleted = true;
+      }
+
+      await pushLosslessEvents(socket, [
         {
-          commandId: command.commandId,
-          ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
-          result,
+          kind: "tool.call.updated",
+          payload: {
+            kind: "mcp",
+            rawInput: command.argumentsJson,
+            rawOutput: result.outputText,
+            status: "completed",
+            title: command.toolName,
+            toolCallId: command.toolCallId,
+          },
         },
-        controller.signal,
-      );
-      effectCompleted = true;
+      ]);
       await this.#commandDelivery.finish(runtimeContext, command, {
         result,
         status: "completed",
@@ -639,6 +668,25 @@ export class DriverCommandDispatcher {
         });
         return;
       }
+
+      await pushLosslessEvents(socket, [
+        {
+          kind: "tool.call.updated",
+          payload: {
+            kind: "mcp",
+            rawInput: command.argumentsJson,
+            rawOutput: toErrorMessage(error, "MCP tool execution failed."),
+            status: "failed",
+            title: command.toolName,
+            toolCallId: command.toolCallId,
+          },
+        },
+      ]).catch((deliveryError: unknown) => {
+        runtimeContext.logger.error("driver.runtime.mcp.failed-event.failed", deliveryError, {
+          commandId: command.commandId,
+          toolCallId: command.toolCallId,
+        });
+      });
 
       await this.#failCommand(runtimeContext, socket, command, error);
     }

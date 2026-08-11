@@ -49,6 +49,7 @@ export interface CmaUserCustomToolResultEvent {
   readonly commandId: string;
   readonly requestId: string;
   readonly serverId: string;
+  readonly toolCallId: string;
   readonly toolName: string;
   readonly type: "user.custom_tool_result";
 }
@@ -65,6 +66,7 @@ const supportedFieldsByInboundType = {
     "commandId",
     "requestId",
     "serverId",
+    "toolCallId",
     "toolName",
     "type",
   ]),
@@ -174,6 +176,7 @@ export function parseCmaInboundEvent(input: unknown): CmaInboundEvent {
         commandId: readString(record, "commandId"),
         requestId: readString(record, "requestId"),
         serverId: readString(record, "serverId"),
+        toolCallId: readString(record, "toolCallId"),
         toolName: readString(record, "toolName"),
         type,
       };
@@ -215,6 +218,7 @@ export function projectCmaInboundToDriverCommand(input: unknown): RuntimeCommand
         kind: "mcp.execute",
         requestId: event.requestId,
         serverId: event.serverId,
+        toolCallId: event.toolCallId,
         toolName: event.toolName,
       };
   }

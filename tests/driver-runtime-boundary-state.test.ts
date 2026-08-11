@@ -321,6 +321,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "request-replay",
               serverId: "mcp-linear",
+              toolCallId: "tool-replay",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
@@ -376,6 +377,7 @@ describe("driver runtime boundary", () => {
       kind: "mcp.execute",
       requestId: "request-persistent-effect",
       serverId: "mcp-linear",
+      toolCallId: "tool-persistent-effect",
       toolName: "createIssue",
     };
     let providerCalls = 0;
@@ -463,6 +465,14 @@ describe("driver runtime boundary", () => {
       { commandId: command.commandId, status: "accepted" },
       { commandId: command.commandId, result: effectResult, status: "completed" },
     ]);
+    expect(secondSocket.pushedEvents).toMatchObject([
+      {
+        events: [{ kind: "tool.call.updated", payload: { toolCallId: command.toolCallId } }],
+      },
+      {
+        events: [{ kind: "tool.call.updated", payload: { toolCallId: command.toolCallId } }],
+      },
+    ]);
   });
 
   test("blocks an unknown MCP effect without another provider call", async () => {
@@ -472,6 +482,7 @@ describe("driver runtime boundary", () => {
       kind: "mcp.execute",
       requestId: "unknown-effect-request",
       serverId: "mcp-linear",
+      toolCallId: "tool-unknown-effect",
       toolName: "createIssue",
     };
     const socket = new FakeDriverRuntimeIo([command]);
@@ -515,6 +526,7 @@ describe("driver runtime boundary", () => {
       kind: "mcp.execute",
       requestId: "cancelled-effect-request",
       serverId: "mcp-linear",
+      toolCallId: "tool-cancelled-effect",
       toolName: "createIssue",
     };
     const cancelCommand: RuntimeCommand = {

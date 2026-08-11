@@ -39,6 +39,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "serialized-request",
               serverId: "mcp-linear",
+              toolCallId: "tool-serialized",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
@@ -117,6 +118,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "joined-request",
               serverId: "mcp-linear",
+              toolCallId: "tool-joined",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
@@ -207,6 +209,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "failed-joined-request",
               serverId: "mcp-linear",
+              toolCallId: "tool-failed-joined",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
@@ -297,6 +300,7 @@ describe("driver runtime boundary", () => {
         kind: "mcp.execute",
         requestId: "sink-mutation-request",
         serverId: "mcp-linear",
+        toolCallId: "tool-sink-mutation",
         toolName: "createIssue",
       };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
@@ -406,6 +410,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "request-report-failure",
               serverId: "mcp-linear",
+              toolCallId: "tool-report-failure",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command]);
