@@ -322,6 +322,7 @@ describe("driver runtime boundary", () => {
               kind: "mcp.execute",
               requestId: "request-replay",
               serverId: "mcp-linear",
+              toolCallId: "tool-replay",
               toolName: "createIssue",
             };
       const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);

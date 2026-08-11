@@ -8,16 +8,17 @@ import {
 } from "@modelcontextprotocol/client";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { DriverStartInput } from "../../protocol/start";
 import type { McpExecuteCommand } from "../../runtime-command";
 import { settlePromiseWithTimeout } from "../../utils/async";
-import { AGENT_DRIVER_VERSION } from "../../core/version";
 
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
 type ActiveMcpServer = Extract<SessionMcpServer, { authorizationState: "active" }>;
 
 const MCP_REQUEST_TIMEOUT_MS = 60_000;
 const MCP_CLEANUP_TIMEOUT_MS = 2_000;
+const MOSOO_TOOL_CALL_ID_HEADER = "X-Mosoo-Tool-Call-Id";
 
 function parseToolArguments(command: McpExecuteCommand): Record<string, unknown> {
   try {
@@ -196,6 +197,9 @@ export async function executeRemoteHttpMcpCommand(
   });
   const transport = new StreamableHTTPClientTransport(new URL(server.proxyUrl), {
     authProvider,
+    requestInit: {
+      headers: { [MOSOO_TOOL_CALL_ID_HEADER]: command.toolCallId },
+    },
   });
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
 
