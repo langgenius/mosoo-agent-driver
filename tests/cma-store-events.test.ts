@@ -191,6 +191,7 @@ describe("CMA memory store lifecycle", () => {
           kind: "mcp.execute",
           requestId: "request-1",
           serverId: "server-1",
+          toolCallId: "tool-1",
           toolName: "tool-1",
         },
         event: {
@@ -198,6 +199,7 @@ describe("CMA memory store lifecycle", () => {
           commandId: "command-1",
           requestId: "request-1",
           serverId: "server-1",
+          toolCallId: "tool-1",
           toolName: "tool-1",
           type: "user.custom_tool_result",
         },

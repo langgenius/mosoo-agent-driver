@@ -222,6 +222,7 @@ describe("CMA HTTP surface", () => {
         commandId: "command-1",
         requestId: "request-1",
         serverId: "server-1",
+        toolCallId: "tool-call-1",
         toolName: "tool-1",
         type: "user.custom_tool_result",
       }),
