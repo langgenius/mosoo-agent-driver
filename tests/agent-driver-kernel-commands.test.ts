@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import type { DriverEventInput } from "../src/protocol/events";
-import type { RuntimeCommand } from "../src/runtime-command";
 import type {
   AgentDriverContext,
   AgentDriverContextPortOverrides,
 } from "../src/core/agent-driver-backend";
+import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import type { DriverEventInput } from "../src/protocol/events";
+import type { RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
@@ -532,6 +532,7 @@ describe("AgentDriverKernelCore", () => {
           kind: "mcp.execute",
           requestId: "request-1",
           serverId: "server-1",
+          toolCallId: "tool-1",
           toolName: "complete",
         },
         new AbortController().signal,

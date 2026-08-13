@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
+import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RuntimeCommand } from "../src/runtime-command";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
@@ -48,6 +48,7 @@ describe("AgentDriverKernelCore", () => {
               kind: "mcp.execute",
               requestId: "request-replay",
               serverId: "mcp-linear",
+              toolCallId: "tool-replay",
               toolName: "createIssue",
             };
 

@@ -60,6 +60,7 @@ describe("CMA projection", () => {
         commandId: "mcp-1",
         requestId: "request-1",
         serverId: "server-1",
+        toolCallId: "tool-1",
         toolName: "complete",
         type: "user.custom_tool_result",
       }),
@@ -69,6 +70,7 @@ describe("CMA projection", () => {
       kind: "mcp.execute",
       requestId: "request-1",
       serverId: "server-1",
+      toolCallId: "tool-1",
       toolName: "complete",
     });
   });
