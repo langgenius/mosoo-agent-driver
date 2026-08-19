@@ -34,6 +34,7 @@ import {
   createClaudeQueryOptions,
   resolveClaudeConfigDir,
 } from "./agent-sdk-query-options";
+import { buildClaudeRecoveryPrompt } from "./agent-sdk-recovery-context";
 import { readClaudeNativeResumeSessionId } from "./agent-sdk-resume";
 import { drainClaudeTasks } from "./agent-sdk-tasks";
 
@@ -160,6 +161,13 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     this.#messageTranslator.resetTurnMessageState();
 
+    // With no native session to resume, every query starts a fresh provider
+    // session, so the bounded platform-history replay must ride the prompt of
+    // whichever turn first establishes one.
+    const recoveryMessages =
+      this.#nativeSessionId === null ? this.#payload.execution.session.recoveryMessages : [];
+    const promptText = buildClaudeRecoveryPrompt(recoveryMessages, input.text);
+
     const { abortController, permissionTasks, processTasks, warmQuery } = this.#prewarm.take();
     const activeTurn: ActiveClaudeTurn = {
       abortController,
@@ -197,7 +205,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
       try {
         if (warmQuery !== null) {
-          activeQuery = warmQuery.query(input.text);
+          activeQuery = warmQuery.query(promptText);
         } else {
           const optionsStartedAtMs = Date.now();
           const queryOptions = await this.#dependencies.createQueryOptions({
@@ -216,7 +224,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
           activeQuery = this.#dependencies.query({
             options: queryOptions,
-            prompt: input.text,
+            prompt: promptText,
           });
         }
 
@@ -256,7 +264,8 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       const queryCreateMs = Date.now() - queryStartedAtMs;
       context.logger.info("driver.claude.prompt.sending", {
         nativeSessionIdPresent: Boolean(this.#nativeSessionId),
-        textLength: input.text.length,
+        recoveryMessageCount: recoveryMessages.length,
+        textLength: promptText.length,
       });
       context.logger.debug("driver.claude.prompt.requested", {
         input: summarizeRuntimeCommandInput(input),
