@@ -26,6 +26,7 @@ import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
   computeRuntimeBootstrapDigest,
+  writeNativeRuntimeSystemPrompt,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
 import { exposeNativeSkillAliases } from "../skill-materialization";
@@ -35,9 +36,11 @@ import { AcpClientRequestHandler } from "./acp-client-request-handler";
 import { limitAcpInput } from "./acp-input-limit";
 import {
   ACP_PROTOCOL_VERSION,
+  appendOpenCodeInstruction,
   buildChildEnv,
   buildClientCapabilities,
   assertProtocolVersion,
+  isOpenCodeCommand,
   readFallbackArgs,
   readFallbackCommand,
   readResumeId,
@@ -73,6 +76,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
   #hostSnapshot: DriverHostIntegrationSnapshot | null = null;
   #nativeSessionId: string | null = null;
+  #nativeInstructionPath: string | null = null;
   readonly #payload: DriverStartInput;
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
@@ -128,6 +132,13 @@ export class AcpDriverBackend implements AgentDriverBackend {
       writeSkillBootstrapArtifacts(this.#payload.execution),
       signal,
     );
+    const launch = (this.#agentLaunch ??= {
+      args: readFallbackArgs(),
+      command: readFallbackCommand(),
+    });
+    this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
+      ? await raceWithAbort(writeNativeRuntimeSystemPrompt(this.#payload.execution), signal)
+      : null;
 
     if (this.#stopRequested || signal.aborted) {
       signal.throwIfAborted();
@@ -142,7 +153,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
       const setup = await this.#connect(context, signal, true);
 
-      if (setup.mode === "created") {
+      if (setup.mode === "created" && this.#nativeInstructionPath === null) {
         await withAcpStartupStage(
           "ACP runtime bootstrap",
           () => this.#applyBootstrap(context, signal),
@@ -167,6 +178,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
           sharedRootPath: summarizePath(this.#payload.execution.session.sharedRootPath),
         },
         nativeResumeRefPresent: this.#nativeSessionId !== null,
+        nativeInstructions: this.#nativeInstructionPath !== null,
         nativeSkillAliasCount: nativeSkillAliases.length,
         skillCount: materializedSkills.length,
       });
@@ -198,10 +210,14 @@ export class AcpDriverBackend implements AgentDriverBackend {
       args: readFallbackArgs(),
       command: readFallbackCommand(),
     });
+    const processEnv =
+      this.#nativeInstructionPath === null
+        ? this.#childProcessEnv
+        : appendOpenCodeInstruction(this.#childProcessEnv, this.#nativeInstructionPath);
     const agentProcess = await startAcpAgentProcess(
       context,
       this.#payload,
-      this.#childProcessEnv,
+      processEnv,
       signal,
       launch,
     );

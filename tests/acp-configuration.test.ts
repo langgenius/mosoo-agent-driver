@@ -3,9 +3,11 @@ import { describe, expect, test } from "bun:test";
 import { createBufferedSinkLogger } from "../src/observability";
 import {
   ACP_PROTOCOL_VERSION,
+  appendOpenCodeInstruction,
   buildChildEnv,
   buildClientCapabilities,
   assertProtocolVersion,
+  isOpenCodeCommand,
   resolveAuthMethod,
   supportsAdditionalDirs,
   supportsSessionClose,
@@ -25,6 +27,35 @@ function createInitializeResult(protocolVersion: number | string | null) {
 }
 
 describe("ACP runtime configuration", () => {
+  test("adds a session instruction to OpenCode's inline config", () => {
+    const instructionPath = "/workspace/session/runtime-instructions.md";
+    const env = appendOpenCodeInstruction(
+      {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          instructions: ["/managed/instructions.md"],
+          model: "deepseek/deepseek-v4-pro",
+        }),
+      },
+      instructionPath,
+    );
+
+    expect(isOpenCodeCommand("/usr/local/bin/opencode")).toBe(true);
+    expect(isOpenCodeCommand("opencode.exe")).toBe(true);
+    expect(isOpenCodeCommand("acp-agent")).toBe(false);
+    expect(JSON.parse(env["OPENCODE_CONFIG_CONTENT"] ?? "{}")).toEqual({
+      instructions: ["/managed/instructions.md", instructionPath],
+      model: "deepseek/deepseek-v4-pro",
+    });
+    expect(
+      JSON.parse(
+        appendOpenCodeInstruction(env, instructionPath)["OPENCODE_CONFIG_CONTENT"] ?? "{}",
+      ),
+    ).toEqual({
+      instructions: ["/managed/instructions.md", instructionPath],
+      model: "deepseek/deepseek-v4-pro",
+    });
+  });
+
   test("accepts the configured ACP protocol version only", () => {
     expect(() => assertProtocolVersion(createInitializeResult(ACP_PROTOCOL_VERSION))).not.toThrow();
     expect(() =>
