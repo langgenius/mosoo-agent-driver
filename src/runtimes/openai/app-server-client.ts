@@ -121,6 +121,10 @@ const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
 const MAX_APP_SERVER_MESSAGE_BYTES = 8 * 1_024 * 1_024;
 const MAX_PENDING_SERVER_MESSAGES = 1_024;
 const MAX_PENDING_SERVER_MESSAGE_BYTES = 32 * 1_024 * 1_024;
+const PAUSE_PENDING_SERVER_MESSAGES = Math.floor(MAX_PENDING_SERVER_MESSAGES * 0.75);
+const RESUME_PENDING_SERVER_MESSAGES = Math.floor(MAX_PENDING_SERVER_MESSAGES * 0.5);
+const PAUSE_PENDING_SERVER_MESSAGE_BYTES = Math.floor(MAX_PENDING_SERVER_MESSAGE_BYTES * 0.75);
+const RESUME_PENDING_SERVER_MESSAGE_BYTES = Math.floor(MAX_PENDING_SERVER_MESSAGE_BYTES * 0.5);
 
 export function limitNdjsonLines(maxMessageBytes = MAX_APP_SERVER_MESSAGE_BYTES): Transform {
   if (!Number.isSafeInteger(maxMessageBytes) || maxMessageBytes < 1) {
@@ -201,6 +205,7 @@ export class OpenAiAppServerClient {
   #processTreeMarker: string | null = null;
   #readline: ReadlineInterface | null = null;
   #serverMessageQueue: Promise<void> = Promise.resolve();
+  #serverMessagesPaused = false;
   #startRequested = false;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
@@ -558,7 +563,12 @@ export class OpenAiAppServerClient {
     for (;;) {
       const tail = this.#serverMessageQueue;
       await tail;
-      await Promise.resolve();
+      // Resuming stdout schedules the next buffered chunk on a later event-loop
+      // turn. A microtask-only check can mistake that backpressure handoff for
+      // an empty queue and return before the resumed notifications are admitted.
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
 
       if (tail === this.#serverMessageQueue) {
         return;
@@ -732,16 +742,14 @@ export class OpenAiAppServerClient {
     if (method !== null) {
       const bytes = Buffer.byteLength(trimmed, "utf8");
 
-      if (
-        this.#pendingServerMessages >= MAX_PENDING_SERVER_MESSAGES ||
-        bytes > MAX_PENDING_SERVER_MESSAGE_BYTES - this.#pendingServerMessageBytes
-      ) {
+      if (bytes > MAX_PENDING_SERVER_MESSAGE_BYTES - this.#pendingServerMessageBytes) {
         this.#failProtocol(new Error("App-server message queue limit exceeded."));
         return;
       }
 
       this.#pendingServerMessages += 1;
       this.#pendingServerMessageBytes += bytes;
+      this.#pauseServerMessagesIfNeeded();
       this.#serverMessageQueue = this.#processMessage(
         this.#serverMessageQueue,
         method,
@@ -750,6 +758,7 @@ export class OpenAiAppServerClient {
       ).finally(() => {
         this.#pendingServerMessages -= 1;
         this.#pendingServerMessageBytes -= bytes;
+        this.#resumeServerMessagesIfReady();
       });
       return;
     }
@@ -757,6 +766,41 @@ export class OpenAiAppServerClient {
     if (id !== null) {
       this.#onResponse(id, parsed);
     }
+  }
+
+  #pauseServerMessagesIfNeeded(): void {
+    if (
+      this.#serverMessagesPaused ||
+      (this.#pendingServerMessages < PAUSE_PENDING_SERVER_MESSAGES &&
+        this.#pendingServerMessageBytes < PAUSE_PENDING_SERVER_MESSAGE_BYTES)
+    ) {
+      return;
+    }
+
+    this.#serverMessagesPaused = true;
+    this.#context.logger.debug("driver.openai.server_message_queue.paused", {
+      pendingBytes: this.#pendingServerMessageBytes,
+      pendingMessages: this.#pendingServerMessages,
+    });
+    this.#process?.stdout.pause();
+  }
+
+  #resumeServerMessagesIfReady(): void {
+    if (
+      !this.#serverMessagesPaused ||
+      this.#stopRequested ||
+      this.#pendingServerMessages > RESUME_PENDING_SERVER_MESSAGES ||
+      this.#pendingServerMessageBytes > RESUME_PENDING_SERVER_MESSAGE_BYTES
+    ) {
+      return;
+    }
+
+    this.#serverMessagesPaused = false;
+    this.#context.logger.debug("driver.openai.server_message_queue.resumed", {
+      pendingBytes: this.#pendingServerMessageBytes,
+      pendingMessages: this.#pendingServerMessages,
+    });
+    this.#process?.stdout.resume();
   }
 
   #failProtocol(error: Error): void {

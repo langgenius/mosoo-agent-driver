@@ -36,6 +36,7 @@ interface TrackTurnFixture {
 interface ProviderFixtureCase {
   readonly expectedEvents: readonly unknown[];
   readonly notifications: readonly ProviderNotificationFixture[];
+  readonly trackTurnBeforeNotifications?: TrackTurnFixture | undefined;
   readonly trackTurnAfterNotifications?: TrackTurnFixture | undefined;
 }
 
@@ -44,6 +45,7 @@ const providerFixtureNames = [
   "command-output-stream",
   "error-before-tracked-turn",
   "reasoning-empty-summary",
+  "root-with-parallel-child-turns",
   "turn-completed-with-final-agent-message",
   "turn-plan-updated",
   "unknown-notification-ignored",
@@ -113,6 +115,7 @@ function readProviderFixtureCase(path: string): ProviderFixtureCase {
   return {
     expectedEvents,
     notifications: notifications.map(readProviderNotificationFixture),
+    trackTurnBeforeNotifications: readTrackTurnFixture(fixture["trackTurnBeforeNotifications"]),
     trackTurnAfterNotifications: readTrackTurnFixture(fixture["trackTurnAfterNotifications"]),
   };
 }
@@ -364,10 +367,23 @@ describe("OpenAI app-server provider fixtures", () => {
     );
     const { bridge, context, events, logger } = createHarness();
 
+    const trackedTurn = fixture.trackTurnBeforeNotifications;
+    const trackedCompletion =
+      trackedTurn === undefined
+        ? null
+        : bridge.trackTurn(trackedTurn.turnId, DRIVER_TEST_IDS.runId);
+
     for (const notification of fixture.notifications) {
       await dispatchProviderNotification(notification, bridge, context);
     }
 
+    if (trackedCompletion !== null) {
+      if (trackedTurn?.expectation === "reject") {
+        await expect(trackedCompletion).rejects.toThrow();
+      } else {
+        await expect(trackedCompletion).resolves.toBeUndefined();
+      }
+    }
     await assertTrackTurnFixture(bridge, fixture.trackTurnAfterNotifications);
     await logger.destroy();
 

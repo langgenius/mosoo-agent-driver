@@ -1,0 +1,259 @@
+{
+  "trackTurnBeforeNotifications": {
+    "expectation": "resolve",
+    "turnId": "turn-root"
+  },
+  "notifications": [
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thread-1",
+        "turn": { "id": "turn-root", "status": "inProgress" }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "agentsStates": {},
+          "id": "agent-call-1",
+          "model": "gpt-5.5",
+          "prompt": "Run A and B in parallel",
+          "reasoningEffort": "high",
+          "receiverThreadIds": ["thread-child-a", "thread-child-b"],
+          "senderThreadId": "thread-1",
+          "status": "inProgress",
+          "tool": "spawnAgent",
+          "type": "collabAgentToolCall"
+        },
+        "threadId": "thread-1",
+        "turnId": "turn-root"
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thread-child-a",
+        "turn": { "id": "turn-child-a", "status": "inProgress" }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": { "id": "message-child-a", "text": "CHILD_A", "type": "agentMessage" },
+        "threadId": "thread-child-a",
+        "turnId": "turn-child-a"
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-child-a",
+        "turn": {
+          "id": "turn-child-a",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thread-child-b",
+        "turn": { "id": "turn-child-b", "status": "inProgress" }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": { "id": "message-child-b", "text": "CHILD_B", "type": "agentMessage" },
+        "threadId": "thread-child-b",
+        "turnId": "turn-child-b"
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-child-b",
+        "turn": {
+          "id": "turn-child-b",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "agentsStates": {
+            "thread-child-a": { "message": "CHILD_A", "status": "completed" },
+            "thread-child-b": { "message": "CHILD_B", "status": "completed" }
+          },
+          "id": "agent-call-1",
+          "model": "gpt-5.5",
+          "prompt": "Run A and B in parallel",
+          "reasoningEffort": "high",
+          "receiverThreadIds": ["thread-child-a", "thread-child-b"],
+          "senderThreadId": "thread-1",
+          "status": "completed",
+          "tool": "spawnAgent",
+          "type": "collabAgentToolCall"
+        },
+        "threadId": "thread-1",
+        "turnId": "turn-root"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "id": "message-parent",
+          "text": "PARENT_OK: CHILD_A + CHILD_B",
+          "type": "agentMessage"
+        },
+        "threadId": "thread-1",
+        "turnId": "turn-root"
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turn": {
+          "id": "turn-root",
+          "items": [
+            {
+              "agentsStates": {
+                "thread-child-a": { "message": "CHILD_A", "status": "completed" },
+                "thread-child-b": { "message": "CHILD_B", "status": "completed" }
+              },
+              "id": "agent-call-1",
+              "model": "gpt-5.5",
+              "prompt": "Run A and B in parallel",
+              "reasoningEffort": "high",
+              "receiverThreadIds": ["thread-child-a", "thread-child-b"],
+              "senderThreadId": "thread-1",
+              "status": "completed",
+              "tool": "spawnAgent",
+              "type": "collabAgentToolCall"
+            },
+            {
+              "id": "message-parent",
+              "text": "PARENT_OK: CHILD_A + CHILD_B",
+              "type": "agentMessage"
+            }
+          ],
+          "itemsView": "full",
+          "status": "completed"
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "item": { "id": "message-child-late", "text": "LATE_CHILD", "type": "agentMessage" },
+        "threadId": "thread-child-b",
+        "turnId": "turn-child-b"
+      }
+    }
+  ],
+  "expectedEvents": [
+    {
+      "kind": "run.started",
+      "native": {
+        "eventName": "turn.started",
+        "provider": "openai",
+        "turnId": "turn-root"
+      },
+      "payload": { "startedAt": "<iso-timestamp>" },
+      "runId": "<driver-id>",
+      "sourceEventId": "openai.turn.started:turn-root"
+    },
+    {
+      "kind": "message.started",
+      "payload": { "messageId": "<driver-id>", "role": "agent" }
+    },
+    {
+      "kind": "item.started",
+      "payload": {
+        "itemId": "agent-call-1",
+        "itemType": "tool_call",
+        "parentMessageId": "<driver-id>",
+        "title": "spawnAgent"
+      }
+    },
+    {
+      "kind": "tool.call.updated",
+      "payload": {
+        "kind": "tool",
+        "parentMessageId": "<driver-id>",
+        "status": "running",
+        "title": "spawnAgent",
+        "toolCallId": "agent-call-1"
+      }
+    },
+    {
+      "kind": "tool.call.updated",
+      "payload": {
+        "content": "{\"thread-child-a\":{\"message\":\"CHILD_A\",\"status\":\"completed\"},\"thread-child-b\":{\"message\":\"CHILD_B\",\"status\":\"completed\"}}",
+        "messageId": "<driver-id>",
+        "rawOutput": "{\"thread-child-a\":{\"message\":\"CHILD_A\",\"status\":\"completed\"},\"thread-child-b\":{\"message\":\"CHILD_B\",\"status\":\"completed\"}}",
+        "status": "completed",
+        "toolCallId": "agent-call-1"
+      }
+    },
+    {
+      "kind": "item.completed",
+      "payload": {
+        "itemId": "agent-call-1",
+        "itemType": "tool_call",
+        "status": "completed"
+      }
+    },
+    {
+      "delivery": "best_effort",
+      "kind": "message.delta",
+      "payload": {
+        "contentDelta": "PARENT_OK: CHILD_A + CHILD_B",
+        "messageId": "<driver-id>",
+        "role": "agent"
+      }
+    },
+    {
+      "delivery": "lossless",
+      "kind": "message.added",
+      "payload": {
+        "content": "PARENT_OK: CHILD_A + CHILD_B",
+        "messageId": "<driver-id>",
+        "role": "agent"
+      }
+    },
+    {
+      "kind": "message.completed",
+      "payload": { "messageId": "<driver-id>", "role": "agent" }
+    },
+    {
+      "kind": "runtime.resume.updated",
+      "payload": { "resumePointer": "thread-1", "threadId": "thread-1" },
+      "visibility": "owner_debug"
+    },
+    {
+      "kind": "run.completed",
+      "native": {
+        "eventName": "turn.completed",
+        "provider": "openai",
+        "turnId": "turn-root"
+      },
+      "payload": {
+        "finalMessageId": "<driver-id>",
+        "finalMessageText": "PARENT_OK: CHILD_A + CHILD_B",
+        "stopReason": "end_turn"
+      },
+      "runId": "<driver-id>",
+      "sourceEventId": "openai.turn.completed:turn-root"
+    }
+  ]
+}
