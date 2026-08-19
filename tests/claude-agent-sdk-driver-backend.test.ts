@@ -1385,7 +1385,11 @@ describe("Claude Agent SDK driver backend", () => {
       ]),
     );
 
-    await harness.backend.handleInput(harness.context, { text: "add a page" }, DRIVER_TEST_IDS.runId);
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "add a page" },
+      DRIVER_TEST_IDS.runId,
+    );
     await harness.backend.handleInput(
       harness.context,
       { text: "now polish it" },
@@ -1419,17 +1423,18 @@ describe("Claude Agent SDK driver backend", () => {
         },
       },
       undefined,
-      recoveryPayload(
-        [{ content: "make a deck", role: "user" }],
-        {
-          kind: "claude_session_id",
-          runtimeId: "claude-agent-sdk",
-          value: "native-session-1",
-        },
-      ),
+      recoveryPayload([{ content: "make a deck", role: "user" }], {
+        kind: "claude_session_id",
+        runtimeId: "claude-agent-sdk",
+        value: "native-session-1",
+      }),
     );
 
-    await harness.backend.handleInput(harness.context, { text: "add a page" }, DRIVER_TEST_IDS.runId);
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "add a page" },
+      DRIVER_TEST_IDS.runId,
+    );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
     await harness.logger.destroy();
 
