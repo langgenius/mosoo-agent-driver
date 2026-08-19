@@ -47,7 +47,20 @@ describe("Driver golden fixtures", () => {
     expect(parseRuntimeCommand(fixture)).toEqual(fixture);
   });
 
-  test("rejects unsupported input attachments", () => {
+  test("preserves v1 compatibility for API-materialized input attachments", () => {
+    const fixture = readJsonFixture("./fixtures/driver/commands/input-start.json") as {
+      readonly input: Record<string, unknown>;
+    };
+
+    expect(
+      parseRuntimeCommand({
+        ...fixture,
+        input: { ...fixture.input, attachmentIds: ["file-1"] },
+      }),
+    ).toEqual(fixture);
+  });
+
+  test("rejects malformed input attachment IDs", () => {
     const fixture = readJsonFixture("./fixtures/driver/commands/input-start.json") as {
       readonly input: Record<string, unknown>;
     };
@@ -55,9 +68,9 @@ describe("Driver golden fixtures", () => {
     expect(() =>
       parseRuntimeCommand({
         ...fixture,
-        input: { ...fixture.input, attachmentIds: [] },
+        input: { ...fixture.input, attachmentIds: [""] },
       }),
-    ).toThrow("input.attachmentIds is unsupported.");
+    ).toThrow("input.attachmentIds must be an array of non-empty strings.");
   });
 
   test.each(runtimeEventFixtures)("ingests runtime event fixture %s", (name) => {
