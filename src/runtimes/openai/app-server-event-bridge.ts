@@ -169,7 +169,21 @@ export class OpenAiAppServerEventBridge {
     params: ServerNotificationParams[M],
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
-    const turnId = readNonEmptyString(payload, "turnId");
+    const turnId =
+      readNonEmptyString(payload, "turnId") ??
+      readNonEmptyString(readRecord(payload, "turn"), "id");
+
+    // Native Codex subagents own child threads and turns. Their direct message
+    // and lifecycle frames are provider-internal activity, not authoritative
+    // mutations of the Mosoo Run attached to the root app-server thread. Root
+    // collabAgentToolCall/subAgentActivity items still arrive on the root thread
+    // and continue through the normal item projection below.
+    if (
+      turnId !== null &&
+      readNonEmptyString(payload, "threadId") !== this.#options.requireThreadId()
+    ) {
+      return;
+    }
 
     if (turnId !== null && this.#turns.hasTerminal(turnId)) {
       return;

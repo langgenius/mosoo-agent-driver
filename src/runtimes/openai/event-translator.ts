@@ -39,6 +39,14 @@ export function toOpenAiToolName(item: JsonObject): string | null {
     return "Web search";
   }
 
+  if (itemType === "collabAgentToolCall") {
+    return readNonEmptyString(item, "tool") ?? "Agent collaboration";
+  }
+
+  if (itemType === "subAgentActivity") {
+    return "Sub-agent activity";
+  }
+
   return null;
 }
 
@@ -86,6 +94,18 @@ export function toOpenAiToolResultText(item: JsonObject): string | null {
 
   if (itemType === "webSearch") {
     return readString(item, "query");
+  }
+
+  if (itemType === "collabAgentToolCall") {
+    return stringifyForDisplay(item["agentsStates"]);
+  }
+
+  if (itemType === "subAgentActivity") {
+    return stringifyForDisplay({
+      agentPath: item["agentPath"] ?? null,
+      agentThreadId: item["agentThreadId"] ?? null,
+      kind: item["kind"] ?? null,
+    });
   }
 
   return null;

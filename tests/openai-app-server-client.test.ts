@@ -1262,11 +1262,10 @@ setInterval(() => {}, 1000);
     }
   });
 
-  test("fails and stops when queued server messages exceed the hard limit", async () => {
-    let releaseNotification: (() => void) | null = null;
-    const notificationGate = new Promise<void>((resolve) => {
-      releaseNotification = resolve;
-    });
+  test("applies backpressure to a bounded multi-agent notification burst", async () => {
+    const firstNotification = Promise.withResolvers<void>();
+    const notificationGate = Promise.withResolvers<void>();
+    let handled = 0;
     const harness = await createClientHarness(
       () => `
 let buffer = "";
@@ -1276,27 +1275,44 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
+  buffer = buffer.slice(newline + 1);
+  if (request.id === undefined) return;
   process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
-  for (let index = 0; index < 1025; index += 1) {
-    process.stdout.write(JSON.stringify({ method: "warning", params: { message: String(index), threadId: null } }) + "\\n");
+  for (let index = 0; index < 2048; index += 1) {
+    process.stdout.write(JSON.stringify({
+      method: "item/agentMessage/delta",
+      params: {
+        delta: "x",
+        itemId: "message-" + index,
+        threadId: "thread-child-" + (index % 2),
+        turnId: "turn-child-" + (index % 2)
+      }
+    }) + "\\n");
   }
 });
 setInterval(() => {}, 1000);
 `,
-      async () => notificationGate,
+      async () => {
+        handled += 1;
+        if (handled === 1) {
+          firstNotification.resolve();
+          await notificationGate.promise;
+        }
+      },
     );
 
     try {
       await harness.client.start();
+      await firstNotification.promise;
+      await Bun.sleep(25);
+      expect(harness.protocolErrors).toEqual([]);
 
-      for (let attempt = 0; attempt < 50 && harness.protocolErrors.length === 0; attempt += 1) {
-        await Bun.sleep(10);
-      }
-
-      expect(harness.protocolErrors).toHaveLength(1);
-      expect(harness.protocolErrors[0]?.message).toBe("App-server message queue limit exceeded.");
+      notificationGate.resolve();
+      await harness.client.drainServerMessages();
+      expect(handled).toBe(2048);
+      expect(harness.protocolErrors).toEqual([]);
     } finally {
-      (releaseNotification as (() => void) | null)?.();
+      notificationGate.resolve();
       await harness.client.stop();
       await harness.logger.destroy();
     }
