@@ -167,6 +167,22 @@ export function buildNativeRuntimeSystemPrompt(execution: DriverExecutionInput):
   return bootstrap.length > 0 ? bootstrap : null;
 }
 
+export async function writeNativeRuntimeSystemPrompt(
+  execution: DriverExecutionInput,
+): Promise<string | null> {
+  const systemPrompt = buildNativeRuntimeSystemPrompt(execution);
+
+  if (systemPrompt === null) {
+    return null;
+  }
+
+  const path = join(execution.session.homePath, "runtime-instructions.md");
+  await mkdir(execution.session.homePath, { recursive: true });
+  await writeFile(path, `${systemPrompt}\n`, { encoding: "utf8", mode: 0o600 });
+
+  return path;
+}
+
 export function computeRuntimeBootstrapDigest(execution: DriverExecutionInput): string | null {
   const bootstrapText = buildRuntimeBootstrapText(execution);
 
