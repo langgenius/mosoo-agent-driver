@@ -158,10 +158,10 @@ describe("provider registry", () => {
     ).toBe("claude-agent-sdk");
   });
 
-  test("rejects OpenAI additional directories", () => {
+  test("preserves v1 compatibility when OpenAI receives additional directories", () => {
     const input = startInputFor("openai-app-server");
 
-    expect(() =>
+    expect(
       AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
         ...input,
         execution: {
@@ -171,8 +171,8 @@ describe("provider registry", () => {
             additionalDirectories: ["/tmp/shared"],
           },
         },
-      }),
-    ).toThrow("Runtime openai-runtime does not support additional directories.");
+      }).runtime,
+    ).toBe("openai-runtime");
   });
 
   test.each(["claude-agent-sdk", "acp-fallback"] as const)(
