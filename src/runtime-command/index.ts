@@ -184,9 +184,14 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
 
 function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
   const record = readRecord(value, "input");
+  const attachmentIds = record["attachmentIds"];
 
-  if ("attachmentIds" in record) {
-    throw new TypeError("input.attachmentIds is unsupported.");
+  if (
+    attachmentIds !== undefined &&
+    (!Array.isArray(attachmentIds) ||
+      attachmentIds.some((id) => typeof id !== "string" || id.length === 0))
+  ) {
+    throw new TypeError("input.attachmentIds must be an array of non-empty strings.");
   }
 
   return {
