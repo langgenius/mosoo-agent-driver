@@ -109,6 +109,7 @@ function nextEventLoopTurn(): Promise<void> {
 function createHarness(
   dependencies: ConstructorParameters<typeof ClaudeAgentSdkDriverBackend>[1],
   beforePush?: (events: readonly DriverEventInput[]) => Promise<void> | void,
+  payloadOverride?: DriverStartInput,
 ) {
   const events: DriverEventInput[] = [];
   let seq = 0;
@@ -117,11 +118,13 @@ function createHarness(
     service: "claude-agent-sdk-driver-backend-test",
     sink: async () => {},
   });
-  const payload = {
-    ...bootPayload,
-    runtime: "claude-agent-sdk",
-    runtimeTransport: "claude-agent-sdk",
-  } as DriverStartInput;
+  const payload =
+    payloadOverride ??
+    ({
+      ...bootPayload,
+      runtime: "claude-agent-sdk",
+      runtimeTransport: "claude-agent-sdk",
+    } as DriverStartInput);
   const context = createAgentDriverContext({
     eventSink: {
       pushEvents: async ({ events: batch }) => {
@@ -1336,5 +1339,105 @@ describe("Claude Agent SDK driver backend", () => {
           event.payload.contentDelta === "late",
       ),
     ).toBe(false);
+  });
+
+  function recoveryPayload(
+    recoveryMessages: DriverStartInput["execution"]["session"]["recoveryMessages"],
+    nativeResumeRef: DriverStartInput["execution"]["session"]["nativeResumeRef"] = null,
+  ): DriverStartInput {
+    const base = {
+      ...bootPayload,
+      runtime: "claude-agent-sdk",
+      runtimeTransport: "claude-agent-sdk",
+    } as DriverStartInput;
+
+    return {
+      ...base,
+      execution: {
+        ...base.execution,
+        session: {
+          ...base.execution.session,
+          nativeResumeRef,
+          recoveryMessages,
+        },
+      },
+    };
+  }
+
+  test("replays recovery messages in the first prompt when no native session exists", async () => {
+    const prompts: string[] = [];
+    const harness = createHarness(
+      {
+        createQueryOptions: async (input) =>
+          ({ abortController: input.abortController }) as ClaudeQueryOptions,
+        query: (input) => {
+          prompts.push(String(input.prompt));
+          return fakeQuery([resultMessage()]);
+        },
+        startup: async () => {
+          throw new Error("prewarm is disabled");
+        },
+      },
+      undefined,
+      recoveryPayload([
+        { content: "make a deck", role: "user" },
+        { content: "deck saved to outputs/presentation/index.html", role: "assistant" },
+      ]),
+    );
+
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "add a page" },
+      DRIVER_TEST_IDS.runId,
+    );
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "now polish it" },
+      DRIVER_TEST_IDS.secondRunId,
+    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    await harness.logger.destroy();
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]).toContain("<conversation_history>");
+    expect(prompts[0]).toContain("[user]: make a deck");
+    expect(prompts[0]).toContain("[assistant]: deck saved to outputs/presentation/index.html");
+    expect(prompts[0]?.endsWith("add a page")).toBe(true);
+    // The first turn established a native session, so the second turn resumes
+    // natively and must not replay history again.
+    expect(prompts[1]).toBe("now polish it");
+  });
+
+  test("does not replay recovery messages when a native resume ref is present", async () => {
+    const prompts: string[] = [];
+    const harness = createHarness(
+      {
+        createQueryOptions: async (input) =>
+          ({ abortController: input.abortController }) as ClaudeQueryOptions,
+        query: (input) => {
+          prompts.push(String(input.prompt));
+          return fakeQuery([resultMessage()]);
+        },
+        startup: async () => {
+          throw new Error("prewarm is disabled");
+        },
+      },
+      undefined,
+      recoveryPayload([{ content: "make a deck", role: "user" }], {
+        kind: "claude_session_id",
+        runtimeId: "claude-agent-sdk",
+        value: "native-session-1",
+      }),
+    );
+
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "add a page" },
+      DRIVER_TEST_IDS.runId,
+    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    await harness.logger.destroy();
+
+    expect(prompts).toEqual(["add a page"]);
   });
 });
