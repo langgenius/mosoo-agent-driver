@@ -134,10 +134,6 @@ export class AcpAssistantTranscriptState {
     }
 
     const finalMessage = this.#lastCompletedAssistantMessage;
-    const emptyTurn =
-      stopReason === "end_turn" &&
-      (finalMessage === null || finalMessage.text.trim().length === 0) &&
-      !this.#tools.hasActivity();
 
     if (stopReason === "cancelled") {
       events.push({
@@ -145,19 +141,6 @@ export class AcpAssistantTranscriptState {
         payload: {
           requestedBy: "user",
           stopReason: "cancelled",
-        },
-        runId,
-      });
-    } else if (emptyTurn) {
-      events.push({
-        kind: "run.failed",
-        payload: {
-          error: {
-            code: "acp.empty_turn",
-            message: "ACP prompt ended without assistant output or tool activity.",
-          },
-          recoverable: true,
-          stopReason,
         },
         runId,
       });

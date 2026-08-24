@@ -70,13 +70,8 @@
       "runId": "run-1"
     },
     {
-      "kind": "run.failed",
+      "kind": "run.completed",
       "payload": {
-        "error": {
-          "code": "acp.empty_turn",
-          "message": "ACP prompt ended without assistant output or tool activity."
-        },
-        "recoverable": true,
         "stopReason": "end_turn"
       },
       "runId": "run-1"
