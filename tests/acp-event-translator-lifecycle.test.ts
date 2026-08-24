@@ -149,7 +149,7 @@ describe("ACP runtime event translation", () => {
     );
   });
 
-  test("uses a later identified final after anonymous progress, but fails closed for an anonymous final", () => {
+  test("uses a later identified final and preserves anonymous message boundaries", () => {
     const state = new AcpTurnEventState();
 
     state.begin({
@@ -219,7 +219,7 @@ describe("ACP runtime event translation", () => {
       }),
       ...anonymousFinalState.completePrompt("end_turn", null),
     ];
-    const anonymousFailed = requireEvent(anonymousFinalEvents, "run.failed");
+    const anonymousCompleted = requireEvent(anonymousFinalEvents, "run.completed");
     const firstAnonymousDelta = requireEvent(
       anonymousFinalEvents.filter(
         (event) =>
@@ -240,11 +240,7 @@ describe("ACP runtime event translation", () => {
     expect(eventPayloadString(firstAnonymousDelta, "messageId")).not.toBe(
       eventPayloadString(finalAnonymousDelta, "messageId"),
     );
-    expect(eventPayload(anonymousFailed)).toMatchObject({
-      error: {
-        code: "acp.empty_turn",
-      },
-      recoverable: true,
+    expect(eventPayload(anonymousCompleted)).toMatchObject({
       stopReason: "end_turn",
     });
   });

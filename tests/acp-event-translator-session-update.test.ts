@@ -144,30 +144,14 @@ describe("ACP runtime event translation", () => {
     });
   });
 
-  test("fails an empty end turn instead of reporting a blank completed run", () => {
+  test("completes an empty end turn", () => {
     const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
 
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const events = state.completePrompt("end_turn", null);
 
-    const events = state.completePrompt("end_turn", {
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-    });
-
-    expect(eventKinds(events)).toEqual(["usage.updated", "run.failed"]);
-    expect(eventPayload(events[1]!)).toMatchObject({
-      error: {
-        code: "acp.empty_turn",
-        message: "ACP prompt ended without assistant output or tool activity.",
-      },
-      recoverable: true,
-      stopReason: "end_turn",
-    });
+    expect(eventKinds(events)).toEqual(["run.completed"]);
+    expect(eventPayload(events[0]!)).toMatchObject({ stopReason: "end_turn" });
   });
 
   test("ignores ACP user message echo chunks because driver input is the source of truth", () => {
@@ -301,7 +285,7 @@ describe("ACP runtime event translation", () => {
     expect(eventPayloadString(completed, "finalMessageText")).not.toContain(progressText);
   });
 
-  test("fails closed when an anonymous thought follows identified progress", () => {
+  test("completes end_turn when an anonymous thought follows identified progress", () => {
     const state = new AcpTurnEventState();
 
     state.begin({
@@ -326,7 +310,7 @@ describe("ACP runtime event translation", () => {
       }),
       ...state.completePrompt("end_turn", null),
     ];
-    const failed = requireEvent(events, "run.failed");
+    const completed = requireEvent(events, "run.completed");
 
     expect(eventKinds(events)).toEqual([
       "message.started",
@@ -335,13 +319,9 @@ describe("ACP runtime event translation", () => {
       "thought.started",
       "thought.delta",
       "thought.completed",
-      "run.failed",
+      "run.completed",
     ]);
-    expect(eventPayload(failed)).toMatchObject({
-      error: {
-        code: "acp.empty_turn",
-      },
-      recoverable: true,
+    expect(eventPayload(completed)).toMatchObject({
       stopReason: "end_turn",
     });
   });
