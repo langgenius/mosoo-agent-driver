@@ -49,7 +49,7 @@ import {
   supportsSessionLoad,
   supportsSessionResume,
 } from "./acp-configuration";
-import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-event-translator";
+import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-session-events";
 import { setupAcpSession } from "./acp-session-setup";
 import { withAcpStartupStage } from "./acp-startup";
 import { AcpTurnController } from "./acp-turn-controller";
@@ -94,6 +94,8 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#turnController = new AcpTurnController(
       (context, reason, events) => this.#push(context, reason, events),
       (context) => this.#recycleCancelledTurn(context),
+      (context, reason, closures, terminal) =>
+        this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
     );
     this.#clientRequests = new AcpClientRequestHandler({
       allowedRoots: payload.execution.session.additionalDirectories,
@@ -355,13 +357,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
         () => this.#setupSession(signal),
         signal,
       );
-
-      if (setup.droppedAdditionalDirectories.length > 0) {
-        context.logger.warn("driver.acp.session.additional_directories_dropped", {
-          count: setup.droppedAdditionalDirectories.length,
-          reason: "agent_capability_missing",
-        });
-      }
 
       if (
         requiredResumeSessionId !== null &&

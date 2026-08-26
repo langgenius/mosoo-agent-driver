@@ -21,13 +21,14 @@ import type {
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { shouldIgnoreReplay } from "./acp-event-translator";
-import type { AcpPermissionOption, AcpTurnEventState } from "./acp-event-translator";
+import type { AcpAssistantTranscriptState } from "./acp-assistant-transcript-state";
 import { AcpFileSystem } from "./acp-file-system";
 import { AcpPathScope } from "./acp-path-scope";
+import type { AcpPermissionOption, AcpPermissionTranslation } from "./acp-permission-events";
+import { shouldIgnoreReplay } from "./acp-session-events";
 import { AcpSessionUpdateInbox, type AcpSessionUpdateScope } from "./acp-session-update-inbox";
 import { AcpTerminalManager } from "./acp-terminal-manager";
-import { isRecord, raceWithAbort, readNonEmptyString, stringifyForDisplay } from "./acp-types";
+import { isRecord, raceWithAbort, readNonEmptyString } from "./acp-types";
 
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
@@ -37,7 +38,7 @@ interface AcpClientRequestHandlerOptions {
   nativeSessionId(): string | null;
   onUpdateFailure(error: Error): void;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
-  readonly turnEvents: AcpTurnEventState;
+  readonly turnEvents: AcpAssistantTranscriptState;
 }
 
 export class AcpClientRequestHandler {
@@ -48,10 +49,11 @@ export class AcpClientRequestHandler {
   readonly #push: AcpClientRequestHandlerOptions["push"];
   #permissionIngressClosed = false;
   #stopping = false;
+  #transcriptTail: Promise<void> = Promise.resolve();
   #turnUpdateIngressClosed = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
-  readonly #turnEvents: AcpTurnEventState;
+  readonly #turnEvents: AcpAssistantTranscriptState;
 
   constructor(options: AcpClientRequestHandlerOptions) {
     this.#isCancelling = options.isCancelling;
@@ -174,6 +176,10 @@ export class AcpClientRequestHandler {
     return this.#terminalManager.create(context, params, signal);
   }
 
+  beginTurnTerminals(): number {
+    return this.#terminalManager.beginTurn();
+  }
+
   async killTerminal(
     context: AgentDriverContext,
     params: KillTerminalRequest,
@@ -208,6 +214,10 @@ export class AcpClientRequestHandler {
   async stopTerminals(context: AgentDriverContext): Promise<void> {
     this.#stopping = true;
     await this.#terminalManager.stopAll(context);
+  }
+
+  async stopTurnTerminals(context: AgentDriverContext, turn: number): Promise<void> {
+    await this.#terminalManager.stopTurn(context, turn);
   }
 
   async closeUpdates(): Promise<void> {
@@ -279,25 +289,22 @@ export class AcpClientRequestHandler {
       return { outcome: { outcome: "cancelled" } };
     }
 
-    const translation = this.#turnEvents.translatePermission({
-      params,
-      requestId,
-    });
-    const toolEvents = translation.events.filter((event) => event.kind !== "permission.requested");
-
-    if (toolEvents.length > 0) {
-      await raceWithAbort(
-        track(this.#push(context, "driver.acp.permission.tool", toolEvents)),
-        signal,
-      );
-    }
+    const translation = await raceWithAbort(
+      this.#withTranscriptTransaction(async () => {
+        signal?.throwIfAborted();
+        const translated = this.#turnEvents.translatePermission({ params, requestId });
+        if (translated.events.length > 0) {
+          await track(this.#push(context, "driver.acp.permission.tool", translated.events));
+        }
+        return translated;
+      }),
+      signal,
+    );
 
     let chosen: AcpPermissionOption | null = null;
 
     if (!this.#isCancelling() && !signal?.aborted) {
-      const permission = track(
-        this.#resolvePermission(context, requestId, translation.options, params, signal),
-      );
+      const permission = track(this.#resolvePermission(context, translation, signal));
       chosen = await raceWithAbort(permission, signal);
     }
     const resolvedOption = this.#isCancelling() || signal?.aborted ? null : chosen;
@@ -332,13 +339,33 @@ export class AcpClientRequestHandler {
       return;
     }
 
-    const events = this.#turnEvents.translateUpdate(params);
+    await this.#withTranscriptTransaction(async () => {
+      const events = this.#turnEvents.translateUpdate(params);
 
-    if (events.length === 0) {
-      return;
-    }
+      if (events.length === 0) {
+        return;
+      }
 
-    await this.#push(context, "driver.acp.session.update", events);
+      await this.#push(context, "driver.acp.session.update", events);
+    });
+  }
+
+  #withTranscriptTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    const transaction = this.#transcriptTail.then(async () => {
+      const restore = this.#turnEvents.checkpoint();
+
+      try {
+        return await operation();
+      } catch (error) {
+        restore();
+        throw error;
+      }
+    });
+    this.#transcriptTail = transaction.then(
+      () => {},
+      () => {},
+    );
+    return transaction;
   }
 
   #assertSession(method: string, params: unknown): void {
@@ -357,33 +384,17 @@ export class AcpClientRequestHandler {
 
   async #resolvePermission(
     context: AgentDriverContext,
-    requestId: string,
-    options: readonly AcpPermissionOption[],
-    params: unknown,
+    translation: AcpPermissionTranslation,
     signal?: AbortSignal,
   ): Promise<AcpPermissionOption | null> {
-    const allow = options.find((option) => option.kind === "allow_once") ?? null;
-    const reject = options.find((option) => option.kind === "reject_once") ?? null;
+    const allow = translation.options.find((option) => option.kind === "allow_once") ?? null;
+    const reject = translation.options.find((option) => option.kind === "reject_once") ?? null;
 
     if (allow === null && reject === null) {
       return null;
     }
 
-    const record = isRecord(params) ? params : {};
-    const toolCall = isRecord(record["toolCall"]) ? record["toolCall"] : {};
-    const decision = await context.ports.permission.request(
-      {
-        rawInput: stringifyForDisplay(toolCall["rawInput"]),
-        requestId,
-        title:
-          readNonEmptyString(toolCall, "title") ??
-          readNonEmptyString(toolCall, "kind") ??
-          "Allow tool call?",
-        toolCallId: readNonEmptyString(toolCall, "toolCallId"),
-        toolKind: readNonEmptyString(toolCall, "kind"),
-      },
-      signal,
-    );
+    const decision = await context.ports.permission.request(translation.request, signal);
 
     return decision === "allow_once" ? allow : reject;
   }

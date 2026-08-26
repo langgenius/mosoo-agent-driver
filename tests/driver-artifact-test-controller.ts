@@ -17,7 +17,7 @@ import {
   parseDriverReadyInput,
   type DriverLogEntry,
 } from "../src/protocol/orpc";
-import type { DriverCapability } from "../src/runtime-command";
+import type { DriverCapability, McpExecuteCommandResult } from "../src/runtime-command";
 import { PROCESS_TREE_OWNER_ENV } from "../src/runtimes/child-process";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
@@ -298,6 +298,12 @@ export class DriverArtifactTestController {
   readonly #eventIngressGates = new Set<EventIngressGateState>();
   readonly #eventIngressObservers = new Set<(event: DriverArtifactTestEvent) => void>();
   readonly #events: DriverArtifactTestEvent[] = [];
+  readonly #externalToolEffects = new Map<
+    string,
+    | { readonly status: "executing" }
+    | { readonly result: McpExecuteCommandResult; readonly status: "completed" }
+    | { readonly status: "unknown" }
+  >();
   readonly #expectedCapabilities: readonly DriverCapability[] | undefined;
   readonly #forbiddenSecrets: readonly string[];
   readonly #heartbeatIntervalMs: number;
@@ -994,6 +1000,78 @@ export class DriverArtifactTestController {
           ...(update.result === undefined ? {} : { result: update.result }),
           status: update.status,
         });
+        return { ok: true };
+      }
+      case "/driver/claimExternalToolEffect": {
+        const commandId = readString(input, "commandId", "external tool effect claim");
+        this.#assertDriverInstanceId(
+          readString(input, "driverInstanceId", "external tool effect claim"),
+        );
+        const effectId = `artifact-test-effect-${commandId}`;
+        const effect = this.#externalToolEffects.get(commandId);
+
+        if (effect?.status === "completed") {
+          return { effectId, kind: "completed", result: structuredClone(effect.result) };
+        }
+        if (effect?.status === "unknown") {
+          return { effectId, kind: "unknown" };
+        }
+
+        this.#externalToolEffects.set(commandId, { status: "executing" });
+        return { attempt: 1, effectId, idempotencyKey: effectId, kind: "execute" };
+      }
+      case "/driver/completeExternalToolEffect": {
+        const commandId = readString(input, "commandId", "external tool effect completion");
+        const driverInstanceId = readString(
+          input,
+          "driverInstanceId",
+          "external tool effect completion",
+        );
+        this.#assertDriverInstanceId(driverInstanceId);
+        const parsed = parseDriverCommandUpdateInput({
+          commandId,
+          driverInstanceId,
+          result: input["result"],
+          status: "completed",
+        });
+
+        if (
+          parsed.result === undefined ||
+          parsed.result === null ||
+          !("outputText" in parsed.result)
+        ) {
+          throw new Error("External tool effect completion requires an MCP result.");
+        }
+
+        const current = this.#externalToolEffects.get(commandId);
+        if (current?.status === "completed") {
+          if (JSON.stringify(current.result) !== JSON.stringify(parsed.result)) {
+            throw new Error(`External tool effect ${commandId} completed with a different result.`);
+          }
+          return { ok: true };
+        }
+        if (current?.status !== "executing") {
+          throw new Error(`External tool effect ${commandId} is not executing.`);
+        }
+
+        this.#externalToolEffects.set(commandId, {
+          result: structuredClone(parsed.result),
+          status: "completed",
+        });
+        return { ok: true };
+      }
+      case "/driver/markExternalToolEffectUnknown": {
+        const commandId = readString(input, "commandId", "external tool effect uncertainty");
+        this.#assertDriverInstanceId(
+          readString(input, "driverInstanceId", "external tool effect uncertainty"),
+        );
+        const current = this.#externalToolEffects.get(commandId);
+
+        if (current?.status === "completed") {
+          throw new Error(`Completed external tool effect ${commandId} cannot become unknown.`);
+        }
+
+        this.#externalToolEffects.set(commandId, { status: "unknown" });
         return { ok: true };
       }
       case "/driver/completeRun": {

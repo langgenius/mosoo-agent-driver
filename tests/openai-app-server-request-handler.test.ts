@@ -2,13 +2,15 @@ import { expect, test } from "bun:test";
 
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
+import type { DriverPermissionRequest } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
 import { OpenAiAppServerRequestHandler } from "../src/runtimes/openai/app-server-request-handler";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
 test("OpenAI server request callbacks handle, reject, and cancel explicitly", async () => {
   const permissionStarted = Promise.withResolvers<void>();
-  let permissionSignal: AbortSignal | null = null;
+  const permissionInputs: DriverPermissionRequest[] = [];
+  const permissionSignals: AbortSignal[] = [];
   const responses: Array<{ id: string | number; result: unknown }> = [];
   const rejections: Array<{ id: string | number; message: string }> = [];
   const errors: Error[] = [];
@@ -18,14 +20,26 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
     logger,
     payload: driverStartInput,
     permission: {
-      request: async (_input, signal) => {
+      request: async (input, signal) => {
         const requestSignal = signal ?? new AbortController().signal;
-        permissionSignal = requestSignal;
-        permissionStarted.resolve();
+        permissionInputs.push(input);
+        permissionSignals.push(requestSignal);
+        if (permissionInputs.length === 3) {
+          permissionStarted.resolve();
+        }
+        if (input.toolKind === "item/permissions/requestApproval") {
+          return "allow_once";
+        }
+        if (input.toolKind === "item/commandExecution/requestApproval") {
+          return "allow_once";
+        }
         return await new Promise<"allow_once">((_resolve, reject) => {
           requestSignal.addEventListener("abort", () => reject(requestSignal.reason), {
             once: true,
@@ -40,33 +54,139 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
       errors.push(error);
     },
     isStopped: () => false,
+    mapToolCallId: (toolCallId) => toolCallId,
     respond: (id, result) => responses.push({ id, result }),
     respondError: (id, message) => rejections.push({ id, message }),
   });
 
   try {
-    handler.dispatch("currentTime/read", 1, {});
+    handler.dispatch("currentTime/read", 1, { threadId: "thread-1" });
     handler.dispatch("attestation/generate", 2, {});
+    handler.dispatch("applyPatchApproval", 6, {});
+    handler.dispatch("execCommandApproval", 7, {});
     handler.dispatch("item/commandExecution/requestApproval", 3, {
-      command: "pwd",
+      additionalPermissions: {
+        fileSystem: { write: ["/secrets"] },
+        network: { enabled: true },
+      },
+      command: "npm test",
+      cwd: "/workspace",
+      availableDecisions: [
+        "acceptForSession",
+        {
+          acceptWithExecpolicyAmendment: {
+            execpolicy_amendment: ["npm", "test"],
+          },
+        },
+        "cancel",
+      ],
       itemId: "tool-1",
+    });
+    handler.dispatch("item/fileChange/requestApproval", 4, {
+      grantRoot: "/workspace",
+      itemId: "tool-2",
+      reason: "Apply changes",
+    });
+    handler.dispatch("item/permissions/requestApproval", 5, {
+      cwd: "/workspace",
+      environmentId: "sandbox-1",
+      permissions: { fileSystem: { read: ["/workspace"] }, network: null },
+      reason: "Install dependencies",
     });
     await permissionStarted.promise;
     await handler.abortAll(new Error("turn cancelled"));
 
-    expect(responses).toHaveLength(1);
-    expect(responses[0]).toMatchObject({ id: 1, result: { currentTimeAt: expect.any(Number) } });
+    expect(responses).toEqual(
+      expect.arrayContaining([
+        { id: 1, result: { currentTimeAt: expect.any(Number) } },
+        { id: 3, result: { decision: "cancel" } },
+        {
+          id: 5,
+          result: {
+            permissions: { fileSystem: { read: ["/workspace"] } },
+            scope: "turn",
+          },
+        },
+      ]),
+    );
     expect(rejections).toEqual([
       { id: 2, message: "Unsupported OpenAi app-server request: attestation/generate." },
+      { id: 6, message: "Unsupported OpenAi app-server request: applyPatchApproval." },
+      { id: 7, message: "Unsupported OpenAi app-server request: execCommandApproval." },
     ]);
-    expect((permissionSignal as AbortSignal | null)?.aborted).toBe(true);
-    expect(responses.some((response) => response.id === 3)).toBe(false);
+    expect(permissionSignals.filter((signal) => signal.aborted)).toHaveLength(1);
+    expect(permissionInputs.map(({ rawInput }) => JSON.parse(rawInput ?? "null"))).toEqual([
+      expect.objectContaining({
+        additionalPermissions: {
+          fileSystem: { write: ["/secrets"] },
+          network: { enabled: true },
+        },
+        command: "npm test",
+        cwd: "/workspace",
+      }),
+      expect.objectContaining({ grantRoot: "/workspace", reason: "Apply changes" }),
+      expect.objectContaining({
+        cwd: "/workspace",
+        environmentId: "sandbox-1",
+        permissions: { fileSystem: { read: ["/workspace"] }, network: null },
+      }),
+    ]);
+    expect(permissionInputs.map(({ title }) => title)).toEqual([
+      "Approve command execution",
+      "Approve file changes",
+      "Approve runtime permissions",
+    ]);
     expect(rejections.some((response) => response.id === 3)).toBe(false);
     expect(errors).toEqual([]);
   } finally {
     await handler.abortAll(new Error("test complete"));
     await logger.destroy();
   }
+});
+
+test("OpenAI writeStdin approval uses terminal-input semantics", async () => {
+  const permission = Promise.withResolvers<DriverPermissionRequest>();
+  const response = Promise.withResolvers<unknown>();
+  const logger = createBufferedSinkLogger({
+    level: "error",
+    service: "openai-request-handler-test",
+    sink: async () => {},
+  });
+  const context = createAgentDriverContext({
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
+    logger,
+    payload: driverStartInput,
+    permission: {
+      request: async (input) => {
+        permission.resolve(input);
+        return "allow_once";
+      },
+    },
+  });
+  const handler = new OpenAiAppServerRequestHandler({
+    context,
+    handleError: async () => {},
+    isStopped: () => false,
+    mapToolCallId: (toolCallId) => toolCallId,
+    respond: (_id, result) => response.resolve(result),
+    respondError: (_id, message) => response.reject(new Error(message)),
+  });
+
+  handler.dispatch("item/commandExecution/requestApproval", 1, {
+    approvalId: "approval-1",
+    itemId: "command-1",
+    kind: "writeStdin",
+  });
+
+  await expect(response.promise).resolves.toEqual({ decision: "accept" });
+  expect(await permission.promise).toMatchObject({
+    title: "Approve terminal input",
+    toolCallId: "command-1",
+  });
+  await logger.destroy();
 });
 
 test("OpenAI server request cancellation propagates permission delivery failures", async () => {
@@ -84,7 +204,10 @@ test("OpenAI server request cancellation propagates permission delivery failures
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
     logger,
     payload: driverStartInput,
     permission: {
@@ -109,6 +232,7 @@ test("OpenAI server request cancellation propagates permission delivery failures
       handledErrors.push(error);
     },
     isStopped: () => false,
+    mapToolCallId: (toolCallId) => toolCallId,
     respond: () => {},
     respondError: () => {},
   });

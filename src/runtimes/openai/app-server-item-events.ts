@@ -1,24 +1,326 @@
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { DriverEventInput } from "../../protocol/events";
+import { chunkJsonText } from "../provider-json";
 import { toOpenAiPlanStatus } from "./app-server-event-mapping";
+import {
+  assertOpenAiDurableEventFits,
+  MAX_OPENAI_DURABLE_EVENT_BYTES,
+} from "./app-server-event-state";
 import type {
   OpenAiEventPush,
   OpenAiItemState,
   OpenAiMessageState,
   OpenAiPlanState,
+  OpenAiTerminalOutcome,
   OpenAiToolState,
 } from "./app-server-event-state";
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
 import {
+  toOpenAiCollaborationOutput,
   toOpenAiFileChangeEvents,
+  toOpenAiMessagePhase,
   toOpenAiToolName,
+  toOpenAiToolRawInput,
   toOpenAiToolResultText,
+  toOpenAiToolStructuredOutput,
 } from "./event-translator";
 import {
   filterOpenAiPrivateCitations,
   OpenAiPrivateCitationStreamFilter,
 } from "./private-citation-filter";
+
+const MAX_OPENAI_MESSAGE_EVENT_TEXT_BYTES = 512 * 1_024;
+
+export function chunkOpenAiText(
+  text: string,
+  firstChunkBytes = MAX_OPENAI_MESSAGE_EVENT_TEXT_BYTES,
+  remainingChunkBytes = MAX_OPENAI_MESSAGE_EVENT_TEXT_BYTES,
+): string[] {
+  return chunkJsonText(text, firstChunkBytes, remainingChunkBytes);
+}
+
+function toOpenAiMessageSnapshotEvents(input: {
+  readonly item: JsonObject;
+  readonly itemId: string;
+  readonly messageId: string;
+  readonly phase: ReturnType<typeof toOpenAiMessagePhase>;
+  readonly sourcePrefix: string;
+  readonly text: string;
+}): DriverEventInput[] {
+  const createAddedEvent = (content: string): DriverEventInput => ({
+    delivery: "lossless",
+    kind: "message.added",
+    payload: {
+      content,
+      ...(input.item["memoryCitation"] === null || input.item["memoryCitation"] === undefined
+        ? {}
+        : { memoryCitation: input.item["memoryCitation"] }),
+      messageId: input.messageId,
+      ...(input.phase === null ? {} : { phase: input.phase }),
+      role: "agent",
+    },
+    sourceEventId: `${input.sourcePrefix}:0`,
+  });
+  const createDeltaEvent = (contentDelta: string, index: number): DriverEventInput => ({
+    delivery: "lossless",
+    kind: "message.delta",
+    payload: {
+      contentDelta,
+      messageId: input.messageId,
+      role: "agent",
+    },
+    sourceEventId: `${input.sourcePrefix}:${String(index)}`,
+  });
+  const emptyAddedEvent = createAddedEvent("");
+  const metadataBytes = Buffer.byteLength(JSON.stringify(emptyAddedEvent), "utf8");
+  assertOpenAiDurableEventFits(emptyAddedEvent, `message snapshot ${input.itemId}`);
+  const emptyDeltaEvent = createDeltaEvent("", input.text.length);
+  const deltaMetadataBytes = Buffer.byteLength(JSON.stringify(emptyDeltaEvent), "utf8");
+  assertOpenAiDurableEventFits(emptyDeltaEvent, `message snapshot ${input.itemId}`);
+  const chunks = chunkOpenAiText(
+    input.text,
+    Math.min(MAX_OPENAI_MESSAGE_EVENT_TEXT_BYTES, MAX_OPENAI_DURABLE_EVENT_BYTES - metadataBytes),
+    Math.min(
+      MAX_OPENAI_MESSAGE_EVENT_TEXT_BYTES,
+      MAX_OPENAI_DURABLE_EVENT_BYTES - deltaMetadataBytes,
+    ),
+  );
+
+  const events: DriverEventInput[] = [
+    createAddedEvent(chunks[0]!),
+    ...chunks.slice(1).map((contentDelta, index) => createDeltaEvent(contentDelta, index + 1)),
+  ];
+  assertOpenAiDurableEventFits(events[0]!, `message snapshot ${input.itemId}`);
+  return events;
+}
+
+interface OpenAiItemCompletionCommit {
+  readonly commit: () => void;
+  readonly events: DriverEventInput[];
+}
+
+function withOpenAiEventIds(
+  events: readonly DriverEventInput[],
+  sourcePrefix: string,
+): DriverEventInput[] {
+  return events.map((event, index) => ({
+    ...event,
+    sourceEventId: event.sourceEventId ?? `${sourcePrefix}:${String(index)}`,
+  }));
+}
+
+function toOpenAiItemLifecycleEvents(
+  item: JsonObject,
+  itemId: string,
+  phase: "completed" | "started",
+): DriverEventInput[] {
+  const itemType = readString(item, "type");
+
+  switch (itemType) {
+    // These are translated by their dedicated message, plan, reasoning, or tool paths.
+    case "agentMessage":
+    case "plan":
+    case "reasoning":
+    case "commandExecution":
+    case "fileChange":
+    case "mcpToolCall":
+    case "dynamicToolCall":
+    case "collabAgentToolCall":
+    case "webSearch":
+    case "imageView":
+    case "sleep":
+      return [];
+    // The input path owns user messages, and hook/* notifications own hook lifecycle.
+    // Their ThreadItem copies are provider echoes and must not publish duplicates.
+    case "userMessage":
+    case "hookPrompt":
+      return [];
+    case "subAgentActivity": {
+      // App-server emits a started/completed pair for one display activity. Publish it once.
+      // Completion is authoritative and is also the only phase present in turn snapshots.
+      if (phase === "started") {
+        return [];
+      }
+
+      const activityKind = readString(item, "kind");
+      const agentId = readNonEmptyString(item, "agentThreadId");
+      const agentPath = readNonEmptyString(item, "agentPath");
+
+      if (
+        agentId === null ||
+        agentPath === null ||
+        (activityKind !== "started" &&
+          activityKind !== "interacted" &&
+          activityKind !== "interrupted" &&
+          activityKind !== "completed")
+      ) {
+        throw new Error("OpenAI sub-agent activity is malformed.");
+      }
+
+      return [
+        {
+          delivery: "lossless",
+          kind: "agent.task.updated",
+          payload: {
+            ...(activityKind === "started"
+              ? { active: true, status: "running" }
+              : activityKind === "interacted"
+                ? {}
+                : {
+                    active: false,
+                    status: activityKind === "interrupted" ? "cancelled" : "completed",
+                  }),
+            activityKind,
+            agentId,
+            agentPath,
+            taskId: agentId,
+            title: `Sub-agent ${activityKind}`,
+          },
+        },
+      ];
+    }
+    case "imageGeneration": {
+      if (phase === "started") {
+        return [];
+      }
+
+      const status = readString(item, "status");
+      const revisedPrompt = readString(item, "revisedPrompt");
+      const transparentBackground = item["transparentBackground"];
+      const imageMetadata = {
+        imageId: itemId,
+        ...(revisedPrompt === null ? {} : { revisedPrompt }),
+        ...(typeof transparentBackground === "boolean" ? { transparentBackground } : {}),
+      };
+
+      if (status === "failed") {
+        return [
+          {
+            kind: "diagnostic.reported",
+            payload: {
+              code: "openai.image_generation.failed",
+              details: {
+                ...imageMetadata,
+              },
+              message: "OpenAI image generation failed.",
+              severity: "error",
+              source: "openai",
+            },
+            visibility: "owner_debug",
+          },
+        ];
+      }
+
+      if (status !== "completed" || readNonEmptyString(item, "result") === null) {
+        throw new Error("OpenAI completed image generation did not contain a PNG result.");
+      }
+
+      throw new Error(
+        "OpenAI image generation completed without a supported durable image transport.",
+      );
+    }
+    case "enteredReviewMode":
+    case "exitedReviewMode":
+      return phase === "completed"
+        ? [
+            {
+              kind: "review.updated",
+              payload: {
+                mode: itemType === "enteredReviewMode" ? "entered" : "exited",
+                review: readString(item, "review") ?? "",
+                reviewId: itemId,
+                status: "completed",
+              },
+            },
+          ]
+        : [];
+    case "contextCompaction":
+      return phase === "completed"
+        ? [
+            {
+              kind: "context.compacted",
+              payload: { itemId, status: "completed" },
+            },
+          ]
+        : [];
+    default:
+      return [
+        {
+          kind: "diagnostic.reported",
+          payload: {
+            code: "openai.item.unknown",
+            details: { itemId, itemType, phase },
+            message: `OpenAI ${String(itemType)} item is unknown to this protocol snapshot.`,
+            severity: "error",
+            source: "openai",
+          },
+          visibility: "owner_debug",
+        },
+      ];
+  }
+}
+
+function toOpenAiToolStatus(
+  item: JsonObject,
+  phase: "completed" | "started",
+): "cancelled" | "completed" | "failed" | null {
+  const itemType = readString(item, "type");
+  const nativeStatus = readString(item, "status");
+
+  if (phase === "started") {
+    if (itemType === "collabAgentToolCall" && nativeStatus !== "inProgress") {
+      throw new Error(
+        `OpenAI ${itemType} started with non-running status ${String(nativeStatus)}.`,
+      );
+    }
+    if (itemType === "imageGeneration" && nativeStatus !== "in_progress") {
+      throw new Error(
+        `OpenAI ${itemType} started with non-running status ${String(nativeStatus)}.`,
+      );
+    }
+    return null;
+  }
+
+  switch (itemType) {
+    case "commandExecution":
+    case "fileChange":
+      if (nativeStatus === "completed") {
+        return "completed";
+      }
+      if (nativeStatus === "failed" || nativeStatus === "declined") {
+        return "failed";
+      }
+      break;
+    case "mcpToolCall":
+    case "dynamicToolCall":
+    case "imageGeneration":
+      if (nativeStatus === "completed") {
+        return "completed";
+      }
+      if (nativeStatus === "failed") {
+        return "failed";
+      }
+      break;
+    case "collabAgentToolCall":
+      if (nativeStatus === "completed") {
+        return "completed";
+      }
+      if (nativeStatus === "failed") {
+        return "failed";
+      }
+      if (nativeStatus === "interrupted") {
+        return "cancelled";
+      }
+      break;
+    default:
+      return null;
+  }
+
+  throw new Error(
+    `OpenAI ${String(itemType)} completed with non-terminal status ${String(nativeStatus)}.`,
+  );
+}
 
 export class OpenAiAppServerItemEventBridge {
   readonly #citationDiagnosticsEmitted = new Set<string>();
@@ -27,6 +329,7 @@ export class OpenAiAppServerItemEventBridge {
   readonly #messages: OpenAiMessageState;
   readonly #plans: OpenAiPlanState;
   readonly #push: OpenAiEventPush;
+  readonly #pushSession: OpenAiEventPush;
   readonly #tools: OpenAiToolState;
 
   constructor(input: {
@@ -34,12 +337,14 @@ export class OpenAiAppServerItemEventBridge {
     messages: OpenAiMessageState;
     plans: OpenAiPlanState;
     push: OpenAiEventPush;
+    pushSession: OpenAiEventPush;
     tools: OpenAiToolState;
   }) {
     this.#items = input.items;
     this.#messages = input.messages;
     this.#plans = input.plans;
     this.#push = input.push;
+    this.#pushSession = input.pushSession;
     this.#tools = input.tools;
   }
 
@@ -52,8 +357,8 @@ export class OpenAiAppServerItemEventBridge {
     this.#tools.reset();
   }
 
-  finishOpen(): DriverEventInput[] {
-    return [...this.#messages.finishOpen(), ...this.#tools.failOpen()];
+  terminalEvents(outcome: OpenAiTerminalOutcome): DriverEventInput[] {
+    return [...this.#messages.terminalEvents(outcome), ...this.#tools.terminalEvents(outcome)];
   }
 
   async onMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -109,34 +414,25 @@ export class OpenAiAppServerItemEventBridge {
       id: itemId,
       type: "fileChange",
     };
+    const publicItemId = this.#items.publicId(itemId);
     const parentMessageId =
       this.#tools.parentMessage(itemId) ??
       (await this.#messages.ensureTurnMessage(context, turnId, this.#push));
 
     await this.#tools.ensureStarted(context, this.#push, {
       parentMessageId,
+      publicToolCallId: publicItemId,
       reason: "driver.openai.file_change.patch_updated.synthetic_start",
+      sourceScope: this.#items.publicId(turnId, "turn"),
       toolCallId: itemId,
       toolCallName: "File change",
     });
 
-    const resultText = toOpenAiToolResultText(item);
-    const events: DriverEventInput[] = [];
+    const events = toOpenAiFileChangeEvents(item);
 
-    if (resultText !== null && resultText.length > 0) {
-      events.push({
-        kind: "tool.call.updated",
-        payload: {
-          content: resultText,
-          messageId: parentMessageId,
-          rawOutput: resultText,
-          status: "running",
-          toolCallId: itemId,
-        },
-      });
+    for (const event of events) {
+      assertOpenAiDurableEventFits(event, `file change ${publicItemId}`);
     }
-
-    events.push(...toOpenAiFileChangeEvents(item));
 
     if (events.length > 0) {
       await this.#push(context, "driver.openai.file_change.patch_updated", events);
@@ -152,21 +448,66 @@ export class OpenAiAppServerItemEventBridge {
       return;
     }
 
-    if (!this.#items.markCompleted(itemId)) {
+    if (this.#items.isCompleted(itemId)) {
       return;
     }
 
-    const events: DriverEventInput[] = [];
-    await this.#appendMessageEnd(context, events, item, itemId, turnId);
-    this.#appendPlanEnd(events, item, itemId);
-    this.#appendReasoningEnd(events, item, itemId);
-    await this.#appendToolEnd(context, events, item, itemId, turnId);
+    // Validate and prepare the full completion before committing replay state.
+    const toolStatus = toOpenAiToolStatus(item, "completed");
+    const publicItemId = this.#items.publicId(itemId);
+    const publicTurnId = this.#items.publicId(turnId, "turn");
+    const lifecycleEvents = toOpenAiItemLifecycleEvents(item, publicItemId, "completed");
+    const completions = await Promise.all([
+      this.#prepareMessageEnd(context, item, itemId, publicItemId, publicTurnId, turnId),
+      this.#preparePlanEnd(item, itemId),
+      this.#prepareReasoningEnd(context, item, itemId),
+      this.#prepareToolEnd(context, item, itemId, publicItemId, publicTurnId, toolStatus, turnId),
+    ]);
+    const events = completions.flatMap((completion) => completion.events);
 
     events.push(...toOpenAiFileChangeEvents(item));
+    events.push(...lifecycleEvents);
 
     if (events.length > 0) {
-      await this.#push(context, "driver.openai.item.completed", events);
+      const durableEvents = withOpenAiEventIds(
+        events,
+        `openai.item.completed:${publicTurnId}:${publicItemId}`,
+      );
+      for (const event of durableEvents) {
+        assertOpenAiDurableEventFits(event, `item completion ${publicItemId}`);
+      }
+      await this.#push(context, "driver.openai.item.completed", durableEvents);
     }
+
+    for (const completion of completions) {
+      completion.commit();
+    }
+    this.#items.markCompleted(itemId);
+  }
+
+  async onPostTerminalSubAgentActivity(
+    context: AgentDriverContext,
+    params: JsonObject,
+  ): Promise<void> {
+    const item = readRecord(params, "item");
+    const itemId = item === null ? null : readNonEmptyString(item, "id");
+    const turnId = readNonEmptyString(params, "turnId");
+
+    if (item === null || itemId === null || turnId === null || this.#items.isCompleted(itemId)) {
+      return;
+    }
+
+    const publicItemId = this.#items.publicId(itemId);
+    const publicTurnId = this.#items.publicId(turnId, "turn");
+    const events = withOpenAiEventIds(
+      toOpenAiItemLifecycleEvents(item, publicItemId, "completed"),
+      `openai.item.completed:${publicTurnId}:${publicItemId}`,
+    );
+    for (const event of events) {
+      assertOpenAiDurableEventFits(event, `post-terminal sub-agent activity ${publicItemId}`);
+    }
+    await this.#pushSession(context, "driver.openai.sub_agent.post_terminal", events);
+    this.#items.markCompleted(itemId);
   }
 
   async onItemStarted(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -180,13 +521,34 @@ export class OpenAiAppServerItemEventBridge {
     const toolName = toOpenAiToolName(item);
     const itemId = readNonEmptyString(item, "id");
 
-    if (toolName === null || itemId === null) {
+    if (itemId === null) {
+      return;
+    }
+    const publicItemId = this.#items.publicId(itemId);
+    const publicTurnId = this.#items.publicId(turnId, "turn");
+
+    if (toolName === null) {
+      const events = withOpenAiEventIds(
+        toOpenAiItemLifecycleEvents(item, publicItemId, "started"),
+        `openai.item.started:${publicTurnId}:${publicItemId}`,
+      );
+
+      if (events.length > 0) {
+        for (const event of events) {
+          assertOpenAiDurableEventFits(event, `item start ${publicItemId}`);
+        }
+        await this.#push(context, "driver.openai.item.started", events);
+      }
       return;
     }
 
+    toOpenAiToolStatus(item, "started");
+
     await this.#tools.ensureStarted(context, this.#push, {
       parentMessageId: await this.#messages.ensureTurnMessage(context, turnId, this.#push),
+      publicToolCallId: publicItemId,
       reason: "driver.openai.item.started",
+      sourceScope: publicTurnId,
       toolCallId: itemId,
       toolCallName: toolName,
     });
@@ -194,14 +556,24 @@ export class OpenAiAppServerItemEventBridge {
 
   async onPlanDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const itemId = readNonEmptyString(params, "itemId");
+    const turnId = readNonEmptyString(params, "turnId");
     const delta = readString(params, "delta");
 
-    if (itemId === null || delta === null || delta.length === 0) {
+    if (itemId === null || turnId === null || delta === null || delta.length === 0) {
       return;
     }
+    const publicItemId = this.#items.publicId(itemId);
+    const publicTurnId = this.#items.publicId(turnId, "turn");
 
+    const event = {
+      ...this.#plans.createDeltaEvent(itemId, delta),
+      sourceEventId: `openai.plan.delta:${publicTurnId}:${publicItemId}:${String(
+        this.#plans.currentLength(itemId),
+      )}`,
+    };
+    assertOpenAiDurableEventFits(event, `plan update ${publicItemId}`);
+    await this.#push(context, "driver.openai.plan.delta", [event]);
     this.#plans.appendDelta(itemId, delta);
-    await this.#push(context, "driver.openai.plan.delta", [this.#plans.createUpdatedEvent()]);
   }
 
   async onReasoningDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -212,35 +584,53 @@ export class OpenAiAppServerItemEventBridge {
       return;
     }
 
-    const messageId = `reasoning:${itemId}`;
+    const messageId = this.#messages.reasoningId(itemId);
     const events: DriverEventInput[] = [];
 
     if (this.#messages.isReasoningEnded(messageId)) {
       return;
     }
 
-    this.#messages.ensureReasoning(messageId, events);
-    events.push({
-      delivery: "best_effort",
-      kind: "thought.delta",
-      payload: {
-        channel: "summary",
-        contentDelta: delta,
-        thoughtId: messageId,
-      },
-    });
+    const currentLength = this.#messages.currentReasoningText(messageId).length;
+    this.#messages.ensureReasoning(messageId, events, false);
+    events.push(
+      ...chunkOpenAiText(delta).map((contentDelta): DriverEventInput => ({
+        delivery: "lossless",
+        kind: "thought.delta",
+        payload: {
+          channel: "summary",
+          contentDelta,
+          thoughtId: messageId,
+        },
+      })),
+    );
 
-    await this.#push(context, "driver.openai.reasoning.summary", events);
+    await this.#push(
+      context,
+      "driver.openai.reasoning.summary",
+      withOpenAiEventIds(events, `openai.reasoning.delta:${messageId}:${String(currentLength)}`),
+    );
+    this.#messages.ensureReasoning(messageId, [], true);
+    this.#messages.appendReasoningText(messageId, delta);
   }
 
   async onReasoningPart(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const summaryIndex = params["summaryIndex"];
 
-    if (typeof summaryIndex !== "number" || !Number.isInteger(summaryIndex) || summaryIndex < 1) {
+    const itemId = readNonEmptyString(params, "itemId");
+
+    if (
+      itemId === null ||
+      typeof summaryIndex !== "number" ||
+      !Number.isInteger(summaryIndex) ||
+      summaryIndex < 1 ||
+      !this.#messages.beginReasoningPart(this.#messages.reasoningId(itemId), summaryIndex, false)
+    ) {
       return;
     }
 
     await this.onReasoningDelta(context, { ...params, delta: "\n\n" });
+    this.#messages.beginReasoningPart(this.#messages.reasoningId(itemId), summaryIndex, true);
   }
 
   async onToolOutput(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -252,8 +642,9 @@ export class OpenAiAppServerItemEventBridge {
     }
 
     const parentMessageId = this.#tools.parentMessage(itemId);
+    const publicToolCallId = this.#tools.publicToolCallId(itemId);
 
-    if (parentMessageId === null) {
+    if (parentMessageId === null || publicToolCallId === null) {
       return;
     }
 
@@ -262,11 +653,10 @@ export class OpenAiAppServerItemEventBridge {
         delivery: "best_effort",
         kind: "tool.call.updated",
         payload: {
-          content: delta,
           messageId: parentMessageId,
           rawOutput: delta,
           status: "running",
-          toolCallId: itemId,
+          toolCallId: publicToolCallId,
         },
       },
     ]);
@@ -306,9 +696,16 @@ export class OpenAiAppServerItemEventBridge {
     const items = readArray(turn, "items");
     const itemsView = readString(turn, "itemsView");
 
-    const finalAssistantItem = items.findLast(
-      (item) => isRecord(item) && readString(item, "type") === "agentMessage",
+    const assistantItems = items.filter(
+      (item): item is JsonObject =>
+        isRecord(item) &&
+        readString(item, "type") === "agentMessage" &&
+        readString(item, "delivery") !== "async",
     );
+    const hasExplicitPhase = assistantItems.some((item) => toOpenAiMessagePhase(item) !== null);
+    const finalAssistantItem = hasExplicitPhase
+      ? assistantItems.findLast((item) => toOpenAiMessagePhase(item) === "final")
+      : assistantItems.at(-1);
 
     if (!isRecord(finalAssistantItem)) {
       // Terminal notifications commonly use `itemsView: "notLoaded"` with an
@@ -344,13 +741,46 @@ export class OpenAiAppServerItemEventBridge {
       this.#push,
     );
     const filteredText = filterOpenAiPrivateCitations(text);
+    const phase = toOpenAiMessagePhase(finalAssistantItem);
+    const publicItemId = this.#items.publicId(itemId);
+    const publicTurnId = this.#items.publicId(turnId, "turn");
     await this.#reportCitations(context, messageId, filteredText.privateCitationCount);
-    this.#messages.setText(messageId, filteredText.text);
+    const snapshot = {
+      itemId,
+      messageId,
+      phase,
+      text: filteredText.text,
+      turnId,
+    };
+
+    if (this.#messages.needsSnapshot(snapshot)) {
+      await this.#push(
+        context,
+        "driver.openai.turn.final_message",
+        withOpenAiEventIds(
+          toOpenAiMessageSnapshotEvents({
+            item: finalAssistantItem,
+            itemId,
+            messageId,
+            phase,
+            sourcePrefix: `openai.turn.final_message:${publicTurnId}:${publicItemId}`,
+            text: filteredText.text,
+          }),
+          `openai.turn.final_message:${publicTurnId}:${publicItemId}`,
+        ),
+      );
+      this.#messages.setText(messageId, filteredText.text);
+      this.#messages.recordSnapshot(snapshot);
+    }
     this.#releaseCitationState(messageId);
     return { id: messageId, text: filteredText.text };
   }
 
   async onTurnPlan(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    const turnId = readNonEmptyString(params, "turnId");
+    if (turnId === null) {
+      return;
+    }
     const plan = readArray(params, "plan").flatMap((entry) => {
       if (!isRecord(entry)) {
         return [];
@@ -371,42 +801,48 @@ export class OpenAiAppServerItemEventBridge {
       ];
     });
 
-    await this.#push(context, "driver.openai.turn.plan.updated", [
-      {
-        kind: "plan.updated",
-        payload: {
-          entries: plan,
-          source: "driver",
-        },
+    const event: DriverEventInput = {
+      kind: "plan.updated",
+      payload: {
+        entries: plan,
+        source: "driver",
       },
-    ]);
+      sourceEventId: `openai.turn.plan:${this.#items.publicId(turnId, "turn")}:${String(
+        this.#plans.turnVersion(turnId),
+      )}`,
+    };
+    assertOpenAiDurableEventFits(event, "turn plan update");
+    await this.#push(context, "driver.openai.turn.plan.updated", [event]);
+    this.#plans.advanceTurnVersion(turnId);
   }
 
-  async #appendMessageEnd(
+  async #prepareMessageEnd(
     context: AgentDriverContext,
-    events: DriverEventInput[],
     item: JsonObject,
     itemId: string,
+    publicItemId: string,
+    publicTurnId: string,
     turnId: string,
-  ): Promise<void> {
+  ): Promise<OpenAiItemCompletionCommit> {
     if (readString(item, "type") !== "agentMessage") {
-      return;
+      return { commit: () => {}, events: [] };
     }
 
+    const events: DriverEventInput[] = [];
     const finalText = readString(item, "text");
+    const isAsync = readString(item, "delivery") === "async";
     const messageId = await this.#messages.ensureItemMessage(
       context,
       { itemId, turnId },
       this.#push,
     );
     const filteredFinalText = finalText === null ? null : filterOpenAiPrivateCitations(finalText);
-    const currentText = this.#messages.currentText(messageId);
+    let trailingText = "";
 
     if (filteredFinalText === null) {
-      const trailingText = this.#citationFilters.get(messageId)?.finish().text ?? "";
+      trailingText = this.#citationFilters.get(messageId)?.previewFinish().text ?? "";
 
       if (trailingText.length > 0) {
-        this.#messages.appendText(messageId, trailingText);
         events.push({
           delivery: "best_effort",
           kind: "message.delta",
@@ -419,68 +855,25 @@ export class OpenAiAppServerItemEventBridge {
       }
     }
 
-    if (filteredFinalText !== null) {
-      this.#appendCitationDiag(events, messageId, filteredFinalText.privateCitationCount);
-    }
+    const commitCitationDiagnostic =
+      filteredFinalText !== null
+        ? this.#appendCitationDiag(events, messageId, filteredFinalText.privateCitationCount)
+        : false;
 
-    if (filteredFinalText !== null && filteredFinalText.text.length > currentText.length) {
-      if (filteredFinalText.text.startsWith(currentText)) {
-        const delta = filteredFinalText.text.slice(currentText.length);
-        this.#messages.appendText(messageId, delta);
-        events.push({
-          delivery: "best_effort",
-          kind: "message.delta",
-          payload: {
-            contentDelta: delta,
-            messageId,
-            role: "agent",
-          },
-        });
-      } else if (currentText.length === 0) {
-        this.#messages.appendText(messageId, filteredFinalText.text);
-        events.push({
-          delivery: "best_effort",
-          kind: "message.delta",
-          payload: {
-            contentDelta: filteredFinalText.text,
-            messageId,
-            role: "agent",
-          },
-        });
-      } else {
-        context.logger.warn("driver.openai.agent.final_text.mismatch", {
-          currentLength: currentText.length,
-          finalLength: filteredFinalText.text.length,
+    if (filteredFinalText !== null) {
+      events.push(
+        ...toOpenAiMessageSnapshotEvents({
+          item,
           itemId,
-        });
-      }
-    }
-
-    if (filteredFinalText !== null) {
-      // item/completed is the provider's authoritative snapshot. Streaming
-      // deltas may be missing or replayed, so canonical completion must not
-      // inherit a corrupted accumulator even when live deltas cannot be undone.
-      this.#messages.setText(messageId, filteredFinalText.text);
-      this.#messages.recordSnapshot({
-        itemId,
-        messageId,
-        text: filteredFinalText.text,
-        turnId,
-      });
-      events.push({
-        delivery: "lossless",
-        kind: "message.added",
-        payload: {
-          content: filteredFinalText.text,
           messageId,
-          role: "agent",
-        },
-      });
+          phase: toOpenAiMessagePhase(item),
+          sourcePrefix: `openai.item.completed:${publicTurnId}:${publicItemId}`,
+          text: filteredFinalText.text,
+        }),
+      );
     }
 
-    this.#citationFilters.delete(messageId);
-
-    if (this.#messages.markEnded(messageId)) {
+    if (!this.#messages.isEnded(messageId)) {
       events.push({
         kind: "message.completed",
         payload: {
@@ -489,18 +882,46 @@ export class OpenAiAppServerItemEventBridge {
         },
       });
     }
+
+    return {
+      commit: () => {
+        if (commitCitationDiagnostic) {
+          this.#citationDiagnosticsEmitted.add(messageId);
+        }
+        if (filteredFinalText === null) {
+          this.#citationFilters.get(messageId)?.finish();
+          this.#messages.appendText(messageId, trailingText);
+        } else {
+          // item/completed is the provider's authoritative snapshot. Streaming
+          // deltas may be missing or replayed, so canonical completion must not
+          // inherit a corrupted accumulator even when live deltas cannot be undone.
+          this.#messages.setText(messageId, filteredFinalText.text);
+          if (!isAsync) {
+            this.#messages.recordSnapshot({
+              itemId,
+              messageId,
+              phase: toOpenAiMessagePhase(item),
+              text: filteredFinalText.text,
+              turnId,
+            });
+          }
+        }
+        this.#citationFilters.delete(messageId);
+        this.#messages.markEnded(messageId);
+      },
+      events,
+    };
   }
 
   #appendCitationDiag(
     events: DriverEventInput[],
     messageId: string,
     privateCitationCount: number,
-  ): void {
+  ): boolean {
     if (privateCitationCount === 0 || this.#citationDiagnosticsEmitted.has(messageId)) {
-      return;
+      return false;
     }
 
-    this.#citationDiagnosticsEmitted.add(messageId);
     events.push({
       kind: "diagnostic.reported",
       payload: {
@@ -514,6 +935,7 @@ export class OpenAiAppServerItemEventBridge {
       },
       visibility: "owner_debug",
     });
+    return true;
   }
 
   #filterCitationDelta(messageId: string, delta: string): string {
@@ -533,10 +955,13 @@ export class OpenAiAppServerItemEventBridge {
     privateCitationCount: number,
   ): Promise<void> {
     const events: DriverEventInput[] = [];
-    this.#appendCitationDiag(events, messageId, privateCitationCount);
+    const commit = this.#appendCitationDiag(events, messageId, privateCitationCount);
 
     if (events.length > 0) {
       await this.#push(context, "driver.openai.private_citation_markup_removed", events);
+    }
+    if (commit) {
+      this.#citationDiagnosticsEmitted.add(messageId);
     }
   }
 
@@ -545,62 +970,108 @@ export class OpenAiAppServerItemEventBridge {
     this.#citationFilters.delete(messageId);
   }
 
-  #appendPlanEnd(events: DriverEventInput[], item: JsonObject, itemId: string): void {
+  #preparePlanEnd(item: JsonObject, itemId: string): OpenAiItemCompletionCommit {
     if (readString(item, "type") !== "plan") {
-      return;
+      return { commit: () => {}, events: [] };
     }
 
     const planText = readString(item, "text");
 
     if (planText === null || planText.trim().length === 0) {
-      return;
+      return { commit: () => {}, events: [] };
     }
 
-    this.#plans.setCompleted(itemId, planText);
-    events.push(this.#plans.createUpdatedEvent());
+    return {
+      commit: () => this.#plans.setCompleted(itemId, planText),
+      events: [this.#plans.createCompletedEvent(itemId, planText)],
+    };
   }
 
-  #appendReasoningEnd(events: DriverEventInput[], item: JsonObject, itemId: string): void {
+  #prepareReasoningEnd(
+    context: AgentDriverContext,
+    item: JsonObject,
+    itemId: string,
+  ): OpenAiItemCompletionCommit {
     if (readString(item, "type") !== "reasoning") {
-      return;
+      return { commit: () => {}, events: [] };
     }
 
+    const events: DriverEventInput[] = [];
     const summary = Array.isArray(item["summary"])
       ? item["summary"].filter((entry): entry is string => typeof entry === "string")
       : [];
-    const messageId = `reasoning:${itemId}`;
+    const messageId = this.#messages.reasoningId(itemId);
+    const summaryText = summary.join("\n\n");
+    const currentText = this.#messages.currentReasoningText(messageId);
+    const missingText = summaryText.startsWith(currentText)
+      ? summaryText.slice(currentText.length)
+      : currentText.length === 0
+        ? summaryText
+        : "";
 
-    if (summary.length > 0) {
-      this.#messages.ensureReasoning(messageId, events);
-      events.push({
-        delivery: "best_effort",
-        kind: "thought.delta",
-        payload: {
-          channel: "summary",
-          contentDelta: summary.join("\n\n"),
-          thoughtId: messageId,
-        },
+    if (
+      summaryText.length > 0 &&
+      currentText.length > 0 &&
+      summaryText !== currentText &&
+      missingText.length === 0
+    ) {
+      context.logger.warn("driver.openai.reasoning.final_text.mismatch", {
+        currentLength: currentText.length,
+        finalLength: summaryText.length,
+        itemId,
       });
     }
 
-    if (this.#messages.markReasoningEnded(messageId)) {
+    if (missingText.length > 0) {
+      this.#messages.ensureReasoning(messageId, events, false);
+      events.push(
+        ...chunkOpenAiText(missingText).map((contentDelta, index): DriverEventInput => ({
+          delivery: "lossless",
+          kind: "thought.delta",
+          payload: {
+            channel: "summary",
+            contentDelta,
+            thoughtId: messageId,
+          },
+          sourceEventId: `openai.reasoning.completed:${messageId}:${String(index)}`,
+        })),
+      );
+    }
+
+    const shouldStart = missingText.length > 0 && !this.#messages.isReasoningStarted(messageId);
+    if (this.#messages.isReasoningStarted(messageId) || shouldStart) {
       events.push({
         kind: "thought.completed",
         payload: {
           channel: "summary",
           thoughtId: messageId,
         },
+        sourceEventId: `openai.reasoning.completed:${messageId}:terminal`,
       });
     }
+
+    return {
+      commit: () => {
+        if (shouldStart) {
+          this.#messages.ensureReasoning(messageId, [], true);
+        }
+        this.#messages.appendReasoningText(messageId, missingText);
+        this.#messages.markReasoningEnded(messageId);
+      },
+      events,
+    };
   }
 
-  async #appendToolEnd(
+  async #prepareToolEnd(
     context: AgentDriverContext,
-    events: DriverEventInput[],
     item: JsonObject,
     itemId: string,
+    publicItemId: string,
+    publicTurnId: string,
+    status: "cancelled" | "completed" | "failed" | null,
     turnId: string,
-  ): Promise<void> {
+  ): Promise<OpenAiItemCompletionCommit> {
+    const events: DriverEventInput[] = [];
     const toolName = toOpenAiToolName(item);
     const parentMessageId =
       this.#tools.parentMessage(itemId) ??
@@ -610,44 +1081,72 @@ export class OpenAiAppServerItemEventBridge {
         : await this.#messages.ensureTurnMessage(context, turnId, this.#push));
 
     if (parentMessageId === null || toolName === null) {
-      return;
+      return { commit: () => {}, events };
     }
 
     await this.#tools.ensureStarted(context, this.#push, {
       parentMessageId,
+      publicToolCallId: publicItemId,
       reason: "driver.openai.item.completed.synthetic_start",
+      sourceScope: publicTurnId,
       toolCallId: itemId,
       toolCallName: toolName,
     });
 
-    const nativeStatus = readString(item, "status");
-    const status =
-      nativeStatus === "failed" || nativeStatus === "declined" ? "failed" : "completed";
+    const itemType = readString(item, "type");
+    const terminalStatus = status ?? "completed";
     const toolResult = toOpenAiToolResultText(item);
+    const rawInput = toOpenAiToolRawInput(item);
+    const collaborationOutput = toOpenAiCollaborationOutput(item);
+    const receiverThreadIds = readArray(item, "receiverThreadIds").filter(
+      (entry): entry is string => typeof entry === "string",
+    );
+    const structuredOutput =
+      toOpenAiToolStructuredOutput(item) ??
+      collaborationOutput ??
+      (itemType === "webSearch"
+        ? {
+            action: item["action"] ?? null,
+            query: readString(item, "query"),
+            results: item["results"] ?? null,
+          }
+        : null);
 
     events.push({
       kind: "tool.call.updated",
       payload: {
-        ...(toolResult === null || toolResult.length === 0
+        ...(itemType === "collabAgentToolCall" && receiverThreadIds.length === 1
+          ? { agentId: receiverThreadIds[0] }
+          : {}),
+        ...(toolResult === null ||
+        toolResult.length === 0 ||
+        ((itemType === "dynamicToolCall" || itemType === "collabAgentToolCall") &&
+          structuredOutput !== null)
           ? {}
           : {
-              content: toolResult,
               messageId: parentMessageId,
               rawOutput: toolResult,
             }),
-        status,
-        toolCallId: itemId,
+        ...(structuredOutput === null ? {} : { structuredOutput }),
+        ...(rawInput === null ? {} : { rawInput }),
+        status: terminalStatus,
+        toolCallId: publicItemId,
       },
+      sourceEventId: `openai.item.completed:${publicTurnId}:${publicItemId}:0`,
     });
+    assertOpenAiDurableEventFits(events[0]!, `tool completion ${publicItemId}`);
     events.push({
       kind: "item.completed",
       payload: {
-        itemId,
+        itemId: publicItemId,
         itemType: "tool_call",
-        status,
+        status: terminalStatus,
       },
     });
 
-    this.#tools.markEnded(itemId);
+    return {
+      commit: () => this.#tools.markEnded(itemId),
+      events,
+    };
   }
 }

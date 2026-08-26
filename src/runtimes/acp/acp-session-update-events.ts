@@ -1,5 +1,7 @@
 import type { DriverEventInput } from "../../protocol/events";
+import { timestampSchema } from "../../contract/common";
 import {
+  ACP_USAGE_CONTRACT,
   isRecord,
   readNonEmptyString,
   readNullableString,
@@ -10,9 +12,6 @@ import {
 } from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
-// Keep in sync with acp-lifecycle-events.ts: ACP usage is Anthropic-bucketed.
-const ACP_USAGE_CONTRACT = "anthropic_bucketed";
-
 export function summarizeContentBlock(content: unknown): string | null {
   if (!isRecord(content)) {
     return null;
@@ -20,7 +19,7 @@ export function summarizeContentBlock(content: unknown): string | null {
 
   switch (content["type"]) {
     case "text": {
-      return readString(content, "text");
+      return readNonEmptyString(content, "text");
     }
     case "image": {
       return summarizeLabel("image", content);
@@ -195,7 +194,7 @@ function normalizePlan(raw: unknown): JsonObject[] {
 }
 
 export function toCommandEvents(update: JsonObject | null): DriverEventInput[] {
-  const commands = normalizeCommands(update?.["availableCommands"] ?? update?.["commands"]);
+  const commands = normalizeCommands(update?.["availableCommands"]);
 
   if (commands === null) {
     return [];
@@ -230,27 +229,8 @@ export function toPlanEvents(update: JsonObject | null): DriverEventInput[] {
   ];
 }
 
-export function toCapabilityEvents(setup: JsonObject | null): DriverEventInput[] {
-  const capabilities =
-    readRecord(setup, "capabilities") ?? readRecord(setup, "sessionCapabilities");
-
-  if (capabilities === null) {
-    return [];
-  }
-
-  return [
-    {
-      kind: "session.capabilities.updated",
-      payload: {
-        capabilities,
-      },
-      visibility: "owner_debug",
-    },
-  ];
-}
-
 export function toConfigEvents(update: JsonObject | null): DriverEventInput[] {
-  const options = normalizeConfigOptions(update?.["configOptions"] ?? update?.["options"]);
+  const options = normalizeConfigOptions(update?.["configOptions"]);
 
   if (options === null) {
     return [];
@@ -258,6 +238,7 @@ export function toConfigEvents(update: JsonObject | null): DriverEventInput[] {
 
   return [
     {
+      delivery: "best_effort",
       kind: "session.config.updated",
       payload: {
         options,
@@ -267,11 +248,16 @@ export function toConfigEvents(update: JsonObject | null): DriverEventInput[] {
 }
 
 export function toInfoEvents(update: JsonObject | null): DriverEventInput[] {
-  const title = readNullableString(update, "title");
-  const goal = readNullableString(update, "goal");
-  const workspace = update?.["workspace"];
+  const rawTitle = readNullableString(update, "title");
+  const rawUpdatedAt = readNullableString(update, "updatedAt");
+  const title = rawTitle === "" ? undefined : rawTitle;
+  const updatedAt =
+    rawUpdatedAt === null ||
+    (rawUpdatedAt !== undefined && timestampSchema.safeParse(rawUpdatedAt).success)
+      ? rawUpdatedAt
+      : undefined;
 
-  if (title === undefined && goal === undefined && workspace === undefined) {
+  if (title === undefined && updatedAt === undefined) {
     return [];
   }
 
@@ -279,53 +265,30 @@ export function toInfoEvents(update: JsonObject | null): DriverEventInput[] {
     {
       kind: "session.info.updated",
       payload: {
-        ...(goal === undefined ? {} : { goal }),
         ...(title === undefined ? {} : { title }),
-        ...(workspace === undefined ? {} : { workspace }),
+        ...(updatedAt === undefined ? {} : { updatedAt }),
       },
     },
   ];
 }
 
 export function toModeEvents(update: JsonObject | null): DriverEventInput[] {
-  const currentMode =
-    readNullableString(update, "currentModeId") ??
-    readNullableString(update, "currentMode") ??
-    undefined;
-  const availableModes =
-    update?.["availableModes"] ?? update?.["visibleModes"] ?? update?.["modes"];
+  const currentMode = readNonEmptyString(update, "currentModeId");
+  const availableModes = Array.isArray(update?.["availableModes"])
+    ? update["availableModes"]
+    : undefined;
 
-  if (currentMode === undefined && availableModes === undefined) {
+  if (currentMode === null && availableModes === undefined) {
     return [];
   }
 
   return [
     {
+      delivery: "best_effort",
       kind: "session.mode.updated",
       payload: {
         ...(availableModes === undefined ? {} : { availableModes }),
-        ...(currentMode === undefined ? {} : { currentMode }),
-      },
-    },
-  ];
-}
-
-export function toModelEvents(setup: JsonObject | null): DriverEventInput[] {
-  const currentModel = readNullableString(setup, "currentModel") ?? undefined;
-  const availableModels = setup?.["availableModels"] ?? setup?.["models"];
-  const providers = setup?.["providers"];
-
-  if (currentModel === undefined && availableModels === undefined && providers === undefined) {
-    return [];
-  }
-
-  return [
-    {
-      kind: "session.models.updated",
-      payload: {
-        ...(availableModels === undefined ? {} : { availableModels }),
-        ...(currentModel === undefined ? {} : { currentModel }),
-        ...(providers === undefined ? {} : { providers }),
+        ...(currentMode === null ? {} : { currentMode }),
       },
     },
   ];

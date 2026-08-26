@@ -1,10 +1,16 @@
-FROM cloudflare/sandbox:0.12.3
+ARG BUN_VERSION=1.4.0
+FROM docker.io/oven/bun:${BUN_VERSION}@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS bun-runtime
 
-# Keep the default base image version in sync with apps/api/package.json -> @cloudflare/sandbox.
-ARG CLAUDE_AGENT_SDK_VERSION=0.3.211
-ARG ANTHROPIC_SDK_VERSION=0.111.0
-ARG OPENAI_RUNTIME_VERSION=0.144.5
-ARG OPENCODE_VERSION=1.18.4
+FROM docker.io/cloudflare/sandbox:0.12.8@sha256:822501de5f0c52a012c125c4e5e4c0080421a8e93ca4ce0ba3d247148021989f
+
+# Keep this pin in sync with downstream mosoo apps/api/package.json -> @cloudflare/sandbox.
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.247
+ARG BUN_VERSION
+ARG OPENAI_RUNTIME_VERSION=0.150.1
+ARG OPENCODE_VERSION=1.18.23
+
+COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
+RUN test "$(bun --version)" = "$BUN_VERSION"
 
 # Install the Python runtime behind writable pip package declarations.
 RUN apt-get update \
@@ -12,7 +18,7 @@ RUN apt-get update \
       python3 \
       python3-pip \
       python-is-python3 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/cache/apt/* /var/lib/apt/lists/*
 
 COPY environment-package-managers.json /etc/mosoo/environment-package-managers.json
 COPY scripts/environment-package-manager-check.mjs /usr/local/libexec/mosoo/environment-package-manager-check.mjs
@@ -26,30 +32,23 @@ RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 # Installed in a single npm invocation to keep the agent packages in one layer.
 #
 # Package -> binary -> runtime:
-#   @anthropic-ai/claude-agent-sdk        -> native claude    -> claude-agent-sdk
+#   Claude native package                 -> claude           -> claude-agent-sdk
 #   OpenAI app-server package             -> OpenAI CLI       -> openai-runtime
-#   opencode-ai                           -> opencode         -> acp-fallback
-#   bun (base image)                      -> bun              -> driver launcher
+#   OpenCode baseline package             -> opencode         -> acp-fallback
+#   bun (bun-runtime stage)               -> bun              -> driver launcher
 #
-# Pick the architecture-specific `claude` binary that npm just installed under
-# `@anthropic-ai/claude-agent-sdk-<linux-x64|linux-arm64>` so the image works
-# on CF Containers (linux/amd64) and local arm64 hosts (e.g. Apple Silicon)
-# without forcing platform emulation.
-RUN OPENAI_RUNTIME_PACKAGE="@openai/codex@${OPENAI_RUNTIME_VERSION}" \
-    && npm install -g \
-      @anthropic-ai/claude-agent-sdk@${CLAUDE_AGENT_SDK_VERSION} \
-      @anthropic-ai/sdk@${ANTHROPIC_SDK_VERSION} \
-      opencode-ai@${OPENCODE_VERSION} \
-      "$OPENAI_RUNTIME_PACKAGE" \
+RUN npm install -g --ignore-scripts \
+      @anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION} \
+      opencode-linux-x64-baseline@${OPENCODE_VERSION} \
+      @openai/codex@${OPENAI_RUNTIME_VERSION} \
+    && ln -s /usr/local/lib/node_modules/opencode-linux-x64-baseline/bin/opencode /usr/local/bin/opencode \
+    && ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude /usr/local/bin/mosoo-claude-code \
     && codex --version \
     && codex app-server --help >/dev/null \
     && opencode --version \
     && opencode acp --help >/dev/null \
-    && CLAUDE_ARCH_PACKAGE="$(node -p "'@anthropic-ai/claude-agent-sdk-' + (process.arch === 'arm64' ? 'linux-arm64' : 'linux-x64')")" \
-    && CLAUDE_BIN="/usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/node_modules/${CLAUDE_ARCH_PACKAGE}/claude" \
-    && test -x "$CLAUDE_BIN" \
-    && ln -sf "$CLAUDE_BIN" /usr/local/bin/mosoo-claude-code \
-    && npm cache clean --force
+    && mosoo-claude-code --version \
+    && rm -rf /root/.npm
 
 ENV MOSOO_CLAUDE_CODE_EXECUTABLE=/usr/local/bin/mosoo-claude-code
 ENV MOSOO_ACP_FALLBACK_COMMAND=opencode

@@ -84,6 +84,7 @@ export type {
   AgentDriverCommandSource,
   AgentDriverEventSink,
   AgentDriverPermissionPort,
+  DriverPermissionRequest,
   AgentDriverMaterializedSkill,
   AgentDriverMcpPort,
   AgentDriverSkillPort,

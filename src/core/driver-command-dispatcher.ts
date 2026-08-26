@@ -1,7 +1,7 @@
 import { createScopedWideEvent, emitWideEvent } from "../observability";
 import type { Logger } from "../observability";
 import { summarizeRuntimeCommand } from "../observability/driver-debug";
-import { parseDriverId } from "../protocol/id";
+import { parseRunId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
 import type { McpExecuteCommandResult, RunError, RuntimeCommand } from "../runtime-command";
 import { promiseWithTimeout, raceWithAbort, sleepPromise } from "../utils/async";
@@ -12,8 +12,11 @@ import {
   PermissionEventDeliveryError,
   type DriverPermissionBroker,
 } from "./driver-permission-broker";
-import { pushLosslessEvents } from "./driver-runtime-io";
-import type { DriverRuntimeIo } from "./driver-runtime-io";
+import {
+  DRIVER_EVENT_DELIVERY_TIMEOUT_MS,
+  pushLosslessEvents,
+  type DriverRuntimeIo,
+} from "./driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "./driver-runtime-state";
 import {
   DriverTurnCancellationCleanupError,
@@ -35,8 +38,8 @@ interface DriverCommandDispatcherOptions {
 }
 
 const COMMAND_POLL_INTERVAL_MS = 250;
-const ACTIVE_INPUT_SETTLE_GRACE_MS = 5_000;
 export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
+const ACTIVE_INPUT_SETTLE_GRACE_MS = ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS;
 const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
@@ -72,10 +75,6 @@ class ExternalToolEffectResolutionRequiredError extends Error {
     );
     this.name = "ExternalToolEffectResolutionRequiredError";
   }
-}
-
-function parseRunId(value: string): RunId {
-  return parseDriverId(value, "Run ID") as RunId;
 }
 
 async function settleInput(activeRunTask: Promise<void>): Promise<void> {

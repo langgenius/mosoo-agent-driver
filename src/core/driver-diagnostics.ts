@@ -39,7 +39,7 @@ export function createDriverDiagnosticEvent(input: DriverDiagnosticInput): Drive
 }
 
 export async function pushDriverDiagnosticEvent(
-  port: DriverRuntimeEventPort,
+  port: Pick<DriverRuntimeEventPort, "pushEvents">,
   input: DriverDiagnosticInput,
   logger?: Logger,
 ): Promise<void> {

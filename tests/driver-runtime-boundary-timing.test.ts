@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
+import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
+import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -12,6 +14,91 @@ import {
 } from "./driver-runtime-boundary-fixtures";
 
 describe("driver runtime boundary", () => {
+  test("allows cancellation cleanup to consume the public event delivery deadline", async () => {
+    const backend = createBackend();
+    const inputEntered = Promise.withResolvers<void>();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "input-with-lossless-terminal",
+        input: { text: "wait" },
+        kind: "input.start",
+        requestId: "request-with-lossless-terminal",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "cancel-with-lossless-terminal",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+      },
+    ]);
+    const nativeSetTimeout = globalThis.setTimeout;
+    const delay = (milliseconds: number) =>
+      new Promise<void>((resolve) => nativeSetTimeout(resolve, milliseconds));
+    const recordEvents = socket.pushEvents.bind(socket);
+    socket.pushEvents = async (input) => {
+      await delay(90);
+      return recordEvents(input);
+    };
+    backend.handleInput = async (context, _input, runId, signal) => {
+      inputEntered.resolve();
+      await new Promise<void>((resolve) => {
+        signal!.addEventListener("abort", () => nativeSetTimeout(resolve, 30), { once: true });
+      });
+      await context.ports.eventSink.pushEvents({
+        events: [
+          {
+            kind: "run.cancelled",
+            payload: { reason: "test.cancel" },
+            runId,
+          },
+        ],
+      });
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend,
+      isShuttingDown: () =>
+        socket.updates.some(
+          (update) =>
+            update.commandId === "cancel-with-lossless-terminal" && update.status === "completed",
+        ),
+      runtimeState,
+    });
+    const acceleratedSetTimeout = (
+      callback: (...args: unknown[]) => void,
+      timeout?: number,
+      ...arguments_: unknown[]
+    ) =>
+      nativeSetTimeout(
+        callback,
+        timeout === 5_000
+          ? 20
+          : timeout === DRIVER_EVENT_DELIVERY_TIMEOUT_MS
+            ? 100
+            : timeout === ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS
+              ? 200
+              : timeout,
+        ...arguments_,
+      );
+    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
+
+    try {
+      const run = dispatcher.run(socket, logger);
+      await inputEntered.promise;
+      await expect(run).resolves.toBeUndefined();
+      expect(runtimeState.status()).toBe("ready");
+      expect(socket.failedRuns).toEqual([]);
+      expect(socket.pushedEvents).toMatchObject([{ events: [{ kind: "run.cancelled" }] }]);
+      expect(socket.updates).toContainEqual({
+        commandId: "cancel-with-lossless-terminal",
+        status: "completed",
+      });
+    } finally {
+      globalThis.setTimeout = nativeSetTimeout;
+      await logger.destroy();
+    }
+  });
+
   test("external shutdown cancels local input and command polling immediately", async () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();

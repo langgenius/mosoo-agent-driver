@@ -52,7 +52,7 @@ function createContext(input: {
   return createAgentDriverContext({
     eventSink: {
       commandUpdate: async () => {},
-      ...(input.currentRunId === undefined ? {} : { currentRunId: input.currentRunId }),
+      currentRunId: input.currentRunId ?? (() => DRIVER_TEST_IDS.runId),
       pushEvents: async ({ events, signal }) => input.pushEvents(events, signal),
     },
     logger: createTestLogger(),

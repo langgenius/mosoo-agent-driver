@@ -158,9 +158,9 @@ vp run check
 vp run clean
 ```
 
-`vp run build:image` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
+`vp run build:image` uses Buildah to produce a local linux/amd64 `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
-The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run docker:smoke:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
+The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 
 ## Boundaries
 
@@ -176,7 +176,7 @@ The image contract in `environment-package-managers.json` exposes `npm` and `pip
 
 - `vp run check`
 - `vp run build:image`
-- `vp run docker:smoke:environment`
+- `vp run test:image:environment`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live artifact tests are gated by environment credentials
@@ -215,7 +215,7 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 - `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
 - `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
 
-The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the complete matrix.
+The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the provider-free MCP artifact test.
 
 ## License
 

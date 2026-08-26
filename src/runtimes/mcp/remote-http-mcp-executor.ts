@@ -1,10 +1,13 @@
 import {
   Client,
+  InsufficientScopeError,
   ProtocolError,
   ProtocolErrorCode,
   SdkError,
   SdkErrorCode,
+  SdkHttpError,
   StreamableHTTPClientTransport,
+  UnauthorizedError,
 } from "@modelcontextprotocol/client";
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
@@ -77,21 +80,32 @@ function normalizeCallToolResult(
   result: CallToolResult,
   command: McpExecuteCommand,
 ): McpExternalToolExecutionResult {
-  const textContent = result.content
-    .flatMap((block) => (block.type === "text" ? [block.text] : []))
-    .map((text) => text.trim())
-    .filter((text) => text.length > 0);
+  const textContent = result.content.flatMap((block) =>
+    block.type === "text" ? [block.text] : [],
+  );
+  const plainText =
+    result.content.length === 1 &&
+    result.content[0]?.type === "text" &&
+    Object.keys(result.content[0]).every((key) => key === "type" || key === "text");
+  const hasRichContent = !plainText || result.structuredContent !== undefined;
 
-  const outputText =
-    textContent.length > 0
+  const outputText = hasRichContent
+    ? JSON.stringify(
+        {
+          content: result.content,
+          ...(result.isError === undefined ? {} : { isError: result.isError }),
+          ...(result.structuredContent === undefined
+            ? {}
+            : { structuredContent: result.structuredContent }),
+        },
+        null,
+        2,
+      )
+    : textContent.length > 0
       ? textContent.join("\n\n")
-      : result.structuredContent !== undefined
-        ? JSON.stringify(result.structuredContent, null, 2)
-        : result.content.length > 0
-          ? JSON.stringify(result.content, null, 2)
-          : result.isError === true
-            ? `MCP tool ${command.toolName} reported an error without textual details.`
-            : "";
+      : result.isError === true
+        ? `MCP tool ${command.toolName} reported an error without textual details.`
+        : "";
 
   return {
     ...(result.isError === undefined ? {} : { isError: result.isError }),
@@ -108,25 +122,64 @@ function mapMcpExecutionError(
   server: ActiveMcpServer,
   error: unknown,
 ): Error {
-  if (error instanceof SdkError) {
-    switch (error.code) {
-      case SdkErrorCode.ClientHttpAuthentication: {
+  if (error instanceof SdkHttpError) {
+    switch (error.status) {
+      case 400:
+        return new Error(
+          `MCP server ${server.name} rejected the request for ${command.toolName} (HTTP 400).`,
+        );
+      case 401:
         return new Error(
           `MCP authorization for ${server.name} is no longer valid. Refresh or reconnect the credential and retry.`,
         );
-      }
-      case SdkErrorCode.ClientHttpForbidden: {
+      case 403:
         return new Error(
           `MCP server ${server.name} rejected the credential for ${command.toolName}. Access may have been revoked.`,
         );
-      }
+      case 404:
+        return new Error(`MCP HTTP endpoint for ${server.name} was not found.`);
+      case 405:
+        return new Error(`MCP server ${server.name} does not support HTTP tool execution.`);
+      case 408:
+        return new Error(`Timed out while calling MCP tool ${command.toolName} on ${server.name}.`);
+      case 409:
+        return new Error(
+          `MCP server ${server.name} reported a conflict while calling ${command.toolName}. Retry the request.`,
+        );
+      case 429:
+        return new Error(
+          `MCP server ${server.name} rate limited ${command.toolName}. Retry the request later.`,
+        );
+      default:
+        return error.status >= 500
+          ? new Error(
+              `MCP server ${server.name} failed while calling ${command.toolName} (HTTP ${error.status}).`,
+            )
+          : new Error(
+              `MCP server ${server.name} rejected ${command.toolName} with HTTP ${error.status}.`,
+            );
+    }
+  }
+
+  if (error instanceof UnauthorizedError) {
+    return new Error(
+      `MCP authorization for ${server.name} is no longer valid. Refresh or reconnect the credential and retry.`,
+    );
+  }
+
+  if (error instanceof InsufficientScopeError) {
+    return new Error(
+      `MCP credential for ${server.name} lacks the access required for ${command.toolName}. Reauthorize the credential and retry.`,
+    );
+  }
+
+  if (error instanceof SdkError) {
+    switch (error.code) {
       case SdkErrorCode.RequestTimeout: {
         return new Error(`Timed out while calling MCP tool ${command.toolName} on ${server.name}.`);
       }
       case SdkErrorCode.ConnectionClosed:
       case SdkErrorCode.SendFailed:
-      case SdkErrorCode.ClientHttpFailedToOpenStream:
-      case SdkErrorCode.ClientHttpUnexpectedContent:
       case SdkErrorCode.NotConnected: {
         return new Error(`Failed to reach MCP server ${server.name}: ${error.message}`);
       }
@@ -135,12 +188,8 @@ function mapMcpExecutionError(
           `MCP server ${server.name} does not support the requested capability for ${command.toolName}.`,
         );
       }
-      case SdkErrorCode.ClientHttpNotImplemented: {
-        return new Error(`MCP server ${server.name} does not support HTTP tool execution.`);
-      }
       case SdkErrorCode.AlreadyConnected:
-      case SdkErrorCode.NotInitialized:
-      case SdkErrorCode.ClientHttpFailedToTerminateSession: {
+      case SdkErrorCode.NotInitialized: {
         return new Error(`MCP client state error for ${server.name}: ${error.message}`);
       }
       default: {
@@ -164,20 +213,6 @@ function mapMcpExecutionError(
   }
 
   if (error instanceof Error) {
-    const lowered = error.message.toLowerCase();
-
-    if (lowered.includes("unauthorized") || lowered.includes("401")) {
-      return new Error(
-        `MCP authorization for ${server.name} is no longer valid. Refresh or reconnect the credential and retry.`,
-      );
-    }
-
-    if (lowered.includes("forbidden") || lowered.includes("403")) {
-      return new Error(
-        `MCP server ${server.name} rejected the credential for ${command.toolName}. Access may have been revoked.`,
-      );
-    }
-
     return new Error(
       `Failed to execute MCP tool ${command.toolName} on ${server.name}: ${error.message}`,
     );
@@ -198,10 +233,15 @@ export async function executeRemoteHttpMcpCommand(
   const authProvider: AuthProvider = {
     token: async () => server.proxyGrantId,
   };
-  const client = new Client({
-    name: "mosoo-driver",
-    version: AGENT_DRIVER_VERSION,
-  });
+  const client = new Client(
+    {
+      name: "mosoo-driver",
+      version: AGENT_DRIVER_VERSION,
+    },
+    {
+      versionNegotiation: { mode: "auto" },
+    },
+  );
   const transport = new StreamableHTTPClientTransport(new URL(server.proxyUrl), {
     authProvider,
     requestInit: {
@@ -233,12 +273,10 @@ export async function executeRemoteHttpMcpCommand(
   } catch (error) {
     throw mapMcpExecutionError(command, server, error);
   } finally {
-    if (!requestSignal.aborted) {
-      await settlePromiseWithTimeout(transport.terminateSession(), {
-        label: "MCP session termination",
-        timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
-      });
-    }
+    await settlePromiseWithTimeout(transport.terminateSession(), {
+      label: "MCP session termination",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    });
 
     await settlePromiseWithTimeout(client.close(), {
       label: "MCP client close",

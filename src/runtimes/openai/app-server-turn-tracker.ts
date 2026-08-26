@@ -1,7 +1,10 @@
+import { createHash } from "node:crypto";
+
 import type { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { RunId } from "../../protocol/id";
 
 interface ActiveOpenAiTurn {
+  nativeTurnId: string;
   promise: Promise<void>;
   reject(error: Error): void;
   resolve(): void;
@@ -13,10 +16,18 @@ type TerminalOpenAiTurn =
   | { error: DriverTurnCancelledError | Error; kind: "failed" };
 
 const MAX_RETAINED_TURNS = 1_024;
+const MAX_RETAINED_NATIVE_TURN_ID_BYTES = 256;
+
+export function retainedOpenAiTurnKey(turnId: string): string {
+  return Buffer.byteLength(turnId, "utf8") <= MAX_RETAINED_NATIVE_TURN_ID_BYTES
+    ? turnId
+    : `sha256:${createHash("sha256").update(turnId).digest("hex")}`;
+}
 
 function rememberBounded<T>(map: Map<string, T>, turnId: string, value: T): void {
-  map.delete(turnId);
-  map.set(turnId, value);
+  const key = retainedOpenAiTurnKey(turnId);
+  map.delete(key);
+  map.set(key, value);
 
   if (map.size > MAX_RETAINED_TURNS) {
     const oldest = map.keys().next().value;
@@ -38,11 +49,11 @@ export class OpenAiTurnTracker {
       return null;
     }
 
-    return this.#activeTurns.get(turnId)?.runId ?? null;
+    return this.#activeTurns.get(retainedOpenAiTurnKey(turnId))?.runId ?? null;
   }
 
   activeTurnIds(): string[] {
-    return [...this.#activeTurns.keys()];
+    return [...this.#activeTurns.values()].map(({ nativeTurnId }) => nativeTurnId);
   }
 
   clearActiveTurns(): void {
@@ -53,16 +64,21 @@ export class OpenAiTurnTracker {
   }
 
   hasTerminal(turnId: string): boolean {
-    return this.#settlingTurnIds.has(turnId) || this.#terminalTurns.has(turnId);
+    const key = retainedOpenAiTurnKey(turnId);
+    return this.#settlingTurnIds.has(key) || this.#terminalTurns.has(key);
   }
 
   markTurnStarted(turnId: string): boolean {
-    if (this.#startedTurnIds.has(turnId) || this.hasTerminal(turnId)) {
+    if (this.#startedTurnIds.has(retainedOpenAiTurnKey(turnId)) || this.hasTerminal(turnId)) {
       return false;
     }
 
     rememberBounded(this.#startedTurnIds, turnId, true);
     return true;
+  }
+
+  hasTurnStarted(turnId: string): boolean {
+    return this.#startedTurnIds.has(retainedOpenAiTurnKey(turnId));
   }
 
   rejectTurn(turnId: string, error: Error): boolean {
@@ -71,7 +87,7 @@ export class OpenAiTurnTracker {
 
   rejectActiveTurns(error: Error): void {
     for (const turnId of this.activeTurnIds()) {
-      this.#settlingTurnIds.delete(turnId);
+      this.#settlingTurnIds.delete(retainedOpenAiTurnKey(turnId));
       this.rejectTurn(turnId, error);
     }
   }
@@ -81,16 +97,17 @@ export class OpenAiTurnTracker {
       return false;
     }
 
-    this.#settlingTurnIds.add(turnId);
+    this.#settlingTurnIds.add(retainedOpenAiTurnKey(turnId));
     return true;
   }
 
   cancelSettlement(turnId: string): void {
-    this.#settlingTurnIds.delete(turnId);
+    this.#settlingTurnIds.delete(retainedOpenAiTurnKey(turnId));
   }
 
   finishSettlement(turnId: string, terminalTurn: TerminalOpenAiTurn): boolean {
-    if (!this.#settlingTurnIds.delete(turnId) || this.#terminalTurns.has(turnId)) {
+    const key = retainedOpenAiTurnKey(turnId);
+    if (!this.#settlingTurnIds.delete(key) || this.#terminalTurns.has(key)) {
       return false;
     }
 
@@ -108,9 +125,10 @@ export class OpenAiTurnTracker {
   }
 
   #recordTerminal(turnId: string, terminalTurn: TerminalOpenAiTurn): void {
-    this.#startedTurnIds.delete(turnId);
+    const key = retainedOpenAiTurnKey(turnId);
+    this.#startedTurnIds.delete(key);
     rememberBounded(this.#terminalTurns, turnId, terminalTurn);
-    const activeTurn = this.#activeTurns.get(turnId);
+    const activeTurn = this.#activeTurns.get(key);
 
     if (activeTurn === undefined) {
       return;
@@ -122,11 +140,12 @@ export class OpenAiTurnTracker {
       activeTurn.reject(terminalTurn.error);
     }
 
-    this.#activeTurns.delete(turnId);
+    this.#activeTurns.delete(key);
   }
 
   async track(turnId: string, runId: RunId): Promise<void> {
-    const terminalTurn = this.#terminalTurns.get(turnId);
+    const key = retainedOpenAiTurnKey(turnId);
+    const terminalTurn = this.#terminalTurns.get(key);
 
     if (terminalTurn?.kind === "completed") {
       return;
@@ -136,18 +155,19 @@ export class OpenAiTurnTracker {
       throw terminalTurn.error;
     }
 
-    const activeTurn = this.#activeTurns.get(turnId);
+    const activeTurn = this.#activeTurns.get(key);
 
     if (activeTurn !== undefined) {
       if (activeTurn.runId !== runId) {
-        throw new Error(`Turn ${turnId} is already tracked by another run.`);
+        throw new Error("OpenAI turn is already tracked by another run.");
       }
 
       return activeTurn.promise;
     }
 
     const turn = Promise.withResolvers<void>();
-    this.#activeTurns.set(turnId, {
+    this.#activeTurns.set(key, {
+      nativeTurnId: turnId,
       promise: turn.promise,
       reject: turn.reject,
       resolve: () => {

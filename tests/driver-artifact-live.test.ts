@@ -282,7 +282,7 @@ function readLiveConfig(): LiveConfig {
     assertCommandVersion(
       openAiCommand,
       ["--version"],
-      resolve(process.cwd(), "node_modules", "@openai", "codex-sdk", "package.json"),
+      resolve(process.cwd(), "node_modules", "@openai", "codex", "package.json"),
       "OpenAI app-server",
     );
   }
@@ -343,16 +343,14 @@ const runtimeCases: LiveRuntimeCase[] = [
     suite: "anthropic",
     transport: "claude-agent-sdk",
   } satisfies LiveRuntimeCase,
-  ...config.openCodeModels.map(
-    (model): LiveRuntimeCase => ({
-      model,
-      nativeResumeKind: "acp_session_id",
-      provider: "openrouter",
-      runtime: "acp-fallback",
-      suite: "opencode",
-      transport: "acp-fallback",
-    }),
-  ),
+  ...config.openCodeModels.map((model): LiveRuntimeCase => ({
+    model,
+    nativeResumeKind: "acp_session_id",
+    provider: "openrouter",
+    runtime: "acp-fallback",
+    suite: "opencode",
+    transport: "acp-fallback",
+  })),
 ].filter((runtimeCase) => config.suite === "all" || config.suite === runtimeCase.suite);
 const representativeOpenCodeModel =
   config.openCodeModels.find((model) => model.includes("/deepseek/")) ?? config.openCodeModels[0]!;
@@ -383,27 +381,64 @@ function payloadRecord(event: DriverArtifactTestEvent): Record<string, unknown> 
     : {};
 }
 
-function eventText(events: readonly DriverArtifactTestEvent[]): string {
-  const finalText = events
-    .filter((event) => event.kind === "run.completed")
-    .map((event) => payloadRecord(event)["finalMessageText"])
-    .findLast((value): value is string => typeof value === "string" && value.length > 0);
+function messageText(events: readonly DriverArtifactTestEvent[], messageId: string): string {
+  let text = "";
 
-  if (finalText !== undefined) {
-    return finalText;
+  for (const event of events) {
+    const payload = payloadRecord(event);
+    if (payload["messageId"] !== messageId) {
+      continue;
+    }
+
+    if (event.kind === "message.delta" && typeof payload["contentDelta"] === "string") {
+      text += payload["contentDelta"];
+      continue;
+    }
+
+    if (event.kind !== "message.added") {
+      continue;
+    }
+
+    const content = payload["content"];
+    text =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+              .flatMap((block) => {
+                const value =
+                  typeof block === "object" && block !== null && !Array.isArray(block)
+                    ? (block as Record<string, unknown>)["text"]
+                    : null;
+                return typeof value === "string" ? [value] : [];
+              })
+              .join("")
+          : text;
   }
 
-  return events
-    .flatMap((event) => {
-      const payload = payloadRecord(event);
+  return text;
+}
 
-      if (event.kind === "message.delta" && typeof payload["contentDelta"] === "string") {
-        return [payload["contentDelta"]];
+function eventText(events: readonly DriverArtifactTestEvent[]): string {
+  const finalMessageId = events
+    .filter((event) => event.kind === "run.completed")
+    .map((event) => payloadRecord(event)["finalMessageId"])
+    .findLast((value): value is string => typeof value === "string" && value.length > 0);
+
+  if (finalMessageId !== undefined) {
+    return messageText(events, finalMessageId);
+  }
+
+  const messageIds = new Set(
+    events.flatMap((event) => {
+      if (event.kind !== "message.added" && event.kind !== "message.delta") {
+        return [];
       }
-
-      return [];
-    })
-    .join("");
+      const messageId = payloadRecord(event)["messageId"];
+      return typeof messageId === "string" ? [messageId] : [];
+    }),
+  );
+  return [...messageIds].map((messageId) => messageText(events, messageId)).join("");
 }
 
 function eventOutputText(events: readonly DriverArtifactTestEvent[]): string {
@@ -693,9 +728,8 @@ function expectSingleRunLifecycle(
   if (expectations.requireFinalMessage) {
     const terminal = terminalEvents[0]!;
     const finalMessageId = payloadString(terminal, "finalMessageId");
-    const finalMessageText = payloadString(terminal, "finalMessageText");
     expect(finalMessageId).not.toBeNull();
-    expect(finalMessageText).not.toBeNull();
+    expect(payloadRecord(terminal)).not.toHaveProperty("finalMessageText");
     expect(
       runEvents.some(
         (event) =>
@@ -703,47 +737,8 @@ function expectSingleRunLifecycle(
           payloadString(event, "messageId") === finalMessageId,
       ),
     ).toBe(true);
-    const completedAgentMessageIds = runEvents
-      .filter(
-        (event) => event.kind === "message.completed" && payloadRecord(event)["role"] === "agent",
-      )
-      .map((event) => payloadString(event, "messageId"))
-      .filter((messageId): messageId is string => messageId !== null);
-    expect(completedAgentMessageIds.length).toBeGreaterThan(0);
-    expect(finalMessageId).toBe(completedAgentMessageIds.at(-1));
-
-    let reconstructedFinalMessageText = "";
-    for (const event of runEvents.filter(
-      (candidate) =>
-        payloadString(candidate, "messageId") === finalMessageId &&
-        (candidate.kind === "message.added" || candidate.kind === "message.delta"),
-    )) {
-      const payload = payloadRecord(event);
-      if (event.kind === "message.delta") {
-        const contentDelta = payloadString(event, "contentDelta");
-        expect(contentDelta).not.toBeNull();
-        reconstructedFinalMessageText += contentDelta ?? "";
-        continue;
-      }
-
-      const content = payload["content"];
-      reconstructedFinalMessageText =
-        typeof content === "string"
-          ? content
-          : Array.isArray(content)
-            ? content
-                .flatMap((block) => {
-                  const text =
-                    typeof block === "object" && block !== null && !Array.isArray(block)
-                      ? (block as Record<string, unknown>)["text"]
-                      : null;
-                  return typeof text === "string" ? [text] : [];
-                })
-                .join("")
-            : reconstructedFinalMessageText;
-    }
+    const reconstructedFinalMessageText = messageText(runEvents, finalMessageId!);
     expect(reconstructedFinalMessageText.length).toBeGreaterThan(0);
-    expect(finalMessageText).toBe(reconstructedFinalMessageText);
   }
 }
 

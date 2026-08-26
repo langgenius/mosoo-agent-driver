@@ -1,91 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
-import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  events: DriverEventInput[];
-  reason: string;
-}
-
-function readEventPayloadString(event: DriverEventInput, field: string): string | null {
-  const payload = event.payload;
-
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return null;
-  }
-
-  const value = (payload as Record<string, unknown>)[field];
-  return typeof value === "string" ? value : null;
-}
-
-function readAssistantMessageId(events: readonly DriverEventInput[]): string {
-  for (const event of events) {
-    const messageId =
-      readEventPayloadString(event, "messageId") ??
-      readEventPayloadString(event, "parentMessageId");
-
-    if (messageId !== null) {
-      expect(isDriverId(messageId)).toBe(true);
-      return messageId;
-    }
-  }
-
-  throw new Error("Expected a platform assistant message ID.");
-}
-
-function createHarness(options: { failNativeResumePublish?: boolean; holdReason?: string } = {}) {
-  const batches: EventBatch[] = [];
-  const heldPush = Promise.withResolvers<void>();
-  const releasePush = Promise.withResolvers<void>();
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-event-bridge-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: bootPayload,
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const bridge = new OpenAiAppServerEventBridge({
-    push: async (_context, reason, events) => {
-      batches.push({ events, reason });
-      if (reason === options.holdReason) {
-        heldPush.resolve();
-        await releasePush.promise;
-      }
-      if (
-        options.failNativeResumePublish === true &&
-        reason === "driver.openai.native_resume_ref.updated"
-      ) {
-        throw new Error("event sink unavailable");
-      }
-    },
-    requireThreadId: () => "thread-1",
-  });
-
-  return {
-    batches,
-    bridge,
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    heldPush: heldPush.promise,
-    logger,
-    releasePush: releasePush.resolve,
-  };
-}
+import {
+  createOpenAiBridgeHarness as createHarness,
+  readAssistantMessageId,
+  readEventPayloadString,
+} from "./openai-app-server-event-bridge-fixture";
 
 describe("OpenAi app-server event bridge", () => {
   test("closes only open item state when a mixed turn is cancelled", async () => {
@@ -100,17 +20,22 @@ describe("OpenAi app-server event bridge", () => {
       turnId: "turn-1",
     });
     await bridge.handleNotification(context, "item/started", {
-      item: { id: "tool-completed", type: "commandExecution" },
+      item: { id: "tool-completed", status: "inProgress", type: "commandExecution" },
       threadId: "thread-1",
       turnId: "turn-1",
     });
     await bridge.handleNotification(context, "item/completed", {
-      item: { aggregatedOutput: "", id: "tool-completed", type: "commandExecution" },
+      item: {
+        aggregatedOutput: "",
+        id: "tool-completed",
+        status: "completed",
+        type: "commandExecution",
+      },
       threadId: "thread-1",
       turnId: "turn-1",
     });
     await bridge.handleNotification(context, "item/started", {
-      item: { id: "tool-open", type: "commandExecution" },
+      item: { id: "tool-open", status: "inProgress", type: "commandExecution" },
       threadId: "thread-1",
       turnId: "turn-1",
     });
@@ -126,8 +51,8 @@ describe("OpenAi app-server event bridge", () => {
         )
         .map((event) => readEventPayloadString(event, "status"));
     expect(toolStatuses("tool-completed")).toEqual(["running", "completed"]);
-    expect(toolStatuses("tool-open")).toEqual(["running", "failed"]);
-    expect(events().filter((event) => event.kind === "thought.completed")).toHaveLength(1);
+    expect(toolStatuses("tool-open")).toEqual(["running", "cancelled"]);
+    expect(events().filter((event) => event.kind === "thought.cancelled")).toHaveLength(1);
     const terminalEventCount = events().length;
 
     await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
@@ -140,6 +65,51 @@ describe("OpenAi app-server event bridge", () => {
     await bridge.cancelTurn(context, "turn-1", "test.cancel.retry");
     expect(events()).toHaveLength(terminalEventCount);
     await logger.destroy();
+  });
+
+  test("does not duplicate streamed reasoning in the completed snapshot", async () => {
+    const { bridge, context, events, logger } = createHarness();
+
+    await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+      delta: "First",
+      itemId: "reasoning-1",
+      summaryIndex: 0,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/reasoning/summaryPartAdded", {
+      itemId: "reasoning-1",
+      summaryIndex: 1,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/reasoning/summaryPartAdded", {
+      itemId: "reasoning-1",
+      summaryIndex: 1,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+      delta: "Second",
+      itemId: "reasoning-1",
+      summaryIndex: 1,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await bridge.handleNotification(context, "item/completed", {
+      item: { content: [], id: "reasoning-1", summary: ["First", "Second"], type: "reasoning" },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    await logger.destroy();
+
+    expect(
+      events()
+        .filter((event) => event.kind === "thought.delta")
+        .map((event) => readEventPayloadString(event, "contentDelta"))
+        .join(""),
+    ).toBe("First\n\nSecond");
+    expect(events().filter((event) => event.kind === "thought.completed")).toHaveLength(1);
   });
 
   test("releases translation state between turns and ignores late terminal replay", async () => {
@@ -283,6 +253,7 @@ describe("OpenAi app-server event bridge", () => {
     await bridge.handleNotification(context, "error", {
       error: {
         additionalDetails: "HTTP 502 from upstream.",
+        codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
         message: "Response stream disconnected.",
       },
       threadId: "thread-1",
@@ -298,6 +269,7 @@ describe("OpenAi app-server event bridge", () => {
       turn: {
         error: {
           additionalDetails: "HTTP 502 from upstream.",
+          codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
           message: "Response stream disconnected.",
         },
         id: "turn-1",
@@ -321,9 +293,15 @@ describe("OpenAi app-server event bridge", () => {
         payload: {
           error: {
             code: "openai.turn_failed",
+            details: {
+              additionalDetails: "HTTP 502 from upstream.",
+              codexErrorInfo: "responseStreamDisconnected",
+              httpStatusCode: 502,
+            },
             message: "Response stream disconnected.\nHTTP 502 from upstream.",
+            retryable: true,
           },
-          recoverable: false,
+          recoverable: true,
         },
       },
     ]);
@@ -342,6 +320,7 @@ describe("OpenAi app-server event bridge", () => {
       turn: {
         error: {
           additionalDetails: null,
+          codexErrorInfo: "serverOverloaded",
           message: "The model returned an empty response.",
         },
         id: "turn-1",
@@ -356,8 +335,11 @@ describe("OpenAi app-server event bridge", () => {
         payload: {
           error: {
             code: "openai.turn_failed",
+            details: { codexErrorInfo: "serverOverloaded" },
             message: "The model returned an empty response.",
+            retryable: false,
           },
+          recoverable: false,
         },
       },
     ]);
@@ -382,15 +364,6 @@ describe("OpenAi app-server event bridge", () => {
       {
         kind: "message.started",
         payload: {
-          messageId: assistantMessageId,
-          role: "agent",
-        },
-      },
-      {
-        delivery: "best_effort",
-        kind: "message.delta",
-        payload: {
-          contentDelta: "pong",
           messageId: assistantMessageId,
           role: "agent",
         },
@@ -453,8 +426,15 @@ describe("OpenAi app-server event bridge", () => {
       throw new Error("Expected a run.completed event.");
     }
 
-    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe(
-      "完整最终回答：中文 Markdown ✅",
+    const finalSnapshot = events().find(
+      (event) =>
+        event.kind === "message.added" &&
+        readEventPayloadString(event, "content") === "完整最终回答：中文 Markdown ✅",
     );
+    expect(finalSnapshot).toBeDefined();
+    expect(readEventPayloadString(runCompleted, "finalMessageId")).toBe(
+      readEventPayloadString(finalSnapshot!, "messageId"),
+    );
+    expect(runCompleted.payload).not.toHaveProperty("finalMessageText");
   });
 });

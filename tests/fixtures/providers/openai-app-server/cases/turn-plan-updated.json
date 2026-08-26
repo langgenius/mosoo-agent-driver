@@ -36,7 +36,8 @@
           }
         ],
         "source": "driver"
-      }
+      },
+      "sourceEventId": "openai.turn.plan:turn-1:0"
     }
   ]
 }

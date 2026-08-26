@@ -1,0 +1,24 @@
+{
+  "runId": "run-1",
+  "messages": [
+    {
+      "type": "future_event",
+      "value": 123
+    }
+  ],
+  "expectedEvents": [
+    {
+      "delivery": "best_effort",
+      "kind": "diagnostic.reported",
+      "payload": {
+        "message": "driver.claude.message.unknown",
+        "raw": {
+          "type": "future_event",
+          "value": 123
+        },
+        "severity": "info"
+      },
+      "visibility": "owner_debug"
+    }
+  ]
+}

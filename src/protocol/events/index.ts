@@ -1,9 +1,13 @@
 import { timestampSchema } from "../../contract/common";
 import { parseRuntimeEventEnvelope } from "./runtime-events";
 import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "./runtime-events";
+import type { RunId } from "../id";
 
 export type DriverEvent = RuntimeEventEnvelope;
-export type DriverEventInput = RuntimeEventEnvelope | RuntimeEventInputDraft;
+type DriverEventInputDraft = Omit<RuntimeEventInputDraft, "runId"> & {
+  readonly runId?: RunId | null | undefined;
+};
+export type DriverEventInput = RuntimeEventEnvelope | DriverEventInputDraft;
 
 export interface DriverEventEnvelope {
   readonly event: DriverEvent;

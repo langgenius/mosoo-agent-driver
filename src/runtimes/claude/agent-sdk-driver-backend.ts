@@ -24,6 +24,7 @@ import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-dr
 import { DriverEventPublisher } from "../driver-event-publisher";
 import { computeRuntimeBootstrapDigest, writeSkillBootstrapArtifacts } from "../skill-bootstrap";
 import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
+import { ClaudeDurableEventTooLargeError } from "./agent-sdk-event-writer";
 import { ClaudeAgentSdkPrewarm } from "./agent-sdk-prewarm";
 import {
   ClaudeAgentSdkMessageTranslator,
@@ -35,7 +36,8 @@ import {
   resolveClaudeConfigDir,
 } from "./agent-sdk-query-options";
 import { buildClaudeRecoveryPrompt } from "./agent-sdk-recovery-context";
-import { readClaudeNativeResumeSessionId } from "./agent-sdk-resume";
+import { readClaudeNativeResumeSessionId, requireClaudeNativeSessionId } from "./agent-sdk-resume";
+import { ClaudePublicToolCallIdState } from "./agent-sdk-tool-id";
 import { drainClaudeTasks } from "./agent-sdk-tasks";
 
 interface ActiveClaudeTurn {
@@ -76,6 +78,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #payload: DriverStartInput;
   readonly #pendingProcessTasks = new Set<Promise<void>>();
   readonly #prewarm: ClaudeAgentSdkPrewarm;
+  readonly #publicToolCallIds = new ClaudePublicToolCallIdState();
   #activeTurn: ActiveClaudeTurn | null = null;
   #nativeSessionId: string | null = null;
   #stopRequested = false;
@@ -92,12 +95,18 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       createQueryOptions: this.#dependencies.createQueryOptions,
       getNativeSessionId: () => this.#nativeSessionId,
       payload,
+      publicToolCallId: (nativeToolCallId) => this.#publicToolCallIds.publicId(nativeToolCallId),
       startup: async (input) => this.#dependencies.startup(input),
     });
     this.#messageTranslator = new ClaudeAgentSdkMessageTranslator({
+      publicToolCallId: (nativeToolCallId) => this.#publicToolCallIds.publicId(nativeToolCallId),
       push: async (context, reason, events) => this.#push(context, reason, events),
+      pushTerminal: async (context, reason, closures, terminal) =>
+        this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
       recordNativeSessionId: async (context, sessionId) =>
         this.#recordNativeSessionId(context, sessionId),
+      replaceNativeSessionId: async (context, previousSessionId, nextSessionId) =>
+        this.#replaceNativeSessionId(context, previousSessionId, nextSessionId),
     });
   }
 
@@ -160,6 +169,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     }
 
     this.#messageTranslator.resetTurnMessageState();
+    this.#publicToolCallIds.reset();
 
     // With no native session to resume, every query starts a fresh provider
     // session, so the bounded platform-history replay must ride the prompt of
@@ -215,6 +225,8 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
             payload: this.#payload,
             permissionTasks,
             processTasks,
+            publicToolCallId: (nativeToolCallId) =>
+              this.#publicToolCallIds.publicId(nativeToolCallId),
           });
           queryOptionsMs = Date.now() - optionsStartedAtMs;
 
@@ -334,40 +346,28 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
       if (isTurnCancelled(activeTurn)) {
         await this.#closeQuery(context, activeTurn, activeTurn.cancelReason ?? "turn.cancelled");
-        await this.#messageTranslator.finishTurn(context, "failed").catch(() => {});
-        await this.#push(context, "driver.claude.turn.cancelled", [
-          {
-            kind: "run.cancelled",
-            payload: {
-              reason: activeTurn.cancelReason ?? "turn.cancelled",
-              requestedBy: "user",
-              stopReason: "cancelled",
-            },
-            runId,
-          },
-        ]);
+        await this.#messageTranslator.cancelTurn(
+          context,
+          runId,
+          activeTurn.cancelReason ?? "turn.cancelled",
+        );
         throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
       }
 
       activeTurn.state = "finalizing";
       await this.#closeQuery(context, activeTurn, "turn.failed");
-      await this.#messageTranslator.finishTurn(context, "failed").catch(() => {});
 
       if (error instanceof ClaudeTerminalWriteError) {
         throw error.cause;
       }
 
       const message = toErrorMessage(error, "Claude Agent SDK turn failed.");
-      await this.#push(context, "driver.claude.turn.failed", [
-        {
-          kind: "run.failed",
-          payload: {
-            error: { code: "claude.turn_failed", message },
-            recoverable: false,
-          },
-          runId,
-        },
-      ]);
+      await this.#messageTranslator.failTurn(
+        context,
+        runId,
+        error instanceof ClaudeDurableEventTooLargeError ? error.code : "claude.turn_failed",
+        message,
+      );
       throw error;
     } finally {
       try {
@@ -488,9 +488,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   }
 
   async #recordNativeSessionId(context: AgentDriverContext, sessionId: string): Promise<void> {
-    if (sessionId.trim().length === 0) {
-      throw new Error("Claude Agent SDK message has an empty native session ID.");
-    }
+    requireClaudeNativeSessionId(sessionId);
 
     if (this.#nativeSessionId === sessionId) {
       return;
@@ -500,8 +498,44 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       throw new Error("Claude Agent SDK message belongs to a different native session.");
     }
 
+    const previousSessionId = this.#nativeSessionId;
     this.#nativeSessionId = sessionId;
-    await this.#publishNativeResumeRef(context);
+    try {
+      await this.#publishNativeResumeRef(context, sessionId);
+    } catch (error) {
+      if (this.#nativeSessionId === sessionId) {
+        this.#nativeSessionId = previousSessionId;
+      }
+      throw error;
+    }
+  }
+
+  async #replaceNativeSessionId(
+    context: AgentDriverContext,
+    previousSessionId: string,
+    nextSessionId: string,
+  ): Promise<void> {
+    requireClaudeNativeSessionId(previousSessionId);
+    requireClaudeNativeSessionId(nextSessionId);
+
+    if (this.#nativeSessionId === nextSessionId) {
+      return;
+    }
+
+    if (this.#nativeSessionId !== null && this.#nativeSessionId !== previousSessionId) {
+      throw new Error("Claude conversation reset belongs to a different native session.");
+    }
+
+    const retainedSessionId = this.#nativeSessionId;
+    this.#nativeSessionId = nextSessionId;
+    try {
+      await this.#publishNativeResumeRef(context, nextSessionId);
+    } catch (error) {
+      if (this.#nativeSessionId === nextSessionId) {
+        this.#nativeSessionId = retainedSessionId;
+      }
+      throw error;
+    }
   }
 
   async #closeQuery(
@@ -529,16 +563,15 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     await turn.queryCloseTask;
   }
 
-  async #publishNativeResumeRef(context: AgentDriverContext): Promise<void> {
-    if (!this.#nativeSessionId) {
-      throw new Error("Claude native session id is required before publishing resume ref.");
-    }
-
+  async #publishNativeResumeRef(
+    context: AgentDriverContext,
+    nativeSessionId: string,
+  ): Promise<void> {
     await this.#push(context, "driver.claude.native_resume_ref.updated", [
       {
         kind: "runtime.resume.updated",
         payload: {
-          resumePointer: this.#nativeSessionId,
+          resumePointer: nativeSessionId,
           threadId: null,
         },
         visibility: "owner_debug",

@@ -2,9 +2,40 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId, RunId } from "../../protocol/id";
+import type { JsonValue } from "../../protocol/json";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import { chunkJsonText } from "../provider-json";
 import type { JsonObject } from "./agent-sdk-json";
 import { toClaudeDiagnosticEvent, toClaudeUsageUpdatedEvents } from "./agent-sdk-message-events";
+
+const MAX_CLAUDE_MESSAGE_CHUNK_BYTES = 512 * 1_024;
+const MAX_CLAUDE_DURABLE_EVENT_BYTES = 1_020 * 1_024;
+
+function claudeDurableEventBytes(event: DriverEventInput): number {
+  return Buffer.byteLength(JSON.stringify(event), "utf8");
+}
+
+export class ClaudeDurableEventTooLargeError extends RangeError {
+  readonly code: string;
+
+  constructor(code: string, subject: string, bytes: number) {
+    super(`Claude ${subject} exceeds durable event capacity (${String(bytes)} UTF-8 bytes).`);
+    this.code = code;
+    this.name = "ClaudeDurableEventTooLargeError";
+  }
+}
+
+export function assertClaudeDurableEventFits(
+  event: DriverEventInput,
+  code: string,
+  subject: string,
+): void {
+  const bytes = claudeDurableEventBytes(event);
+
+  if (bytes > MAX_CLAUDE_DURABLE_EVENT_BYTES) {
+    throw new ClaudeDurableEventTooLargeError(code, subject, bytes);
+  }
+}
 
 interface ClaudeAgentSdkEventWriterOptions {
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
@@ -12,7 +43,7 @@ interface ClaudeAgentSdkEventWriterOptions {
 
 export interface ClaudeToolStartEvent {
   context: AgentDriverContext;
-  parentMessageId: string;
+  parentMessageId?: string;
   toolCallId: string;
   toolCallName: string;
 }
@@ -38,15 +69,30 @@ export interface ClaudeToolArgumentsEvent {
 }
 
 export interface ClaudeToolResultEvent {
+  agentId?: string;
+  authoritative?: boolean;
   content: string;
   context: AgentDriverContext;
-  messageId: string;
-  status: "completed" | "failed";
+  decisionReason?: string;
+  decisionReasonType?: string;
+  messageId?: string;
+  nonExecutionKind?: string;
+  rawInput?: string;
+  status: "cancelled" | "completed" | "failed";
+  structuredOutput?: JsonValue;
   toolCallId: string;
+  toolCallName?: string;
+  userFeedback?: string;
+}
+
+export interface ClaudeTurnClosure {
+  readonly commit: () => void;
+  readonly events: readonly DriverEventInput[];
 }
 
 export class ClaudeAgentSdkEventWriter {
   readonly #messageEnded = new Set<string>();
+  readonly #messageRetracted = new Set<string>();
   readonly #messageSealed = new Set<string>();
   readonly #messageStarted = new Set<string>();
   readonly #options: ClaudeAgentSdkEventWriterOptions;
@@ -55,6 +101,7 @@ export class ClaudeAgentSdkEventWriter {
   readonly #toolEnded = new Set<string>();
   readonly #toolParentMessage = new Map<string, string>();
   readonly #toolStarted = new Set<string>();
+  readonly #toolRetracted = new Set<string>();
 
   constructor(options: ClaudeAgentSdkEventWriterOptions) {
     this.#options = options;
@@ -66,6 +113,7 @@ export class ClaudeAgentSdkEventWriter {
 
   resetTurnState(): void {
     this.#messageEnded.clear();
+    this.#messageRetracted.clear();
     this.#messageSealed.clear();
     this.#messageStarted.clear();
     this.#thoughtEnded.clear();
@@ -73,6 +121,7 @@ export class ClaudeAgentSdkEventWriter {
     this.#toolEnded.clear();
     this.#toolParentMessage.clear();
     this.#toolStarted.clear();
+    this.#toolRetracted.clear();
   }
 
   toolParentMessageId(toolCallId: string): string | null {
@@ -84,8 +133,7 @@ export class ClaudeAgentSdkEventWriter {
       return false;
     }
 
-    this.#messageEnded.add(messageId);
-    await this.#push(context, "driver.claude.message.ended", [
+    await this.#options.push(context, "driver.claude.message.ended", [
       {
         kind: "message.completed",
         payload: {
@@ -94,6 +142,80 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    this.#messageEnded.add(messageId);
+    return true;
+  }
+
+  async cancelMessage(context: AgentDriverContext, messageId: string): Promise<boolean> {
+    if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
+      return false;
+    }
+
+    await this.#options.push(context, "driver.claude.message.cancelled", [
+      {
+        kind: "message.cancelled",
+        payload: { messageId, role: "agent" },
+      },
+    ]);
+    this.#messageEnded.add(messageId);
+    return true;
+  }
+
+  async retractMessage(context: AgentDriverContext, messageId: string): Promise<void> {
+    if (!this.#messageStarted.has(messageId) || this.#messageRetracted.has(messageId)) {
+      return;
+    }
+
+    await this.#options.push(context, "driver.claude.message.retracted", [
+      {
+        kind: "message.cancelled",
+        payload: { messageId, reason: "superseded", role: "agent" },
+      },
+    ]);
+    this.#messageRetracted.add(messageId);
+    this.#messageEnded.add(messageId);
+  }
+
+  async retractTool(context: AgentDriverContext, toolCallId: string): Promise<void> {
+    if (!this.#toolStarted.has(toolCallId) || this.#toolRetracted.has(toolCallId)) {
+      return;
+    }
+
+    const ended = this.#toolEnded.has(toolCallId);
+    await this.#options.push(context, "driver.claude.tool.retracted", [
+      {
+        kind: "tool.call.updated",
+        payload: { status: "cancelled", toolCallId },
+      },
+      ...(ended
+        ? []
+        : [
+            {
+              kind: "item.completed" as const,
+              payload: { itemId: toolCallId, itemType: "tool_call", status: "cancelled" },
+            },
+          ]),
+    ]);
+    this.#toolRetracted.add(toolCallId);
+    this.#toolEnded.add(toolCallId);
+  }
+
+  async failMessage(
+    context: AgentDriverContext,
+    messageId: string,
+    error: { readonly code: string; readonly message: string; readonly retryable: boolean },
+  ): Promise<boolean> {
+    if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
+      return false;
+    }
+
+    await this.#options.push(context, "driver.claude.message.failed", [
+      {
+        kind: "message.failed",
+        payload: { error, messageId, role: "agent" },
+      },
+    ]);
+    this.#messageEnded.add(messageId);
     return true;
   }
 
@@ -102,8 +224,7 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    this.#messageStarted.add(messageId);
-    await this.#push(context, "driver.claude.message.started", [
+    await this.#options.push(context, "driver.claude.message.started", [
       {
         kind: "message.started",
         payload: {
@@ -112,6 +233,7 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    this.#messageStarted.add(messageId);
   }
 
   async ensureToolStarted({
@@ -124,16 +246,13 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    await this.ensureMessageStarted(context, parentMessageId);
-    this.#toolStarted.add(toolCallId);
-    this.#toolParentMessage.set(toolCallId, parentMessageId);
-    await this.#push(context, "driver.claude.tool.started", [
+    const events: DriverEventInput[] = [
       {
         kind: "item.started",
         payload: {
           itemId: toolCallId,
           itemType: "tool_call",
-          parentMessageId,
+          ...(parentMessageId === undefined ? {} : { parentMessageId }),
           title: toolCallName,
         },
       },
@@ -141,96 +260,183 @@ export class ClaudeAgentSdkEventWriter {
         kind: "tool.call.updated",
         payload: {
           kind: "tool",
-          parentMessageId,
+          ...(parentMessageId === undefined ? {} : { parentMessageId }),
           status: "running",
           title: toolCallName,
           toolCallId,
         },
       },
-    ]);
+    ];
+
+    for (const event of events) {
+      assertClaudeDurableEventFits(event, "claude.tool_start_too_large", "tool start");
+    }
+
+    if (parentMessageId !== undefined) {
+      await this.ensureMessageStarted(context, parentMessageId);
+    }
+    await this.#options.push(context, "driver.claude.tool.started", events);
+    if (parentMessageId !== undefined) {
+      this.#toolParentMessage.set(toolCallId, parentMessageId);
+    }
+    this.#toolStarted.add(toolCallId);
   }
 
   async pushDiagnostic(context: AgentDriverContext, message: SDKMessage): Promise<void> {
-    await this.pushRaw(context, "driver.claude.diagnostic", toClaudeDiagnosticEvent(message));
+    await this.pushRawDiagnostic(
+      context,
+      "driver.claude.diagnostic",
+      toClaudeDiagnosticEvent(message),
+    );
   }
 
-  async pushRaw(context: AgentDriverContext, reason: string, event: JsonObject): Promise<void> {
-    await this.#push(context, reason, [
+  async pushRawDiagnostic(
+    context: AgentDriverContext,
+    reason: string,
+    event: JsonObject,
+    options: {
+      readonly message?: string;
+      readonly severity?: "error" | "info" | "warn";
+    } = {},
+  ): Promise<void> {
+    await this.#options.push(context, reason, [
       {
+        delivery: "best_effort",
         kind: "diagnostic.reported",
         payload: {
-          message: reason,
+          message: options.message ?? reason,
           raw: event,
-          severity: "info",
+          severity: options.severity ?? "info",
         },
         visibility: "owner_debug",
       },
     ]);
   }
 
-  async pushRunError(
-    context: AgentDriverContext,
+  runError(
     runId: RunId,
     code: string,
     message: string,
-  ): Promise<void> {
-    await this.#push(context, "driver.claude.turn.failed", [
-      {
-        kind: "run.failed",
-        payload: {
-          error: {
-            code,
-            message,
-          },
-          recoverable: false,
+    retryable: boolean,
+    details?: JsonObject,
+  ): DriverEventInput {
+    const event: DriverEventInput = {
+      kind: "run.failed",
+      payload: {
+        error: {
+          code,
+          ...(details === undefined ? {} : { details }),
+          message,
+          retryable,
         },
-        runId,
+        recoverable: retryable,
       },
-    ]);
+      runId,
+    };
+
+    if (claudeDurableEventBytes(event) <= MAX_CLAUDE_DURABLE_EVENT_BYTES) {
+      return event;
+    }
+
+    return {
+      kind: "run.failed",
+      payload: {
+        error: {
+          code,
+          details: {
+            ...(details === undefined
+              ? {}
+              : { originalDetailsUtf8Bytes: Buffer.byteLength(JSON.stringify(details), "utf8") }),
+            originalMessageUtf8Bytes: Buffer.byteLength(message, "utf8"),
+          },
+          message: "Claude Agent SDK failure exceeded durable event capacity.",
+          retryable,
+        },
+        recoverable: retryable,
+      },
+      runId,
+    };
   }
 
-  async pushRunFinished(
-    context: AgentDriverContext,
+  runFinished(
     runId: RunId,
-    finalMessage: { id: MessageId; text: string } | null,
-  ): Promise<void> {
-    await this.#push(context, "driver.claude.turn.completed", [
-      {
-        runId,
-        kind: "run.completed",
-        payload: {
-          ...(finalMessage === null
-            ? {}
-            : {
-                finalMessageId: finalMessage.id,
-                finalMessageText: finalMessage.text,
-              }),
-          stopReason: "end_turn",
-        },
+    finalMessage: { readonly id: MessageId } | null,
+    structuredOutput?: JsonValue,
+  ): DriverEventInput {
+    return {
+      runId,
+      kind: "run.completed",
+      payload: {
+        ...(finalMessage === null
+          ? {}
+          : {
+              finalMessageId: finalMessage.id,
+            }),
+        stopReason: "end_turn",
+        ...(structuredOutput === undefined ? {} : { structuredOutput }),
       },
-    ]);
+    };
+  }
+
+  runCancelled(runId: RunId, reason: string): DriverEventInput {
+    const event: DriverEventInput = {
+      kind: "run.cancelled",
+      payload: { reason, stopReason: "cancelled" },
+      runId,
+    };
+
+    if (claudeDurableEventBytes(event) <= MAX_CLAUDE_DURABLE_EVENT_BYTES) {
+      return event;
+    }
+
+    return {
+      kind: "run.cancelled",
+      payload: {
+        originalReasonUtf8Bytes: Buffer.byteLength(reason, "utf8"),
+        reason: "Claude cancellation reason exceeded durable event capacity.",
+        stopReason: "cancelled",
+      },
+      runId,
+    };
   }
 
   async pushMessageSnapshot(
     context: AgentDriverContext,
     messageId: string,
     text: string,
+    metadata: JsonObject = {},
   ): Promise<boolean> {
     if (this.#messageEnded.has(messageId)) {
       return false;
     }
 
     await this.ensureMessageStarted(context, messageId);
-    await this.#push(context, "driver.claude.message.snapshot", [
+    const chunks = chunkJsonText(text, MAX_CLAUDE_MESSAGE_CHUNK_BYTES);
+    const events: DriverEventInput[] = [
       {
         kind: "message.added",
         payload: {
-          content: [{ text, type: "text" }],
+          ...metadata,
+          content: [{ text: chunks[0]!, type: "text" }],
           messageId,
           role: "agent",
         },
       },
-    ]);
+      ...chunks.slice(1).map((contentDelta): DriverEventInput => ({
+        kind: "message.delta",
+        payload: { contentDelta, messageId, role: "agent" },
+      })),
+    ];
+
+    for (const event of events) {
+      assertClaudeDurableEventFits(
+        event,
+        "claude.message_snapshot_too_large",
+        `message snapshot ${messageId}`,
+      );
+    }
+
+    await this.#options.push(context, "driver.claude.message.snapshot", events);
     return true;
   }
 
@@ -238,11 +444,12 @@ export class ClaudeAgentSdkEventWriter {
     this.#messageSealed.add(messageId);
   }
 
-  async pushSessionInfoUpdated(context: AgentDriverContext): Promise<void> {
-    await this.#push(context, "driver.claude.session.info", [
+  async pushSessionInfoUpdated(context: AgentDriverContext, resetTitle = false): Promise<void> {
+    await this.#options.push(context, "driver.claude.session.info", [
       {
         kind: "session.info.updated",
         payload: {
+          ...(resetTitle ? { title: null } : {}),
           updatedAt: new Date().toISOString(),
         },
       },
@@ -260,7 +467,7 @@ export class ClaudeAgentSdkEventWriter {
     }
 
     await this.ensureMessageStarted(context, messageId);
-    await this.#push(context, reason, [
+    await this.#options.push(context, reason, [
       {
         delivery: "best_effort",
         kind: "message.delta",
@@ -279,8 +486,7 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    this.#thoughtStarted.add(thoughtId);
-    await this.#push(context, "driver.claude.thought.started", [
+    await this.#options.push(context, "driver.claude.thought.started", [
       {
         kind: "thought.started",
         payload: {
@@ -289,6 +495,7 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    this.#thoughtStarted.add(thoughtId);
   }
 
   async pushThoughtDelta({ context, delta, thoughtId }: ClaudeThoughtDeltaEvent): Promise<void> {
@@ -297,7 +504,7 @@ export class ClaudeAgentSdkEventWriter {
     }
 
     await this.ensureThoughtStarted(context, thoughtId);
-    await this.#push(context, "driver.claude.thought.delta", [
+    await this.#options.push(context, "driver.claude.thought.delta", [
       {
         delivery: "best_effort",
         kind: "thought.delta",
@@ -315,8 +522,7 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    this.#thoughtEnded.add(thoughtId);
-    await this.#push(context, "driver.claude.thought.completed", [
+    await this.#options.push(context, "driver.claude.thought.completed", [
       {
         kind: "thought.completed",
         payload: {
@@ -325,6 +531,21 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    this.#thoughtEnded.add(thoughtId);
+  }
+
+  async cancelThought(context: AgentDriverContext, thoughtId: string): Promise<void> {
+    if (!this.#thoughtStarted.has(thoughtId) || this.#thoughtEnded.has(thoughtId)) {
+      return;
+    }
+
+    await this.#options.push(context, "driver.claude.thought.cancelled", [
+      {
+        kind: "thought.cancelled",
+        payload: { channel: "summary", thoughtId },
+      },
+    ]);
+    this.#thoughtEnded.add(thoughtId);
   }
 
   async pushToolArguments({
@@ -337,7 +558,7 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    await this.#push(context, reason, [
+    await this.#options.push(context, reason, [
       {
         delivery: "best_effort",
         kind: "tool.call.updated",
@@ -359,30 +580,29 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    await this.#push(context, "driver.claude.tool.snapshot", [
-      {
-        kind: "tool.call.updated",
-        payload: {
-          rawInput,
-          status: "running",
-          toolCallId,
-        },
+    const event: DriverEventInput = {
+      kind: "tool.call.updated",
+      payload: {
+        rawInput,
+        status: "running",
+        toolCallId,
       },
-    ]);
+    };
+    assertClaudeDurableEventFits(event, "claude.tool_input_too_large", `tool input ${toolCallId}`);
+    await this.#options.push(context, "driver.claude.tool.snapshot", [event]);
   }
 
-  async finishTools(context: AgentDriverContext, status: "completed" | "failed"): Promise<void> {
+  async finishTools(
+    context: AgentDriverContext,
+    status: "cancelled" | "completed" | "failed",
+  ): Promise<void> {
     const toolCallIds = [...this.#toolStarted].filter((id) => !this.#toolEnded.has(id));
 
     if (toolCallIds.length === 0) {
       return;
     }
 
-    for (const toolCallId of toolCallIds) {
-      this.#toolEnded.add(toolCallId);
-    }
-
-    await this.#push(
+    await this.#options.push(
       context,
       "driver.claude.tools.finished",
       toolCallIds.flatMap((toolCallId): DriverEventInput[] => [
@@ -396,16 +616,85 @@ export class ClaudeAgentSdkEventWriter {
         },
       ]),
     );
+    for (const toolCallId of toolCallIds) {
+      this.#toolEnded.add(toolCallId);
+    }
+  }
+
+  prepareTurnClosure(status: "cancelled" | "completed" | "failed"): ClaudeTurnClosure {
+    const messageIds = [...this.#messageStarted].filter((id) => !this.#messageEnded.has(id));
+    const thoughtIds = [...this.#thoughtStarted].filter((id) => !this.#thoughtEnded.has(id));
+    const toolCallIds = [...this.#toolStarted].filter((id) => !this.#toolEnded.has(id));
+    const events: DriverEventInput[] = [
+      ...thoughtIds.map((thoughtId): DriverEventInput => ({
+        kind: status === "completed" ? "thought.completed" : "thought.cancelled",
+        payload: { channel: "summary", thoughtId },
+      })),
+      ...messageIds.map((messageId): DriverEventInput => ({
+        kind:
+          status === "cancelled"
+            ? "message.cancelled"
+            : status === "failed"
+              ? "message.failed"
+              : "message.completed",
+        payload:
+          status === "failed"
+            ? {
+                error: {
+                  code: "claude.turn_failed",
+                  message: "Claude Agent SDK turn failed.",
+                  retryable: false,
+                },
+                messageId,
+                role: "agent",
+              }
+            : { messageId, role: "agent" },
+      })),
+      ...toolCallIds.flatMap((toolCallId): DriverEventInput[] => [
+        {
+          kind: "tool.call.updated",
+          payload: { status, toolCallId },
+        },
+        {
+          kind: "item.completed",
+          payload: { itemId: toolCallId, itemType: "tool_call", status },
+        },
+      ]),
+    ];
+
+    return {
+      commit: () => {
+        for (const thoughtId of thoughtIds) this.#thoughtEnded.add(thoughtId);
+        for (const messageId of messageIds) this.#messageEnded.add(messageId);
+        for (const toolCallId of toolCallIds) this.#toolEnded.add(toolCallId);
+      },
+      events,
+    };
   }
 
   async pushToolResult({
+    agentId,
+    authoritative = false,
     content,
     context,
+    decisionReason,
+    decisionReasonType,
     messageId,
+    nonExecutionKind,
+    rawInput,
     status,
+    structuredOutput,
     toolCallId,
+    toolCallName,
+    userFeedback,
   }: ClaudeToolResultEvent): Promise<void> {
-    if (this.#toolEnded.has(toolCallId)) {
+    if (this.#toolRetracted.has(toolCallId)) {
+      return;
+    }
+
+    const ended = this.#toolEnded.has(toolCallId);
+
+    if (ended && !authoritative) {
       return;
     }
 
@@ -413,26 +702,43 @@ export class ClaudeAgentSdkEventWriter {
       {
         kind: "tool.call.updated",
         payload: {
+          ...(agentId === undefined ? {} : { agentId }),
           content,
-          messageId,
-          rawOutput: content,
+          ...(decisionReason === undefined ? {} : { decisionReason }),
+          ...(decisionReasonType === undefined ? {} : { decisionReasonType }),
+          ...(messageId === undefined ? {} : { messageId }),
+          ...(nonExecutionKind === undefined ? {} : { nonExecutionKind }),
+          ...(rawInput === undefined ? {} : { rawInput }),
           status,
+          ...(structuredOutput === undefined ? {} : { structuredOutput }),
+          ...(toolCallName === undefined ? {} : { title: toolCallName }),
           toolCallId,
+          ...(userFeedback === undefined ? {} : { userFeedback }),
         },
       },
     ];
 
-    this.#toolEnded.add(toolCallId);
-    events.push({
-      kind: "item.completed",
-      payload: {
-        itemId: toolCallId,
-        itemType: "tool_call",
-        status,
-      },
-    });
+    assertClaudeDurableEventFits(
+      events[0]!,
+      "claude.tool_result_too_large",
+      `tool result ${toolCallId}`,
+    );
 
-    await this.#push(context, "driver.claude.tool.result", events);
+    if (!ended && this.#toolStarted.has(toolCallId)) {
+      events.push({
+        kind: "item.completed",
+        payload: {
+          itemId: toolCallId,
+          itemType: "tool_call",
+          status,
+        },
+      });
+    }
+
+    await this.#options.push(context, "driver.claude.tool.result", events);
+    if (!ended && this.#toolStarted.has(toolCallId)) {
+      this.#toolEnded.add(toolCallId);
+    }
   }
 
   async pushUsage(
@@ -446,14 +752,6 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
-    await this.#push(context, "driver.claude.usage.updated", events);
-  }
-
-  async #push(
-    context: AgentDriverContext,
-    reason: string,
-    events: DriverEventInput[],
-  ): Promise<void> {
-    await this.#options.push(context, reason, events);
+    await this.#options.push(context, "driver.claude.usage.updated", events);
   }
 }

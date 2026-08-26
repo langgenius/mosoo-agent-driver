@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
+import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import type {
   AgentDriverContext,
   AgentDriverContextPortOverrides,
 } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -239,6 +241,7 @@ describe("AgentDriverKernelCore", () => {
                   entered.resolve();
                   await late.promise;
                 },
+                currentRunId: () => null,
                 pushEvents: async ({ events }) => ({
                   accepted: events.map((event, index) => ({
                     seq: index + 1,
@@ -632,17 +635,32 @@ describe("AgentDriverKernelCore", () => {
       })
       .catch(() => {});
     await inputEntered.promise;
+    const nativeSetTimeout = globalThis.setTimeout;
+    const acceleratedSetTimeout = (
+      callback: (...args: unknown[]) => void,
+      timeout?: number,
+      ...args: unknown[]
+    ) =>
+      nativeSetTimeout(
+        callback,
+        timeout === ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS ? 10 : timeout,
+        ...args,
+      );
+    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
-    const first = await Promise.allSettled([kernel.stop("first stop")]);
-    const second = await Promise.allSettled([kernel.stop("second stop")]);
-    const settledBeforeRelease = inputSettled;
-    releaseInput.resolve();
-    await input;
+    try {
+      const first = await Promise.allSettled([kernel.stop("first stop")]);
+      const second = await Promise.allSettled([kernel.stop("second stop")]);
 
-    expect(first[0]?.status).toBe("rejected");
-    expect(second[0]?.status).toBe("rejected");
-    expect(settledBeforeRelease).toBe(false);
-  }, 12_000);
+      expect(first[0]?.status).toBe("rejected");
+      expect(second[0]?.status).toBe("rejected");
+      expect(inputSettled).toBe(false);
+    } finally {
+      globalThis.setTimeout = nativeSetTimeout;
+      releaseInput.resolve();
+      await input;
+    }
+  });
 
   test("keeps cleanup event delivery available across a transient stop failure", async () => {
     const backend = createBackend();

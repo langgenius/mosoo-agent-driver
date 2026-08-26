@@ -17,7 +17,7 @@ import type {
 } from "../runtime-command";
 
 export interface DriverRuntimeEventPort {
-  currentRunId?(): RunId | null;
+  currentRunId(): RunId | null;
   pushEvents(input: {
     events: DriverEventInput[];
     signal?: AbortSignal;
@@ -83,10 +83,10 @@ export function assertDriverEventReceiptPrefix(
 /**
  * Owns one invocation's input and drains partial receipt prefixes.
  *
- * Transport failures are returned to the caller and are not retried automatically.
+ * One transport failure after a valid receipt prefix is retried with the same event IDs.
  */
 export async function pushLosslessEvents(
-  port: DriverRuntimeEventPort,
+  port: Pick<DriverRuntimeEventPort, "pushEvents">,
   events: readonly DriverEventInput[],
   onAccepted?: (receipts: readonly DriverEventReceipt[]) => void,
   signal?: AbortSignal,
@@ -94,12 +94,26 @@ export async function pushLosslessEvents(
   const receipts: DriverEventReceipt[] = [];
   const deadline = signal ?? AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
   let remaining = structuredClone(withSourceEventIds(events));
+  let retryTransport = false;
 
   while (remaining.length > 0) {
-    const result = await port.pushEvents({
-      events: remaining,
-      signal: deadline,
-    });
+    deadline.throwIfAborted();
+    let result: DriverEventBatchOutput;
+
+    try {
+      result = await port.pushEvents({
+        events: remaining,
+        signal: deadline,
+      });
+    } catch (error) {
+      if (error instanceof DriverEventRejectedError || !retryTransport) {
+        throw error;
+      }
+
+      retryTransport = false;
+      continue;
+    }
+
     assertDriverEventReceiptPrefix(remaining, result.accepted);
 
     if (result.accepted.length === 0) {
@@ -109,6 +123,7 @@ export async function pushLosslessEvents(
     onAccepted?.(result.accepted);
     receipts.push(...result.accepted);
     remaining = remaining.slice(result.accepted.length);
+    retryTransport = true;
   }
 
   return receipts;

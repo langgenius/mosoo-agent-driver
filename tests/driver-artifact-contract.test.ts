@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import { OPENAI_APP_SERVER_SCHEMA_VERSION } from "../src/runtimes/openai/generated/app-server-protocol-types";
 import { AGENT_DRIVER_VERSION } from "../src/core/version";
 
 type DriverPackageExportTarget =
@@ -38,6 +37,26 @@ interface EnvironmentPackageManagerManifest {
   readonly schemaVersion?: number;
 }
 
+interface WorkflowStep {
+  readonly name?: string;
+  readonly run?: string;
+  readonly uses?: string;
+}
+
+interface WorkflowJob {
+  readonly if?: string;
+  readonly needs?: string | readonly string[];
+  readonly steps?: readonly WorkflowStep[];
+}
+
+interface Workflow {
+  readonly concurrency?: {
+    readonly group?: string;
+    readonly queue?: string;
+  };
+  readonly jobs?: Record<string, WorkflowJob>;
+}
+
 const PUBLIC_EXPORTS = [
   ".",
   "./boot",
@@ -65,6 +84,26 @@ function readEnvironmentPackageManagerManifest(): EnvironmentPackageManagerManif
   ) as EnvironmentPackageManagerManifest;
 }
 
+function readWorkflow(path: string): Workflow {
+  return Bun.YAML.parse(readText(path)) as Workflow;
+}
+
+function workflowJob(workflow: Workflow, id: string): WorkflowJob {
+  const job = workflow.jobs?.[id];
+  if (job === undefined) {
+    throw new Error(`Missing workflow job ${id}.`);
+  }
+  return job;
+}
+
+function workflowStep(job: WorkflowJob, name: string): WorkflowStep {
+  const step = job.steps?.find((candidate) => candidate.name === name);
+  if (step === undefined) {
+    throw new Error(`Missing workflow step ${name}.`);
+  }
+  return step;
+}
+
 describe("driver artifact contract", () => {
   test("uses the public mosoo package identity", () => {
     const packageJson = readDriverPackageJson();
@@ -74,8 +113,8 @@ describe("driver artifact contract", () => {
     expect(packageJson.version).toBe(AGENT_DRIVER_VERSION);
     expect(packageJson.description).toContain("Agent Driver");
     expect(packageJson.license).toBe("Apache-2.0");
-    expect(packageJson.packageManager).toBe("bun@1.3.14");
-    expect(packageJson.engines).toEqual({ bun: ">=1.3.14" });
+    expect(packageJson.packageManager).toBe("bun@1.4.0");
+    expect(packageJson.engines).toEqual({ bun: ">=1.4.0" });
     expect(packageJson.repository).toEqual({
       type: "git",
       url: "git+https://github.com/langgenius/mosoo-agent-driver.git",
@@ -90,7 +129,7 @@ describe("driver artifact contract", () => {
       "agent-driver": "./dist/driver.mjs",
     });
     expect(packageJson.types).toBe("./dist/types/index.d.ts");
-    expect(packageJson.files).toEqual(["dist", "src", "assets"]);
+    expect(packageJson.files).toEqual(["dist", "src", "!src/runtimes/openai/generated", "assets"]);
     expect(packageJson.files).not.toContain("tests/fixtures");
   });
 
@@ -145,6 +184,7 @@ describe("driver artifact contract", () => {
     const packageJson = readDriverPackageJson();
     const buildScript = packageJson.scripts?.["build"] ?? "";
     const imageBuildScript = packageJson.scripts?.["build:image"] ?? "";
+    const imageTestScript = packageJson.scripts?.["test:image:environment"] ?? "";
     const containerignore = readText("../.containerignore");
     const containerfile = readText("../Containerfile");
     const processEntry = readText("../src/bin/driver.ts");
@@ -157,19 +197,27 @@ describe("driver artifact contract", () => {
     expect(containerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
     expect(containerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
     expect(containerignore).toContain("!dist/driver.mjs");
-    expect(imageBuildScript).toBe("vp run build && buildah build -t agent-driver:local .");
+    expect(imageBuildScript).toBe(
+      "vp run build && buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .",
+    );
+    expect(imageTestScript).toBe(
+      "podman run --pull=never --rm --entrypoint node agent-driver:local /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
+    );
     expect(packageJson.scripts?.["prepack"]).toBe("vp run build");
   });
 
-  test("pins the OpenAI runtime, SDK, and app-server schema to one stable version", () => {
+  test("pins the OpenAI runtime, CLI, and app-server schema to one stable version", () => {
     const packageJson = readDriverPackageJson();
     const containerfile = readText("../Containerfile");
+    const runtimeVersion = packageJson.devDependencies?.["@openai/codex"];
 
-    expect(packageJson.devDependencies?.["@openai/codex-sdk"]).toBe(
-      OPENAI_APP_SERVER_SCHEMA_VERSION,
+    expect(runtimeVersion).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(containerfile).toContain(`ARG OPENAI_RUNTIME_VERSION=${runtimeVersion}`);
+    expect(readText("../src/runtimes/openai/generated/README.md")).toContain(
+      `version \`${runtimeVersion}\``,
     );
-    expect(containerfile).toContain(
-      `ARG OPENAI_RUNTIME_VERSION=${OPENAI_APP_SERVER_SCHEMA_VERSION}`,
+    expect(readText("../src/runtimes/openai/generated-json-schema/README.md")).toContain(
+      `@openai/codex@${runtimeVersion}`,
     );
   });
 
@@ -233,23 +281,93 @@ describe("driver artifact contract", () => {
     expect(liveTest).not.toMatch(/from ["']\.\.\/src\/(?:core|runtimes)/);
   });
 
-  test("pins the release OpenCode executable and gates publishing on the packed artifact", () => {
+  test("pins runtime executables and keeps release publication monotonic", () => {
     const packageJson = readDriverPackageJson();
     const containerfile = readText("../Containerfile");
-    const releaseWorkflow = readText("../.github/workflows/release.yml");
+    const prWorkflow = readWorkflow("../.github/workflows/pr.yml");
+    const releaseWorkflowText = readText("../.github/workflows/release.yml");
+    const releaseWorkflow = readWorkflow("../.github/workflows/release.yml");
+    const verifyJob = workflowJob(releaseWorkflow, "verify");
+    const buildJob = workflowJob(releaseWorkflow, "build");
+    const imageJob = workflowJob(releaseWorkflow, "publish-versioned-image");
+    const npmJob = workflowJob(releaseWorkflow, "publish-npm");
+    const latestJob = workflowJob(releaseWorkflow, "publish-latest-image");
+    const verifyRun = workflowStep(verifyJob, "Verify release tag").run ?? "";
+    const buildRun =
+      buildJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
+    const imageRun = workflowStep(imageJob, "Publish versioned image").run ?? "";
+    const npmRun = workflowStep(npmJob, "Publish package").run ?? "";
+    const latestRun =
+      latestJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
+    const claudeVersion = packageJson.dependencies?.["@anthropic-ai/claude-agent-sdk"];
     const openCodeVersion = packageJson.devDependencies?.["opencode-ai"];
-    const packIndex = releaseWorkflow.indexOf("- name: Pack package");
-    const liveIndex = releaseWorkflow.indexOf("- name: Test packed driver");
-    const imageIndex = releaseWorkflow.indexOf("- name: Build image");
+    const bunVersion = packageJson.packageManager?.replace("bun@", "");
+    const actionUses = [prWorkflow, releaseWorkflow].flatMap((workflow) =>
+      Object.values(workflow.jobs ?? {}).flatMap((job) =>
+        (job.steps ?? []).flatMap((step) => (step.uses === undefined ? [] : [step.uses])),
+      ),
+    );
 
-    expect(openCodeVersion).toBe("1.18.4");
+    expect(containerfile).toContain(`ARG BUN_VERSION=${bunVersion}`);
+    expect(containerfile).toContain('RUN test "$(bun --version)" = "$BUN_VERSION"');
+    expect(containerfile).toContain(`ARG CLAUDE_AGENT_SDK_VERSION=${claudeVersion}`);
     expect(containerfile).toContain(`ARG OPENCODE_VERSION=${openCodeVersion}`);
-    expect(releaseWorkflow).toContain("AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs");
-    expect(releaseWorkflow).toContain("--strip-components=1");
-    expect(releaseWorkflow).toContain("secrets.OPENROUTER_API_KEY");
-    expect(packIndex).toBeGreaterThan(-1);
-    expect(liveIndex).toBeGreaterThan(packIndex);
-    expect(imageIndex).toBeGreaterThan(liveIndex);
+    expect(containerfile).toContain(
+      "@anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}",
+    );
+    expect(containerfile).toContain("opencode-linux-x64-baseline@${OPENCODE_VERSION}");
+    expect(releaseWorkflow.concurrency).toEqual({ group: "release", queue: "max" });
+    expect({
+      build: buildJob.needs,
+      latest: latestJob.needs,
+      npm: npmJob.needs,
+      versionedImage: imageJob.needs,
+    }).toEqual({
+      build: "verify",
+      latest: ["publish-versioned-image", "publish-npm"],
+      npm: ["build", "publish-versioned-image"],
+      versionedImage: "build",
+    });
+    expect(latestJob.if).toBe("needs.publish-npm.outputs.promote_latest == 'true'");
+    for (const marker of [
+      'version="$(node -p "require(\'./package.json\').version")"',
+      'if [[ "${tag}" != "v${version}" ]]',
+      'git merge-base --is-ancestor "${GITHUB_SHA}" origin/main',
+    ])
+      expect(verifyRun).toContain(marker);
+    for (const marker of [
+      "npm pack --ignore-scripts",
+      "declarations=(packed/dist/types/**/*.d.ts)",
+      "bun test tests/driver-artifact-mcp.test.ts",
+      "buildah build",
+      "podman run --pull=never --rm",
+    ])
+      expect(buildRun).toContain(marker);
+    for (const marker of [
+      "remote_digest=",
+      'if [[ "$remote_digest" != "$EXPECTED_DIGEST" ]]',
+      "skopeo copy --preserve-digests",
+      "gh attestation verify",
+    ])
+      expect(imageRun).toContain(marker);
+    for (const marker of [
+      "remote_integrity=",
+      'npm view "$package_name@>$VERSION"',
+      'npm publish "$tarball" --ignore-scripts --provenance',
+    ])
+      expect(npmRun).toContain(marker);
+    for (const marker of [
+      'npm view "$PACKAGE_NAME" dist-tags.latest',
+      'npm view "$PACKAGE_NAME@>$VERSION"',
+      'skopeo copy --preserve-digests "docker://$IMAGE@$DIGEST" "docker://$IMAGE:latest"',
+    ])
+      expect(latestRun).toContain(marker);
+    expect(releaseWorkflowText).not.toContain("OPENROUTER_API_KEY");
+    expect(releaseWorkflowText).not.toContain("test:live:artifact");
+    expect(actionUses.length).toBeGreaterThan(0);
+    for (const uses of actionUses) {
+      expect(uses).toMatch(/^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/);
+    }
   });
 
   test("declares writable Environment package managers", () => {

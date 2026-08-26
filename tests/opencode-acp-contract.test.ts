@@ -108,7 +108,7 @@ async function stopOpenCode(
   }
 }
 
-test("OpenCode creates a session after unadvertised additional directories are dropped", async () => {
+test("OpenCode rejects unadvertised additional directories before session creation", async () => {
   expect(existsSync(OPENCODE_COMMAND)).toBe(true);
 
   const root = await mkdtemp(join(tmpdir(), "agent-driver-opencode-acp-contract-"));
@@ -184,7 +184,7 @@ test("OpenCode creates a session after unadvertised additional directories are d
       runtime: "acp-fallback",
       runtimeTransport: "acp-fallback",
     };
-    const setup = await requestWithTimeout(connection, "OpenCode ACP session/new", () =>
+    await expect(
       setupAcpSession({
         agentCapabilities: initialize.agentCapabilities ?? null,
         connection: connection.agent,
@@ -193,11 +193,7 @@ test("OpenCode creates a session after unadvertised additional directories are d
         sessionContext,
         replaySession: async (operation) => operation(),
       }),
-    );
-
-    expect(setup.mode).toBe("created");
-    expect(setup.sessionId.trim().length).toBeGreaterThan(0);
-    expect(setup.droppedAdditionalDirectories).toEqual([additionalDirectory]);
+    ).rejects.toThrow("does not advertise additionalDirectories support");
   } finally {
     await stopOpenCode(connection, child, closed);
     await rm(root, { force: true, recursive: true });

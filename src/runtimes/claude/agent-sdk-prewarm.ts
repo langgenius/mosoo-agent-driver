@@ -21,6 +21,7 @@ export interface ClaudeAgentSdkPrewarmOptions {
   readonly createQueryOptions: typeof createClaudeQueryOptions;
   readonly getNativeSessionId: () => string | null;
   readonly payload: DriverStartInput;
+  readonly publicToolCallId: (nativeToolCallId: string) => string;
   readonly startup: (input: {
     options: Awaited<ReturnType<typeof createClaudeQueryOptions>>;
   }) => Promise<WarmQuery>;
@@ -41,6 +42,7 @@ export class ClaudeAgentSdkPrewarm {
   readonly #createQueryOptions: typeof createClaudeQueryOptions;
   readonly #getNativeSessionId: () => string | null;
   readonly #payload: DriverStartInput;
+  readonly #publicToolCallId: (nativeToolCallId: string) => string;
   readonly #startup: ClaudeAgentSdkPrewarmOptions["startup"];
   #failure: { readonly error: unknown } | null = null;
   #state: ClaudePrewarmState | null = null;
@@ -51,6 +53,7 @@ export class ClaudeAgentSdkPrewarm {
     this.#createQueryOptions = options.createQueryOptions;
     this.#getNativeSessionId = options.getNativeSessionId;
     this.#payload = options.payload;
+    this.#publicToolCallId = options.publicToolCallId;
     this.#startup = options.startup;
   }
 
@@ -163,6 +166,7 @@ export class ClaudeAgentSdkPrewarm {
         payload: this.#payload,
         permissionTasks: state.permissionTasks,
         processTasks: state.processTasks,
+        publicToolCallId: this.#publicToolCallId,
       });
 
       if (this.#stopped || abortController.signal.aborted || this.#state !== state) {

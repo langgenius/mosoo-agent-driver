@@ -2,6 +2,7 @@ import type { StopReason } from "@agentclientprotocol/sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
+import { chunkJsonText } from "../provider-json";
 import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 import { toPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
@@ -16,13 +17,21 @@ import {
   toUsageEvents,
 } from "./acp-session-events";
 import { AcpToolEventState, toRuntimeToolStatus } from "./acp-tool-events";
-import { isRecord, readNonEmptyString, readRecord, readString } from "./acp-types";
+import {
+  assertBoundedLosslessEvents,
+  isRecord,
+  MAX_ACP_LOSSLESS_EVENT_BYTES,
+  readNonEmptyString,
+  readRecord,
+  readString,
+} from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
-export interface AcpTurnEventStateInput {
+const MAX_ACP_MESSAGE_EVENT_TEXT_BYTES = MAX_ACP_LOSSLESS_EVENT_BYTES - 1_024;
+
+export interface AcpAssistantTranscriptStateInput {
   readonly messageId: string;
   readonly runId: RunId;
-  readonly sessionId: string;
 }
 
 interface AcpAssistantMessageState {
@@ -43,7 +52,6 @@ export class AcpAssistantTranscriptState {
   #promptMessageId: string | null = null;
   #runId: RunId | null = null;
   #sequence = 0;
-  #sessionId: string | null = null;
   readonly #settledAssistantNativeMessageIds = new Set<string>();
   #unidentifiedAssistantMessageSequence = 0;
   #thoughtCompleted = false;
@@ -57,14 +65,13 @@ export class AcpAssistantTranscriptState {
     return this.#runId;
   }
 
-  begin(input: AcpTurnEventStateInput): void {
+  begin(input: AcpAssistantTranscriptStateInput): void {
     this.#activeAssistantMessage = null;
     this.#assistantMessageIds.reset();
     this.#lastCompletedAssistantMessage = null;
     this.#promptMessageId = input.messageId;
     this.#runId = input.runId;
     this.#sequence = 0;
-    this.#sessionId = input.sessionId;
     this.#settledAssistantNativeMessageIds.clear();
     this.#unidentifiedAssistantMessageSequence = 0;
     this.#thoughtCompleted = false;
@@ -82,7 +89,6 @@ export class AcpAssistantTranscriptState {
     this.#promptMessageId = null;
     this.#runId = null;
     this.#sequence = 0;
-    this.#sessionId = null;
     this.#settledAssistantNativeMessageIds.clear();
     this.#unidentifiedAssistantMessageSequence = 0;
     this.#thoughtCompleted = false;
@@ -93,33 +99,79 @@ export class AcpAssistantTranscriptState {
     this.#tools.clear();
   }
 
+  checkpoint(): () => void {
+    const activeAssistantMessage =
+      this.#activeAssistantMessage === null ? null : { ...this.#activeAssistantMessage };
+    const lastCompletedAssistantMessage =
+      this.#lastCompletedAssistantMessage === null
+        ? null
+        : { ...this.#lastCompletedAssistantMessage };
+    const sequence = this.#sequence;
+    const settledAssistantNativeMessageIds = new Set(this.#settledAssistantNativeMessageIds);
+    const thoughtCompleted = this.#thoughtCompleted;
+    const thoughtFallbackNativeMessageId = this.#thoughtFallbackNativeMessageId;
+    const thoughtFallbackText = this.#thoughtFallbackText;
+    const thoughtStarted = this.#thoughtStarted;
+    const unidentifiedAssistantMessageSequence = this.#unidentifiedAssistantMessageSequence;
+    const restoreTools = this.#tools.checkpoint();
+
+    return () => {
+      this.#activeAssistantMessage = activeAssistantMessage;
+      this.#lastCompletedAssistantMessage = lastCompletedAssistantMessage;
+      this.#sequence = sequence;
+      this.#settledAssistantNativeMessageIds.clear();
+      settledAssistantNativeMessageIds.forEach((id) =>
+        this.#settledAssistantNativeMessageIds.add(id),
+      );
+      this.#thoughtCompleted = thoughtCompleted;
+      this.#thoughtFallbackNativeMessageId = thoughtFallbackNativeMessageId;
+      this.#thoughtFallbackText = thoughtFallbackText;
+      this.#thoughtStarted = thoughtStarted;
+      this.#unidentifiedAssistantMessageSequence = unidentifiedAssistantMessageSequence;
+      restoreTools();
+    };
+  }
+
   completePrompt(stopReason: StopReason, usage: unknown): DriverEventInput[] {
     const events: DriverEventInput[] = [];
     const runId = this.#requireRunId();
+    const terminalError =
+      stopReason === "end_turn" || stopReason === "cancelled"
+        ? null
+        : `ACP prompt stopped with ${stopReason}.`;
 
     events.push(...this.#promoteThought());
-    events.push(...this.#finishMessage());
+    events.push(
+      ...(stopReason === "end_turn"
+        ? this.#finishMessage()
+        : this.#finishMessageWithOutcome(stopReason, terminalError)),
+    );
 
     if (this.#thoughtStarted && !this.#thoughtCompleted) {
       this.#thoughtCompleted = true;
       events.push({
-        kind: "thought.completed",
+        kind: stopReason === "end_turn" ? "thought.completed" : "thought.cancelled",
         payload: {
           channel: "summary",
+          ...(stopReason === "end_turn"
+            ? {}
+            : { reason: terminalError ?? "cancelled", stopReason }),
           thoughtId: this.#requireThoughtId(),
         },
         runId,
       });
     }
 
-    const toolStatus = stopReason === "cancelled" ? "failed" : "completed";
-    const toolError =
-      stopReason === "cancelled" ? "Turn cancelled before tool completion." : undefined;
     events.push(
       ...this.#tools.completeOpen({
+        ...(terminalError === null ? {} : { error: terminalError }),
         runId,
-        status: toolStatus,
-        ...(toolError === undefined ? {} : { error: toolError }),
+        status:
+          stopReason === "end_turn"
+            ? "completed"
+            : stopReason === "cancelled"
+              ? "cancelled"
+              : "failed",
       }),
     );
 
@@ -148,6 +200,19 @@ export class AcpAssistantTranscriptState {
         },
         runId,
       });
+    } else if (terminalError !== null) {
+      events.push({
+        kind: "run.failed",
+        payload: {
+          error: {
+            code: `acp.${stopReason}`,
+            message: terminalError,
+          },
+          recoverable: false,
+          stopReason,
+        },
+        runId,
+      });
     } else if (emptyTurn) {
       events.push({
         kind: "run.failed",
@@ -169,7 +234,6 @@ export class AcpAssistantTranscriptState {
             ? {}
             : {
                 finalMessageId: finalMessage.id,
-                finalMessageText: finalMessage.text,
               }),
           stopReason,
         },
@@ -177,8 +241,7 @@ export class AcpAssistantTranscriptState {
       });
     }
 
-    this.clear();
-    return events;
+    return assertBoundedLosslessEvents(events);
   }
 
   failPrompt(error: { code: string; message: string; recoverable?: boolean }): DriverEventInput[] {
@@ -189,16 +252,23 @@ export class AcpAssistantTranscriptState {
       return [];
     }
 
+    const originalMessageUtf8Bytes = Buffer.byteLength(error.message, "utf8");
+    const message =
+      originalMessageUtf8Bytes <= 16 * 1_024
+        ? error.message
+        : `ACP failure exceeded durable event capacity (originalMessageUtf8Bytes=${originalMessageUtf8Bytes}).`;
     const events: DriverEventInput[] = [];
     const thoughtId = this.#thoughtId;
 
-    events.push(...this.#finishMessage());
+    events.push(...this.#failMessage({ ...error, message }));
 
     if (this.#thoughtStarted && !this.#thoughtCompleted && thoughtId !== null) {
+      this.#thoughtCompleted = true;
       events.push({
-        kind: "thought.completed",
+        kind: "thought.cancelled",
         payload: {
           channel: "summary",
+          reason: message,
           thoughtId,
         },
         runId,
@@ -207,7 +277,7 @@ export class AcpAssistantTranscriptState {
 
     events.push(
       ...this.#tools.completeOpen({
-        error: error.message,
+        error: message,
         runId,
         status: "failed",
       }),
@@ -218,15 +288,15 @@ export class AcpAssistantTranscriptState {
       payload: {
         error: {
           code: error.code,
-          message: error.message,
+          ...(message === error.message ? {} : { details: { originalMessageUtf8Bytes } }),
+          message,
         },
         recoverable: error.recoverable ?? false,
       },
       runId,
     });
 
-    this.clear();
-    return events;
+    return assertBoundedLosslessEvents(events);
   }
 
   translateUpdate(params: unknown): DriverEventInput[] {
@@ -234,43 +304,56 @@ export class AcpAssistantTranscriptState {
     const update = readRecord(record, "update");
     const sessionUpdate = readString(update, "sessionUpdate");
 
+    let events: DriverEventInput[];
+
     switch (sessionUpdate) {
       case "agent_message_chunk": {
-        return this.#messageChunk(update);
+        events = this.#messageChunk(update);
+        break;
       }
       case "agent_thought_chunk": {
-        return this.#thoughtChunk(update);
+        events = this.#thoughtChunk(update);
+        break;
       }
       case "available_commands_update": {
-        return toCommandEvents(update);
+        events = toCommandEvents(update);
+        break;
       }
       case "config_option_update": {
-        return toConfigEvents(update);
+        events = toConfigEvents(update);
+        break;
       }
       case "current_mode_update": {
-        return toModeEvents(update);
+        events = toModeEvents(update);
+        break;
       }
       case "plan": {
-        return toPlanEvents(update);
+        events = toPlanEvents(update);
+        break;
       }
       case "session_info_update": {
-        return toInfoEvents(update);
+        events = toInfoEvents(update);
+        break;
       }
       case "tool_call":
       case "tool_call_update": {
-        return this.#tool(update, sessionUpdate);
+        events = this.#tool(update, sessionUpdate);
+        break;
       }
       case "usage_update": {
-        return toUsageEvents(update);
+        events = toUsageEvents(update);
+        break;
       }
       case "user_message_chunk":
       case undefined:
       case null: {
-        return [];
+        events = [];
+        break;
       }
       default: {
-        return [
+        events = [
           {
+            delivery: "best_effort",
             kind: "diagnostic.reported",
             payload: {
               message: `Unsupported ACP session update: ${sessionUpdate}.`,
@@ -280,8 +363,11 @@ export class AcpAssistantTranscriptState {
             visibility: "owner_debug",
           },
         ];
+        break;
       }
     }
+
+    return assertBoundedLosslessEvents(events);
   }
 
   translatePermission(input: { params: unknown; requestId: string }): AcpPermissionTranslation {
@@ -293,7 +379,10 @@ export class AcpAssistantTranscriptState {
     });
 
     if (runId === null || translation.toolCall === null) {
-      return translation;
+      return {
+        ...translation,
+        events: assertBoundedLosslessEvents(translation.events),
+      };
     }
 
     this.#tools.patch({
@@ -304,22 +393,22 @@ export class AcpAssistantTranscriptState {
 
     return {
       ...translation,
-      events: [
+      events: assertBoundedLosslessEvents([
         ...this.#ensureToolParentMessage(translation.targetItemId),
         ...this.#tools.ensureStarted({
           parentMessageId: this.#toolParentMessageId(),
           runId,
-          title: translation.title,
+          title: translation.request.title,
           toolCallId: translation.targetItemId,
         }),
         ...translation.events,
-      ],
+      ]),
     };
   }
 
   #nextEventId(kind: string): string {
     this.#sequence += 1;
-    return `acp:${this.#sessionId ?? "session"}:${this.#runId ?? "run"}:${kind}:${this.#sequence}`;
+    return `acp:${this.#runId ?? "run"}:${kind}:${this.#sequence}`;
   }
 
   #messageChunk(update: JsonObject | null): DriverEventInput[] {
@@ -494,24 +583,7 @@ export class AcpAssistantTranscriptState {
     }
 
     started.message.text += contentDelta;
-    return [
-      ...started.events,
-      {
-        delivery: "best_effort",
-        kind: "message.delta",
-        payload: {
-          contentBlock: {
-            text: contentDelta,
-            type: "text",
-          },
-          contentDelta,
-          messageId: started.message.id,
-          role: "agent",
-        },
-        runId: this.#requireRunId(),
-        sourceEventId: this.#nextEventId("agent-thought-fallback-message"),
-      },
-    ];
+    return started.events;
   }
 
   #clearThoughtFallback(): void {
@@ -541,10 +613,116 @@ export class AcpAssistantTranscriptState {
       this.#lastCompletedAssistantMessage = null;
     }
 
+    const chunks =
+      message.text.length === 0
+        ? []
+        : chunkJsonText(message.text, MAX_ACP_MESSAGE_EVENT_TEXT_BYTES);
+
     return [
+      ...(chunks.length === 0
+        ? []
+        : [
+            {
+              delivery: "lossless" as const,
+              kind: "message.added" as const,
+              payload: {
+                content: chunks[0]!,
+                messageId: message.id,
+                role: "agent",
+              },
+              runId: this.#requireRunId(),
+            },
+          ]),
+      ...chunks.slice(1).map((contentDelta): DriverEventInput => ({
+        delivery: "lossless",
+        kind: "message.delta",
+        payload: {
+          contentDelta,
+          messageId: message.id,
+          role: "agent",
+        },
+        runId: this.#requireRunId(),
+      })),
       {
         kind: "message.completed",
         payload: {
+          messageId: message.id,
+          role: "agent",
+        },
+        runId: this.#requireRunId(),
+      },
+    ];
+  }
+
+  #finishMessageWithOutcome(stopReason: StopReason, error: string | null): DriverEventInput[] {
+    const message = this.#activeAssistantMessage;
+
+    if (message === null) {
+      return [];
+    }
+
+    this.#activeAssistantMessage = null;
+    this.#lastCompletedAssistantMessage = null;
+
+    if (message.nativeMessageId !== null) {
+      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+    }
+
+    if (stopReason === "cancelled") {
+      return [
+        {
+          kind: "message.cancelled",
+          payload: { messageId: message.id, reason: "cancelled", role: "agent", stopReason },
+          runId: this.#requireRunId(),
+        },
+      ];
+    }
+
+    return [
+      {
+        kind: "message.failed",
+        payload: {
+          error: {
+            code: `acp.${stopReason}`,
+            message: error ?? `ACP prompt stopped with ${stopReason}.`,
+            retryable: false,
+          },
+          messageId: message.id,
+          role: "agent",
+          stopReason,
+        },
+        runId: this.#requireRunId(),
+      },
+    ];
+  }
+
+  #failMessage(error: {
+    readonly code: string;
+    readonly message: string;
+    readonly recoverable?: boolean;
+  }): DriverEventInput[] {
+    const message = this.#activeAssistantMessage;
+
+    if (message === null) {
+      return [];
+    }
+
+    this.#activeAssistantMessage = null;
+    this.#lastCompletedAssistantMessage = null;
+
+    if (message.nativeMessageId !== null) {
+      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+    }
+
+    return [
+      {
+        kind: "message.failed",
+        payload: {
+          error: {
+            code: error.code,
+            message: error.message,
+            retryable: error.recoverable ?? false,
+          },
           messageId: message.id,
           role: "agent",
         },

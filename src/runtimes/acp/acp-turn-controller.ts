@@ -16,7 +16,8 @@ import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
 import type { AcpClientRequestHandler } from "./acp-client-request-handler";
 import { toRequestMeta } from "./acp-configuration";
-import { AcpTurnEventState, toPromptStartEvents } from "./acp-event-translator";
+import { AcpAssistantTranscriptState } from "./acp-assistant-transcript-state";
+import { toPromptStartEvents } from "./acp-session-events";
 
 interface ActiveAcpTurn {
   readonly cancellation: AbortController;
@@ -30,6 +31,7 @@ interface ActiveAcpTurn {
   providerPromptAdmitted: boolean;
   readonly providerPromptSettled: ReturnType<typeof Promise.withResolvers<boolean>>;
   readonly runId: RunId;
+  readonly terminalTurn: number;
   terminalStarted: boolean;
 }
 
@@ -86,20 +88,31 @@ export type AcpTurnEventPush = (
   events: DriverEventInput[],
 ) => Promise<void>;
 
+export type AcpTurnTerminalPush = (
+  context: AgentDriverContext,
+  reason: string,
+  closures: readonly DriverEventInput[],
+  terminal: DriverEventInput,
+) => Promise<void>;
+
 export type AcpCancelledTurnBarrier = (context: AgentDriverContext) => Promise<void>;
 
 export class AcpTurnController {
   #active: ActiveAcpTurn | null = null;
   readonly #cancelledTurnBarrier: AcpCancelledTurnBarrier;
-  readonly events = new AcpTurnEventState();
+  readonly events = new AcpAssistantTranscriptState();
   readonly #push: AcpTurnEventPush;
+  readonly #pushTerminal: AcpTurnTerminalPush;
 
   constructor(
     push: AcpTurnEventPush,
     cancelledTurnBarrier: AcpCancelledTurnBarrier = async () => {},
+    pushTerminal: AcpTurnTerminalPush = async (context, reason, closures, terminal) =>
+      push(context, reason, [...closures, terminal]),
   ) {
     this.#push = push;
     this.#cancelledTurnBarrier = cancelledTurnBarrier;
+    this.#pushTerminal = pushTerminal;
   }
 
   isCancelling(): boolean {
@@ -155,10 +168,11 @@ export class AcpTurnController {
       providerPromptAdmitted: false,
       providerPromptSettled: Promise.withResolvers<boolean>(),
       runId,
+      terminalTurn: clientRequests.beginTurnTerminals(),
       terminalStarted: false,
     };
     this.#active = active;
-    this.events.begin({ messageId, runId, sessionId });
+    this.events.begin({ messageId, runId });
     const onAbort = () =>
       requestCancellation(
         active,
@@ -173,6 +187,7 @@ export class AcpTurnController {
     clientRequests.openPermissionIngress();
     clientRequests.openTurnUpdateIngress();
     let drainTask: Promise<void> | null = null;
+    let preserveEventState = false;
     const drain = async () => {
       try {
         await (drainTask ??= drainTurnWork(clientRequests, active.drainCancellation.signal));
@@ -186,6 +201,26 @@ export class AcpTurnController {
 
         drainTask = drainTurnWork(clientRequests);
         await drainTask;
+      }
+    };
+    const publishTerminal = async (
+      reason: string | ((events: readonly DriverEventInput[]) => string),
+      prepare: () => DriverEventInput[],
+    ): Promise<DriverEventInput[]> => {
+      const restore = this.events.checkpoint();
+
+      try {
+        const events = prepare();
+        await this.#pushTerminalEvents(
+          context,
+          typeof reason === "string" ? reason : reason(events),
+          events,
+        );
+        return events;
+      } catch (error) {
+        restore();
+        preserveEventState = true;
+        throw error;
       }
     };
 
@@ -215,9 +250,7 @@ export class AcpTurnController {
           active.cancellationReason ?? "ACP driver backend turn was cancelled.",
         );
         active.terminalStarted = true;
-        await this.#push(
-          context,
-          "driver.acp.prompt.cancelled",
+        await publishTerminal("driver.acp.prompt.cancelled", () =>
           this.events.completePrompt("cancelled", null),
         );
         throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
@@ -242,21 +275,19 @@ export class AcpTurnController {
       const stopReason = active.cancelRequested ? "cancelled" : promptResult.stopReason;
       const promptCancelled = active.cancelRequested || promptResult.stopReason === "cancelled";
       if (promptCancelled) {
-        await this.#crossCancelledTurnBarrier(context, active);
+        await this.#crossCancelledTurnBarrier(context, active, clientRequests);
       }
-      const completionEvents = this.events.completePrompt(stopReason, promptResult.usage);
-      const promptFailed = completionEvents.some((event) => event.kind === "run.failed");
-
       active.terminalStarted = true;
-      await this.#push(
-        context,
-        promptCancelled
-          ? "driver.acp.prompt.cancelled"
-          : promptFailed
-            ? "driver.acp.prompt.failed"
-            : "driver.acp.prompt.completed",
-        completionEvents,
+      const completionEvents = await publishTerminal(
+        (events) =>
+          promptCancelled
+            ? "driver.acp.prompt.cancelled"
+            : events.some((event) => event.kind === "run.failed")
+              ? "driver.acp.prompt.failed"
+              : "driver.acp.prompt.completed",
+        () => this.events.completePrompt(stopReason, promptResult.usage),
       );
+      const promptFailed = completionEvents.some((event) => event.kind === "run.failed");
       context.logger.info(
         promptFailed ? "driver.acp.prompt.failed" : "driver.acp.prompt.completed",
         { sessionId, stopReason: promptResult.stopReason },
@@ -273,12 +304,23 @@ export class AcpTurnController {
       active.providerPromptSettled.resolve(active.providerPromptAdmitted && active.cancelRequested);
       clientRequests.closePermissionIngress();
       clientRequests.closeTurnUpdateIngress();
+      if (preserveEventState) {
+        throw error;
+      }
       const fatal = readFatal(active);
       const fatalCleanup =
         fatal === null
           ? null
           : Promise.allSettled([fatal.cleanup, clientRequests.stopTerminals(context)]);
-      await drain();
+      let catchDrainError: unknown = null;
+      try {
+        await drain();
+      } catch (drainError) {
+        catchDrainError = drainError;
+        context.logger.warn("driver.acp.prompt.drain.failed", {
+          message: drainError instanceof Error ? drainError.message : "ACP turn drain failed.",
+        });
+      }
 
       if (fatal !== null && fatalCleanup !== null) {
         const cleanupResults = await fatalCleanup;
@@ -291,9 +333,7 @@ export class AcpTurnController {
         }
 
         active.terminalStarted = true;
-        await this.#push(
-          context,
-          "driver.acp.provider.failed",
+        await publishTerminal("driver.acp.provider.failed", () =>
           this.events.failPrompt({
             code: "acp.provider_failed",
             message: fatal.error.message,
@@ -302,15 +342,23 @@ export class AcpTurnController {
         throw fatal.error;
       }
 
+      if (catchDrainError !== null) {
+        const message =
+          catchDrainError instanceof Error ? catchDrainError.message : "ACP turn drain failed.";
+        active.terminalStarted = true;
+        await publishTerminal("driver.acp.prompt.failed", () =>
+          this.events.failPrompt({ code: "acp.turn_drain_failed", message }),
+        );
+        throw catchDrainError;
+      }
+
       if (error instanceof DriverTurnCancelledError || error instanceof AcpPromptTerminalError) {
         throw error;
       }
 
       if (error instanceof DriverTurnCancellationCleanupError) {
         active.terminalStarted = true;
-        await this.#push(
-          context,
-          "driver.acp.prompt.failed",
+        await publishTerminal("driver.acp.prompt.failed", () =>
           this.events.failPrompt({
             code: "acp.cancel_cleanup_failed",
             message: error.message,
@@ -321,12 +369,10 @@ export class AcpTurnController {
 
       if (active.cancelRequested) {
         try {
-          await this.#crossCancelledTurnBarrier(context, active);
+          await this.#crossCancelledTurnBarrier(context, active, clientRequests);
         } catch (cleanupError) {
           active.terminalStarted = true;
-          await this.#push(
-            context,
-            "driver.acp.prompt.failed",
+          await publishTerminal("driver.acp.prompt.failed", () =>
             this.events.failPrompt({
               code: "acp.cancel_cleanup_failed",
               message:
@@ -337,18 +383,16 @@ export class AcpTurnController {
           );
           throw cleanupError;
         }
-        const events =
-          this.events.activeRunId() === null ? [] : this.events.completePrompt("cancelled", null);
         active.terminalStarted = true;
-        await this.#push(context, "driver.acp.prompt.cancelled", events);
+        await publishTerminal("driver.acp.prompt.cancelled", () =>
+          this.events.activeRunId() === null ? [] : this.events.completePrompt("cancelled", null),
+        );
         throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
       }
 
       const message = error instanceof Error ? error.message : "ACP driver backend turn failed.";
       active.terminalStarted = true;
-      await this.#push(
-        context,
-        "driver.acp.prompt.failed",
+      await publishTerminal("driver.acp.prompt.failed", () =>
         this.events.failPrompt({ code: "acp.turn_failed", message }),
       );
       throw error;
@@ -361,7 +405,9 @@ export class AcpTurnController {
       signal?.removeEventListener("abort", onAbort);
       active.providerPromptSettled.resolve(false);
       this.#active = null;
-      this.events.clear();
+      if (!preserveEventState) {
+        this.events.clear();
+      }
     }
   }
 
@@ -408,16 +454,41 @@ export class AcpTurnController {
     ]));
   }
 
-  async #crossCancelledTurnBarrier(
+  async #pushTerminalEvents(
     context: AgentDriverContext,
-    active: ActiveAcpTurn,
+    reason: string,
+    events: DriverEventInput[],
   ): Promise<void> {
-    if (!active.providerPromptAdmitted) {
+    if (events.length === 0) {
+      await this.#push(context, reason, events);
       return;
     }
 
+    const terminal = events.at(-1)!;
+
+    if (
+      terminal.kind !== "run.cancelled" &&
+      terminal.kind !== "run.completed" &&
+      terminal.kind !== "run.failed"
+    ) {
+      throw new Error("ACP terminal event batch must end with a run terminal.");
+    }
+
+    await this.#pushTerminal(context, reason, events.slice(0, -1), terminal);
+  }
+
+  async #crossCancelledTurnBarrier(
+    context: AgentDriverContext,
+    active: ActiveAcpTurn,
+    clientRequests: AcpClientRequestHandler,
+  ): Promise<void> {
     try {
-      await (active.cancellationBarrier ??= this.#cancelledTurnBarrier(context));
+      await (active.cancellationBarrier ??= (async () => {
+        await clientRequests.stopTurnTerminals(context, active.terminalTurn);
+        if (active.providerPromptAdmitted) {
+          await this.#cancelledTurnBarrier(context);
+        }
+      })());
     } catch (error) {
       throw new DriverTurnCancellationCleanupError(
         `ACP cancelled turn process recycle failed: ${

@@ -34,8 +34,10 @@ import {
   requireEnumValue,
   requireNonNegativeInt,
   requireNullableTimestamp,
+  requireOptionalBoolean,
   requireOptionalContentString,
   requireOptionalEnumValue,
+  requireOptionalJsonValue,
   requireOptionalNullableString,
   requireOptionalString,
   requireOptionalStringArray,
@@ -102,7 +104,7 @@ const runStatuses = new Set<string>([
   "running",
   "waiting_input",
 ]);
-const toolStatuses = new Set<string>(["completed", "failed", "running"]);
+const toolStatuses = new Set<string>(["cancelled", "completed", "failed", "running"]);
 const fileChangeKinds = new Set<string>(["delete", "upsert"]);
 export { isRuntimeEventRecord } from "./runtime-event-validation";
 
@@ -336,6 +338,16 @@ function admitRuntimeEventPayload(
   payload: unknown,
 ): unknown {
   switch (context.kind) {
+    case "agent.task.updated": {
+      const record = requirePayloadRecord(context.kind, payload);
+      requireString(record, "taskId", context.kind);
+      requireOptionalBoolean(record, "active", context.kind);
+      requireOptionalEnumValue(record, "status", toolStatuses, context.kind);
+      for (const field of ["activityKind", "agentId", "agentPath", "taskType", "title"]) {
+        requireOptionalString(record, field, context.kind);
+      }
+      return omitPayloadIdentity(record);
+    }
     case "diagnostic.reported": {
       const record = requirePayloadRecord(context.kind, payload);
       requireOptionalString(record, "code", context.kind);
@@ -369,11 +381,26 @@ function admitRuntimeEventPayload(
       }
 
       requireOptionalString(record, "messageId", context.kind);
+      requireOptionalEnumValue(
+        record,
+        "level",
+        new Set(["info", "notice", "suggestion", "warning"]),
+        context.kind,
+      );
+      requireOptionalBoolean(record, "preventContinuation", context.kind);
       requireOptionalEnumValue(record, "role", new Set(["agent", "user"]), context.kind);
+      requireOptionalString(record, "subtype", context.kind);
+      requireOptionalString(record, "toolCallId", context.kind);
+
+      requireOptionalEnumValue(record, "phase", new Set(["commentary", "final"]), context.kind);
+      requireOptionalJsonValue(record, "memoryCitation", context.kind);
+
       return omitPayloadIdentity(record);
     }
+    case "message.cancelled":
     case "message.completed":
     case "message.started":
+    case "thought.cancelled":
     case "thought.completed":
     case "thought.started": {
       const record = requirePayloadRecord(context.kind, payload);
@@ -381,6 +408,14 @@ function admitRuntimeEventPayload(
       requireOptionalString(record, "thoughtId", context.kind);
       requireOptionalEnumValue(record, "role", new Set(["agent", "user"]), context.kind);
       return omitPayloadIdentity(record);
+    }
+    case "message.failed": {
+      const record = requirePayloadRecord(context.kind, payload);
+      requireString(record, "messageId", context.kind);
+      requireOptionalEnumValue(record, "role", new Set(["agent", "user"]), context.kind);
+      const admitted = omitPayloadIdentity(record);
+      admitted["error"] = readRunError(context.kind, record["error"], "error");
+      return admitted;
     }
     case "thought.delta": {
       const record = requirePayloadRecord(context.kind, payload);
@@ -404,8 +439,23 @@ function admitRuntimeEventPayload(
       const record = requirePayloadRecord(context.kind, payload);
       requireString(record, "requestId", context.kind);
       requireString(record, "title", context.kind);
+      requireOptionalString(record, "agentId", context.kind);
+      requireOptionalString(record, "blockedPath", context.kind);
+      requireOptionalString(record, "decisionReason", context.kind);
+      requireOptionalString(record, "description", context.kind);
       requireOptionalNullableString(record, "details", context.kind);
       requireOptionalNullableString(record, "targetItemId", context.kind);
+
+      if (record["matchedAskRule"] !== undefined) {
+        const matchedAskRule = requirePayloadRecord(
+          context.kind,
+          record["matchedAskRule"],
+          "matchedAskRule",
+        );
+        requireString(matchedAskRule, "source", context.kind);
+        requireString(matchedAskRule, "toolName", context.kind);
+        requireOptionalString(matchedAskRule, "ruleContent", context.kind);
+      }
 
       if (
         "options" in record &&
@@ -429,6 +479,14 @@ function admitRuntimeEventPayload(
       requireString(record, "outcome", context.kind);
       requireOptionalString(record, "optionId", context.kind);
       requireOptionalString(record, "optionKind", context.kind);
+      return omitPayloadIdentity(record);
+    }
+    case "session.info.updated": {
+      const record = requirePayloadRecord(context.kind, payload);
+      requireOptionalNullableString(record, "title", context.kind);
+      if (record["updatedAt"] !== undefined) {
+        requireNullableTimestamp(record, "updatedAt", context.kind, "updatedAt");
+      }
       return omitPayloadIdentity(record);
     }
     case "run.cancel.requested":
@@ -466,12 +524,19 @@ function admitRuntimeEventPayload(
       requireEnumValue(record, "status", toolStatuses, context.kind);
       requireString(record, "toolCallId", context.kind);
       requireOptionalContentString(record, "content", context.kind);
+      requireOptionalString(record, "agentId", context.kind);
+      requireOptionalString(record, "decisionReason", context.kind);
+      requireOptionalString(record, "decisionReasonType", context.kind);
       requireOptionalString(record, "kind", context.kind);
       requireOptionalString(record, "messageId", context.kind);
+      requireOptionalString(record, "name", context.kind);
+      requireOptionalString(record, "nonExecutionKind", context.kind);
       requireOptionalString(record, "parentMessageId", context.kind);
       requireOptionalString(record, "rawInput", context.kind);
       requireOptionalString(record, "rawOutput", context.kind);
+      requireOptionalJsonValue(record, "structuredOutput", context.kind);
       requireOptionalNullableString(record, "title", context.kind);
+      requireOptionalString(record, "userFeedback", context.kind);
       return omitPayloadIdentity(record);
     }
     default: {
@@ -503,6 +568,7 @@ function readRunPayload(
   requireOptionalString(record, "targetRunId", context.kind);
   requireOptionalString(record, "userMessageId", context.kind);
   requireOptionalStringArray(record, "inputItemIds", context.kind);
+  requireOptionalJsonValue(record, "structuredOutput", context.kind);
   requireOptionalTimestamp(record, "completedAt", context.kind);
   requireOptionalTimestamp(record, "startedAt", context.kind);
 

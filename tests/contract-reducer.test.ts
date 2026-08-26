@@ -239,11 +239,13 @@ describe("contract authority reducer", () => {
   });
 
   test.each([
-    ["decreases", { input: 9, total: 10 }],
-    ["drops a field", { total: 10 }],
+    ["decreases", { cachedWrite: 10, input: 9, total: 10 }],
+    ["drops a field", { cachedWrite: 10, total: 10 }],
+    ["decreases cached writes", { cachedWrite: 9, input: 10, total: 10 }],
+    ["drops cached writes", { input: 10, total: 10 }],
   ])("rejects cumulative Run usage that %s", (_name, usage) => {
     const initial = snapshot();
-    const run = { ...activeRun(), usage: { input: 10, total: 10 } };
+    const run = { ...activeRun(), usage: { cachedWrite: 10, input: 10, total: 10 } };
     const running = applyCommittedMutation(
       initial,
       mutation(initial, [{ entity: "run", op: "put", value: run }]),

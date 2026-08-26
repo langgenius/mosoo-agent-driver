@@ -47,7 +47,7 @@ const PROVIDERS = [
     capabilities: [
       ...TEXT_TOOL_CAPABILITIES,
       { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "unsupported", version: 1 },
+      { id: "thinking_stream", status: "supported", version: 1 },
     ],
     createBackend: (payload) => new OpenAiAppServerDriverBackend(payload),
     id: "openai-app-server",

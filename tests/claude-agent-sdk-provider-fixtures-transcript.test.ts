@@ -8,6 +8,7 @@ import type { RunId } from "../src/protocol/id";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
+import { isRecord, messageText } from "./claude-agent-sdk-test-helpers";
 import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 interface EventBatch {
@@ -15,13 +16,10 @@ interface EventBatch {
   readonly reason: string;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function createHarness() {
+function createHarness(publicToolCallId: (nativeToolCallId: string) => string = (id) => id) {
   const batches: EventBatch[] = [];
   const nativeSessionIds: string[] = [];
+  const nativeSessionResets: Array<readonly [string, string]> = [];
   const logger = createBufferedSinkLogger({
     level: "debug",
     service: "claude-agent-sdk-provider-fixtures-test",
@@ -29,6 +27,7 @@ function createHarness() {
   });
   const context: AgentDriverContext = createAgentDriverContext({
     eventSink: {
+      currentRunId: () => "run-1" as RunId,
       pushEvents: async () => ({ accepted: [] }),
     },
     logger,
@@ -38,11 +37,18 @@ function createHarness() {
     },
   });
   const translator = new ClaudeAgentSdkMessageTranslator({
+    publicToolCallId,
     push: async (_context, reason, events) => {
       batches.push({ events, reason });
     },
+    pushTerminal: async (_context, reason, closures, terminal) => {
+      batches.push({ events: [...closures, terminal], reason });
+    },
     recordNativeSessionId: async (_context, sessionId) => {
       nativeSessionIds.push(sessionId);
+    },
+    replaceNativeSessionId: async (_context, previousSessionId, nextSessionId) => {
+      nativeSessionResets.push([previousSessionId, nextSessionId]);
     },
   });
 
@@ -51,11 +57,370 @@ function createHarness() {
     events: () => batches.flatMap((batch) => batch.events),
     logger,
     nativeSessionIds,
+    nativeSessionResets,
     translator,
   };
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
+  test("projects visible task activity without leaking task internals", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        description: "Inspect the repository",
+        is_backgrounded: true,
+        prompt: "private task prompt",
+        session_id: "native-session-1",
+        subtype: "task_started",
+        task_id: "task-1",
+        task_type: "local_agent",
+        tool_use_id: "tool-1",
+        type: "system",
+        uuid: "task-started-1",
+      },
+      {
+        description: "Inspecting tests",
+        last_tool_name: "Read",
+        session_id: "native-session-1",
+        subtype: "task_progress",
+        summary: "private progress summary",
+        task_id: "task-1",
+        tool_use_id: "tool-1",
+        type: "system",
+        usage: { duration_ms: 10, tool_uses: 1, total_tokens: 50 },
+        uuid: "task-progress-1",
+      },
+      {
+        patch: { description: "Finalizing", error: "private task error", status: "running" },
+        session_id: "native-session-1",
+        subtype: "task_updated",
+        task_id: "task-1",
+        type: "system",
+        uuid: "task-updated-1",
+      },
+      {
+        output_file: "/tmp/private-task-output",
+        session_id: "native-session-1",
+        status: "completed",
+        subtype: "task_notification",
+        summary: "private terminal summary",
+        task_id: "task-1",
+        tool_use_id: "tool-1",
+        type: "system",
+        usage: { duration_ms: 25, tool_uses: 2, total_tokens: 100 },
+        uuid: "task-notification-1",
+      },
+      {
+        session_id: "native-session-1",
+        subtype: "background_tasks_changed",
+        tasks: [
+          {
+            description: "Inspect the repository",
+            task_id: "task-1",
+            task_type: "local_agent",
+          },
+          {
+            ambient: true,
+            description: "private ambient task",
+            task_id: "ambient-task",
+            task_type: "local_agent",
+          },
+        ],
+        type: "system",
+        uuid: "background-tasks-1",
+      },
+      {
+        session_id: "native-session-1",
+        subtype: "background_tasks_changed",
+        tasks: [],
+        type: "system",
+        uuid: "background-tasks-2",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const taskEvents = events().filter((event) => event.kind === "agent.task.updated");
+    expect(taskEvents).toHaveLength(2);
+    expect(taskEvents.at(0)).toMatchObject({
+      delivery: "lossless",
+      payload: {
+        active: true,
+        taskId: "task-1",
+        taskType: "local_agent",
+        title: "Inspect the repository",
+      },
+    });
+    expect(taskEvents.at(1)).toEqual({
+      delivery: "lossless",
+      kind: "agent.task.updated",
+      payload: { active: false, taskId: "task-1" },
+    });
+    expect(JSON.stringify(taskEvents)).not.toContain("private");
+    expect(events().filter((event) => event.kind === "diagnostic.reported")).toHaveLength(4);
+  });
+
+  test("closes visible tasks before the run terminal and resets them between turns", async () => {
+    const { context, events, logger, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        session_id: "native-session-1",
+        subtype: "background_tasks_changed",
+        tasks: [
+          {
+            description: "Inspect the repository",
+            task_id: "task-1",
+            task_type: "local_agent",
+          },
+        ],
+        type: "system",
+        uuid: "background-tasks-1",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await translator.handleSdkMessage(
+      context,
+      {
+        result: "",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+
+    const terminalIndex = events().findIndex((event) => event.kind === "run.completed");
+    expect(terminalIndex).toBeGreaterThan(0);
+    expect(events().slice(0, terminalIndex)).toContainEqual({
+      delivery: "lossless",
+      kind: "agent.task.updated",
+      payload: { active: false, taskId: "task-1" },
+    });
+
+    const beforeReset = events().length;
+    translator.resetTurnMessageState();
+    await translator.handleSdkMessage(
+      context,
+      {
+        session_id: "native-session-1",
+        subtype: "background_tasks_changed",
+        tasks: [
+          {
+            description: "Inspect the repository again",
+            task_id: "task-1",
+            task_type: "local_agent",
+          },
+        ],
+        type: "system",
+        uuid: "background-tasks-2",
+      } as unknown as SDKMessage,
+      "run-2" as RunId,
+    );
+    expect(events().slice(beforeReset)).toContainEqual({
+      delivery: "lossless",
+      kind: "agent.task.updated",
+      payload: {
+        active: true,
+        taskId: "task-1",
+        taskType: "local_agent",
+        title: "Inspect the repository again",
+      },
+    });
+    await logger.destroy();
+  });
+
+  test("projects informational, local command, mirror failure, and conversation reset frames", async () => {
+    const { context, events, logger, nativeSessionResets, translator } = createHarness();
+    const messages = [
+      {
+        content: "A stop hook blocked continuation.",
+        level: "warning",
+        prevent_continuation: true,
+        session_id: "native-session-1",
+        subtype: "informational",
+        tool_use_id: "tool-1",
+        type: "system",
+        uuid: "informational-1",
+      },
+      {
+        error: "Transcript mirror write failed.",
+        key: {
+          projectKey: "project-1",
+          sessionId: "native-session-1",
+          subpath: "events.jsonl",
+        },
+        session_id: "native-session-1",
+        subtype: "mirror_error",
+        type: "system",
+        uuid: "mirror-1",
+      },
+      {
+        new_conversation_id: "native-session-2",
+        session_id: "native-session-1",
+        type: "conversation_reset",
+        uuid: "reset-1",
+      },
+      {
+        content: "Local command output.",
+        session_id: "native-session-2",
+        subtype: "local_command_output",
+        type: "system",
+        uuid: "local-command-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "message.added",
+        payload: expect.objectContaining({
+          content: [{ text: "A stop hook blocked continuation.", type: "text" }],
+          level: "warning",
+          preventContinuation: true,
+          subtype: "informational",
+          toolCallId: "tool-1",
+        }),
+      }),
+    );
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "message.added",
+        payload: expect.objectContaining({
+          content: [{ text: "Local command output.", type: "text" }],
+          subtype: "local_command_output",
+        }),
+      }),
+    );
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        delivery: "best_effort",
+        kind: "diagnostic.reported",
+        payload: expect.objectContaining({
+          message: "Claude transcript mirror write failed.",
+          raw: {
+            errorBytes: 31,
+            kind: "claude.mirror_error",
+          },
+          severity: "error",
+        }),
+      }),
+    );
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "session.info.updated",
+        payload: expect.objectContaining({ title: null }),
+      }),
+    );
+    expect(nativeSessionResets).toEqual([["native-session-1", "native-session-2"]]);
+  });
+
+  test("cancels a truncated assistant frame", async () => {
+    const { context, events, logger, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        aborted: true,
+        message: { content: [{ text: "partial", type: "text" }] },
+        type: "assistant",
+        uuid: "assistant-aborted",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await logger.destroy();
+
+    const transcript = events();
+    expect(transcript).toContainEqual(
+      expect.objectContaining({
+        kind: "message.added",
+        payload: expect.objectContaining({ content: [{ text: "partial", type: "text" }] }),
+      }),
+    );
+    expect(transcript.findIndex(({ kind }) => kind === "message.added")).toBeLessThan(
+      transcript.findIndex(({ kind }) => kind === "message.cancelled"),
+    );
+    expect(transcript.map(({ kind }) => kind)).not.toContain("message.completed");
+  });
+
+  test("fails an assistant frame carrying an SDK error", async () => {
+    const { context, events, logger, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        error: "rate_limit",
+        message: { content: [] },
+        type: "assistant",
+        uuid: "assistant-error",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "message.failed",
+        payload: expect.objectContaining({
+          error: expect.objectContaining({ code: "claude.rate_limit", retryable: true }),
+        }),
+      }),
+    );
+    expect(events().findIndex(({ kind }) => kind === "message.started")).toBeLessThan(
+      events().findIndex(({ kind }) => kind === "message.failed"),
+    );
+    expect(events().map(({ kind }) => kind)).not.toContain("message.completed");
+  });
+
+  test("fails a terminating API error carried by a success result", async () => {
+    const { context, events, logger, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        api_error_status: 529,
+        is_error: true,
+        modelUsage: {},
+        permission_denials: [],
+        result: "API Error: 529",
+        session_id: "native-session-1",
+        stop_reason: null,
+        subtype: "success",
+        terminal_reason: "api_error",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-api-error",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "run.failed",
+        payload: expect.objectContaining({
+          error: expect.objectContaining({
+            details: { apiErrorStatus: 529, terminalReason: "api_error" },
+            retryable: true,
+          }),
+          recoverable: true,
+        }),
+      }),
+    );
+    expect(events().map(({ kind }) => kind)).not.toContain("run.completed");
+  });
+
   test("marks an SDK tool error as failed", async () => {
     const { context, events, logger, translator } = createHarness();
     const messages = [
@@ -93,6 +458,189 @@ describe("Claude Agent SDK provider fixtures", () => {
         payload: expect.objectContaining({ status: "failed", toolCallId: "tool-1" }),
       }),
     );
+  });
+
+  test("classifies wrapper-level tool non-execution metadata", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [{ id: "tool-1", input: {}, name: "Bash", type: "tool_use" }],
+        },
+        type: "assistant",
+        uuid: "assistant-1",
+      },
+      {
+        message: {
+          content: [
+            {
+              content: "Request interrupted",
+              is_error: true,
+              tool_use_id: "tool-1",
+              type: "tool_result",
+            },
+          ],
+        },
+        tool_result_meta: [
+          {
+            id: "tool-1",
+            non_execution_kind: "interrupted",
+            user_feedback: "Stop here",
+          },
+        ],
+        tool_use_result: {
+          usage: { output_tokens_details: { thinking_tokens: 3 } },
+        },
+        type: "user",
+        uuid: "user-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "tool.call.updated",
+        payload: expect.objectContaining({
+          nonExecutionKind: "interrupted",
+          status: "cancelled",
+          structuredOutput: {
+            usage: { output_tokens_details: { thinking_tokens: 3 } },
+          },
+          toolCallId: "tool-1",
+          userFeedback: "Stop here",
+        }),
+      }),
+    );
+  });
+
+  test("materializes authoritative result permission denials without a tool result", async () => {
+    const { context, events, logger, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        decision_reason: "Blocked by policy X",
+        decision_reason_type: "rule",
+        message: "Denied by policy X",
+        subtype: "permission_denied",
+        tool_name: "Bash",
+        tool_use_id: "tool-denied",
+        type: "system",
+        uuid: "denial-advisory",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await translator.handleSdkMessage(
+      context,
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [
+          { tool_input: { command: "pwd" }, tool_name: "Bash", tool_use_id: "tool-denied" },
+        ],
+        result: "done",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+    await logger.destroy();
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "tool.call.updated",
+        payload: expect.objectContaining({
+          rawInput: '{"command":"pwd"}',
+          content: "Denied by policy X",
+          decisionReason: "Blocked by policy X",
+          decisionReasonType: "rule",
+          status: "failed",
+          title: "Bash",
+          toolCallId: "tool-denied",
+        }),
+      }),
+    );
+    expect(events().filter(({ kind }) => kind === "item.started")).toHaveLength(1);
+    expect(events().filter(({ kind }) => kind === "item.completed")).toHaveLength(1);
+  });
+
+  test("lets result permission denials override earlier tool terminals", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [
+            { id: "tool-completed", input: {}, name: "Read", type: "tool_use" },
+            { id: "tool-cancelled", input: {}, name: "Bash", type: "tool_use" },
+          ],
+        },
+        type: "assistant",
+        uuid: "assistant-1",
+      },
+      {
+        message: {
+          content: [
+            { content: "ok", tool_use_id: "tool-completed", type: "tool_result" },
+            {
+              content: "interrupted",
+              is_error: true,
+              tool_use_id: "tool-cancelled",
+              type: "tool_result",
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "tool-cancelled", non_execution_kind: "cancelled" }],
+        type: "user",
+        uuid: "user-1",
+      },
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [
+          { tool_input: {}, tool_name: "Read", tool_use_id: "tool-completed" },
+          { tool_input: {}, tool_name: "Bash", tool_use_id: "tool-cancelled" },
+        ],
+        result: "done",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    for (const toolCallId of ["tool-completed", "tool-cancelled"]) {
+      const statuses = events().flatMap((event) => {
+        if (event.kind !== "tool.call.updated" || !isRecord(event.payload)) {
+          return [];
+        }
+        return event.payload["toolCallId"] === toolCallId &&
+          typeof event.payload["status"] === "string"
+          ? [event.payload["status"]]
+          : [];
+      });
+      expect(statuses.at(-1)).toBe("failed");
+      expect(
+        events().filter(
+          (event) =>
+            event.kind === "item.completed" &&
+            isRecord(event.payload) &&
+            event.payload["itemId"] === toolCallId,
+        ),
+      ).toHaveLength(1);
+    }
   });
 
   test("rotates assistant identity across a tool boundary and marks the final message", async () => {
@@ -223,7 +771,8 @@ describe("Claude Agent SDK provider fixtures", () => {
     const completedIndex = translated.findIndex((event) => event.kind === "message.completed");
     const terminalIndex = translated.findIndex((event) => event.kind === "run.completed");
 
-    expect(payload?.["finalMessageText"]).toBe("完整最终回答");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), payload?.["finalMessageId"])).toBe("完整最终回答");
     expect(snapshot).toMatchObject({
       kind: "message.added",
       payload: {
@@ -403,9 +952,14 @@ describe("Claude Agent SDK provider fixtures", () => {
             event.payload["messageId"] === messageId,
         ),
     ).toEqual([]);
-    expect(translated.find((event) => event.kind === "run.completed")).toMatchObject({
-      payload: expect.objectContaining({ finalMessageText: "complete" }),
-    });
+    const terminal = translated.find((event) => event.kind === "run.completed");
+    expect(terminal?.payload).not.toHaveProperty("finalMessageText");
+    expect(
+      messageText(
+        translated,
+        isRecord(terminal?.payload) ? terminal.payload["finalMessageId"] : null,
+      ),
+    ).toBe("complete");
   });
 
   test("repairs streamed tool input with a lossless assistant snapshot", async () => {
@@ -519,7 +1073,11 @@ describe("Claude Agent SDK provider fixtures", () => {
         ["run.completed", "run.failed"].includes(event.kind),
       );
       expect(terminalIndex).toBeGreaterThan(-1);
-      for (const kind of ["message.completed", "thought.completed", "item.completed"] as const) {
+      const closureKinds =
+        outcome === "success"
+          ? (["message.completed", "thought.completed", "item.completed"] as const)
+          : (["message.failed", "thought.cancelled", "item.completed"] as const);
+      for (const kind of closureKinds) {
         expect(translated.findIndex((event) => event.kind === kind)).toBeGreaterThan(-1);
         expect(translated.findIndex((event) => event.kind === kind)).toBeLessThan(terminalIndex);
       }
@@ -628,7 +1186,10 @@ describe("Claude Agent SDK provider fixtures", () => {
       { text: "Pong. What would you like to work on?", type: "text" },
     ]);
     expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
-    expect(payload?.["finalMessageText"]).toBe("Pong. What would you like to work on?");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(translated, payload?.["finalMessageId"])).toBe(
+      "Pong. What would you like to work on?",
+    );
   });
 
   test("anchors uuid-fractured stream fragments to one closed assistant message", async () => {
@@ -752,7 +1313,141 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(textMessages.map((entry) => entry.contentDelta)).toEqual(["相同文本"]);
     expect(snapshotPayload?.["messageId"]).toBe(textMessages[0]?.messageId);
     expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
-    expect(payload?.["finalMessageText"]).toBe("相同文本");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), payload?.["finalMessageId"])).toBe("相同文本");
+  });
+
+  test("keeps a confirmed streamed assistant replay on its original message", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const assistant = {
+      message: {
+        content: [{ text: "canonical", type: "text" }],
+        id: "native-message",
+      },
+      type: "assistant",
+      uuid: "wire-assistant",
+    };
+    const messages = [
+      {
+        event: {
+          message: { id: "native-message" },
+          type: "message_start",
+        },
+        type: "stream_event",
+        uuid: "stream-start",
+      },
+      {
+        event: {
+          delta: { text: "canonical", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "stream-delta",
+      },
+      {
+        event: { type: "message_stop" },
+        type: "stream_event",
+        uuid: "stream-stop",
+      },
+      assistant,
+      assistant,
+      {
+        result: "canonical",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const started = events().filter((event) => event.kind === "message.started");
+    const completed = events().filter((event) => event.kind === "message.completed");
+    const snapshots = events().filter((event) => event.kind === "message.added");
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+    const startedMessageId = isRecord(started[0]?.payload)
+      ? started[0].payload["messageId"]
+      : undefined;
+
+    expect(started).toHaveLength(1);
+    expect(completed).toHaveLength(1);
+    expect(snapshots).toHaveLength(1);
+    expect(runCompleted?.payload).toMatchObject({
+      finalMessageId: startedMessageId,
+    });
+    expect(runCompleted?.payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), startedMessageId)).toBe("canonical");
+  });
+
+  test("keeps distinct live assistant envelopes that share a native message id", async () => {
+    const { context, events, logger, translator } = createHarness();
+    const messages = [
+      {
+        event: { message: { id: "shared-native" }, type: "message_start" },
+        type: "stream_event",
+        uuid: "stream-start",
+      },
+      {
+        event: {
+          delta: { text: "first", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "stream-first",
+      },
+      {
+        message: { content: [{ text: "first", type: "text" }], id: "shared-native" },
+        type: "assistant",
+        uuid: "wire-first",
+      },
+      {
+        event: {
+          delta: { text: "second", type: "text_delta" },
+          type: "content_block_delta",
+        },
+        type: "stream_event",
+        uuid: "stream-second",
+      },
+      {
+        message: { content: [{ text: "second", type: "text" }], id: "shared-native" },
+        type: "assistant",
+        uuid: "wire-second",
+      },
+      {
+        result: "second",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-1",
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, "run-1" as RunId);
+    }
+    await logger.destroy();
+
+    const snapshots = events().filter((event) => event.kind === "message.added");
+    const messageIds = snapshots.flatMap((event) =>
+      isRecord(event.payload) && typeof event.payload["messageId"] === "string"
+        ? [event.payload["messageId"]]
+        : [],
+    );
+    const runCompleted = events().find((event) => event.kind === "run.completed");
+
+    expect(snapshots).toHaveLength(2);
+    expect(new Set(messageIds).size).toBe(2);
+    expect(runCompleted?.payload).toMatchObject({
+      finalMessageId: messageIds.at(-1),
+    });
+    expect(runCompleted?.payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), messageIds.at(-1))).toBe("second");
   });
 
   test("keeps duplicate text on distinct messages when the stream identity is confirmed", async () => {
@@ -823,6 +1518,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(textMessages.map((entry) => entry.contentDelta)).toEqual(["相同文本", "相同文本"]);
     expect(new Set(textMessages.map((entry) => entry.messageId)).size).toBe(2);
     expect(payload?.["finalMessageId"]).toBe(textMessages.at(-1)?.messageId);
-    expect(payload?.["finalMessageText"]).toBe("相同文本");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), payload?.["finalMessageId"])).toBe("相同文本");
   });
 });

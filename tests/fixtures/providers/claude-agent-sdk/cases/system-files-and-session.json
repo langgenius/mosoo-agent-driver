@@ -28,7 +28,7 @@
       "type": "system"
     }
   ],
-  "expectedNativeSessionIds": ["claude-session-1", "claude-session-1"],
+  "expectedNativeSessionIds": ["claude-session-1"],
   "expectedEvents": [
     {
       "kind": "session.info.updated",
@@ -51,9 +51,11 @@
       }
     },
     {
+      "delivery": "best_effort",
       "kind": "diagnostic.reported",
       "payload": {
-        "failed": ["src/b.ts"],
+        "failedCount": 1,
+        "failedUtf8Bytes": 12,
         "message": "Claude file persistence failed.",
         "severity": "warn"
       },

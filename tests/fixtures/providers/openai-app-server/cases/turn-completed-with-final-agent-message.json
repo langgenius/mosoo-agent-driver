@@ -40,16 +40,8 @@
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
-    },
-    {
-      "delivery": "best_effort",
-      "kind": "message.delta",
-      "payload": {
-        "contentDelta": "pong",
-        "messageId": "<driver-id>",
-        "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.message.started:<driver-id>"
     },
     {
       "delivery": "lossless",
@@ -58,14 +50,16 @@
         "content": "pong",
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.item.completed:turn-1:message-1:0"
     },
     {
       "kind": "message.completed",
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.item.completed:turn-1:message-1:1"
     },
     {
       "kind": "runtime.resume.updated",
@@ -84,7 +78,6 @@
       },
       "payload": {
         "finalMessageId": "<driver-id>",
-        "finalMessageText": "pong",
         "stopReason": "end_turn"
       },
       "sourceEventId": "openai.turn.completed:turn-1"

@@ -25,7 +25,10 @@ function createHarness() {
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
     logger,
     payload: driverStartInput,
     permission: { request: async () => "reject_once" },

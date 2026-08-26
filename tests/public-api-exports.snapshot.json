@@ -86,6 +86,7 @@
       "DriverInstanceId",
       "DriverNativeRuntimeRef",
       "DriverNativeRuntimeRefKind",
+      "DriverPermissionRequest",
       "DriverRuntime",
       "DriverRuntimeTransport",
       "DriverStartInput",

@@ -3,8 +3,11 @@ import type { StopReason } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
 
 import type { DriverEventInput } from "../src/protocol/events";
-import { AcpTurnEventState, toSessionReadyEvents } from "../src/runtimes/acp/acp-event-translator";
-import type { AcpTurnEventStateInput } from "../src/runtimes/acp/acp-event-translator";
+import {
+  AcpAssistantTranscriptState,
+  type AcpAssistantTranscriptStateInput,
+} from "../src/runtimes/acp/acp-assistant-transcript-state";
+import { toSessionReadyEvents } from "../src/runtimes/acp/acp-session-events";
 
 interface CompletePromptFixture {
   readonly stopReason: StopReason;
@@ -29,7 +32,7 @@ interface SessionReadyFixture {
 }
 
 interface AcpProviderFixtureCase {
-  readonly begin?: AcpTurnEventStateInput | undefined;
+  readonly begin?: AcpAssistantTranscriptStateInput | undefined;
   readonly completePrompt?: CompletePromptFixture | undefined;
   readonly expectedEvents: readonly unknown[];
   readonly failPrompt?: FailPromptFixture | undefined;
@@ -74,7 +77,7 @@ function readRecordField(record: Record<string, unknown>, field: string): Record
   return value;
 }
 
-function readBeginFixture(value: unknown): AcpTurnEventStateInput | undefined {
+function readBeginFixture(value: unknown): AcpAssistantTranscriptStateInput | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -85,8 +88,7 @@ function readBeginFixture(value: unknown): AcpTurnEventStateInput | undefined {
 
   return {
     messageId: readStringField(value, "messageId"),
-    runId: readStringField(value, "runId") as AcpTurnEventStateInput["runId"],
-    sessionId: readStringField(value, "sessionId"),
+    runId: readStringField(value, "runId") as AcpAssistantTranscriptStateInput["runId"],
   };
 }
 
@@ -277,7 +279,7 @@ function normalizeAcpEvents(events: readonly DriverEventInput[]): Record<string,
 }
 
 function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
-  const state = new AcpTurnEventState();
+  const state = new AcpAssistantTranscriptState();
   const events: DriverEventInput[] = [];
 
   if (fixture.begin !== undefined) {

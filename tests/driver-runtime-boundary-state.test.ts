@@ -147,6 +147,20 @@ describe("driver runtime boundary", () => {
     expect(event?.event.runId).toBe(DRIVER_TEST_IDS.thirdRunId);
   });
 
+  test("driver socket preserves explicit session scope during an active turn", () => {
+    const [event] = toDriverEventEnvelopes(
+      driverBootPayload,
+      {
+        kind: "agent.task.updated",
+        payload: { active: false, status: "completed", taskId: "agent-1" },
+        runId: null,
+      },
+      DRIVER_TEST_IDS.secondRunId,
+    );
+
+    expect(event?.event.runId).toBeUndefined();
+  });
+
   test("driver socket preserves a valid explicit run id during another active turn", () => {
     const draft = {
       kind: "run.started",

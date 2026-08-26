@@ -1,12 +1,11 @@
-import type { JsonObject } from "../provider-json";
-
-export { isRecord, readRecord, readString, stringifyForDisplay } from "../provider-json";
+export {
+  isRecord,
+  readNumber,
+  readRecord,
+  readString,
+  stringifyForDisplay,
+} from "../provider-json";
 export type { JsonObject } from "../provider-json";
-
-export function readNumber(value: JsonObject | null, key: string): number | null {
-  const entry = value?.[key];
-  return typeof entry === "number" && Number.isFinite(entry) ? entry : null;
-}
 
 export function toTokenCount(value: unknown): number | null {
   return typeof value === "number" && value >= 0 && Number.isSafeInteger(value) ? value : null;

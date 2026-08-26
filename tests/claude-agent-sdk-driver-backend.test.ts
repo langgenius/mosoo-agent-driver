@@ -10,6 +10,7 @@ import type {
 import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
+import type { RunId } from "../src/protocol/id";
 import type { DriverStartInput } from "../src/protocol/start";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "../src/runtimes/claude/agent-sdk-driver-backend";
@@ -18,6 +19,10 @@ import { bootPayload, DRIVER_TEST_IDS } from "./driver-runtime-boundary-fixtures
 
 const PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 const previousPrewarm = process.env[PREWARM_ENV];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
 
 afterEach(() => {
   if (previousPrewarm === undefined) {
@@ -112,6 +117,7 @@ function createHarness(
   payloadOverride?: DriverStartInput,
 ) {
   const events: DriverEventInput[] = [];
+  let currentRunId: RunId | null = null;
   let seq = 0;
   const logger = createBufferedSinkLogger({
     level: "error",
@@ -127,9 +133,22 @@ function createHarness(
     } as DriverStartInput);
   const context = createAgentDriverContext({
     eventSink: {
+      currentRunId: () => currentRunId,
       pushEvents: async ({ events: batch }) => {
         await beforePush?.(batch);
         events.push(...batch);
+        for (const event of batch) {
+          if (event.kind === "run.started" && event.runId !== undefined) {
+            currentRunId = event.runId;
+          } else if (
+            (event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed") &&
+            event.runId === currentRunId
+          ) {
+            currentRunId = null;
+          }
+        }
         return {
           accepted: batch.map((event) => ({ seq: (seq += 1), type: event.kind })),
         };
@@ -150,6 +169,63 @@ function createHarness(
 }
 
 describe("Claude Agent SDK driver backend", () => {
+  test("rejects invalid native session IDs before retaining or publishing them", async () => {
+    const oversizedSessionId = "s".repeat(257);
+    const resumePayload = {
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        session: {
+          ...bootPayload.execution.session,
+          nativeResumeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: oversizedSessionId,
+          },
+        },
+      },
+      runtime: "claude-agent-sdk",
+      runtimeTransport: "claude-agent-sdk",
+    } as DriverStartInput;
+    expect(() => new ClaudeAgentSdkDriverBackend(resumePayload)).toThrow(
+      "Claude native session ID must contain 1-256 UTF-8 bytes (received 257).",
+    );
+
+    const harness = createHarness({
+      createQueryOptions: async () => ({}),
+      query: () => fakeQuery([resultMessage(oversizedSessionId)]),
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+    await expect(
+      harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("Claude native session ID must contain 1-256 UTF-8 bytes (received 257).");
+    expect(harness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+    expect(harness.events.some((event) => event.kind === "run.failed")).toBe(true);
+    expect(JSON.stringify(harness.events)).not.toContain(oversizedSessionId);
+    await harness.logger.destroy();
+
+    const emptyHarness = createHarness({
+      createQueryOptions: async () => ({}),
+      query: () => fakeQuery([resultMessage("")]),
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+    await expect(
+      emptyHarness.backend.handleInput(
+        emptyHarness.context,
+        { text: "hello" },
+        DRIVER_TEST_IDS.runId,
+      ),
+    ).rejects.toThrow("Claude native session ID must contain 1-256 UTF-8 bytes (received 0).");
+    expect(emptyHarness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(
+      false,
+    );
+    await emptyHarness.logger.destroy();
+  });
+
   test("consumes a ready prewarm for the first turn", async () => {
     process.env[PREWARM_ENV] = "1";
     const startupCalled = Promise.withResolvers<void>();
@@ -1183,7 +1259,6 @@ describe("Claude Agent SDK driver backend", () => {
     "does not replace a selected $terminal provider terminal after its delivery fails",
     async ({ message, terminal }) => {
       delete process.env[PREWARM_ENV];
-      let rejectTerminal = true;
       const terminalAttempts: string[][] = [];
       const harness = createHarness(
         {
@@ -1202,8 +1277,7 @@ describe("Claude Agent SDK driver backend", () => {
           if (terminals.length > 0) {
             terminalAttempts.push(terminals);
           }
-          if (rejectTerminal && terminals.includes(terminal)) {
-            rejectTerminal = false;
+          if (terminals.includes(terminal)) {
             throw new Error("terminal delivery unavailable");
           }
         },
@@ -1215,7 +1289,7 @@ describe("Claude Agent SDK driver backend", () => {
       await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
       await harness.logger.destroy();
 
-      expect(terminalAttempts).toEqual([[terminal]]);
+      expect(terminalAttempts).toEqual([[terminal], [terminal]]);
     },
   );
 
@@ -1281,6 +1355,67 @@ describe("Claude Agent SDK driver backend", () => {
       { kind: "run.completed", runId: DRIVER_TEST_IDS.runId },
       { kind: "run.failed", runId: DRIVER_TEST_IDS.secondRunId },
     ]);
+  });
+
+  test("adopts a conversation reset as the next native resume session", async () => {
+    delete process.env[PREWARM_ENV];
+    let queryIndex = 0;
+    const optionSessionIds: Array<string | null> = [];
+    const harness = createHarness({
+      createQueryOptions: async (input) => {
+        optionSessionIds.push(input.nativeSessionId);
+        return {};
+      },
+      query: () => {
+        queryIndex += 1;
+        return queryIndex === 1
+          ? fakeQuery([resultMessage("native-session-1")])
+          : fakeQuery([
+              {
+                event: { message: { id: "old-message" }, type: "message_start" },
+                parent_tool_use_id: null,
+                session_id: "native-session-1",
+                type: "stream_event",
+                uuid: "old-stream",
+              } as unknown as SDKMessage,
+              {
+                new_conversation_id: "native-session-2",
+                session_id: "native-session-1",
+                type: "conversation_reset",
+                uuid: "reset-1",
+              } as unknown as SDKMessage,
+              resultMessage("native-session-2"),
+            ]);
+      },
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+
+    await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "second" },
+      DRIVER_TEST_IDS.secondRunId,
+    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    await harness.logger.destroy();
+
+    expect(optionSessionIds).toEqual([null, "native-session-1"]);
+    expect(
+      harness.events.flatMap((event) => {
+        if (
+          event.kind !== "runtime.resume.updated" ||
+          !isRecord(event.payload) ||
+          typeof event.payload["resumePointer"] !== "string"
+        ) {
+          return [];
+        }
+        return [event.payload["resumePointer"]];
+      }),
+    ).toEqual(["native-session-1", "native-session-2"]);
+    expect(harness.events.some(({ kind }) => kind === "message.cancelled")).toBe(true);
+    expect(harness.events.filter(({ kind }) => kind === "run.completed")).toHaveLength(2);
   });
 
   test("requires one result frame and ignores provider frames after it", async () => {

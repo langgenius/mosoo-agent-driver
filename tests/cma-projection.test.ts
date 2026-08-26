@@ -2,8 +2,70 @@ import { describe, expect, test } from "bun:test";
 
 import { CmaInvalidEventError, CmaUnsupportedFieldError } from "../src/projections/cma";
 import { projectCmaInboundToDriverCommand, projectDriverEventToCma } from "../src/projections/cma";
+import { ingestRuntimeEventInput } from "../src/runtime-events";
+import { createDriverId } from "../src/protocol/id";
+import type { EventId, RunId, SessionId } from "../src/protocol/id";
 
 describe("CMA projection", () => {
+  test("rejects malformed Claude terminal and structured payload fields", () => {
+    const context = {
+      createId: () => createDriverId() as EventId,
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      sessionId: createDriverId() as SessionId,
+    } as const;
+
+    for (const input of [
+      { kind: "message.failed", payload: { messageId: "message-1" } },
+      {
+        kind: "message.failed",
+        payload: { error: { code: "failed" }, messageId: "message-1" },
+      },
+      {
+        kind: "message.added",
+        payload: {
+          content: [{ text: "message", type: "text" }],
+          preventContinuation: "yes",
+        },
+      },
+      { kind: "message.added", payload: { content: "message", phase: "final_answer" } },
+      {
+        kind: "message.added",
+        payload: { content: "message", memoryCitation: Symbol("bad") },
+      },
+      {
+        kind: "tool.call.updated",
+        payload: { nonExecutionKind: 1, status: "failed", toolCallId: "tool-1" },
+      },
+      {
+        kind: "tool.call.updated",
+        payload: { status: "completed", structuredOutput: Symbol("bad"), toolCallId: "tool-1" },
+      },
+    ]) {
+      expect(ingestRuntimeEventInput(context, input).status).toBe("rejected");
+    }
+  });
+
+  test("admits message snapshot phase and memory citations", () => {
+    const context = {
+      createId: () => createDriverId() as EventId,
+      occurredAt: "2026-08-12T00:00:00.000Z",
+      sessionId: createDriverId() as SessionId,
+    } as const;
+    const memoryCitation = {
+      entries: [{ lineEnd: 2, lineStart: 1, path: "MEMORY.md" }],
+      threadIds: ["thread-1"],
+    };
+    const result = ingestRuntimeEventInput(context, {
+      kind: "message.added",
+      payload: { content: "answer", memoryCitation, phase: "final" },
+    });
+
+    expect(result).toMatchObject({
+      event: { payload: { content: "answer", memoryCitation, phase: "final" } },
+      status: "accepted",
+    });
+  });
+
   test("projects user messages to input.start commands", () => {
     expect(
       projectCmaInboundToDriverCommand({
@@ -109,7 +171,16 @@ describe("CMA projection", () => {
       projectDriverEventToCma({
         kind: "permission.requested",
         payload: {
+          agentId: "subagent-1",
+          blockedPath: "/workspace/secret",
+          decisionReason: "Path is outside the allowed roots.",
           details: '{"command":"vp test"}',
+          description: "Read access to /workspace/secret",
+          matchedAskRule: {
+            ruleContent: "Read(/workspace/secret/**)",
+            source: "project",
+            toolName: "Read",
+          },
           requestId: "permission-1",
           targetItemId: "tool-1",
           title: "Approve command",
@@ -122,7 +193,16 @@ describe("CMA projection", () => {
     ).toEqual([
       {
         requiresAction: {
+          agentId: "subagent-1",
+          blockedPath: "/workspace/secret",
+          decisionReason: "Path is outside the allowed roots.",
           details: '{"command":"vp test"}',
+          description: "Read access to /workspace/secret",
+          matchedAskRule: {
+            ruleContent: "Read(/workspace/secret/**)",
+            source: "project",
+            toolName: "Read",
+          },
           requestId: "permission-1",
           targetItemId: "tool-1",
           title: "Approve command",
@@ -155,6 +235,43 @@ describe("CMA projection", () => {
     ).toEqual([]);
   });
 
+  test("projects structured final output without flattening it into text", () => {
+    const runId = createDriverId() as RunId;
+    const context = {
+      createId: () => createDriverId() as EventId,
+      occurredAt: "2026-08-13T00:00:00.000Z",
+      runId,
+      sessionId: createDriverId() as SessionId,
+    } as const;
+    const event = {
+      kind: "run.completed" as const,
+      payload: {
+        stopReason: "end_turn",
+        structuredOutput: { answer: 42, citations: ["source-1"] },
+      },
+      runId,
+    };
+
+    expect(ingestRuntimeEventInput(context, event).status).toBe("accepted");
+    expect(
+      ingestRuntimeEventInput(context, {
+        ...event,
+        payload: { ...event.payload, structuredOutput: Symbol("invalid") },
+      }).status,
+    ).toBe("rejected");
+    expect(projectDriverEventToCma(event)).toEqual([
+      {
+        metadata: {
+          stopReason: "end_turn",
+          structuredOutput: { answer: 42, citations: ["source-1"] },
+        },
+        sessionStatus: "idle",
+        sourceEventKind: "run.completed",
+        type: "session.status_idle",
+      },
+    ]);
+  });
+
   test("projects driver event families to CMA outbound events", () => {
     expect(
       projectDriverEventToCma({
@@ -172,16 +289,55 @@ describe("CMA projection", () => {
     ]);
     expect(
       projectDriverEventToCma({
+        kind: "message.failed",
+        payload: { error: { code: "provider.failed" }, messageId: "message-1" },
+      }),
+    ).toMatchObject([
+      {
+        message: { error: { code: "provider.failed" }, messageId: "message-1" },
+        sourceEventKind: "message.failed",
+        type: "agent.message",
+      },
+    ]);
+    expect(
+      projectDriverEventToCma({
+        kind: "tool.call.updated",
+        payload: {
+          status: "completed",
+          structuredOutput: {
+            usage: { output_tokens_details: { thinking_tokens: 3 } },
+          },
+          toolCallId: "tool-1",
+        },
+      }),
+    ).toMatchObject([
+      {
+        message: {
+          structuredOutput: {
+            usage: { output_tokens_details: { thinking_tokens: 3 } },
+          },
+        },
+        type: "agent.tool_use",
+      },
+    ]);
+    expect(
+      projectDriverEventToCma({
         kind: "run.failed",
         payload: {
           error: {
             code: "driver.failed",
+            details: { apiErrorStatus: 529, terminalReason: "api_error" },
             message: "failed",
           },
         },
       }),
     ).toMatchObject([
       {
+        error: expect.objectContaining({
+          error: expect.objectContaining({
+            details: { apiErrorStatus: 529, terminalReason: "api_error" },
+          }),
+        }),
         sessionStatus: "terminated",
         sourceEventKind: "run.failed",
         type: "session.error",
@@ -191,6 +347,7 @@ describe("CMA projection", () => {
       projectDriverEventToCma({
         kind: "usage.updated",
         payload: {
+          cachedWriteTokens: 3,
           inputTokens: 1,
           outputTokens: 2,
         },
@@ -199,6 +356,11 @@ describe("CMA projection", () => {
       {
         sourceEventKind: "usage.updated",
         type: "session.usage",
+        usage: {
+          cachedWriteTokens: 3,
+          inputTokens: 1,
+          outputTokens: 2,
+        },
       },
     ]);
   });

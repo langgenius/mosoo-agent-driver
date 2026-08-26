@@ -32,6 +32,7 @@ function createContext(events: DriverEventInput[]): {
   return {
     context: createAgentDriverContext({
       eventSink: {
+        currentRunId: () => null,
         pushEvents: async (input) => {
           events.push(...input.events);
           return {

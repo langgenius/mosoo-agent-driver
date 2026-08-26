@@ -1,6 +1,6 @@
 import type { CommittedMutation } from "./mutation";
 import { committedMutationSchema } from "./mutation";
-import { assertProtocolAdmission, compareTimestamps } from "./common";
+import { PROTOCOL_VERSION, assertProtocolAdmission, compareTimestamps } from "./common";
 import type { SyncPayload } from "./sync";
 import { syncPayloadSchema } from "./sync";
 import type { SessionSnapshot } from "./state";
@@ -169,7 +169,7 @@ function applyMutation(current: SessionSnapshot, mutation: CommittedMutation): S
   }
 
   const next: SessionSnapshot = {
-    protocolVersion: 2,
+    protocolVersion: PROTOCOL_VERSION,
     revision: mutation.revision,
     capturedAt: mutation.committedAt,
     session,

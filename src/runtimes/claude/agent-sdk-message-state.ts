@@ -38,23 +38,28 @@ export function readClaudeSdkSessionId(value: unknown): string | null {
 export class ClaudeAgentSdkMessageState {
   readonly #activeAssistantMessageIds = new Map<RunId, MessageId>();
   readonly #activeThoughtIds = new Map<string, string>();
+  readonly #auxiliaryMessageIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #authoritativeAssistantMessageIds = new Set<MessageId>();
   readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #assistantMessageOrdinals = new Map<MessageId, number>();
   readonly #assistantMessageRunIds = new Map<MessageId, RunId>();
   readonly #assistantMessageSequences = new Map<RunId, number>();
   readonly #blockToolCallIds = new Map<string, Map<number, string>>();
-  readonly #assistantNativeAliases = new Map<string, string>();
+  readonly #assistantWireAliases = new Map<string, string>();
   readonly #lastCompletedAssistantMessages = new Map<RunId, ClaudeAssistantFinalCandidate>();
   readonly #pendingAssistantStreamAnchors = new Map<string, ClaudeStreamMessageAnchor>();
   readonly #streamedTextMessages = new Set<string>();
   readonly #streamingNativeMessageIds = new Map<string, ClaudeStreamMessageAnchor>();
+  readonly #streamingWireUuids = new Map<string, string>();
   readonly #textByAssistantMessageId = new Map<MessageId, string>();
+  readonly #wireAssistantMessageIds = new Map<string, MessageId>();
+  readonly #wireToolCallIds = new Map<string, readonly string[]>();
 
   reset(): void {
     this.#activeAssistantMessageIds.clear();
     this.#activeThoughtIds.clear();
-    this.#assistantNativeAliases.clear();
+    this.#auxiliaryMessageIds.reset();
+    this.#assistantWireAliases.clear();
     this.#authoritativeAssistantMessageIds.clear();
     this.#assistantMessageIds.reset();
     this.#assistantMessageOrdinals.clear();
@@ -65,7 +70,10 @@ export class ClaudeAgentSdkMessageState {
     this.#pendingAssistantStreamAnchors.clear();
     this.#streamedTextMessages.clear();
     this.#streamingNativeMessageIds.clear();
+    this.#streamingWireUuids.clear();
     this.#textByAssistantMessageId.clear();
+    this.#wireAssistantMessageIds.clear();
+    this.#wireToolCallIds.clear();
   }
 
   assistantMessageId(runId: RunId, nativeMessageId: string | null): MessageId {
@@ -88,8 +96,45 @@ export class ClaudeAgentSdkMessageState {
     return messageId;
   }
 
+  auxiliaryMessageId(runId: RunId, nativeMessageId: string): MessageId {
+    return this.#auxiliaryMessageIds.getOrCreate(`${runId}:${nativeMessageId}`);
+  }
+
   assistantMessages(): readonly (readonly [MessageId, RunId])[] {
     return [...this.#assistantMessageRunIds];
+  }
+
+  bindWireAssistantMessage(wireUuid: string, messageId: MessageId): void {
+    this.#wireAssistantMessageIds.set(wireUuid, messageId);
+  }
+
+  bindWireToolCalls(wireUuid: string, toolCallIds: readonly string[]): void {
+    if (toolCallIds.length > 0) {
+      this.#wireToolCallIds.set(wireUuid, [...toolCallIds]);
+    }
+  }
+
+  wireItems(wireUuid: string): {
+    readonly messageId: MessageId | null;
+    readonly toolCallIds: readonly string[];
+  } {
+    return {
+      messageId: this.#wireAssistantMessageIds.get(wireUuid) ?? null,
+      toolCallIds: this.#wireToolCallIds.get(wireUuid) ?? [],
+    };
+  }
+
+  commitWireMessageRetraction(wireUuid: string, messageId: MessageId): void {
+    if (this.#wireAssistantMessageIds.get(wireUuid) !== messageId) {
+      return;
+    }
+
+    this.#wireAssistantMessageIds.delete(wireUuid);
+    this.#retractAssistantMessage(messageId);
+  }
+
+  commitWireToolRetractions(wireUuid: string): void {
+    this.#wireToolCallIds.delete(wireUuid);
   }
 
   activeAssistantMessageId(runId: RunId): MessageId | undefined {
@@ -141,16 +186,20 @@ export class ClaudeAgentSdkMessageState {
     return thoughtId;
   }
 
-  takeThoughtId(messageId: string): string | undefined {
-    const thoughtId = this.#activeThoughtIds.get(messageId);
-    this.#activeThoughtIds.delete(messageId);
-    return thoughtId;
+  activeThoughts(): readonly (readonly [string, string])[] {
+    return [...this.#activeThoughtIds];
   }
 
-  takeAllThoughtIds(): readonly string[] {
-    const thoughtIds = [...this.#activeThoughtIds.values()];
+  thoughtIdForMessage(messageId: string): string | undefined {
+    return this.#activeThoughtIds.get(messageId);
+  }
+
+  deleteThoughtId(messageId: string): void {
+    this.#activeThoughtIds.delete(messageId);
+  }
+
+  clearThoughtIds(): void {
     this.#activeThoughtIds.clear();
-    return thoughtIds;
   }
 
   streamScopeKey(runId: RunId, message: SDKMessage): string {
@@ -160,6 +209,7 @@ export class ClaudeAgentSdkMessageState {
 
   setStreamingNativeMessageId(scope: string, nativeMessageId: string): void {
     this.#streamingNativeMessageIds.set(scope, { confirmed: true, nativeId: nativeMessageId });
+    this.#streamingWireUuids.delete(scope);
     this.#pendingAssistantStreamAnchors.delete(scope);
   }
 
@@ -193,6 +243,7 @@ export class ClaudeAgentSdkMessageState {
   clearStreamingNativeMessageId(scope: string): void {
     const anchor = this.#streamingNativeMessageIds.get(scope);
     this.#streamingNativeMessageIds.delete(scope);
+    this.#streamingWireUuids.delete(scope);
 
     // The aggregated assistant envelope for this burst arrives after
     // message_stop; park the anchor so that envelope can bind to the streamed
@@ -209,13 +260,15 @@ export class ClaudeAgentSdkMessageState {
    * anchor — one envelope aggregates one burst. A confirmed anchor proves
    * the stream's identity and the envelope's native id wins.
    */
-  resolveAssistantMessageNativeId(scope: string, nativeMessageId: string | null): string | null {
-    if (nativeMessageId !== null) {
-      const alias = this.#assistantNativeAliases.get(nativeMessageId);
+  resolveAssistantMessageNativeId(
+    scope: string,
+    nativeMessageId: string | null,
+    wireUuid: string,
+  ): string {
+    const alias = this.#assistantWireAliases.get(wireUuid);
 
-      if (alias !== undefined) {
-        return alias;
-      }
+    if (alias !== undefined) {
+      return alias;
     }
 
     const pending = this.#pendingAssistantStreamAnchors.get(scope);
@@ -223,33 +276,40 @@ export class ClaudeAgentSdkMessageState {
     if (pending !== undefined) {
       this.#pendingAssistantStreamAnchors.delete(scope);
       return pending.confirmed
-        ? (nativeMessageId ?? pending.nativeId)
-        : this.#bindAssistantNativeAlias(pending.nativeId, nativeMessageId);
+        ? nativeMessageId === pending.nativeId
+          ? this.#bindAssistantWireAlias(pending.nativeId, wireUuid)
+          : wireUuid
+        : this.#bindAssistantWireAlias(pending.nativeId, wireUuid);
     }
 
     const live = this.#streamingNativeMessageIds.get(scope);
 
     if (live === undefined) {
-      return nativeMessageId;
+      return wireUuid;
     }
 
     if (live.confirmed) {
       // The envelope arrived before message_stop; keep the confirmed anchor
       // so the remaining stream frames stay on the same message.
-      return nativeMessageId ?? live.nativeId;
+      const boundWireUuid = this.#streamingWireUuids.get(scope);
+      if (
+        nativeMessageId === live.nativeId &&
+        (boundWireUuid === undefined || boundWireUuid === wireUuid)
+      ) {
+        this.#streamingWireUuids.set(scope, wireUuid);
+        return this.#bindAssistantWireAlias(live.nativeId, wireUuid);
+      }
+      return wireUuid;
     }
 
     this.#streamingNativeMessageIds.delete(scope);
-    return this.#bindAssistantNativeAlias(live.nativeId, nativeMessageId);
+    return this.#bindAssistantWireAlias(live.nativeId, wireUuid);
   }
 
-  #bindAssistantNativeAlias(burstNativeId: string, nativeMessageId: string | null): string {
-    if (nativeMessageId !== null) {
-      // A replayed envelope re-presents the same native id after the anchor
-      // is consumed; remember the binding so it stays on the same message.
-      this.#assistantNativeAliases.set(nativeMessageId, burstNativeId);
-    }
-
+  #bindAssistantWireAlias(burstNativeId: string, wireUuid: string): string {
+    // A replayed envelope re-presents the same wire uuid after the anchor is
+    // consumed; remember the binding so it stays on the same message.
+    this.#assistantWireAliases.set(wireUuid, burstNativeId);
     return burstNativeId;
   }
 
@@ -311,6 +371,26 @@ export class ClaudeAgentSdkMessageState {
     }
 
     return readString(readRecord(message, "message"), "id") ?? readString(message, "uuid");
+  }
+
+  #retractAssistantMessage(messageId: MessageId): void {
+    const runId = this.#assistantMessageRunIds.get(messageId);
+
+    if (runId !== undefined) {
+      if (this.#activeAssistantMessageIds.get(runId) === messageId) {
+        this.#activeAssistantMessageIds.delete(runId);
+      }
+
+      if (this.#lastCompletedAssistantMessages.get(runId)?.id === messageId) {
+        this.#lastCompletedAssistantMessages.delete(runId);
+      }
+    }
+
+    this.#assistantMessageRunIds.delete(messageId);
+    this.#authoritativeAssistantMessageIds.delete(messageId);
+    this.#blockToolCallIds.delete(messageId);
+    this.#streamedTextMessages.delete(messageId);
+    this.#textByAssistantMessageId.delete(messageId);
   }
 
   #nextAssistantMessageSequence(runId: RunId): number {

@@ -14,12 +14,19 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import * as childProcessHelpers from "../src/runtimes/child-process";
 import { OpenAiAppServerClient, limitNdjsonLines } from "../src/runtimes/openai/app-server-client";
-import type { ServerNotificationMethod } from "../src/runtimes/openai/generated/app-server-protocol";
+import type { ServerNotificationMethod } from "../src/runtimes/openai/app-server-protocol";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 
 const originalExecutable = process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"];
 const temporaryDirectories: string[] = [];
+const initializeResult = {
+  codexHome: "/tmp/openai-home",
+  platformFamily: "unix",
+  platformOs: "linux",
+  userAgent: "test-app-server/0.150.1",
+} as const;
+const initializeResultJson = JSON.stringify(initializeResult);
 
 async function createClientHarness(
   script: (directory: string) => string,
@@ -57,21 +64,27 @@ async function createClientHarness(
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
     logger,
     payload,
     permission: { request: requestPermission },
   });
   const protocolErrors: Error[] = [];
+  const protocolError = Promise.withResolvers<Error>();
   const client = new OpenAiAppServerClient(payload, {
     ...context,
     handleNotification,
     handleProtocolError: async (error) => {
       protocolErrors.push(error);
+      protocolError.resolve(error);
     },
+    mapToolCallId: (toolCallId) => toolCallId,
   });
 
-  return { client, directory, logger, protocolErrors };
+  return { client, directory, logger, protocolError: protocolError.promise, protocolErrors };
 }
 
 afterEach(async () => {
@@ -96,11 +109,17 @@ let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", async (chunk) => {
   buffer += chunk;
-  const newline = buffer.indexOf("\\n");
-  if (newline < 0) return;
-  const request = JSON.parse(buffer.slice(0, newline));
-  await Bun.write(${JSON.stringify(join(directory, "initialize.json"))}, JSON.stringify(request));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.method === "initialize") {
+      await Bun.write(${JSON.stringify(join(directory, "initialize.json"))}, JSON.stringify(request));
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (request.method === "initialized") {
+      await Bun.write(${JSON.stringify(join(directory, "initialized.json"))}, JSON.stringify(request));
+    }
+  }
 });
 setInterval(() => {}, 1000);
 `,
@@ -116,6 +135,63 @@ setInterval(() => {}, 1000);
         experimentalApi: true,
         requestAttestation: false,
       });
+      for (
+        let attempt = 0;
+        attempt < 50 && !(await Bun.file(join(harness.directory, "initialized.json")).exists());
+        attempt += 1
+      ) {
+        await Bun.sleep(5);
+      }
+      expect(
+        JSON.parse(await Bun.file(join(harness.directory, "initialized.json")).text()),
+      ).toEqual({ method: "initialized" });
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("rejects a malformed approval before requesting host permission", async () => {
+    let permissionRequests = 0;
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (message.method === "initialized") {
+      process.stdout.write(JSON.stringify({
+        id: 41,
+        method: "item/commandExecution/requestApproval",
+        params: {},
+      }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      async () => {
+        permissionRequests += 1;
+        return "allow_once";
+      },
+    );
+
+    try {
+      await harness.client.start();
+
+      for (let attempt = 0; attempt < 50 && harness.protocolErrors.length === 0; attempt += 1) {
+        await Bun.sleep(5);
+      }
+
+      expect(permissionRequests).toBe(0);
+      expect(harness.protocolErrors).toHaveLength(1);
     } finally {
       await harness.client.stop();
       await harness.logger.destroy();
@@ -140,6 +216,276 @@ setInterval(() => {}, 1000);
     const output = Readable.from([Buffer.from("12345\n")]).pipe(limitNdjsonLines(4));
 
     await expect(Array.fromAsync(output)).rejects.toThrow("exceeds 4 bytes");
+  });
+
+  test.each([
+    ["non-JSON", "not-json", "stdout is not valid JSON"],
+    ["non-object", "[]", "protocol message must be an object"],
+    ["unframed object", "{}", "requires a valid method or id"],
+  ] as const)("fails the protocol for %s stdout", async (_label, line, message) => {
+    const harness = await createClientHarness(
+      () => `
+process.stdin.once("data", () => {
+  process.stdout.write(${JSON.stringify(`${line}\n`)});
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow(message);
+      expect(harness.protocolErrors).toHaveLength(1);
+      expect(harness.protocolErrors[0]?.message).toContain(message);
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test.each([
+    [
+      "both result and error",
+      { error: { code: -32_000, message: "failed" }, id: 1, result: initializeResult },
+    ],
+    ["neither result nor error", { id: 1 }],
+    ["primitive error", { error: "failed", id: 1 }],
+    ["non-integer error code", { error: { code: "-32000", message: "failed" }, id: 1 }],
+    ["non-string error message", { error: { code: -32_000, message: 7 }, id: 1 }],
+  ] as const)("fails the protocol for a response with %s", async (_label, response) => {
+    const harness = await createClientHarness(
+      () => `
+process.stdin.once("data", () => {
+  process.stdout.write(${JSON.stringify(`${JSON.stringify(response)}\n`)});
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow("response envelope is invalid");
+      expect(harness.protocolErrors).toHaveLength(1);
+      expect(harness.protocolErrors[0]?.message).toContain("response envelope is invalid");
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("rejects a response that also claims to be a server message", async () => {
+    const harness = await createClientHarness(
+      () => `
+process.stdin.once("data", () => {
+  process.stdout.write(JSON.stringify({
+    id: 1,
+    method: "warning",
+    params: { message: "not a response", threadId: null },
+    result: ${initializeResultJson},
+  }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow("response envelope is invalid");
+      expect(harness.protocolErrors).toHaveLength(1);
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("stops after a malformed known notification", async () => {
+    const handled: ServerNotificationMethod[] = [];
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (message.method === "initialized") {
+      process.stdout.write(JSON.stringify({
+        method: "turn/completed",
+        params: { threadId: "thread-1", turn: { id: "turn-1", items: [], status: "inProgress" } },
+      }) + "\\n");
+      process.stdout.write(JSON.stringify({
+        method: "warning",
+        params: { message: "must not be handled", threadId: null },
+      }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      async (method) => {
+        handled.push(method);
+      },
+    );
+
+    try {
+      await harness.client.start();
+      for (let attempt = 0; attempt < 50 && harness.protocolErrors.length === 0; attempt += 1) {
+        await Bun.sleep(5);
+      }
+
+      expect(harness.protocolErrors).toHaveLength(1);
+      expect(handled).toEqual([]);
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("fails the protocol for a duplicate pending server-request id", async () => {
+    const permissionStarted = Promise.withResolvers<void>();
+    const permissionAborted = Promise.withResolvers<void>();
+    let permissionRequests = 0;
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const message = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (message.method === "initialized") {
+      const request = {
+        id: 41,
+        method: "item/commandExecution/requestApproval",
+        params: { environmentId: null, itemId: "item-1", startedAtMs: 1, threadId: "thread-1", turnId: "turn-1" },
+      };
+      process.stdout.write(JSON.stringify(request) + "\\n");
+      process.stdout.write(JSON.stringify(request) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      async (_input, signal) => {
+        permissionRequests += 1;
+        permissionStarted.resolve();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        permissionAborted.resolve();
+        return "reject_once";
+      },
+    );
+
+    try {
+      await harness.client.start();
+      await permissionStarted.promise;
+      for (let attempt = 0; attempt < 50 && harness.protocolErrors.length === 0; attempt += 1) {
+        await Bun.sleep(5);
+      }
+
+      expect(harness.protocolErrors).toHaveLength(1);
+      expect(harness.protocolErrors[0]?.message).toContain("already pending");
+      expect(permissionRequests).toBe(1);
+      await permissionAborted.promise;
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("keeps a valid JSON-RPC error scoped to its request", async () => {
+    const harness = await createClientHarness(
+      () => `
+process.stdin.once("data", () => {
+  process.stdout.write(JSON.stringify({
+    error: { code: -32600, data: { reason: "test" }, message: "initialize denied" },
+    id: 1,
+  }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow("initialize denied");
+      expect(harness.protocolErrors).toEqual([]);
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("fails the protocol when initialize returns an invalid result", async () => {
+    const harness = await createClientHarness(
+      () => `
+process.stdin.once("data", () => {
+  process.stdout.write(JSON.stringify({ id: 1, result: {} }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow("codexHome");
+      expect(harness.protocolErrors).toHaveLength(1);
+      await expect(
+        harness.client.request("initialize", {
+          capabilities: { experimentalApi: true, requestAttestation: false },
+          clientInfo: { name: "test", title: null, version: "1" },
+        }),
+      ).rejects.toThrow("stopping");
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
+  test("fails the protocol when turn/start returns contradictory status and error", async () => {
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (request.method === "turn/start") {
+      process.stdout.write(JSON.stringify({
+        id: request.id,
+        result: { turn: { error: null, id: "turn-1", items: [], status: "failed" } },
+      }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+    );
+
+    try {
+      await harness.client.start();
+      await expect(
+        harness.client.request("turn/start", { input: [], threadId: "thread-1" }),
+      ).rejects.toThrow("turn.error must be present exactly when the turn failed");
+      expect(harness.protocolErrors).toHaveLength(1);
+    } finally {
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
   });
 
   test("rejects a child process spawn failure without an unhandled error", async () => {
@@ -254,7 +600,9 @@ process.stdin.on("data", (chunk) => {
     const request = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (request.id !== undefined) {
-      process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+      process.stdout.write(
+        JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+      );
     }
   }
 });
@@ -295,7 +643,9 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     requests += 1;
     if (requests === 1) {
-      process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+      process.stdout.write(
+        JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+      );
     }
   }
 });
@@ -307,7 +657,7 @@ setInterval(() => {}, 1000);
       await harness.client.start();
       const request = harness.client.request("initialize", {
         capabilities: { experimentalApi: true, requestAttestation: false },
-        clientInfo: { name: "test", version: "1" },
+        clientInfo: { name: "test", title: null, version: "1" },
       });
       const stop = harness.client.stop();
 
@@ -331,7 +681,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
   setTimeout(() => process.exit(17), 25);
 });
 `,
@@ -378,12 +728,12 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       process.stdout.write(JSON.stringify({
         id: 41,
         method: "item/commandExecution/requestApproval",
-        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+        params: { environmentId: null, itemId: "item-1", startedAtMs: 1, threadId: "thread-1", turnId: "turn-1" },
       }) + "\\n");
       process.stdout.write(JSON.stringify({
         method: "serverRequest/resolved",
@@ -391,7 +741,7 @@ process.stdin.on("data", (chunk) => {
       }) + "\\n");
       process.stdout.write(JSON.stringify({
         method: "turn/completed",
-        params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+        params: { threadId: "thread-1", turn: { id: "turn-1", items: [], status: "completed" } },
       }) + "\\n");
     }
   }
@@ -458,12 +808,12 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       process.stdout.write(JSON.stringify({
         id: 41,
         method: "item/commandExecution/requestApproval",
-        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+        params: { environmentId: null, itemId: "item-1", startedAtMs: 1, threadId: "thread-1", turnId: "turn-1" },
       }) + "\\n");
       process.stdout.write(JSON.stringify({
         method: "serverRequest/resolved",
@@ -471,7 +821,7 @@ process.stdin.on("data", (chunk) => {
       }) + "\\n");
       process.stdout.write(JSON.stringify({
         method: "turn/completed",
-        params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+        params: { threadId: "thread-1", turn: { id: "turn-1", items: [], status: "completed" } },
       }) + "\\n");
     }
   }
@@ -545,12 +895,12 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       process.stdout.write(JSON.stringify({
         id: 41,
         method: "item/commandExecution/requestApproval",
-        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+        params: { environmentId: null, itemId: "item-1", startedAtMs: 1, threadId: "thread-1", turnId: "turn-1" },
       }) + "\\n");
       setTimeout(() => process.exit(17), 10);
     }
@@ -575,23 +925,9 @@ setInterval(() => {}, 1000);
 
     try {
       await harness.client.start();
-      const settled = await settlePromiseWithTimeout(
-        (async () => {
-          while (harness.protocolErrors.length === 0) {
-            await Bun.sleep(5);
-          }
-        })(),
-        { label: "process close", timeoutMs: 250 },
-      );
+      const [protocolError] = await Promise.all([harness.protocolError, permissionAborted.promise]);
 
-      expect(settled.status).toBe("completed");
-      await expect(
-        settlePromiseWithTimeout(permissionAborted.promise, {
-          label: "permission abort",
-          timeoutMs: 250,
-        }),
-      ).resolves.toMatchObject({ status: "completed" });
-      expect(harness.protocolErrors[0]?.message).toContain("code 17");
+      expect(protocolError.message).toContain("code 17");
     } finally {
       await harness.client.stop();
       await harness.logger.destroy();
@@ -613,12 +949,12 @@ process.stdin.on("data", async (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       process.stdout.write(JSON.stringify({
         id: 41,
         method: "item/commandExecution/requestApproval",
-        params: { itemId: "item-1", threadId: "thread-1", turnId: "turn-1" },
+        params: { environmentId: null, itemId: "item-1", startedAtMs: 1, threadId: "thread-1", turnId: "turn-1" },
       }) + "\\n");
     } else if (message.id === 41) {
       await Bun.write(${JSON.stringify(join(directory, "late-response.json"))}, JSON.stringify(message));
@@ -666,11 +1002,11 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       process.stdout.write(JSON.stringify({
         method: "turn/completed",
-        params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } },
+        params: { threadId: "thread-1", turn: { id: "turn-1", items: [], status: "completed" } },
       }) + "\\n", () => process.exit(17));
     }
   }
@@ -728,7 +1064,7 @@ process.stdin.on("data", (chunk) => {
     const message = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
     if (message.method === "initialize") {
-      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+      process.stdout.write(JSON.stringify({ id: message.id, result: ${initializeResultJson} }) + "\\n");
     } else if (message.method === "initialized") {
       setTimeout(() => process.exit(0), 5);
     }
@@ -774,7 +1110,7 @@ process.stdin.on("data", (chunk) => {
     const harness = await createClientHarness(
       () => `
 IFS= read -r _
-printf '%s\n' '{"id":1,"result":{}}'
+printf '%s\n' '${JSON.stringify({ id: 1, result: initializeResult })}'
 IFS= read -r _
 exec 0<&-
 printf '%s\n' '{"method":"warning","params":{"message":"stdin closed","threadId":null}}'
@@ -790,7 +1126,7 @@ sleep 10
       await closedInput.promise;
       const request = harness.client.request("initialize", {
         capabilities: { experimentalApi: true, requestAttestation: false },
-        clientInfo: { name: "x".repeat(1024 * 1024), version: "1" },
+        clientInfo: { name: "x".repeat(1024 * 1024), title: null, version: "1" },
       });
       const settled = await settlePromiseWithTimeout(request, {
         label: "stdin EPIPE",
@@ -824,7 +1160,9 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(newline + 1);
     requests += 1;
     if (requests === 1) {
-      process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+      process.stdout.write(
+        JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+      );
     } else {
       ${terminate}
     }
@@ -838,7 +1176,7 @@ setInterval(() => {}, 1000);
         await harness.client.start();
         const request = harness.client.request("initialize", {
           capabilities: { experimentalApi: true, requestAttestation: false },
-          clientInfo: { name: "crash-test", version: "1" },
+          clientInfo: { name: "crash-test", title: null, version: "1" },
         });
 
         await expect(request).rejects.toThrow(`app-server exited with ${expectedExit}`);
@@ -872,11 +1210,15 @@ process.stdin.on("data", (chunk) => {
     if (request.id === undefined) continue;
     requests += 1;
     if (requests === 1) {
-      process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+      process.stdout.write(
+        JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+      );
       process.stdout.write(JSON.stringify({ method: "warning", params: { message: "first", threadId: null } }) + "\\n");
     } else {
       process.stdout.write(JSON.stringify({ method: "warning", params: { message: "second", threadId: null } }) + "\\n");
-      process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+      process.stdout.write(
+        JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+      );
     }
   }
 });
@@ -903,7 +1245,7 @@ setInterval(() => {}, 1000);
       });
       await harness.client.request("initialize", {
         capabilities: { experimentalApi: true, requestAttestation: false },
-        clientInfo: { name: "drain-test", version: "1" },
+        clientInfo: { name: "drain-test", title: null, version: "1" },
       });
       expect(drained).toBe(false);
 
@@ -931,7 +1273,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
 });
 process.on("SIGTERM", async () => {
   await Bun.write(${JSON.stringify(join(directory, "stopped"))}, "stopped");
@@ -986,7 +1328,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n", () => process.exit(0));
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n", () => process.exit(0));
 });
 `;
     });
@@ -1045,7 +1387,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
 });
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
@@ -1110,7 +1452,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
 });
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
@@ -1176,7 +1518,7 @@ process.stdin.on("data", (chunk) => {
   const newline = buffer.indexOf("\\n");
   if (newline < 0) return;
   const request = JSON.parse(buffer.slice(0, newline));
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
 });
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
@@ -1231,7 +1573,9 @@ process.stdin.on("data", (chunk) => {
   while ((newline = buffer.indexOf("\\n")) >= 0) {
     const request = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
-    process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+    process.stdout.write(
+      JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n",
+    );
   }
 });
 process.on("SIGTERM", () => setTimeout(() => process.exit(0), 200));
@@ -1244,7 +1588,7 @@ setInterval(() => {}, 1000);
       const stop = harness.client.stop();
       const request = harness.client.request("initialize", {
         capabilities: { experimentalApi: true, requestAttestation: false },
-        clientInfo: { name: "shutdown-race", version: "1" },
+        clientInfo: { name: "shutdown-race", title: null, version: "1" },
       });
       const outcome = await settlePromiseWithTimeout(request, {
         label: "request after client shutdown",
@@ -1277,7 +1621,7 @@ process.stdin.on("data", (chunk) => {
   const request = JSON.parse(buffer.slice(0, newline));
   buffer = buffer.slice(newline + 1);
   if (request.id === undefined) return;
-  process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
   for (let index = 0; index < 2048; index += 1) {
     process.stdout.write(JSON.stringify({
       method: "item/agentMessage/delta",

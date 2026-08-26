@@ -123,15 +123,20 @@ export class OpenAiPrivateCitationStreamFilter {
   }
 
   finish(): OpenAiPrivateCitationFilterResult {
+    const result = this.previewFinish();
+    this.#discardUntilEnd = false;
+    this.#pendingMarkup = "";
+    return result;
+  }
+
+  previewFinish(): OpenAiPrivateCitationFilterResult {
     if (this.#discardUntilEnd) {
-      this.#discardUntilEnd = false;
       return { privateCitationCount: 0, text: "" };
     }
 
     const result = scanOpenAiPrivateCitations(this.#pendingMarkup, {
       preserveIncompleteMarkup: false,
     });
-    this.#pendingMarkup = "";
 
     return {
       privateCitationCount: result.privateCitationCount,

@@ -5,9 +5,16 @@ import {
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
+import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
+import type { RunId } from "../src/protocol/id";
 import type { DriverEventBatchOutput } from "../src/protocol/orpc";
+import { CMA_MAX_EVENT_BYTES } from "../src/stores/cma-store";
+import { createCmaMemoryStore } from "../src/stores/memory";
 import { settlePromiseWithTimeout } from "../src/utils/async";
+import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
+
+const runId = "run-1" as RunId;
 
 interface RecordingSocket extends DriverRuntimeEventPort {
   readonly pushedEvents: DriverEventInput[];
@@ -26,6 +33,7 @@ function createRecordingSocket(): RecordingSocket {
   const pushedEvents: DriverEventInput[] = [];
 
   return {
+    currentRunId: () => runId,
     pushedEvents,
     pushEvents: async (input) => {
       pushedEvents.push(...input.events);
@@ -35,6 +43,15 @@ function createRecordingSocket(): RecordingSocket {
 }
 
 const permissionInput = {
+  agentId: "subagent-1",
+  blockedPath: "/workspace/secret",
+  decisionReason: "Path is outside the allowed roots.",
+  description: "Read access to /workspace/secret",
+  matchedAskRule: {
+    ruleContent: "Read(/workspace/secret/**)",
+    source: "project",
+    toolName: "Read",
+  },
   rawInput: '{"command":"fd ."}',
   requestId: "permission-1",
   title: "Approve command execution",
@@ -58,7 +75,16 @@ describe("DriverPermissionBroker", () => {
       {
         kind: "permission.requested",
         payload: {
+          agentId: "subagent-1",
+          blockedPath: "/workspace/secret",
+          decisionReason: "Path is outside the allowed roots.",
+          description: "Read access to /workspace/secret",
           details: '{"command":"fd ."}',
+          matchedAskRule: {
+            ruleContent: "Read(/workspace/secret/**)",
+            source: "project",
+            toolName: "Read",
+          },
           requestId: "permission-1",
           targetItemId: "tool-1",
           title: "Approve command execution",
@@ -153,6 +179,55 @@ describe("DriverPermissionBroker", () => {
     expect(socket.pushedEvents).toEqual([]);
   });
 
+  test("rejects an oversized permission event before the real CMA boundary", async () => {
+    const broker = new DriverPermissionBroker(() => null);
+    const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
+    const pushedEvents: DriverEventInput[] = [];
+    let sequence = 0;
+    const socket: RecordingSocket = {
+      currentRunId: () => DRIVER_TEST_IDS.runId,
+      pushedEvents,
+      pushEvents: async ({ events }) => {
+        for (const event of events) {
+          const [envelope] = toDriverEventEnvelopes(
+            driverBootPayload,
+            event,
+            DRIVER_TEST_IDS.runId,
+          );
+          await store.appendDriverEvent(DRIVER_TEST_IDS.sessionId, envelope!.event);
+        }
+        pushedEvents.push(...events);
+        return {
+          accepted: events.map((event) => ({
+            eventId: event.sourceEventId,
+            seq: (sequence += 1),
+            type: event.kind,
+          })),
+        };
+      },
+    };
+    const safeInput = { ...permissionInput, rawInput: "x".repeat(500_000) };
+    const safeRequest = broker.request(socket, safeInput);
+
+    await Bun.sleep(0);
+    expect(broker.resolve(safeInput.requestId, "reject_once")).toBe(true);
+    await expect(safeRequest).resolves.toBe("reject_once");
+    expect(pushedEvents.map(({ kind }) => kind)).toEqual([
+      "permission.requested",
+      "permission.resolved",
+    ]);
+
+    await expect(
+      broker.request(socket, {
+        ...permissionInput,
+        rawInput: "x".repeat(CMA_MAX_EVENT_BYTES),
+        requestId: "permission-oversized",
+      }),
+    ).rejects.toThrow("permission request event exceeds 524288 UTF-8 bytes");
+    expect(pushedEvents).toHaveLength(2);
+    expect(broker.hasPending()).toBe(false);
+  });
+
   test.each([0, -1, 1.5, Number.POSITIVE_INFINITY, Number.NaN])(
     "rejects invalid pending limits %p",
     (limit) => {
@@ -187,6 +262,7 @@ describe("DriverPermissionBroker", () => {
       const controller = new AbortController();
       let failPublish = mode === "publish failure";
       const socket: DriverRuntimeEventPort = {
+        currentRunId: () => runId,
         pushEvents: async ({ events }) => {
           if (failPublish) {
             failPublish = false;
@@ -241,6 +317,7 @@ describe("DriverPermissionBroker", () => {
       let stallRequested = true;
       let requestedEvents: readonly DriverEventInput[] = [];
       const socket: DriverRuntimeEventPort = {
+        currentRunId: () => runId,
         pushEvents: async ({ events }) => {
           if (stallRequested && events.some((event) => event.kind === "permission.requested")) {
             requestedEvents = events;
@@ -303,6 +380,7 @@ describe("DriverPermissionBroker", () => {
       let stallResolution = true;
       let resolutionEvents: readonly DriverEventInput[] = [];
       const socket: DriverRuntimeEventPort = {
+        currentRunId: () => runId,
         pushEvents: async ({ events }) => {
           if (stallResolution && events.some((event) => event.kind === "permission.resolved")) {
             resolutionEvents = events;
@@ -363,6 +441,7 @@ describe("DriverPermissionBroker", () => {
       requestTimeoutMs: 1,
     });
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         if (events.some((event) => event.kind === "permission.resolved")) {
           await Bun.sleep(10);
@@ -383,6 +462,7 @@ describe("DriverPermissionBroker", () => {
       maxPendingRequests: 1,
     });
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         if (failResolution && events.some((event) => event.kind === "permission.resolved")) {
           throw deliveryFailure;
@@ -435,6 +515,7 @@ describe("DriverPermissionBroker", () => {
       const releaseResolution = Promise.withResolvers<void>();
       const controller = new AbortController();
       const socket: DriverRuntimeEventPort = {
+        currentRunId: () => runId,
         pushEvents: async ({ events }) => {
           if (events.some((event) => event.kind === "permission.resolved")) {
             resolutionPublishing.resolve();
@@ -493,6 +574,7 @@ describe("DriverPermissionBroker", () => {
       let resolvedEvents = 0;
       const broker = new DriverPermissionBroker(() => null, { requestTimeoutMs: 100 });
       const socket: DriverRuntimeEventPort = {
+        currentRunId: () => runId,
         pushEvents: async ({ events }) => {
           if (events.some((event) => event.kind === "permission.resolved")) {
             resolvedEvents += 1;
@@ -553,6 +635,7 @@ describe("DriverPermissionBroker", () => {
       requestTimeoutMs: 100,
     });
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         if (events.some((event) => event.kind === "permission.resolved")) {
           resolutionCount += 1;
@@ -586,6 +669,7 @@ describe("DriverPermissionBroker", () => {
     let fail = true;
     const broker = new DriverPermissionBroker(() => null);
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         if (fail) {
           fail = false;
@@ -669,6 +753,7 @@ describe("DriverPermissionBroker", () => {
     const releaseResolution = Promise.withResolvers<void>();
     const pushedEvents: DriverEventInput[] = [];
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         pushedEvents.push(...events);
 
@@ -723,6 +808,7 @@ describe("DriverPermissionBroker", () => {
     const requestedPublishing = Promise.withResolvers<void>();
     const pushedKinds: string[] = [];
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events, signal }) => {
         pushedKinds.push(...events.map((event) => event.kind));
 
@@ -759,6 +845,7 @@ describe("DriverPermissionBroker", () => {
     const acceptedKinds: string[] = [];
     const pushedKinds: string[] = [];
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events, signal }) => {
         pushedKinds.push(...events.map((event) => event.kind));
 
@@ -799,6 +886,7 @@ describe("DriverPermissionBroker", () => {
     const controller = new AbortController();
     let deliveryAborted = false;
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events, signal }) => {
         if (events.some((event) => event.kind === "permission.resolved")) {
           resolutionPublishing.resolve();
@@ -886,6 +974,7 @@ describe("DriverPermissionBroker", () => {
     let pushCount = 0;
     const broker = new DriverPermissionBroker(() => null, { requestTimeoutMs: 1 });
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         pushCount += 1;
 
@@ -913,6 +1002,7 @@ describe("DriverPermissionBroker", () => {
     const batchSizes: number[] = [];
     const broker = new DriverPermissionBroker(() => null);
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         batchSizes.push(events.length);
         return acceptEvents(events.slice(0, 1));
@@ -930,6 +1020,7 @@ describe("DriverPermissionBroker", () => {
   test("fails and releases a request when event delivery makes no progress", async () => {
     const broker = new DriverPermissionBroker(() => null);
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async () => ({ accepted: [] }),
     };
 
@@ -954,6 +1045,7 @@ describe("DriverPermissionBroker", () => {
     const broker = new DriverPermissionBroker(() => null);
     const pushedEvents: DriverEventInput[] = [];
     const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
       pushEvents: async ({ events }) => {
         pushedEvents.push(...events);
 

@@ -9,6 +9,7 @@ import type {
   McpExternalToolEffectClaim,
   McpExternalToolEffectExecution,
   McpExternalToolExecutionResult,
+  RunError,
   RuntimeCommand,
   RuntimeCommandResult,
 } from "../runtime-command";
@@ -34,6 +35,7 @@ export interface AgentDriverEventSink {
   commandUpdate(
     input: {
       commandId: string;
+      error?: RunError;
       result?: RuntimeCommandResult;
       status: "accepted" | "cancelled" | "completed" | "failed";
     },
@@ -47,7 +49,7 @@ export interface AgentDriverEventSink {
     },
     signal: AbortSignal,
   ): Promise<void>;
-  currentRunId?(): RunId | null;
+  currentRunId(): RunId | null;
   markExternalToolEffectUnknown?(input: { commandId: string }, signal: AbortSignal): Promise<void>;
   pushEvents(input: {
     events: DriverEventInput[];
@@ -57,15 +59,26 @@ export interface AgentDriverEventSink {
 
 export interface AgentDriverPermissionPort {
   request(
-    input: {
-      rawInput: string | null;
-      requestId: string;
-      title: string;
-      toolCallId: string | null;
-      toolKind: string | null;
-    },
+    input: DriverPermissionRequest,
     signal?: AbortSignal,
   ): Promise<"allow_once" | "reject_once">;
+}
+
+export interface DriverPermissionRequest {
+  agentId?: string;
+  blockedPath?: string;
+  decisionReason?: string;
+  description?: string;
+  matchedAskRule?: {
+    readonly ruleContent?: string;
+    readonly source: string;
+    readonly toolName: string;
+  };
+  rawInput: string | null;
+  requestId: string;
+  title: string;
+  toolCallId: string | null;
+  toolKind: string | null;
 }
 
 export interface AgentDriverMcpPort {

@@ -8,14 +8,16 @@ export interface RunError {
   readonly retryable: boolean;
 }
 
-export type RuntimeCommandStatus =
-  | "accepted"
-  | "cancelled"
-  | "completed"
-  | "delivered"
-  | "expired"
-  | "failed"
-  | "queued";
+export const RUNTIME_COMMAND_STATUSES = [
+  "accepted",
+  "cancelled",
+  "completed",
+  "delivered",
+  "expired",
+  "failed",
+  "queued",
+] as const;
+export type RuntimeCommandStatus = (typeof RUNTIME_COMMAND_STATUSES)[number];
 
 export interface RuntimeCommandInput {
   readonly text: string;
@@ -114,20 +116,24 @@ export type McpExternalToolEffectClaim =
 
 export type RuntimeCommandResult = InputStartCommandResult | McpExecuteCommandResult | null;
 
-export type DriverCapabilityId =
-  | "custom_tool_execute"
-  | "file_change"
-  | "input_start"
-  | "mcp_execute"
-  | "native_resume"
-  | "permission_request"
-  | "session_stop"
-  | "text_stream"
-  | "thinking_stream"
-  | "tool_stream"
-  | "turn_cancel"
-  | "usage"
-  | "visible_activity";
+export const DRIVER_CAPABILITY_IDS = [
+  "custom_tool_execute",
+  "file_change",
+  "input_start",
+  "mcp_execute",
+  "native_resume",
+  "permission_request",
+  "session_stop",
+  "text_stream",
+  "thinking_stream",
+  "tool_stream",
+  "turn_cancel",
+  "usage",
+  "visible_activity",
+] as const;
+export type DriverCapabilityId = (typeof DRIVER_CAPABILITY_IDS)[number];
+
+const MAX_RUNTIME_CONTROL_REASON_BYTES = 16 * 1_024;
 
 export interface DriverCapability {
   readonly details?: string | undefined;
@@ -180,6 +186,13 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
   }
 
   return value;
+}
+
+function normalizeControlReason(reason: string): string {
+  const bytes = Buffer.byteLength(reason, "utf8");
+  return bytes <= MAX_RUNTIME_CONTROL_REASON_BYTES
+    ? reason
+    : `Runtime command reason exceeded ${String(MAX_RUNTIME_CONTROL_REASON_BYTES)} UTF-8 bytes (received ${String(bytes)}).`;
 }
 
 function readRuntimeCommandInput(value: unknown): RuntimeCommandInput {
@@ -242,7 +255,7 @@ export function parseRuntimeCommand(value: unknown): RuntimeCommand {
       return {
         commandId: readNonEmptyString(record, "commandId"),
         kind,
-        reason: readNonEmptyString(record, "reason"),
+        reason: normalizeControlReason(readNonEmptyString(record, "reason")),
       };
     case "turn.cancel": {
       const reason = readOptionalString(record, "reason");
@@ -250,7 +263,7 @@ export function parseRuntimeCommand(value: unknown): RuntimeCommand {
       return {
         commandId: readNonEmptyString(record, "commandId"),
         kind,
-        ...(reason === undefined ? {} : { reason }),
+        ...(reason === undefined ? {} : { reason: normalizeControlReason(reason) }),
       };
     }
     default:

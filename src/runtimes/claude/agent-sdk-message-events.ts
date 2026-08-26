@@ -22,9 +22,11 @@ export function toClaudeFilesPersistedEvents(message: SDKFilesPersistedEvent): D
 
   if (message.failed.length > 0) {
     events.push({
+      delivery: "best_effort",
       kind: "diagnostic.reported",
       payload: {
-        failed: message.failed,
+        failedCount: message.failed.length,
+        failedUtf8Bytes: Buffer.byteLength(JSON.stringify(message.failed), "utf8"),
         message: "Claude file persistence failed.",
         severity: "warn",
       },
@@ -44,6 +46,33 @@ export function toClaudeDiagnosticEvent(message: SDKMessage): JsonObject {
     subtype: readString(record, "subtype"),
     type: readString(record, "type"),
   };
+}
+
+function sumModelUsage(modelUsage: unknown, key: string): number | null {
+  if (!isRecord(modelUsage)) {
+    return null;
+  }
+
+  const counts = Object.values(modelUsage).flatMap((value) => {
+    const count = isRecord(value) ? toTokenCount(value[key]) : null;
+    return count === null ? [] : [count];
+  });
+  return counts.length === 0 ? null : toTokenCount(counts.reduce((total, count) => total + count));
+}
+
+export function aggregateClaudeModelUsage(modelUsage: unknown): JsonObject | null {
+  const inputTokens = sumModelUsage(modelUsage, "inputTokens");
+  const outputTokens = sumModelUsage(modelUsage, "outputTokens");
+  const cacheReadTokens = sumModelUsage(modelUsage, "cacheReadInputTokens");
+  const cacheCreationTokens = sumModelUsage(modelUsage, "cacheCreationInputTokens");
+  const usage: JsonObject = {
+    ...(cacheCreationTokens === null ? {} : { cache_creation_input_tokens: cacheCreationTokens }),
+    ...(cacheReadTokens === null ? {} : { cache_read_input_tokens: cacheReadTokens }),
+    ...(inputTokens === null ? {} : { input_tokens: inputTokens }),
+    ...(outputTokens === null ? {} : { output_tokens: outputTokens }),
+  };
+
+  return Object.keys(usage).length === 0 ? null : usage;
 }
 
 export function toClaudeUsageUpdatedEvents(

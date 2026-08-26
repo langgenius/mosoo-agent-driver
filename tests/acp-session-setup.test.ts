@@ -54,34 +54,30 @@ function setupInput(input: {
 }
 
 describe("ACP session setup", () => {
-  test("drops additional directories when the agent does not advertise support", async () => {
+  test("rejects additional directories when the agent does not advertise support", async () => {
     const { connection, requests } = createRecordingConnection();
 
-    const setup = await setupAcpSession(
-      setupInput({
-        agentCapabilities: {
-          loadSession: true,
-          sessionCapabilities: { close: {}, resume: {} },
-        },
-        connection,
-        currentSessionId: null,
-        payload: withAdditionalDirectories(["/workspace/extra"]),
-        replaySession: async (operation) => operation(),
-      }),
-    );
-
-    expect(setup.mode).toBe("created");
-    expect(setup.sessionId).toBe("acp-session-1");
-    expect(setup.droppedAdditionalDirectories).toEqual(["/workspace/extra"]);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.method).toBe(acpMethods.agent.session.new);
-    expect("additionalDirectories" in (requests[0]?.params ?? {})).toBe(false);
+    await expect(
+      setupAcpSession(
+        setupInput({
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: { close: {}, resume: {} },
+          },
+          connection,
+          currentSessionId: null,
+          payload: withAdditionalDirectories(["/workspace/extra"]),
+          replaySession: async (operation) => operation(),
+        }),
+      ),
+    ).rejects.toThrow("does not advertise additionalDirectories support");
+    expect(requests).toHaveLength(0);
   });
 
   test("passes additional directories through when the agent advertises support", async () => {
     const { connection, requests } = createRecordingConnection();
 
-    const setup = await setupAcpSession(
+    await setupAcpSession(
       setupInput({
         agentCapabilities: {
           loadSession: true,
@@ -94,7 +90,6 @@ describe("ACP session setup", () => {
       }),
     );
 
-    expect(setup.droppedAdditionalDirectories).toEqual([]);
     expect(requests[0]?.params["additionalDirectories"]).toEqual(["/workspace/extra"]);
   });
 
@@ -210,24 +205,21 @@ describe("ACP session setup", () => {
     });
   });
 
-  test("creates a new session when native restoration is unavailable", async () => {
+  test("rejects a native session when restoration is unavailable", async () => {
     const methods: string[] = [];
-    const result = await setupAcpSession(
-      setupInput({
-        agentCapabilities: {},
-        connection: connectionWith(async (method) => {
-          methods.push(method);
-          return { sessionId: "native-session-new" };
+    await expect(
+      setupAcpSession(
+        setupInput({
+          agentCapabilities: {},
+          connection: connectionWith(async (method) => {
+            methods.push(method);
+            return { sessionId: "native-session-new" };
+          }),
+          currentSessionId: EXISTING_SESSION_ID,
+          replaySession: async (operation) => operation(),
         }),
-        currentSessionId: EXISTING_SESSION_ID,
-        replaySession: async (operation) => operation(),
-      }),
-    );
-
-    expect(result).toMatchObject({
-      mode: "created",
-      sessionId: "native-session-new",
-    });
-    expect(methods).toEqual([acpMethods.agent.session.new]);
+      ),
+    ).rejects.toThrow("cannot restore the requested native session");
+    expect(methods).toEqual([]);
   });
 });

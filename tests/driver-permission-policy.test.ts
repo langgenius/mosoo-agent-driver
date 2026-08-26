@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { DriverPermissionRequest } from "../src/core/driver-permission-broker";
+import type { DriverPermissionRequest } from "../src/host-ports";
 import {
   createDriverPermissionRequestHandler,
   isDriverFullAccess,
@@ -74,6 +74,28 @@ describe("driver permission policy", () => {
 
     await expect(handler(SAMPLE_REQUEST)).resolves.toBe("allow_once");
     expect(supervisedCalls).toBe(0);
+  });
+
+  test("full_access preserves a user-configured ask rule", async () => {
+    const seen: DriverPermissionRequest[] = [];
+    const handler = createDriverPermissionRequestHandler({
+      payload: startInputWithPolicy("full_access"),
+      supervised: async (request) => {
+        seen.push(request);
+        return "reject_once";
+      },
+    });
+    const request = {
+      ...SAMPLE_REQUEST,
+      matchedAskRule: {
+        ruleContent: "Bash(*)",
+        source: "project",
+        toolName: "Bash",
+      },
+    };
+
+    await expect(handler(request)).resolves.toBe("reject_once");
+    expect(seen).toEqual([request]);
   });
 
   test("supervised delegates to the interactive handler", async () => {

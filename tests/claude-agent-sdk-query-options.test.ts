@@ -184,6 +184,7 @@ describe("Claude Agent SDK query options", () => {
     let permissionSignal: AbortSignal | undefined;
     const context = createAgentDriverContext({
       eventSink: {
+        currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
       logger,
@@ -233,6 +234,15 @@ describe("Claude Agent SDK query options", () => {
       "Bash",
       { command: "pwd" },
       {
+        agentID: "subagent-1",
+        blockedPath: "/workspace/secret",
+        decisionReason: "Path is outside the allowed roots.",
+        description: "Read access to /workspace/secret",
+        matchedAskRule: {
+          ruleContent: "Bash(*)",
+          source: "project",
+          toolName: "Bash",
+        },
         requestId: "permission-request-1",
         signal: abortController.signal,
         toolUseID: "tool-1",
@@ -252,6 +262,15 @@ describe("Claude Agent SDK query options", () => {
     await drainClaudeTasks(permissionTasks);
     expect(permissionTasks.size).toBe(0);
     expect(permissionInput).toMatchObject({
+      agentId: "subagent-1",
+      blockedPath: "/workspace/secret",
+      decisionReason: "Path is outside the allowed roots.",
+      description: "Read access to /workspace/secret",
+      matchedAskRule: {
+        ruleContent: "Bash(*)",
+        source: "project",
+        toolName: "Bash",
+      },
       requestId: "permission-request-1",
       toolCallId: "tool-1",
     });
@@ -282,6 +301,7 @@ describe("Claude Agent SDK query options", () => {
     const logger = createTestLogger();
     const context = createAgentDriverContext({
       eventSink: {
+        currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
       logger,

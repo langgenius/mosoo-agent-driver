@@ -1,5 +1,6 @@
 import { summarizeDriverPermissionRequest } from "../observability/driver-debug";
 import type { Logger } from "../observability";
+import type { DriverPermissionRequest } from "../host-ports";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import { promiseWithTimeout, settlePromiseWithTimeout } from "../utils/async";
@@ -12,6 +13,7 @@ const PERMISSION_EVENT_DELIVERY_TIMEOUT_MS = 10_000;
 const PERMISSION_CANCEL_DELIVERY_TIMEOUT_MS = 1_500;
 const MAX_PENDING_PERMISSION_REQUEST_BYTES = 8 * 1_024 * 1_024;
 const MAX_PENDING_PERMISSION_REQUESTS = 1_024;
+const MAX_PERMISSION_REQUEST_EVENT_BYTES = 512 * 1_024;
 const UTF8 = new TextEncoder();
 
 export type PermissionDecision = "allow_once" | "reject_once";
@@ -37,14 +39,6 @@ interface PermissionResolution {
 interface PermissionCancellationDelivery {
   useFullBudget(): void;
   useTurnBudget(): void;
-}
-
-export interface DriverPermissionRequest {
-  rawInput: string | null;
-  requestId: string;
-  title: string;
-  toolCallId: string | null;
-  toolKind: string | null;
 }
 
 export interface DriverPermissionBrokerOptions {
@@ -199,12 +193,17 @@ export class DriverPermissionBroker {
       throw new RangeError("Driver permission broker pending request byte budget is exhausted.");
     }
 
-    const runId = socket.currentRunId?.() ?? null;
+    const runId = socket.currentRunId();
     const events: DriverEventInput[] = [
       {
         kind: "permission.requested",
         payload: {
+          ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+          ...(input.blockedPath === undefined ? {} : { blockedPath: input.blockedPath }),
+          ...(input.decisionReason === undefined ? {} : { decisionReason: input.decisionReason }),
           details: input.rawInput,
+          ...(input.description === undefined ? {} : { description: input.description }),
+          ...(input.matchedAskRule === undefined ? {} : { matchedAskRule: input.matchedAskRule }),
           options: [],
           requestId: input.requestId,
           targetItemId: input.toolCallId,
@@ -217,6 +216,13 @@ export class DriverPermissionBroker {
         ...(runId === null ? {} : { runId }),
       },
     ];
+
+    if (UTF8.encode(JSON.stringify(events[0])).byteLength > MAX_PERMISSION_REQUEST_EVENT_BYTES) {
+      throw new RangeError(
+        `Driver permission request event exceeds ${String(MAX_PERMISSION_REQUEST_EVENT_BYTES)} UTF-8 bytes.`,
+      );
+    }
+
     const deferred = Promise.withResolvers<PermissionResolution>();
     const cancellationDelivery = new AbortController();
     let cancellationDeliveryTimeout: ReturnType<typeof setTimeout> | null = null;

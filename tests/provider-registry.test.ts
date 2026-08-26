@@ -79,7 +79,7 @@ describe("provider registry", () => {
         { id: "input_start", status: "supported", version: 1 },
         { id: "permission_request", status: "unsupported", version: 1 },
         { id: "session_stop", status: "supported", version: 1 },
-        { id: "thinking_stream", status: "unsupported", version: 1 },
+        { id: "thinking_stream", status: "supported", version: 1 },
       ]),
     );
   });

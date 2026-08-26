@@ -20,18 +20,25 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
   readonly pushedEvents: Parameters<DriverRuntimeIo["pushEvents"]>[0][] = [];
   readonly updates: Parameters<DriverRuntimeIo["commandUpdate"]>[0][] = [];
   readonly #commands: readonly RuntimeCommand[];
+  #activeRunId: ReturnType<DriverRuntimeIo["currentRunId"]> = null;
   #commandIndex = 0;
 
   constructor(commands: readonly RuntimeCommand[]) {
     this.#commands = commands;
   }
 
-  beginRun(): void {
-    return;
+  beginRun(runId: Parameters<DriverRuntimeIo["beginRun"]>[0]): void {
+    this.#activeRunId = runId;
   }
 
-  endRun(): void {
-    return;
+  currentRunId(): ReturnType<DriverRuntimeIo["currentRunId"]> {
+    return this.#activeRunId;
+  }
+
+  endRun(runId: Parameters<DriverRuntimeIo["endRun"]>[0]): void {
+    if (this.#activeRunId === runId) {
+      this.#activeRunId = null;
+    }
   }
 
   async heartbeat(): ReturnType<DriverRuntimeIo["heartbeat"]> {

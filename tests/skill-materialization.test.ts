@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zipSync as createZipArchive } from "fflate";
 
 import type { AgentDriverMaterializedSkill } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
@@ -22,8 +23,6 @@ import {
   exposeNativeSkillAliases,
   materializeResolvedSkills,
 } from "../src/runtimes/skill-materialization";
-import { createZipArchive } from "../src/skill-package";
-import type { SkillPackageEntry } from "../src/skill-package";
 import { bootPayload } from "./driver-runtime-boundary-fixtures";
 
 const textEncoder = new TextEncoder();
@@ -73,15 +72,8 @@ function createTestLogger() {
   });
 }
 
-function createMarkdownSkillEntries(markdown: string): SkillPackageEntry[] {
-  return [
-    {
-      body: textEncoder.encode(markdown),
-      entryKind: "file",
-      isExecutable: false,
-      path: "SKILL.md",
-    },
-  ];
+function createMarkdownSkillEntries(markdown: string) {
+  return { "SKILL.md": textEncoder.encode(markdown) };
 }
 
 describe("skill materialization", () => {
@@ -146,14 +138,9 @@ Check the diff.`),
   test("fails malformed packages before reporting materialization success", async () => {
     const root = await mkdtemp(join(tmpdir(), "mosoo-skill-materialization-"));
     const logger = createTestLogger();
-    const archive = createZipArchive([
-      {
-        body: textEncoder.encode("missing skill markdown"),
-        entryKind: "file",
-        isExecutable: false,
-        path: "references/README.md",
-      } satisfies SkillPackageEntry,
-    ]);
+    const archive = createZipArchive({
+      "references/README.md": textEncoder.encode("missing skill markdown"),
+    });
     const skill = createSkill(root, archive);
 
     try {

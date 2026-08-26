@@ -1,4 +1,4 @@
-import { timestampSchema } from "../../contract/common";
+import { jsonValueSchema, timestampSchema } from "../../contract/common";
 import type { DriverId } from "../id";
 import { parseDriverId } from "../id";
 import type {
@@ -170,6 +170,34 @@ export function requireOptionalString(
   }
 
   requireString(value, field, label);
+}
+
+export function requireOptionalBoolean(
+  value: RuntimeEventRecord,
+  field: string,
+  label: RuntimeEventKind | string,
+): void {
+  if (!(field in value) || value[field] === undefined) {
+    return;
+  }
+
+  if (typeof value[field] !== "boolean") {
+    throw new Error(`${label} ${field} must be a boolean.`);
+  }
+}
+
+export function requireOptionalJsonValue(
+  value: RuntimeEventRecord,
+  field: string,
+  label: RuntimeEventKind | string,
+): void {
+  if (!(field in value) || value[field] === undefined) {
+    return;
+  }
+
+  if (!jsonValueSchema.safeParse(value[field]).success) {
+    throw new Error(`${label} ${field} must be JSON-serializable.`);
+  }
 }
 
 export function requireOptionalContentString(

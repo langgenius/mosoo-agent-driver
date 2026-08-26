@@ -1,5 +1,6 @@
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
+import type { DriverPermissionRequest } from "../../host-ports";
 import { toRuntimeToolStatus, toToolCallPayload } from "./acp-tool-events";
 import {
   isRecord,
@@ -11,12 +12,10 @@ import {
 import type { JsonObject } from "./acp-types";
 
 export interface AcpPermissionTranslation {
-  readonly defaultOptionId: string | null;
   readonly events: DriverEventInput[];
   readonly options: readonly AcpPermissionOption[];
-  readonly requestId: string;
+  readonly request: DriverPermissionRequest;
   readonly targetItemId: string;
-  readonly title: string;
   readonly toolCall: JsonObject | null;
 }
 
@@ -34,7 +33,8 @@ export function toPermissionRequest(input: {
   const params = isRecord(input.params) ? input.params : {};
   const toolCall = readRecord(params, "toolCall");
   const options = normalizePermissionOptions(params["options"]);
-  const toolCallId = readNonEmptyString(toolCall, "toolCallId") ?? input.requestId;
+  const nativeToolCallId = readNonEmptyString(toolCall, "toolCallId");
+  const toolCallId = nativeToolCallId ?? input.requestId;
   const title =
     readNonEmptyString(toolCall, "title") ??
     readNonEmptyString(toolCall, "kind") ??
@@ -53,51 +53,18 @@ export function toPermissionRequest(input: {
     });
   }
 
-  events.push({
-    kind: "permission.requested",
-    payload: {
-      defaultOptionId: options.find((option) => option.kind === "allow_once")?.optionId ?? null,
-      details: stringifyForDisplay(toolCall?.["rawInput"]),
-      options,
-      requestId: input.requestId,
-      targetItemId: toolCallId,
-      title,
-      toolCall: toolCall === null ? null : toToolCallPayload(toolCallId, "running", toolCall),
-    },
-    ...(input.runId === null ? {} : { runId: input.runId }),
-  });
-
   return {
-    defaultOptionId: options.find((option) => option.kind === "allow_once")?.optionId ?? null,
     events,
     options,
-    requestId: input.requestId,
+    request: {
+      rawInput: stringifyForDisplay(toolCall?.["rawInput"]),
+      requestId: input.requestId,
+      title,
+      toolCallId: nativeToolCallId,
+      toolKind: readNonEmptyString(toolCall, "kind"),
+    },
     targetItemId: toolCallId,
-    title,
     toolCall,
-  };
-}
-
-export function toPermissionResolvedEvent(input: {
-  option: AcpPermissionOption | null;
-  requestId: string;
-  runId: RunId | null;
-}): DriverEventInput {
-  return {
-    kind: "permission.resolved",
-    payload:
-      input.option === null
-        ? {
-            outcome: "cancelled",
-            requestId: input.requestId,
-          }
-        : {
-            optionId: input.option.optionId,
-            optionKind: input.option.kind,
-            outcome: "selected",
-            requestId: input.requestId,
-          },
-    ...(input.runId === null ? {} : { runId: input.runId }),
   };
 }
 

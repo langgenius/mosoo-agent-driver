@@ -206,6 +206,13 @@ artifactTest(
         };
         methods.push(message.method);
 
+        if (message.method === "server/discover") {
+          return Response.json({
+            error: { code: -32601, message: "Method not found" },
+            id: message.id,
+            jsonrpc: "2.0",
+          });
+        }
         if (message.method !== "initialize" && !hasValidSessionHeaders()) {
           invalidSessionHeaders += 1;
           return new Response("Invalid MCP session headers.", { status: 400 });
@@ -444,7 +451,14 @@ artifactTest(
       controller.enqueue(mcpCommand("mcp-structured", "structured"));
       expect(await controller.waitForCommandTerminal("mcp-structured", 10_000)).toMatchObject({
         result: {
-          outputText: '{\n  "count": 1,\n  "status": "ok"\n}',
+          outputText: JSON.stringify(
+            {
+              content: [],
+              structuredContent: { count: 1, status: "ok" },
+            },
+            null,
+            2,
+          ),
         },
         status: "completed",
       });

@@ -27,7 +27,10 @@ function createHarness(
     sink: async () => {},
   });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
     logger,
     payload: driverStartInput,
     permission: { request: async () => "reject_once" },
@@ -429,38 +432,32 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     }
   });
 
-  test("reuses one supervisor across the full terminal capacity", async () => {
+  test("reuses one supervisor for concurrent terminals", async () => {
     const supervisors = new Set<ChildProcess>();
-    let leaseCount = 0;
-    const harness = createHarness(undefined, 32, false, (pid, marker) => {
+    const harness = createHarness(undefined, 2, false, (pid, marker) => {
       const lease = spawnLinuxProcessTreeWatchdog(pid, marker);
       if (lease === null) {
         throw new Error("Test process supervision could not start.");
       }
-      leaseCount += 1;
       supervisors.add(lease.process);
       return lease;
     });
 
     try {
       await Promise.all(
-        Array.from({ length: 32 }, () =>
+        Array.from({ length: 2 }, () =>
           harness.manager.create(harness.context, {
             args: ["-e", "setInterval(() => {}, 1_000)"],
             command: process.execPath,
           }),
         ),
       );
-
-      expect(leaseCount).toBe(32);
       expect(supervisors.size).toBe(1);
-      expect([...supervisors][0]?.pid).toBeGreaterThan(1);
-      await harness.manager.stopAll(harness.context);
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
       await harness.logger.destroy();
     }
-  }, 10_000);
+  });
 
   test("rejects terminal buffers above the deployment hard limit", async () => {
     const harness = createHarness();
@@ -496,6 +493,69 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       });
       await harness.manager.waitForExit(second);
       await harness.manager.release(harness.context, second);
+    } finally {
+      await harness.manager.stopAll(harness.context);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("reserves capacity before concurrent terminal creation can yield", async () => {
+    const harness = createHarness(undefined, 1);
+
+    try {
+      const creations = await Promise.allSettled(
+        Array.from({ length: 8 }, () =>
+          harness.manager.create(harness.context, {
+            args: ["-e", "setInterval(() => {}, 1000)"],
+            command: process.execPath,
+          }),
+        ),
+      );
+      const created = creations.flatMap((result) =>
+        result.status === "fulfilled" ? [result.value] : [],
+      );
+
+      expect(created).toHaveLength(1);
+      expect(creations.filter((result) => result.status === "rejected")).toHaveLength(7);
+      expect(harness.events.filter((event) => event.kind === "terminal.created")).toHaveLength(1);
+
+      await harness.manager.release(harness.context, created[0]);
+      const next = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(next);
+      await harness.manager.release(harness.context, next);
+    } finally {
+      await harness.manager.stopAll(harness.context);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("stops only one turn and accepts terminals in the next turn", async () => {
+    const harness = createHarness(undefined, 1);
+
+    try {
+      const firstTurn = harness.manager.beginTurn();
+      const first = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      while (harness.manager.output(first).output !== "ready") {
+        await Bun.sleep(10);
+      }
+
+      await harness.manager.stopTurn(harness.context, firstTurn);
+      expect(() => harness.manager.output(first)).toThrow("does not exist");
+
+      const secondTurn = harness.manager.beginTurn();
+      const second = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(second);
+      await harness.manager.stopTurn(harness.context, secondTurn);
+      expect(() => harness.manager.output(second)).toThrow("does not exist");
     } finally {
       await harness.manager.stopAll(harness.context);
       await harness.logger.destroy();

@@ -1,3 +1,4 @@
+import type { DriverPermissionRequest } from "../host-ports";
 import type { RuntimeCommand, RuntimeCommandInput, RuntimeCommandResult } from "../runtime-command";
 import { summarizeTextDigest } from "./driver-debug-paths";
 
@@ -80,14 +81,22 @@ export function summarizeRuntimeCommandResult(
   };
 }
 
-export function summarizeDriverPermissionRequest(input: {
-  rawInput: string | null;
-  requestId: string;
-  title: string;
-  toolCallId: string | null;
-  toolKind: string | null;
-}): Record<string, unknown> {
+export function summarizeDriverPermissionRequest(
+  input: DriverPermissionRequest,
+): Record<string, unknown> {
   return {
+    agentId: input.agentId,
+    blockedPath: summarizeTextDigest(input.blockedPath ?? null),
+    decisionReason: summarizeTextDigest(input.decisionReason ?? null),
+    description: summarizeTextDigest(input.description ?? null),
+    matchedAskRule:
+      input.matchedAskRule === undefined
+        ? undefined
+        : {
+            ruleContent: summarizeTextDigest(input.matchedAskRule.ruleContent ?? null),
+            source: input.matchedAskRule.source,
+            toolName: input.matchedAskRule.toolName,
+          },
     rawInput: summarizeTextDigest(input.rawInput),
     requestId: input.requestId,
     title: summarizeTextDigest(input.title),

@@ -43,12 +43,19 @@ interface AcpTerminalState {
   readonly outputByteLimit: number;
   readonly process: ChildProcessWithoutNullStreams;
   readonly rejectExit: (reason?: unknown) => void;
+  readonly reservation: AcpTerminalReservation;
   releaseTask: Promise<void> | null;
   readonly resolveExit: (status: AcpTerminalExitStatus) => void;
   supervisionFailure: Error | null;
   readonly target: BoundSpawnedProcess;
   truncated: boolean;
   watchdog: LinuxProcessTreeWatchdog | null;
+}
+
+interface AcpTerminalReservation {
+  active: boolean;
+  claimed: boolean;
+  readonly turn: number;
 }
 
 interface AcpTerminalExitStatus {
@@ -84,9 +91,11 @@ export class AcpTerminalManager {
   readonly #maxTerminals: number;
   readonly #pathScope: AcpPathScope;
   readonly #push: AcpTerminalManagerOptions["push"];
-  readonly #createTasks = new Set<Promise<unknown>>();
+  readonly #createTasks = new Map<Promise<unknown>, number>();
   readonly #spawnWatchdog: typeof spawnLinuxProcessTreeWatchdog;
+  #currentTurn = 0;
   #stopping = false;
+  #terminalReservations = 0;
   readonly #terminals = new Map<string, AcpTerminalState>();
 
   constructor(options: AcpTerminalManagerOptions) {
@@ -110,20 +119,41 @@ export class AcpTerminalManager {
     if (this.#stopping) {
       throw new Error("ACP terminal manager is stopping.");
     }
+    if (this.#terminalReservations >= this.#maxTerminals) {
+      throw new Error(`ACP terminal limit of ${this.#maxTerminals} is exhausted.`);
+    }
 
-    const creation = this.#create(context, params, signal);
-    this.#createTasks.add(creation);
+    const reservation: AcpTerminalReservation = {
+      active: true,
+      claimed: false,
+      turn: this.#currentTurn,
+    };
+    this.#terminalReservations += 1;
+    const creation = this.#create(context, params, reservation, signal);
+    this.#createTasks.set(creation, reservation.turn);
 
     try {
       return await creation;
     } finally {
       this.#createTasks.delete(creation);
+      if (!reservation.claimed) {
+        this.#releaseReservation(reservation);
+      }
     }
+  }
+
+  beginTurn(): number {
+    if (this.#stopping) {
+      throw new Error("ACP terminal manager is stopping.");
+    }
+
+    return ++this.#currentTurn;
   }
 
   async #create(
     context: AgentDriverContext,
     params: unknown,
+    reservation: AcpTerminalReservation,
     signal?: AbortSignal,
   ): Promise<{ terminalId: string }> {
     signal?.throwIfAborted();
@@ -137,10 +167,6 @@ export class AcpTerminalManager {
 
     if (command === null) {
       throw new Error("ACP terminal/create requires a command.");
-    }
-
-    if (this.#terminals.size >= this.#maxTerminals) {
-      throw new Error(`ACP terminal limit of ${this.#maxTerminals} is exhausted.`);
     }
 
     const args = readArray(record, "args").filter(
@@ -189,6 +215,7 @@ export class AcpTerminalManager {
       outputByteLimit,
       process: child,
       rejectExit,
+      reservation,
       releaseTask: null,
       resolveExit,
       supervisionFailure: null,
@@ -197,6 +224,7 @@ export class AcpTerminalManager {
       watchdog: null,
     };
 
+    reservation.claimed = true;
     this.#terminals.set(terminalId, terminal);
     child.once("close", (exitCode, signal) => {
       const status = { exitCode: exitCode ?? null, signal: signal ?? null };
@@ -327,7 +355,7 @@ export class AcpTerminalManager {
       }
 
       releaseLinuxProcessMarker(terminal.marker);
-      this.#terminals.delete(terminalId);
+      this.#removeTerminal(terminal);
       throw error;
     }
 
@@ -403,9 +431,24 @@ export class AcpTerminalManager {
 
   async stopAll(context: AgentDriverContext): Promise<void> {
     this.#stopping = true;
-    const creations = await Promise.allSettled(this.#createTasks);
+    await this.#stop(context);
+  }
+
+  async stopTurn(context: AgentDriverContext, turn: number): Promise<void> {
+    await this.#stop(context, turn);
+  }
+
+  async #stop(context: AgentDriverContext, turn?: number): Promise<void> {
+    const ownsTurn = (ownedTurn: number): boolean => turn === undefined || ownedTurn === turn;
+    const creations = await Promise.allSettled(
+      [...this.#createTasks].flatMap(([creation, ownedTurn]) =>
+        ownsTurn(ownedTurn) ? [creation] : [],
+      ),
+    );
     const releases = await Promise.allSettled(
-      [...this.#terminals.values()].map((terminal) => this.#releaseTerminal(context, terminal)),
+      [...this.#terminals.values()].flatMap((terminal) =>
+        ownsTurn(terminal.reservation.turn) ? [this.#releaseTerminal(context, terminal)] : [],
+      ),
     );
     const failures = [
       ...creations.flatMap((result) =>
@@ -498,8 +541,26 @@ export class AcpTerminalManager {
 
     if (this.#terminals.get(terminal.id) === terminal) {
       releaseLinuxProcessMarker(terminal.marker);
-      this.#terminals.delete(terminal.id);
+      this.#removeTerminal(terminal);
     }
+  }
+
+  #removeTerminal(terminal: AcpTerminalState): void {
+    if (this.#terminals.get(terminal.id) !== terminal) {
+      return;
+    }
+
+    this.#terminals.delete(terminal.id);
+    this.#releaseReservation(terminal.reservation);
+  }
+
+  #releaseReservation(reservation: AcpTerminalReservation): void {
+    if (!reservation.active) {
+      return;
+    }
+
+    reservation.active = false;
+    this.#terminalReservations -= 1;
   }
 
   async #completeExit(

@@ -65,8 +65,6 @@ function toAgentDriverEventSink(
     return eventSink;
   }
 
-  const currentRunId = eventSink.currentRunId?.bind(eventSink);
-
   return {
     claimExternalToolEffect: async () => {
       throw new Error("Driver external tool effect ledger is not configured.");
@@ -75,7 +73,7 @@ function toAgentDriverEventSink(
     completeExternalToolEffect: async () => {
       throw new Error("Driver external tool effect ledger is not configured.");
     },
-    ...(currentRunId === undefined ? {} : { currentRunId }),
+    currentRunId: eventSink.currentRunId.bind(eventSink),
     markExternalToolEffectUnknown: async () => {},
     pushEvents: (input) => eventSink.pushEvents(input),
   };

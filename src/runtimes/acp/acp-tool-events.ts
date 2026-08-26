@@ -3,9 +3,9 @@ import { isDeepStrictEqual } from "node:util";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import {
+  MAX_ACP_LOSSLESS_EVENT_BYTES,
   isRecord,
   readNonEmptyString,
-  readNullableString,
   readNumber,
   readRecord,
   readString,
@@ -13,7 +13,7 @@ import {
 } from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
-export type RuntimeToolStatus = "completed" | "failed" | "running";
+export type RuntimeToolStatus = "cancelled" | "completed" | "failed" | "running";
 
 function readToolDisplayString(value: unknown): string | undefined {
   const display = stringifyForDisplay(value);
@@ -41,10 +41,10 @@ function hasNonzeroExecuteExit(kind: unknown, update: JsonObject | null): boolea
 }
 
 export class AcpToolEventState {
-  readonly #completed = new Set<string>();
-  readonly #nonzeroExecuteExits = new Set<string>();
-  readonly #snapshots = new Map<string, JsonObject>();
-  readonly #started = new Set<string>();
+  #completed = new Set<string>();
+  #nonzeroExecuteExits = new Set<string>();
+  #snapshots = new Map<string, JsonObject>();
+  #started = new Set<string>();
 
   hasActivity(): boolean {
     return this.#started.size > 0;
@@ -61,6 +61,20 @@ export class AcpToolEventState {
     this.#started.clear();
   }
 
+  checkpoint(): () => void {
+    const completed = new Set(this.#completed);
+    const nonzeroExecuteExits = new Set(this.#nonzeroExecuteExits);
+    const snapshots = new Map(this.#snapshots);
+    const started = new Set(this.#started);
+
+    return () => {
+      this.#completed = completed;
+      this.#nonzeroExecuteExits = nonzeroExecuteExits;
+      this.#snapshots = snapshots;
+      this.#started = started;
+    };
+  }
+
   patch(input: {
     parentMessageId?: string | undefined;
     status: RuntimeToolStatus | null;
@@ -72,14 +86,15 @@ export class AcpToolEventState {
     const kind = readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool";
     const nextStatus = input.status ?? "running";
 
-    if (hasNonzeroExecuteExit(kind, input.update)) {
-      this.#nonzeroExecuteExits.add(input.toolCallId);
-    }
+    const hasNonzeroExit =
+      this.#nonzeroExecuteExits.has(input.toolCallId) || hasNonzeroExecuteExit(kind, input.update);
 
     const status =
-      previousStatus === "completed" || previousStatus === "failed"
+      previousStatus === "cancelled" ||
+      previousStatus === "completed" ||
+      previousStatus === "failed"
         ? previousStatus
-        : nextStatus === "completed" && this.#nonzeroExecuteExits.has(input.toolCallId)
+        : nextStatus === "completed" && hasNonzeroExit
           ? "failed"
           : nextStatus;
     // The projection layer links tool calls to their assistant message via
@@ -88,16 +103,25 @@ export class AcpToolEventState {
       (typeof previous?.["parentMessageId"] === "string"
         ? previous["parentMessageId"]
         : undefined) ?? input.parentMessageId;
+    const title = readNonEmptyString(input.update, "title") ?? previous?.["title"];
     const payload = {
       ...previous,
       ...toToolCallPayload(input.toolCallId, status, input.update),
       kind,
       ...(parentMessageId === undefined ? {} : { parentMessageId }),
       status,
-      title: readNullableString(input.update, "title") ?? previous?.["title"] ?? null,
+      ...(typeof title === "string" ? { title } : {}),
       toolCallId: input.toolCallId,
     };
     const changed = previous === undefined || !isDeepStrictEqual(previous, payload);
+
+    if (Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_ACP_LOSSLESS_EVENT_BYTES) {
+      throw new RangeError(`ACP tool update exceeds ${MAX_ACP_LOSSLESS_EVENT_BYTES} UTF-8 bytes.`);
+    }
+
+    if (hasNonzeroExit) {
+      this.#nonzeroExecuteExits.add(input.toolCallId);
+    }
 
     if (changed) {
       this.#snapshots.set(input.toolCallId, structuredClone(payload));
@@ -123,7 +147,6 @@ export class AcpToolEventState {
         error: input.status === "failed" ? readString(input.update, "error") : undefined,
         itemId: input.toolCallId,
         itemType: "tool_call",
-        result: input.update?.["rawOutput"],
         status: input.status,
       },
       runId: input.runId,
@@ -146,7 +169,7 @@ export class AcpToolEventState {
       events.push({
         kind: "tool.call.updated",
         payload: {
-          ...this.#snapshots.get(itemId),
+          ...(input.error === undefined ? {} : { error: input.error }),
           status: input.status,
           toolCallId: itemId,
         },
@@ -198,7 +221,7 @@ export function toRuntimeToolStatus(status: string | null): RuntimeToolStatus {
     return "completed";
   }
 
-  if (status === "failed" || status === "cancelled") {
+  if (status === "failed") {
     return "failed";
   }
 
@@ -212,9 +235,10 @@ export function toToolCallPayload(
 ): JsonObject {
   const content = readToolContentString(update?.["content"]);
   const kind = readNonEmptyString(update, "kind");
+  const name = readNonEmptyString(update, "name");
   const rawInput = readToolDisplayString(update?.["rawInput"]);
   const rawOutput = readToolDisplayString(update?.["rawOutput"]);
-  const title = readNullableString(update, "title");
+  const title = readNonEmptyString(update, "title");
   const locations = update?.["locations"];
 
   return {
@@ -222,7 +246,8 @@ export function toToolCallPayload(
     ...(kind === null ? {} : { kind }),
     ...(locations === undefined || locations === null ? {} : { locations }),
     ...(rawInput === undefined ? {} : { rawInput }),
-    ...(rawOutput === undefined ? {} : { rawOutput }),
+    ...(rawOutput === undefined || rawOutput === content ? {} : { rawOutput }),
+    ...(name === null ? {} : { name }),
     status,
     ...(title === undefined || title === null ? {} : { title }),
     toolCallId,

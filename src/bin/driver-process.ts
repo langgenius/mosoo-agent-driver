@@ -24,7 +24,7 @@ import { DRIVER_PROTOCOL_VERSION } from "../protocol/boot";
 import type { DriverBootPayload } from "../protocol/boot";
 import { createDriverHostIntegrationSnapshotFromBootExecution } from "../protocol/host-integration";
 import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
-import { parseDriverId } from "../protocol/id";
+import { parseRunId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
 import { createDriverStartInputFromBootPayload } from "../protocol/start";
 import type { DriverStartInput } from "../protocol/start";
@@ -41,7 +41,7 @@ const DRIVER_BACKEND_START_TIMEOUT_MS = 60_000;
 const DRIVER_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 function parseNullableRunId(value: string | null): RunId | null {
-  return value === null ? null : (parseDriverId(value, "Run ID") as RunId);
+  return value === null ? null : parseRunId(value);
 }
 
 export class DriverProcess {

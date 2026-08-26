@@ -53,6 +53,7 @@ const CLAUDE_PROVIDER_OPTION_KEYS = new Set<string>([
 function createCanUseTool(
   context: AgentDriverContext,
   permissionTasks: Set<Promise<unknown>>,
+  publicToolCallId: (nativeToolCallId: string) => string,
 ): CanUseTool {
   return (toolName, input, options): Promise<PermissionResult> => {
     const task = (async () => {
@@ -67,10 +68,19 @@ function createCanUseTool(
 
       const decision = await context.ports.permission.request(
         {
+          ...(options.agentID === undefined ? {} : { agentId: options.agentID }),
+          ...(options.blockedPath === undefined ? {} : { blockedPath: options.blockedPath }),
+          ...(options.decisionReason === undefined
+            ? {}
+            : { decisionReason: options.decisionReason }),
+          ...(options.description === undefined ? {} : { description: options.description }),
+          ...(options.matchedAskRule === undefined
+            ? {}
+            : { matchedAskRule: options.matchedAskRule }),
           rawInput: stringifyForDisplay(input),
           requestId: options.requestId,
           title: options.title ?? options.displayName ?? `Approve ${toolName}`,
-          toolCallId: options.toolUseID,
+          toolCallId: publicToolCallId(options.toolUseID),
           toolKind: toolName,
         },
         options.signal,
@@ -165,6 +175,7 @@ export async function createClaudeQueryOptions(input: {
   payload: DriverStartInput;
   permissionTasks?: Set<Promise<unknown>>;
   processTasks?: Set<Promise<void>>;
+  publicToolCallId?: (nativeToolCallId: string) => string;
 }): Promise<ClaudeQueryOptions> {
   const claudeConfigDir = resolveClaudeConfigDir(input.payload);
   await mkdir(claudeConfigDir, { recursive: true });
@@ -174,7 +185,11 @@ export async function createClaudeQueryOptions(input: {
   const options: ClaudeQueryOptions = {
     abortController: input.abortController,
     additionalDirectories: input.payload.execution.session.additionalDirectories,
-    canUseTool: createCanUseTool(input.context, input.permissionTasks ?? new Set()),
+    canUseTool: createCanUseTool(
+      input.context,
+      input.permissionTasks ?? new Set(),
+      input.publicToolCallId ?? ((nativeToolCallId) => nativeToolCallId),
+    ),
     cwd: input.payload.execution.session.cwd,
     env: toClaudeEnv(input.payload, claudeConfigDir),
     includePartialMessages: true,

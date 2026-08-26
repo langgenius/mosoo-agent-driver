@@ -1,22 +1,15 @@
 import { expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-import * as ts from "typescript";
+import { API, SymbolFlags, type Project } from "typescript/unstable/async";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 const snapshotPath = resolve(repositoryRoot, "tests/public-api-exports.snapshot.json");
 
 interface PackageManifest {
-  readonly exports: Readonly<
-    Record<
-      string,
-      {
-        readonly default: string;
-      }
-    >
-  >;
+  readonly exports: Readonly<Record<string, { readonly default: string }>>;
 }
 
 interface EntryExports {
@@ -26,94 +19,105 @@ interface EntryExports {
 
 type ExportSnapshot = Readonly<Record<string, EntryExports>>;
 
-function compilerProgram(): ts.Program {
-  const configPath = resolve(repositoryRoot, "tsconfig.json");
-  const config = ts.readConfigFile(configPath, (path) => readFileSync(path, "utf8"));
+async function collectEntryExports(project: Project, entryPath: string): Promise<EntryExports> {
+  const source = await project.program.getSourceFile(entryPath);
 
-  if (config.error !== undefined) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, "\n"));
+  if (source === undefined) {
+    throw new Error(`Public package entry is missing: ${entryPath}.`);
   }
 
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, repositoryRoot);
-  return ts.createProgram(parsed.fileNames, parsed.options);
-}
-
-function isTypeOnlyAlias(symbol: ts.Symbol): boolean {
-  const declarations = symbol.declarations;
-
-  return (
-    declarations !== undefined &&
-    declarations.length > 0 &&
-    declarations.every((declaration) => {
-      if (!ts.isExportSpecifier(declaration)) {
-        return false;
-      }
-
-      return declaration.isTypeOnly || declaration.parent.parent.isTypeOnly;
-    })
-  );
-}
-
-function collectEntryExports(program: ts.Program, entryPath: string): EntryExports {
-  const sourceFile = program.getSourceFile(entryPath);
-
-  if (sourceFile === undefined) {
-    throw new Error(`Public package entry is missing from the TypeScript program: ${entryPath}.`);
-  }
-
-  const checker = program.getTypeChecker();
-  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  const values = new Set(Object.keys(await import(pathToFileURL(entryPath).href)));
+  const moduleSymbol = await project.checker.getSymbolAtLocation(source);
 
   if (moduleSymbol === undefined) {
-    return { types: [], values: [] };
+    throw new Error(`Public package entry has no module symbol: ${entryPath}.`);
   }
 
   const types = new Set<string>();
-  const values = new Set<string>();
 
-  for (const exported of checker.getExportsOfModule(moduleSymbol)) {
+  for (const exported of await project.checker.getExportsOfModule(moduleSymbol)) {
     const target =
-      (exported.flags & ts.SymbolFlags.Alias) === 0 ? exported : checker.getAliasedSymbol(exported);
-    const typeOnly = isTypeOnlyAlias(exported);
+      exported.flags & SymbolFlags.Alias
+        ? await project.checker.getAliasedSymbol(exported)
+        : exported;
 
-    if ((target.flags & ts.SymbolFlags.Type) !== 0) {
+    if (await project.checker.isUnknownSymbol(target)) {
+      throw new Error(`Public API export ${exported.name} is unresolved.`);
+    }
+
+    if (target.flags & (SymbolFlags.Type | SymbolFlags.Namespace)) {
       types.add(exported.name);
     }
+  }
 
-    if (!typeOnly && (target.flags & ts.SymbolFlags.Value) !== 0) {
-      values.add(exported.name);
+  return { types: [...types].toSorted(), values: [...values].toSorted() };
+}
+
+test("public package entries preserve their complete value and type export sets", async () => {
+  const configPath = resolve(repositoryRoot, "tsconfig.json");
+  const api = new API({ cwd: repositoryRoot });
+
+  try {
+    const snapshot = await api.updateSnapshot({ openProjects: [configPath] });
+    const project = snapshot.getProject(configPath);
+
+    if (project === undefined) {
+      throw new Error(`TypeScript project is missing: ${configPath}.`);
     }
+
+    expect(
+      await collectEntryExports(
+        project,
+        resolve(repositoryRoot, "tests/fixtures/public-api-type-namespace.ts"),
+      ),
+    ).toEqual({
+      types: [
+        "AuditBoth",
+        "AuditDeclaredNamespace",
+        "AuditDefault",
+        "AuditMerged",
+        "AuditNamespace",
+        "AuditType",
+        "AuditTypeNamespace",
+        "Named",
+        "TypeStarBoth",
+        "TypeStarOnly",
+        "default",
+      ],
+      values: [
+        "AuditBoth",
+        "AuditDefault",
+        "AuditMerged",
+        "AuditNamespace",
+        "AuditValue",
+        "default",
+      ],
+    });
+
+    const manifest = JSON.parse(
+      readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
+    ) as PackageManifest;
+    const current = Object.fromEntries(
+      (
+        await Promise.all(
+          Object.entries(manifest.exports).map(
+            async ([entry, target]) =>
+              [
+                entry,
+                await collectEntryExports(project, resolve(repositoryRoot, target.default)),
+              ] as const,
+          ),
+        )
+      ).toSorted(([left], [right]) => left.localeCompare(right)),
+    );
+
+    if (process.env["UPDATE_PUBLIC_EXPORT_SNAPSHOT"] === "1") {
+      writeFileSync(snapshotPath, `${JSON.stringify(current, null, 2)}\n`);
+    }
+
+    const expected = JSON.parse(readFileSync(snapshotPath, "utf8")) as ExportSnapshot;
+    expect(current).toEqual(expected);
+  } finally {
+    await api.close();
   }
-
-  return {
-    types: [...types].toSorted(),
-    values: [...values].toSorted(),
-  };
-}
-
-function collectPublicExports(): ExportSnapshot {
-  const manifest = JSON.parse(
-    readFileSync(resolve(repositoryRoot, "package.json"), "utf8"),
-  ) as PackageManifest;
-  const program = compilerProgram();
-
-  return Object.fromEntries(
-    Object.entries(manifest.exports)
-      .map(([entry, target]): [string, EntryExports] => [
-        entry,
-        collectEntryExports(program, resolve(repositoryRoot, target.default)),
-      ])
-      .toSorted(([left], [right]) => left.localeCompare(right)),
-  );
-}
-
-test("public package entries preserve their complete value and type export sets", () => {
-  const current = collectPublicExports();
-
-  if (process.env["UPDATE_PUBLIC_EXPORT_SNAPSHOT"] === "1") {
-    writeFileSync(snapshotPath, `${JSON.stringify(current, null, 2)}\n`);
-  }
-
-  const expected = JSON.parse(readFileSync(snapshotPath, "utf8")) as ExportSnapshot;
-  expect(current).toEqual(expected);
 });

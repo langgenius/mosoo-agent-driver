@@ -1,16 +1,13 @@
-import { Unzip, UnzipInflate, zipSync } from "fflate";
-import type { ZipOptions, Zippable } from "fflate";
+import { Unzip, UnzipInflate } from "fflate";
 
 import { SkillPackageError } from "./errors";
 import { admitSkillPackagePath, createSkillPackagePathAdmission } from "./path-admission";
 import type { AdmittedSkillPackagePath, SkillPackagePathKind } from "./path-admission";
 import { rejectUnsupportedArchivePath } from "./path-admission";
 
-export type SkillEntryKind = "directory" | "file";
-
 export interface SkillPackageEntry {
   body: Uint8Array;
-  entryKind: SkillEntryKind;
+  entryKind: SkillPackagePathKind;
   isExecutable: boolean;
   path: string;
 }
@@ -28,40 +25,11 @@ interface ZipArchiveMetadata {
   uncompressedSize: number;
 }
 
-const DEFAULT_ZIP_OPTIONS: ZipOptions = {
-  level: 6,
-};
-const DEFAULT_ZIP_LEVEL = 6;
-const FIXED_ZIP_MTIME = new Date("1980-01-01T00:00:00.000Z");
 const UNIX_ZIP_OS = 3;
-const EXECUTABLE_FILE_MODE = 0o10_0755;
-const REGULAR_FILE_MODE = 0o10_0644;
-const DIRECTORY_MODE = 0o04_0755;
 const BYTE_VALUE_COUNT = 0x01_00;
 const ZIP_EXTERNAL_ATTRIBUTE_MODE_FACTOR = 0x01_00_00;
 const ZIP_STORED_COMPRESSION = 0;
 const ZIP_DEFLATE_COMPRESSION = 8;
-
-export function createZipArchive(entries: SkillPackageEntry[]): Uint8Array {
-  const archive: Zippable = {};
-  const admission = createSkillPackagePathAdmission();
-
-  for (const entry of entries) {
-    const admitted = admission.admit(entry.path, entry.entryKind);
-    rejectUnsupportedArchivePath(admitted);
-    const archivePath = entry.entryKind === "directory" ? `${admitted.path}/` : admitted.path;
-
-    archive[archivePath] = [entry.body, createZipEntryOptions(entry)];
-  }
-
-  try {
-    return zipSync(archive, DEFAULT_ZIP_OPTIONS);
-  } catch (error) {
-    throw new SkillPackageError(
-      error instanceof Error ? error.message : "Skill zip compression failed.",
-    );
-  }
-}
 
 export function extractZipArchive(
   bytes: Uint8Array,
@@ -214,43 +182,6 @@ export function extractZipArchive(
   });
 }
 
-export function looksLikeZipArchive(bytes: Uint8Array): boolean {
-  if (bytes.byteLength < 4) {
-    return false;
-  }
-
-  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
-    return false;
-  }
-
-  return (
-    (bytes[2] === 0x03 && bytes[3] === 0x04) ||
-    (bytes[2] === 0x05 && bytes[3] === 0x06) ||
-    (bytes[2] === 0x07 && bytes[3] === 0x08)
-  );
-}
-
-function createZipEntryOptions(entry: SkillPackageEntry): ZipOptions {
-  return {
-    attrs: getZipEntryFileMode(entry) * ZIP_EXTERNAL_ATTRIBUTE_MODE_FACTOR,
-    level: entry.entryKind === "directory" ? 0 : DEFAULT_ZIP_LEVEL,
-    mtime: FIXED_ZIP_MTIME,
-    os: UNIX_ZIP_OS,
-  };
-}
-
-function getZipEntryFileMode(entry: SkillPackageEntry): number {
-  if (entry.entryKind === "directory") {
-    return DIRECTORY_MODE;
-  }
-
-  if (entry.isExecutable) {
-    return EXECUTABLE_FILE_MODE;
-  }
-
-  return REGULAR_FILE_MODE;
-}
-
 function listZipArchiveEntries(
   bytes: Uint8Array,
   options: SkillArchiveExtractOptions,
@@ -294,10 +225,9 @@ function listZipArchiveEntries(
     }
 
     const rawPath = decodeZipFileName(bytes.subarray(fileNameStart, fileNameEnd));
-    const entryKind = inferZipEntryKind(rawPath);
-    const admitted = admission.admit(rawPath, entryKind);
+    const admitted = admission.admit(rawPath);
     rejectUnsupportedArchivePath(admitted);
-    const path = admitted.path;
+    const { entryKind, path } = admitted;
 
     if (options.maxEntryCount !== undefined && metadata.length >= options.maxEntryCount) {
       throw new SkillPackageError(
@@ -377,16 +307,12 @@ function findEndOfCentralDirectory(bytes: Uint8Array): number {
 
 function readAdmittedZipArchivePath(path: string): AdmittedSkillPackagePath | SkillPackageError {
   try {
-    const admitted = admitSkillPackagePath(path, inferZipEntryKind(path));
+    const admitted = admitSkillPackagePath(path);
     rejectUnsupportedArchivePath(admitted);
     return admitted;
   } catch (error) {
     return toSkillZipError(error, "Skill zip decompression failed.");
   }
-}
-
-function inferZipEntryKind(path: string): SkillPackagePathKind {
-  return path.endsWith("/") || path.endsWith("\\") ? "directory" : "file";
 }
 
 function decodeZipFileName(bytes: Uint8Array): string {

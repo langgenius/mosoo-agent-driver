@@ -24,13 +24,7 @@ import {
 } from "../child-process";
 import type { BoundSpawnedProcess } from "../child-process";
 import { summarizeOpenAiProxyEnv } from "./app-server-env";
-import {
-  isRecord,
-  readNonEmptyString,
-  readRecord,
-  readString,
-  toJsonRpcId,
-} from "./app-server-json";
+import { isRecord, readNonEmptyString, toJsonRpcId } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
 import {
   materializeOpenAiApiKeyAuthState,
@@ -43,15 +37,18 @@ import type {
   RequestId,
   ServerNotificationMethod,
   ServerNotificationParams,
-} from "./generated/app-server-protocol";
+} from "./app-server-protocol";
 import {
   CLIENT_REQUEST_RESULT_PARSERS,
   isServerNotificationMethod,
   isServerRequestMethod,
-  parseServerNotificationParams,
-} from "./generated/app-server-protocol";
+  parseServerNotification,
+  parseServerRequest,
+} from "./app-server-protocol";
 import { buildOpenAiMcpServerConfig } from "./mcp-config";
 import { OpenAiAppServerRequestHandler } from "./app-server-request-handler";
+import { jsonRpcResponseSchema } from "./app-server-protocol-client-schemas";
+import { toOpenAiProtocolError } from "./app-server-event-mapping";
 
 interface PendingJsonRpcRequest {
   method: string;
@@ -74,6 +71,7 @@ interface OpenAiClientContext extends AgentDriverContext {
     params: ServerNotificationParams[M],
   ): Promise<void>;
   handleProtocolError(error: Error): Promise<void>;
+  mapToolCallId(toolCallId: string): string;
 }
 
 function summarizeJsonRpcErrorData(value: unknown): JsonObject | null {
@@ -217,6 +215,7 @@ export class OpenAiAppServerClient {
       context,
       handleError: async (error) => this.#failProtocol(error),
       isStopped: () => this.#stopRequested,
+      mapToolCallId: context.mapToolCallId,
       respond: (id, result) => this.respond(id, result),
       respondError: (id, message) => this.respondError(id, message),
     });
@@ -478,7 +477,7 @@ export class OpenAiAppServerClient {
         return;
       }
 
-      this.notify("initialized", {});
+      this.notify("initialized", undefined);
     });
 
     return { phases };
@@ -493,16 +492,7 @@ export class OpenAiAppServerClient {
   }
 
   async cleanBackgroundTerminals(threadId: string, signal?: AbortSignal): Promise<void> {
-    await this.#request(
-      "thread/backgroundTerminals/clean",
-      { threadId },
-      (value) => {
-        if (!isRecord(value ?? {})) {
-          throw new Error("thread/backgroundTerminals/clean result must be an object.");
-        }
-      },
-      signal,
-    );
+    await this.request("thread/backgroundTerminals/clean", { threadId }, signal);
   }
 
   async #request<T>(
@@ -730,18 +720,27 @@ export class OpenAiAppServerClient {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      this.#context.logger.debug("driver.openai.non_json_stdout", {
-        line: trimmed,
-      });
+      this.#failProtocol(new TypeError("OpenAi app-server stdout is not valid JSON."));
       return;
     }
 
     if (!isRecord(parsed)) {
+      this.#failProtocol(new TypeError("OpenAi app-server protocol message must be an object."));
       return;
     }
 
     const method = readNonEmptyString(parsed, "method");
     const id = toJsonRpcId(parsed["id"]);
+
+    if ("result" in parsed || "error" in parsed) {
+      if (id === null) {
+        this.#failProtocol(new TypeError("OpenAi app-server response requires a valid id."));
+        return;
+      }
+
+      this.#onResponse(id, parsed);
+      return;
+    }
 
     if (method !== null) {
       const bytes = Buffer.byteLength(trimmed, "utf8");
@@ -756,9 +755,9 @@ export class OpenAiAppServerClient {
       this.#pauseServerMessagesIfNeeded();
       this.#serverMessageQueue = this.#processMessage(
         this.#serverMessageQueue,
+        parsed,
         method,
         id,
-        parsed["params"],
       ).finally(() => {
         this.#pendingServerMessages -= 1;
         this.#pendingServerMessageBytes -= bytes;
@@ -769,7 +768,12 @@ export class OpenAiAppServerClient {
 
     if (id !== null) {
       this.#onResponse(id, parsed);
+      return;
     }
+
+    this.#failProtocol(
+      new TypeError("OpenAi app-server protocol message requires a valid method or id."),
+    );
   }
 
   #pauseServerMessagesIfNeeded(): void {
@@ -840,9 +844,9 @@ export class OpenAiAppServerClient {
 
   async #processMessage(
     previousMessage: Promise<void>,
+    message: JsonObject,
     method: string,
     id: RequestId | null,
-    params: unknown,
   ): Promise<void> {
     try {
       await previousMessage;
@@ -851,20 +855,26 @@ export class OpenAiAppServerClient {
         return;
       }
 
-      await this.#onServerMessage(method, id, params);
+      await this.#onServerMessage(message, method, id);
     } catch (error) {
+      const failure =
+        error instanceof Error ? error : new Error("OpenAi app-server protocol message failed.");
       this.#context.logger.error("driver.openai.server_message.failed", error, {
         method,
       });
+
+      if (id === null) {
+        this.#failProtocol(failure);
+        return;
+      }
+
       if (!this.#stopRequested) {
-        await this.#notifyProtocolError(
-          error instanceof Error ? error : new Error("OpenAi app-server protocol message failed."),
-        );
+        await this.#notifyProtocolError(failure);
       }
 
       if (id !== null && !this.#stopRequested) {
         try {
-          this.respondError(id, error instanceof Error ? error.message : "Server request failed.");
+          this.respondError(id, failure.message);
         } catch (responseError) {
           this.#context.logger.error("driver.openai.server_error_response.failed", responseError, {
             method,
@@ -875,6 +885,17 @@ export class OpenAiAppServerClient {
   }
 
   #onResponse(id: RequestId, message: JsonObject): void {
+    const parsed = jsonRpcResponseSchema.safeParse(message);
+
+    if (!parsed.success) {
+      this.#failProtocol(
+        new TypeError("OpenAi app-server response envelope is invalid.", {
+          cause: parsed.error,
+        }),
+      );
+      return;
+    }
+
     const pending = this.#pendingRequests.get(id);
 
     if (pending === undefined) {
@@ -883,37 +904,41 @@ export class OpenAiAppServerClient {
 
     this.#pendingRequests.delete(id);
 
-    const responseError = readRecord(message, "error");
+    if ("error" in parsed.data) {
+      const { error } = parsed.data;
 
-    if (responseError !== null) {
-      const errorMessage =
-        readString(responseError, "message") ?? "OpenAi app-server request failed.";
-      const responseCode = responseError["code"];
-      const errorCode =
-        typeof responseCode === "number" || typeof responseCode === "string" ? responseCode : null;
-
-      this.#context.logger.error("driver.openai.client_request.failed", new Error(errorMessage), {
-        data: summarizeJsonRpcErrorData(responseError["data"]),
-        method: pending.method,
-        responseCode: errorCode,
-      });
-      pending.reject(new Error(errorMessage));
+      this.#context.logger.error(
+        "driver.openai.client_request.failed",
+        new Error(toOpenAiProtocolError({ message: error.message }).message),
+        {
+          data: summarizeJsonRpcErrorData(error.data),
+          method: pending.method,
+          responseCode: error.code,
+        },
+      );
+      pending.reject(new Error(error.message));
       return;
     }
 
     try {
-      pending.resolve(message["result"]);
+      pending.resolve(parsed.data.result);
     } catch (parseError) {
-      pending.reject(
+      const error =
         parseError instanceof Error
           ? parseError
-          : new Error("OpenAi app-server result parse failed."),
-      );
+          : new Error("OpenAi app-server result parse failed.");
+      pending.reject(error);
+      this.#failProtocol(error);
     }
   }
 
-  async #onServerMessage(method: string, id: RequestId | null, params: unknown): Promise<void> {
+  async #onServerMessage(message: JsonObject, method: string, id: RequestId | null): Promise<void> {
     if (id === null) {
+      if (isServerRequestMethod(method)) {
+        parseServerRequest(message);
+        throw new Error(`OpenAi app-server request ${method} is missing a valid id.`);
+      }
+
       if (!isServerNotificationMethod(method)) {
         this.#context.logger.debug("driver.openai.server_notification.ignored", {
           method,
@@ -921,14 +946,21 @@ export class OpenAiAppServerClient {
         return;
       }
 
-      if (method === "serverRequest/resolved") {
-        const parsed = parseServerNotificationParams(method, params);
-        await this.#requestHandler.resolveElsewhere(parsed.requestId);
-        await this.#context.handleNotification(method, parsed);
+      const notification = parseServerNotification(message)!;
+
+      if (notification.method === "serverRequest/resolved") {
+        const requestId = notification.params["requestId"];
+
+        if (typeof requestId !== "number" && typeof requestId !== "string") {
+          throw new TypeError("serverRequest/resolved params.requestId is invalid.");
+        }
+
+        await this.#requestHandler.resolveElsewhere(requestId);
+        await this.#context.handleNotification(notification.method, notification.params);
         return;
       }
 
-      await this.#context.handleNotification(method, parseServerNotificationParams(method, params));
+      await this.#context.handleNotification(notification.method, notification.params);
       return;
     }
 
@@ -937,7 +969,16 @@ export class OpenAiAppServerClient {
       return;
     }
 
-    this.#requestHandler.dispatch(method, id, params);
+    const request = parseServerRequest(message)!;
+
+    if (this.#requestHandler.isPending(request.id)) {
+      this.#failProtocol(
+        new Error(`OpenAi app-server request ${String(request.id)} is already pending.`),
+      );
+      return;
+    }
+
+    this.#requestHandler.dispatch(request.method, request.id, request.params);
   }
 
   #rejectPending(error: Error): void {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ClientSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
 
 import { createBufferedSinkLogger } from "../src/observability";
 import {
@@ -81,6 +82,98 @@ describe("ACP runtime configuration", () => {
     );
   });
 
+  test("leaves JSON-RPC parsing and wire validation to the official SDK", async () => {
+    let sdkOutput = "";
+    const inputReady = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+    const handled = Promise.withResolvers<void>();
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        inputReady.resolve(controller);
+        controller.enqueue(
+          new TextEncoder().encode(
+            '{\n{}\n{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{"sessionId":"session-1","path":"/tmp/alive"}}\n',
+          ),
+        );
+      },
+    });
+    const transport = ndJsonStream(
+      new WritableStream<Uint8Array>({
+        write(chunk) {
+          sdkOutput += new TextDecoder().decode(chunk);
+          if (sdkOutput.includes('"content":"alive"')) handled.resolve();
+        },
+      }),
+      limitAcpInput(input),
+    );
+    const connection = new ClientSideConnection(
+      () => ({
+        readTextFile: async () => ({ content: "alive" }),
+        requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+        sessionUpdate: async () => {},
+      }),
+      transport,
+    );
+
+    await handled.promise;
+    (await inputReady.promise).close();
+    void connection;
+    expect(
+      sdkOutput
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line)),
+    ).toMatchObject([
+      { error: { code: -32700 }, id: null, jsonrpc: "2.0" },
+      { error: { code: -32600 }, id: null, jsonrpc: "2.0" },
+      { id: 1, jsonrpc: "2.0", result: { content: "alive" } },
+    ]);
+  });
+
+  test("counts UTF-8 bytes across chunk boundaries", async () => {
+    const bytes = new TextEncoder().encode("😀\n");
+    const stream = (limit: number) =>
+      limitAcpInput(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes.subarray(0, 3));
+            controller.enqueue(bytes.subarray(3));
+            controller.close();
+          },
+        }),
+        limit,
+      );
+
+    await expect(new Response(stream(3)).text()).rejects.toThrow("message exceeds 3 bytes");
+    await expect(new Response(stream(4)).text()).resolves.toBe("😀\n");
+  });
+
+  test("rejects malformed UTF-8 before the ACP decoder", async () => {
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Uint8Array.of(0xc3, 0x28, 0x0a));
+        controller.close();
+      },
+    });
+
+    await expect(new Response(limitAcpInput(input)).text()).rejects.toThrow();
+  });
+
+  test("passes one JSON-RPC object across UTF-8 chunks and an unterminated EOF line", async () => {
+    const message = '{"jsonrpc":"2.0","method":"session/update","params":{"text":"😀"}}';
+    const bytes = new TextEncoder().encode(`\n${message}`);
+    const emoji = new TextEncoder().encode("😀");
+    const split = bytes.findIndex((byte) => byte === emoji[0]) + 2;
+    const input = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes.subarray(0, split));
+        controller.enqueue(bytes.subarray(split));
+        controller.close();
+      },
+    });
+
+    expect(await new Response(limitAcpInput(input)).text()).toBe(`\n${message}`);
+  });
+
   test("advertises stable boolean configuration support", () => {
     expect(buildClientCapabilities()).toEqual({
       fs: {
@@ -115,18 +208,32 @@ describe("ACP runtime configuration", () => {
 
   test("fails fast when a configured auth method is not advertised", () => {
     expect(
-      resolveAuthMethod([{ id: "browser-login" }], {
+      resolveAuthMethod([{ id: "browser-login", name: "Browser login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "browser-login",
       }),
     ).toBe("browser-login");
 
-    expect(resolveAuthMethod([{ id: "browser-login" }], {})).toBeNull();
+    expect(resolveAuthMethod([{ id: "browser-login", name: "Browser login" }], {})).toBeNull();
 
     expect(() =>
-      resolveAuthMethod([{ id: "browser-login" }], {
+      resolveAuthMethod([{ id: "browser-login", name: "Browser login" }], {
         MOSOO_ACP_AUTH_METHOD_ID: "device-login",
       }),
     ).toThrow();
+
+    expect(() =>
+      resolveAuthMethod(
+        [
+          {
+            args: ["auth"],
+            id: "terminal-login",
+            name: "Terminal login",
+            type: "terminal",
+          },
+        ],
+        { MOSOO_ACP_AUTH_METHOD_ID: "terminal-login" },
+      ),
+    ).toThrow("requires unsupported terminal auth");
   });
 
   test("inherits only runtime proxy env and prepends artifact paths", () => {
@@ -195,6 +302,7 @@ describe("ACP runtime configuration", () => {
     const context = createAgentDriverContext({
       eventSink: {
         commandUpdate: async () => {},
+        currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
       logger,

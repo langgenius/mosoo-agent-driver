@@ -1,13 +1,15 @@
+import { DRIVER_CAPABILITY_IDS, RUNTIME_COMMAND_STATUSES } from "../../runtime-command";
 import type {
   DriverCapability,
   DriverCapabilityId,
   McpExecuteCommandResult,
   McpExternalToolEffectClaim,
+  RunError,
   RuntimeCommand,
   RuntimeCommandResult,
   RuntimeCommandStatus,
 } from "../../runtime-command";
-import type { DriverBootPayload } from "../boot";
+import { DRIVER_PROTOCOL_VERSION, type DriverBootPayload } from "../boot";
 import { parseDriverEventEnvelope, type DriverEventEnvelope } from "../events";
 import { isSupportedDriverRuntime } from "../runtime";
 import type { DriverRuntime } from "../runtime";
@@ -90,12 +92,7 @@ export interface DriverLogBatchOutput {
 
 export interface DriverFailureInput {
   readonly driverInstanceId: string;
-  readonly error: {
-    readonly code: string;
-    readonly details: Record<string, string | number | boolean | null>;
-    readonly message: string;
-    readonly retryable: boolean;
-  };
+  readonly error: RunError;
 }
 
 export interface DriverCommandUpdateInput {
@@ -287,8 +284,8 @@ function readProtocolVersion(
 ): DriverBootPayload["protocolVersion"] {
   const value = record["protocolVersion"];
 
-  if (value !== 2) {
-    throw new TypeError("protocolVersion must be 2.");
+  if (value !== DRIVER_PROTOCOL_VERSION) {
+    throw new TypeError(`protocolVersion must be ${DRIVER_PROTOCOL_VERSION}.`);
   }
 
   return value;
@@ -312,24 +309,8 @@ function readHeartbeatReason(value: unknown): DriverHeartbeatInput["reason"] {
   throw new TypeError("reason must be interval or ping.");
 }
 
-const DRIVER_CAPABILITY_IDS = new Set<DriverCapabilityId>([
-  "custom_tool_execute",
-  "file_change",
-  "input_start",
-  "mcp_execute",
-  "native_resume",
-  "permission_request",
-  "session_stop",
-  "text_stream",
-  "thinking_stream",
-  "tool_stream",
-  "turn_cancel",
-  "usage",
-  "visible_activity",
-]);
-
 function readDriverCapabilityId(value: unknown): DriverCapabilityId {
-  if (typeof value === "string" && DRIVER_CAPABILITY_IDS.has(value as DriverCapabilityId)) {
+  if (typeof value === "string" && DRIVER_CAPABILITY_IDS.includes(value as DriverCapabilityId)) {
     return value as DriverCapabilityId;
   }
 
@@ -413,18 +394,11 @@ export function parseDriverReadyInput(value: unknown): DriverReadyInput {
   };
 }
 
-const DRIVER_COMMAND_STATUSES = new Set<RuntimeCommandStatus>([
-  "accepted",
-  "cancelled",
-  "completed",
-  "delivered",
-  "expired",
-  "failed",
-  "queued",
-]);
-
 function readDriverCommandStatus(value: unknown): RuntimeCommandStatus {
-  if (typeof value === "string" && DRIVER_COMMAND_STATUSES.has(value as RuntimeCommandStatus)) {
+  if (
+    typeof value === "string" &&
+    RUNTIME_COMMAND_STATUSES.includes(value as RuntimeCommandStatus)
+  ) {
     return value as RuntimeCommandStatus;
   }
 

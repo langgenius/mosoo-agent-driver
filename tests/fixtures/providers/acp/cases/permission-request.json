@@ -1,8 +1,7 @@
 {
   "begin": {
     "messageId": "message-1",
-    "runId": "run-1",
-    "sessionId": "session-1"
+    "runId": "run-1"
   },
   "permissionRequest": {
     "params": {
@@ -64,36 +63,6 @@
       "runId": "run-1"
     },
     {
-      "kind": "permission.requested",
-      "payload": {
-        "defaultOptionId": "allow",
-        "details": "{\"command\":\"pwd\"}",
-        "options": [
-          {
-            "kind": "allow_once",
-            "name": "Allow once",
-            "optionId": "allow"
-          },
-          {
-            "kind": "reject_once",
-            "name": "Reject once",
-            "optionId": "reject"
-          }
-        ],
-        "requestId": "rpc-42",
-        "targetItemId": "tool-1",
-        "title": "Run command",
-        "toolCall": {
-          "kind": "shell",
-          "rawInput": "{\"command\":\"pwd\"}",
-          "status": "running",
-          "title": "Run command",
-          "toolCallId": "tool-1"
-        }
-      },
-      "runId": "run-1"
-    },
-    {
       "kind": "message.completed",
       "payload": {
         "messageId": "assistant-message-1",
@@ -104,10 +73,7 @@
     {
       "kind": "tool.call.updated",
       "payload": {
-        "kind": "shell",
-        "rawInput": "{\"command\":\"pwd\"}",
         "status": "completed",
-        "title": "Run command",
         "toolCallId": "tool-1"
       },
       "runId": "run-1"

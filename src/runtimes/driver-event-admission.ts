@@ -4,7 +4,6 @@ import type { RunId } from "../protocol/id";
 
 const MAX_PENDING_DRIVER_EVENTS = 1_024;
 const MAX_PENDING_DRIVER_EVENT_BYTES = 32 * 1_024 * 1_024;
-const MAX_RUN_TERMINAL_BATCH_EVENTS = 64;
 const MAX_RUN_TERMINAL_BATCH_BYTES = 1_024 * 1_024;
 
 export interface QueuedDriverEvent {
@@ -35,6 +34,31 @@ export interface AdmittedDriverEventPush {
   readonly terminalKey: string | null;
 }
 
+const EMPTY_DRIVER_EVENT_ADMISSION_STATE: DriverEventAdmissionState = {
+  pendingLosslessBytes: 0,
+  pendingLosslessCount: 0,
+  pendingTerminalBatch: false,
+  queuedEventBytes: 0,
+  queuedEventCount: 0,
+  queuedLosslessBytes: 0,
+  queuedLosslessCount: 0,
+  queuedTerminalBatches: 0,
+};
+
+export function preflightDriverEventPush(
+  events: readonly DriverEventInput[],
+  activeRunId: RunId | null,
+): void {
+  for (const event of events) {
+    admitDriverEventPush(
+      [event],
+      activeRunId,
+      Symbol("driver-event-preflight"),
+      EMPTY_DRIVER_EVENT_ADMISSION_STATE,
+    );
+  }
+}
+
 export function driverEventBatchBytes(bytes: number, count: number): number {
   return count === 0 ? 0 : bytes + count + 1;
 }
@@ -43,13 +67,28 @@ export function isLosslessDriverEvent(event: DriverEventInput): boolean {
   return event.delivery !== "best_effort";
 }
 
-function isRunTerminal(event: DriverEventInput): boolean {
+export function losslessDriverEventRetryKey(
+  event: DriverEventInput,
+  activeRunId: RunId | null,
+): string | null {
+  if (!isLosslessDriverEvent(event)) {
+    return null;
+  }
+
+  const { sourceEventId: _, ...scoped } = scopeDriverEvent(event, activeRunId);
+  return JSON.stringify(scoped);
+}
+
+export function isRunTerminalDriverEvent(event: DriverEventInput): boolean {
   return (
     event.kind === "run.cancelled" || event.kind === "run.completed" || event.kind === "run.failed"
   );
 }
 
-function scopeEvent(event: DriverEventInput, activeRunId: RunId | null): DriverEventInput {
+export function scopeDriverEvent(
+  event: DriverEventInput,
+  activeRunId: RunId | null,
+): DriverEventInput {
   const { runId, sourceEventId, ...content } = event;
   const frozenRunId = runId === undefined ? activeRunId : runId;
   const explicitSourceId =
@@ -58,7 +97,7 @@ function scopeEvent(event: DriverEventInput, activeRunId: RunId | null): DriverE
   return {
     ...content,
     ...(explicitSourceId === null ? {} : { sourceEventId: explicitSourceId }),
-    ...(frozenRunId === null ? {} : { runId: frozenRunId }),
+    ...(runId === null ? { runId: null } : frozenRunId === null ? {} : { runId: frozenRunId }),
   } as DriverEventInput;
 }
 
@@ -70,14 +109,13 @@ export function terminalDriverEventRetryKey(
 
   if (
     losslessEvents.length === 0 ||
-    losslessEvents.length > MAX_RUN_TERMINAL_BATCH_EVENTS ||
-    losslessEvents.filter(isRunTerminal).length !== 1 ||
-    !isRunTerminal(losslessEvents.at(-1)!)
+    losslessEvents.filter(isRunTerminalDriverEvent).length !== 1 ||
+    !isRunTerminalDriverEvent(losslessEvents.at(-1)!)
   ) {
     return null;
   }
 
-  const key = JSON.stringify(losslessEvents.map((event) => scopeEvent(event, activeRunId)));
+  const key = JSON.stringify(losslessEvents.map((event) => scopeDriverEvent(event, activeRunId)));
   return Buffer.byteLength(key, "utf8") <= MAX_RUN_TERMINAL_BATCH_BYTES ? key : null;
 }
 
@@ -88,7 +126,7 @@ export function admitDriverEventPush(
   state: DriverEventAdmissionState,
 ): AdmittedDriverEventPush | null {
   const losslessEvents = events.filter(isLosslessDriverEvent);
-  const runTerminals = losslessEvents.filter(isRunTerminal);
+  const runTerminals = losslessEvents.filter(isRunTerminalDriverEvent);
   const terminalBatch = runTerminals.length > 0;
 
   if (runTerminals.length > 1) {
@@ -100,13 +138,7 @@ export function admitDriverEventPush(
       throw new Error("Driver event run terminal slot is full.");
     }
 
-    if (losslessEvents.length > MAX_RUN_TERMINAL_BATCH_EVENTS) {
-      throw new Error(
-        `Driver event run terminal batch exceeds ${MAX_RUN_TERMINAL_BATCH_EVENTS} events.`,
-      );
-    }
-
-    if (!isRunTerminal(losslessEvents.at(-1)!)) {
+    if (!isRunTerminalDriverEvent(losslessEvents.at(-1)!)) {
       throw new Error("Driver event run terminal must be the final lossless event.");
     }
   }
@@ -141,9 +173,14 @@ export function admitDriverEventPush(
     admittedEvents = includeBestEffort ? events : losslessEvents;
   }
 
-  const frozenEvents = admittedEvents.map((event) => scopeEvent(event, activeRunId));
+  const frozenEvents = admittedEvents.map((event) => scopeDriverEvent(event, activeRunId));
   const terminalKey = terminalBatch ? JSON.stringify(frozenEvents) : null;
   const stampedEvents = withSourceEventIds(frozenEvents);
+
+  if (new Set(stampedEvents.map((event) => event.sourceEventId)).size !== stampedEvents.length) {
+    throw new Error("Driver event push requires unique source event IDs.");
+  }
+
   const serialized: (string | undefined)[] = [];
   const serializedBytes: (number | undefined)[] = [];
   let losslessByteSum = 0;

@@ -3,6 +3,7 @@
     {
       "method": "item/completed",
       "params": {
+        "completedAtMs": 1700000003000,
         "item": {
           "id": "message-1",
           "text": "pong",
@@ -19,16 +20,8 @@
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
-    },
-    {
-      "delivery": "best_effort",
-      "kind": "message.delta",
-      "payload": {
-        "contentDelta": "pong",
-        "messageId": "<driver-id>",
-        "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.message.started:<driver-id>"
     },
     {
       "delivery": "lossless",
@@ -37,14 +30,16 @@
         "content": "pong",
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.item.completed:turn-1:message-1:0"
     },
     {
       "kind": "message.completed",
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.item.completed:turn-1:message-1:1"
     }
   ]
 }

@@ -58,6 +58,10 @@ export function parseDriverId(value: unknown, label?: string): DriverId {
   return normalizeDriverId(value, label);
 }
 
+export function parseRunId(value: unknown): RunId {
+  return parseDriverId(value, "Run ID") as RunId;
+}
+
 function readRandomByte(): number {
   const crypto = (globalThis as typeof globalThis & { readonly crypto?: DriverIdCrypto }).crypto;
 
