@@ -9,7 +9,7 @@ import {
 
 describe("OpenAi app-server event bridge", () => {
   test("closes only open item state when a mixed turn is cancelled", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
@@ -64,11 +64,10 @@ describe("OpenAi app-server event bridge", () => {
     });
     await bridge.cancelTurn(context, "turn-1", "test.cancel.retry");
     expect(events()).toHaveLength(terminalEventCount);
-    await logger.destroy();
   });
 
   test("does not duplicate streamed reasoning in the completed snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
       delta: "First",
@@ -101,7 +100,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     expect(
       events()
@@ -113,7 +111,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("releases translation state between turns and ignores late terminal replay", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/plan/delta", {
       delta: "old plan",
@@ -170,7 +168,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-2",
     });
-    await logger.destroy();
 
     const planEvents = events().filter((event) => event.kind === "plan.updated");
     expect(planEvents.at(-1)).toMatchObject({
@@ -187,7 +184,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("turn completion can arrive before the turn response is tracked", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/completed", {
       threadId: "thread-1",
@@ -198,7 +195,6 @@ describe("OpenAi app-server event bridge", () => {
     });
 
     await expect(bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId)).resolves.toBeUndefined();
-    await logger.destroy();
 
     for (const event of events()) {
       expect(event.runId).toBeUndefined();
@@ -227,7 +223,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("resume metadata failure does not reject a completed turn", async () => {
-    const { bridge, context, events, logger } = createHarness({
+    const { bridge, context, events } = createHarness({
       failNativeResumePublish: true,
     });
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
@@ -242,13 +238,12 @@ describe("OpenAi app-server event bridge", () => {
       }),
     ).resolves.toBeUndefined();
     await expect(trackedTurn).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(events().some((event) => event.kind === "run.completed")).toBe(true);
   });
 
   test("turn errors wait for the authoritative failed turn", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "error", {
       error: {
@@ -280,7 +275,6 @@ describe("OpenAi app-server event bridge", () => {
     await expect(trackedTurn).rejects.toThrow(
       "Response stream disconnected.\nHTTP 502 from upstream.",
     );
-    await logger.destroy();
 
     const failedEvent = events().find((event) => event.kind === "run.failed");
     expect(failedEvent?.runId).toBe(DRIVER_TEST_IDS.runId);
@@ -308,7 +302,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("thread systemError waits for the authoritative failed turn", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "thread/status/changed", {
@@ -329,7 +323,6 @@ describe("OpenAi app-server event bridge", () => {
     });
 
     await expect(trackedTurn).rejects.toThrow("The model returned an empty response.");
-    await logger.destroy();
     expect(events().filter((event) => event.kind === "run.failed")).toMatchObject([
       {
         payload: {
@@ -346,7 +339,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("completed agent messages backfill text when no deltas streamed", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: {
@@ -357,7 +350,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([
@@ -388,7 +380,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("uses item completion text as the authoritative final snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "损坏的流式片段",
@@ -418,7 +410,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 

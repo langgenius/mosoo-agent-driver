@@ -1,4 +1,4 @@
-import { createBufferedSinkLogger } from "../observability";
+import { createDisabledLogger } from "../observability";
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
 import { createDriverId, type RunId } from "../protocol/id";
@@ -60,14 +60,6 @@ function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
-function createKernelLogger(): Logger {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "agent-driver-kernel",
-    sink: async () => {},
-  });
-}
-
 function toDispatchError(error: RunError | undefined, command: RuntimeCommand): Error {
   if (!error) {
     return new Error(`Driver command ${command.kind} failed.`);
@@ -122,7 +114,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#backendFactory = options.backendFactory;
     this.#externalToolEffectLedger = options.externalToolEffectLedger;
     this.#hostPorts = options.hostPorts;
-    this.#logger = options.logger ?? createKernelLogger();
+    this.#logger = options.logger ?? createDisabledLogger();
     this.#permissionBroker = new DriverPermissionBroker(() => this.#logger);
   }
 
@@ -342,10 +334,6 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
 
   runEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
     return this.#runEventTerminal?.runId === runId ? this.#runEventTerminal.status : null;
-  }
-
-  selectedRunEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
-    return this.runEventTerminal(runId);
   }
 
   async start(input: AgentDriverKernelStartInput): Promise<void> {

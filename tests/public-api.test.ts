@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "../src/boot";
 import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "../src/cma-http";
-import { createCmaSdkClient as createCmaSdkClientFromSubpath } from "../src/cma-sdk";
+import { CmaSdkClient as CmaSdkClientFromSubpath } from "../src/cma-sdk";
 import {
   PROTOCOL_VERSION as PROTOCOL_VERSION_FROM_CONTRACT,
   protocolVersionSchema as protocolVersionSchemaFromContract,
@@ -13,6 +13,7 @@ import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   AgentDriverKernelCore,
   CMA_DEFAULT_BETA_HEADER_VALUE,
+  CmaSdkClient,
   CmaSdkError,
   SUPPORTED_DRIVER_RUNTIMES,
   createAgentDriverContext,
@@ -20,7 +21,6 @@ import {
   createAgentDriverProviderCapabilities,
   createCmaHttpHandler,
   createCmaMemoryStore,
-  createCmaSdkClient,
   parseDriverNativeRuntimeRef,
   pushDriverDiagnosticEvent,
   projectCmaInboundToDriverCommand,
@@ -43,7 +43,7 @@ describe("public API", () => {
     expect(createAgentDriverProviderCapabilities).toBeFunction();
     expect(createCmaHttpHandler).toBeFunction();
     expect(createCmaMemoryStore).toBeFunction();
-    expect(createCmaSdkClient).toBeFunction();
+    expect(CmaSdkClient).toBeFunction();
     expect(CmaSdkError).toBeFunction();
     expect(CMA_DEFAULT_BETA_HEADER_VALUE).toBe("managed-agents-2026-04-01");
     expect(projectCmaInboundToDriverCommand).toBeFunction();
@@ -66,7 +66,7 @@ describe("public API", () => {
     expect(protocolVersionSchemaFromContract.parse(2)).toBe(2);
     expect(sessionSnapshotSchemaFromContract.parse).toBeFunction();
     expect(createCmaHttpHandlerFromSubpath).toBe(createCmaHttpHandler);
-    expect(createCmaSdkClientFromSubpath).toBe(createCmaSdkClient);
+    expect(CmaSdkClientFromSubpath).toBe(CmaSdkClient);
     expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();
     expect(heartbeatReason).toBe("ping");
     expect(parseDriverHeartbeatInputFromOrpcSubpath({ at: "now", pid: 1, reason: "ping" })).toEqual(

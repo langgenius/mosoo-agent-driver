@@ -157,11 +157,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
         throw new Error("ACP driver backend stopped during startup.");
       }
 
-      signal.throwIfAborted();
-      if (this.#stopRequested) {
-        throw new Error("ACP driver backend stopped during startup.");
-      }
-
       const setup = await this.#connect(context, signal, true);
 
       if (setup.mode === "created" && this.#nativeInstructionPath === null) {

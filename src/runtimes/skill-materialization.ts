@@ -1,6 +1,7 @@
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, opendir, rename, rmdir, unlink } from "node:fs/promises";
+import { mkdir, open, opendir, rename, rmdir, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -15,9 +16,13 @@ import {
   closeFileHandles,
   directoryEntryPath,
   ensureRealDirectoryAt,
+  hasErrorCode,
   openedDirectoryPath,
   openAbsoluteRealDirectory,
+  openOptionalRealDirectory,
   openRealDirectory,
+  openRelativeRealDirectory,
+  readPathStats,
   readDirectoryEntriesBounded,
 } from "./atomic-file";
 
@@ -95,10 +100,6 @@ function createSerialLock(): <T>(operation: () => Promise<T>) => Promise<T> {
 const withCommitLock = createSerialLock();
 const withCleanupLock = createSerialLock();
 
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
 function enforceSkillMountPath(sessionOrganizationPath: string, mountPath: string): string {
   const allowedRoot = resolve(sessionOrganizationPath, ".mosoo", "skill");
   const resolvedMountPath = resolve(mountPath);
@@ -108,29 +109,6 @@ function enforceSkillMountPath(sessionOrganizationPath: string, mountPath: strin
   }
 
   return resolvedMountPath;
-}
-
-async function readPathStats(path: string): Promise<Awaited<ReturnType<typeof lstat>> | null> {
-  try {
-    return await lstat(path);
-  } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) {
-      return null;
-    }
-
-    throw error;
-  }
-}
-
-async function openOptionalRealDirectory(path: string, label: string): Promise<FileHandle | null> {
-  try {
-    return await openRealDirectory(path, label);
-  } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) {
-      return null;
-    }
-    throw error;
-  }
 }
 
 async function ensureMaterializationRoots(
@@ -378,53 +356,30 @@ export async function materializeResolvedSkills(
   });
 
   const operationSignal = AbortSignal.any([signal, generation.signal]);
-  let roots: MaterializationRoots | null = null;
-  let result: AgentDriverMaterializedSkill[] | null = null;
-  let materializationError: unknown = null;
   try {
-    roots = await ensureMaterializationRoots(
+    const roots = await ensureMaterializationRoots(
       execution.session.sharedRootPath,
       inputs.length > 0,
       operationSignal,
     );
     if (roots === null) {
-      result = [];
-    } else {
-      result = await materializeSkillGeneration(
-        logger,
-        inputs,
-        roots,
-        generation.signal,
-        operationSignal,
-      );
+      return [];
     }
-  } catch (error) {
-    materializationError = error;
-  }
 
-  if (latestGenerationByRoot.get(rootKey) === generation) {
-    latestGenerationByRoot.delete(rootKey);
-  }
-  const closeFailures =
-    roots === null
-      ? []
-      : await closeFileHandles([roots.transactionDirectory, roots.mosooDirectory]);
-  if (materializationError !== null) {
-    if (closeFailures.length > 0) {
-      throw new AggregateError(
-        [materializationError, ...closeFailures],
-        "Skill materialization and root cleanup failed.",
-      );
+    await using _mosooDirectory = roots.mosooDirectory;
+    await using _transactionDirectory = roots.transactionDirectory;
+    return await materializeSkillGeneration(
+      logger,
+      inputs,
+      roots,
+      generation.signal,
+      operationSignal,
+    );
+  } finally {
+    if (latestGenerationByRoot.get(rootKey) === generation) {
+      latestGenerationByRoot.delete(rootKey);
     }
-    throw materializationError;
   }
-  if (closeFailures.length > 0) {
-    throw new AggregateError(closeFailures, "Failed to close skill materialization roots.");
-  }
-  if (result === null) {
-    throw new Error("Skill materialization completed without a result.");
-  }
-  return result;
 }
 
 async function materializeSkillGeneration(
@@ -991,8 +946,9 @@ async function recoverSkillTransactions(
     }
     const owner = await openExistingMaterializationOwner(roots);
     let retiredPath: string | null = null;
-    let recoveryError: unknown = null;
-    try {
+    {
+      await using _ownerDirectory = owner.ownerDirectory;
+      await using _newDirectory = owner.newDirectory;
       if (await hasSkillTransactionCommitMarker(owner)) {
         await finishCommittedSkillTransaction(owner, roots);
         await retireMaterializationOwner(owner, roots);
@@ -1002,21 +958,6 @@ async function recoverSkillTransactions(
         logger.info("driver.skill.materialization.transaction_restored", {});
       }
       retiredPath = directoryEntryPath(roots.transactionDirectory, owner.currentName);
-    } catch (error) {
-      recoveryError = error;
-    }
-    const closeFailures = await closeFileHandles([owner.newDirectory, owner.ownerDirectory]);
-    if (recoveryError !== null) {
-      if (closeFailures.length > 0) {
-        throw new AggregateError(
-          [recoveryError, ...closeFailures],
-          "Skill transaction recovery and cleanup failed.",
-        );
-      }
-      throw recoveryError;
-    }
-    if (closeFailures.length > 0) {
-      throw new AggregateError(closeFailures, "Failed to close recovered skill transaction.");
     }
     if (retiredPath !== null) {
       try {
@@ -1071,39 +1012,6 @@ async function recoverSkillTransactions(
   await roots.transactionDirectory.sync();
 }
 
-async function openRelativeSkillDirectory(
-  root: FileHandle,
-  path: string,
-  create: boolean,
-  signal: AbortSignal,
-): Promise<FileHandle> {
-  signal.throwIfAborted();
-  let directory = await openRealDirectory(
-    `${openedDirectoryPath(root)}/.`,
-    "Staged skill directory",
-  );
-
-  try {
-    for (const segment of path === "." ? [] : path.split("/")) {
-      signal.throwIfAborted();
-      const next = create
-        ? await ensureRealDirectoryAt(directory, segment, "Staged skill directory", signal)
-        : await openRealDirectory(directoryEntryPath(directory, segment), "Staged skill directory");
-      try {
-        await directory.close();
-      } catch (error) {
-        await next.close();
-        throw error;
-      }
-      directory = next;
-    }
-    return directory;
-  } catch (error) {
-    await directory.close().catch(() => {});
-    throw error;
-  }
-}
-
 async function materializeSkillEntry(
   stagingDirectory: FileHandle,
   entry: SkillPackageEntry,
@@ -1112,18 +1020,20 @@ async function materializeSkillEntry(
   signal.throwIfAborted();
 
   if (entry.entryKind === "directory") {
-    await using _directory = await openRelativeSkillDirectory(
+    await using _directory = await openRelativeRealDirectory(
       stagingDirectory,
       entry.path,
+      "Staged skill directory",
       true,
       signal,
     );
     return;
   }
 
-  await using parent = await openRelativeSkillDirectory(
+  await using parent = await openRelativeRealDirectory(
     stagingDirectory,
     dirname(entry.path),
+    "Staged skill directory",
     true,
     signal,
   );
@@ -1156,9 +1066,10 @@ async function syncSkillStageDirectories(
     (a, b) => b.split("/").length - a.split("/").length,
   )) {
     signal.throwIfAborted();
-    await using handle = await openRelativeSkillDirectory(
+    await using handle = await openRelativeRealDirectory(
       stagingDirectory,
       directory,
+      "Staged skill directory",
       false,
       signal,
     );
@@ -1233,12 +1144,7 @@ async function downloadSkillPackage(
     reader.releaseLock();
   }
 
-  const bytes = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const bytes = Buffer.concat(chunks, totalBytes);
 
   if (hash.digest("hex") !== skill.blobSha256) {
     throw new Error(`Skill blob checksum mismatch for ${skill.skillId}.`);

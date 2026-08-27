@@ -39,7 +39,7 @@ import type {
   ServerNotificationParams,
 } from "./app-server-protocol";
 import {
-  CLIENT_REQUEST_RESULT_PARSERS,
+  CLIENT_RESULT_SCHEMAS,
   isServerNotificationMethod,
   isServerRequestMethod,
   parseServerNotification,
@@ -501,7 +501,7 @@ export class OpenAiAppServerClient {
     params: ClientRequestParams[M],
     signal?: AbortSignal,
   ): Promise<ClientRequestResult[M]> {
-    return this.#request(method, params, CLIENT_REQUEST_RESULT_PARSERS[method], null, signal);
+    return this.#request(method, params, CLIENT_RESULT_SCHEMAS[method].parse, null, signal);
   }
 
   async requestAtWireBarrier<M extends ClientRequestMethod, R>(
@@ -513,7 +513,7 @@ export class OpenAiAppServerClient {
     },
     signal?: AbortSignal,
   ): Promise<R> {
-    return this.#request(method, params, CLIENT_REQUEST_RESULT_PARSERS[method], handlers, signal);
+    return this.#request(method, params, CLIENT_RESULT_SCHEMAS[method].parse, handlers, signal);
   }
 
   async #request<T, R>(
@@ -584,9 +584,11 @@ export class OpenAiAppServerClient {
       // Resuming stdout schedules the next buffered chunk on a later event-loop
       // turn. A microtask-only check can mistake that backpressure handoff for
       // an empty queue and return before the resumed notifications are admitted.
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      if (!this.#stopRequested) {
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+      }
 
       if (tail === this.#serverMessageQueue) {
         if (this.#fatalError !== null) {

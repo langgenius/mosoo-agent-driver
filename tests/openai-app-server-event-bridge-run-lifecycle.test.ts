@@ -9,7 +9,7 @@ import {
 
 describe("OpenAi app-server event bridge", () => {
   test("publishes a lossless completed assistant snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const finalText = "I will inspect the files.";
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
@@ -27,7 +27,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     const assistantMessageId = readAssistantMessageId(events());
     const snapshot = events().find((event) => event.kind === "message.added");
@@ -44,7 +43,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("preserves final phase and memory citations on completed snapshots", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const memoryCitation = {
       entries: [{ lineEnd: 8, lineStart: 4, note: "Relevant context", path: "MEMORY.md" }],
       threadIds: ["thread-memory"],
@@ -61,7 +60,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     expect(events().find((event) => event.kind === "message.added")).toMatchObject({
       payload: { memoryCitation, phase: "final" },
@@ -72,7 +70,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("selects only final-phase messages once a turn uses explicit phases", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/completed", {
       threadId: "thread-1",
@@ -106,7 +104,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const allEvents = events();
     const finalSnapshot = allEvents.find(
@@ -125,7 +122,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("keeps asynchronous progress out of legacy final selection", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/completed", {
       threadId: "thread-1",
@@ -151,7 +148,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const allEvents = events();
     const finalSnapshot = allEvents.find(
@@ -173,7 +169,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("does not fall back to a legacy snapshot when explicit commentary exists", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     for (const item of [
       { id: "legacy", memoryCitation: null, phase: null, text: "Legacy", type: "agentMessage" },
@@ -195,7 +191,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "completed" },
     });
-    await logger.destroy();
 
     const terminalPayload = events().find((event) => event.kind === "run.completed")?.payload;
     expect(terminalPayload).not.toHaveProperty("finalMessageId");
@@ -203,7 +198,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("fails an active turn exactly once when the provider exits", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const failure = new Error("app-server exited");
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void completion.catch(() => {});
@@ -224,7 +219,6 @@ describe("OpenAi app-server event bridge", () => {
     await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(true);
     await expect(completion).rejects.toThrow("app-server exited");
     await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(false);
-    await logger.destroy();
 
     expect(
       events().filter((event) =>
@@ -257,7 +251,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("replays run start after delivery rejection before committing deduplication", async () => {
-    const { attempts, bridge, context, logger } = createHarness({
+    const { attempts, bridge, context } = createHarness({
       failReasonOnce: "driver.openai.turn.started",
     });
     const started = { runId: DRIVER_TEST_IDS.runId, turnId: "turn-1" } as const;
@@ -270,11 +264,10 @@ describe("OpenAi app-server event bridge", () => {
     );
     expect(starts).toHaveLength(2);
     expect(starts[0]!.sourceEventId).toBe(starts[1]!.sourceEventId);
-    await logger.destroy();
   });
 
   test("final turn items do not duplicate already completed messages", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: {
@@ -299,7 +292,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([
@@ -349,7 +341,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("rotates assistant message identity after each completed agent item", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     const progressMessages = [
       "进度 1：已完成读取。",
@@ -433,7 +425,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const assistantMessages = events().flatMap((event) => {
       if (event.kind !== "message.delta") {
@@ -461,7 +452,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("keeps interleaved assistant item identities isolated and ignores late replay", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "消息甲",
@@ -502,7 +493,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const deltas = events().flatMap((event) => {
       if (event.kind !== "message.delta") {
@@ -530,7 +520,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("command output streams as tool result content", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/started", {
       item: {
@@ -552,7 +542,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([
@@ -605,7 +594,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("turn plan updates map to the session plan custom event", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/plan/updated", {
       explanation: null,
@@ -637,7 +626,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     expect(events()).toEqual([
       {

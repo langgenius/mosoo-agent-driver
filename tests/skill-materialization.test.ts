@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { zipSync as createZipArchive } from "fflate";
 
 import type { AgentDriverMaterializedSkill } from "../src/host-ports";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger as createTestLogger } from "../src/observability";
 import type { DriverResolvedSkill } from "../src/protocol/boot";
 import type { DriverExecutionInput } from "../src/protocol/execution";
 import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
@@ -99,14 +99,6 @@ function exposeAliases(
   return exposeNativeSkillAliases(execution, logger, skills, signal);
 }
 
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "skill-materialization-test",
-    sink: async () => {},
-  });
-}
-
 function createMarkdownSkillEntries(markdown: string) {
   return { "SKILL.md": textEncoder.encode(markdown) };
 }
@@ -153,7 +145,6 @@ Check the diff.`),
         "Check the diff.",
       );
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -179,7 +170,6 @@ Check the diff.`),
         "outside the allowed root",
       );
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -205,7 +195,6 @@ Check the diff.`),
       await expect(readFile(join(first.mountPath, "KEEP"), "utf8")).resolves.toBe("untouched");
       await expect(readdir(join(root, ".mosoo"))).resolves.toEqual(["skill"]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -227,7 +216,6 @@ Check the diff.`),
       );
       await expect(readdir(root)).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -248,7 +236,6 @@ Check the diff.`),
       await expect(materialize(execution, logger)).rejects.toThrow("does not match resolved skill");
       await expect(readdir(root)).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -272,7 +259,6 @@ Check the diff.`),
       await expect(readFile(join(outsideMount, "KEEP"), "utf8")).resolves.toBe("outside");
       await expect(readlink(join(root, ".mosoo", "skill"))).resolves.toBe(outsideRoot);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -295,7 +281,6 @@ Check the diff.`),
       await expect(readFile(join(outsideRoot, "KEEP"), "utf8")).resolves.toBe("outside");
       await expect(readlink(skill.mountPath)).resolves.toBe(outsideRoot);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -316,7 +301,6 @@ Check the diff.`),
       await expect(readFile(join(outsideRoot, "KEEP"), "utf8")).resolves.toBe("outside");
       await expect(readlink(join(root, ".mosoo", "skill"))).resolves.toBe(outsideRoot);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -335,7 +319,6 @@ Check the diff.`),
       );
       await expect(readFile(mountRoot, "utf8")).resolves.toBe("user-controlled");
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -356,7 +339,6 @@ Check the diff.`),
       await expect(readFile(join(outsideRoot, "KEEP"), "utf8")).resolves.toBe("outside");
       await expect(readlink(join(root, ".mosoo", "skill"))).resolves.toBe(outsideRoot);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -404,7 +386,6 @@ Check the diff.`),
     } finally {
       globalThis.fetch = nativeFetch;
       releaseResponse.resolve();
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -466,7 +447,6 @@ Check the diff.`),
       await expect(readFile(join(skill.mountPath, "SKILL.md"), "utf8")).rejects.toThrow();
     } finally {
       handlePrototype.sync = nativeSync;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -493,7 +473,6 @@ Check the diff.`),
         "previous contents",
       );
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -522,7 +501,6 @@ Check the diff.`),
         readFile(join(skill.mountPath, ".mosoo-skill-cache.json"), "utf8"),
       ).rejects.toThrow();
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -546,7 +524,6 @@ Check the diff.`),
       );
       await expect(readFile(join(outsideRoot, "KEEP"), "utf8")).resolves.toBe("outside");
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outsideRoot, { force: true, recursive: true });
     }
@@ -567,7 +544,6 @@ Check the diff.`),
       await expect(readFile(join(skill.mountPath, "SKILL.md"), "utf8")).rejects.toThrow();
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -582,7 +558,6 @@ Check the diff.`),
       await expect(exposeAliases(execution, logger, [])).resolves.toEqual([]);
       await expect(readdir(root)).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -624,7 +599,6 @@ Check the diff.`),
     } finally {
       releaseResponse.resolve();
       globalThis.fetch = nativeFetch;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -662,7 +636,6 @@ Check the diff.`),
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
       handlePrototype.sync = nativeSync;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -681,7 +654,6 @@ Check the diff.`),
       await expect(materialize(createExecution(root, []), logger)).resolves.toEqual([]);
       await expect(readdir(transactionRoot)).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -705,7 +677,6 @@ Check the diff.`),
       await expect(materialize(createExecution(root, []), logger)).resolves.toEqual([]);
       await expect(readdir(transactionRoot)).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -738,7 +709,6 @@ Check the diff.`),
       expect(sharedRootSynced).toBe(true);
     } finally {
       handlePrototype.sync = nativeSync;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -767,7 +737,6 @@ Check the diff.`),
       );
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -794,7 +763,6 @@ Check the diff.`),
       );
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -825,7 +793,6 @@ Check the diff.`),
       );
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -853,7 +820,6 @@ Check the diff.`),
       );
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -879,7 +845,6 @@ Check the diff.`),
       await expect(materialize(createExecution(root, []), logger)).resolves.toEqual([]);
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -904,7 +869,6 @@ Check the diff.`),
       );
       await expect(readdir(join(root, ".mosoo", ".skill-transactions"))).resolves.toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -968,7 +932,6 @@ Check the diff.`),
       );
     } finally {
       globalThis.fetch = nativeFetch;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1006,7 +969,6 @@ Check the diff.`),
       );
     } finally {
       globalThis.fetch = nativeFetch;
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1039,7 +1001,6 @@ Check the diff.`),
 
       await expect(readFile(join(aliasPath, "SKILL.md"), "utf8")).rejects.toThrow();
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1063,7 +1024,6 @@ Check the diff.`),
       await expect(exposeAliases(execution, logger, [skill])).resolves.toEqual([]);
       await expect(readdir(join(root, ".agents", "skills"))).rejects.toThrow();
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1098,7 +1058,6 @@ Check the diff.`),
       );
       await expect(readlink(join(root, ".agents", "skills", "review"))).rejects.toThrow();
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1134,7 +1093,6 @@ Check the diff.`),
 
       await expect(readlink(aliasPath)).rejects.toThrow();
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -1167,7 +1125,6 @@ Check the diff.`),
       ).rejects.toThrow('Native skill alias "review" collides');
       await expect(readFile(join(aliasPath, "KEEP"), "utf8")).resolves.toBe("user-owned");
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });

@@ -40,10 +40,6 @@ import { promiseWithTimeout } from "../utils/async";
 const DRIVER_BACKEND_START_TIMEOUT_MS = 60_000;
 const DRIVER_SHUTDOWN_TIMEOUT_MS = 5_000;
 
-function parseNullableRunId(value: string | null): RunId | null {
-  return value === null ? null : parseRunId(value);
-}
-
 export class DriverProcess {
   readonly #startedAt = new Date().toISOString();
   readonly #backendFactory: AgentDriverBackendFactory;
@@ -135,7 +131,7 @@ export class DriverProcess {
             startedAt: this.#startedAt,
           }),
         );
-        const initialRunId = parseNullableRunId(hello.runId);
+        const initialRunId = hello.runId === null ? null : parseRunId(hello.runId);
         // The server accepts pushLogs only after hello commits; release the
         // buffered boot logs now instead of racing the handshake round-trip.
         uplink.open();

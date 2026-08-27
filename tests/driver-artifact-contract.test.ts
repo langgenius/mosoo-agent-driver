@@ -2,13 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import { AGENT_DRIVER_VERSION } from "../src/core/version";
+import viteConfig from "../vite.config";
 
-type DriverPackageExportTarget =
-  | string
-  | {
-      readonly default?: string;
-      readonly types?: string;
-    };
+interface DriverPackageExportTarget {
+  readonly default?: string;
+  readonly types?: string;
+}
 
 interface DriverPackageJson {
   readonly bin?: Record<string, string>;
@@ -145,6 +144,32 @@ describe("driver artifact contract", () => {
       types: "./dist/types/index.d.ts",
     });
     expect(packageJson.exports).not.toHaveProperty("./bin/driver");
+  });
+
+  test("builds declarations for exactly the public package entries", () => {
+    const packageJson = readDriverPackageJson();
+    const targets = Object.values(packageJson.exports ?? {});
+    const sources = [
+      ...new Bun.Glob("src/*.ts").scanSync({
+        cwd: new URL("../", import.meta.url).pathname,
+      }),
+      "src/contract/index.ts",
+    ].toSorted();
+
+    expect(packageJson.scripts?.["build:types"]).toBe("vp pack");
+    expect(viteConfig.pack).toEqual({
+      dts: { emitDtsOnly: true },
+      entry: ["src/*.ts", "src/contract/index.ts"],
+      fixedExtension: false,
+      outDir: "dist/types",
+      platform: "neutral",
+    });
+    expect(targets.map(({ default: source }) => source?.slice(2)).toSorted()).toEqual(sources);
+    for (const { default: source, types } of targets) {
+      expect(source).toMatch(/^\.\/src\/.+\.ts$/);
+      expect(types).toBe(source?.replace("./src/", "./dist/types/").replace(/\.ts$/, ".d.ts"));
+      expect(source).not.toContain("/generated");
+    }
   });
 
   test("uses package.json as the runtime version source", () => {
@@ -339,7 +364,6 @@ describe("driver artifact contract", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});
     const tsconfig = readText("../tsconfig.json");
-    const typesTsconfig = readText("../tsconfig.types.json");
 
     expect(deps.filter((dependency) => dependency.startsWith("@mosoo/"))).toEqual([]);
     expect(packageJson.dependencies).not.toHaveProperty("@cfworker/json-schema");
@@ -347,9 +371,5 @@ describe("driver artifact contract", () => {
     expect(packageJson.dependencies).toHaveProperty("vestig");
     expect(tsconfig).not.toContain("../../dev/");
     expect(tsconfig).not.toContain('"extends"');
-    expect(typesTsconfig).not.toContain("../../dev/");
-    expect(typesTsconfig).toContain('"declaration": true');
-    expect(typesTsconfig).toContain('"emitDeclarationOnly": true');
-    expect(typesTsconfig).toContain('"outDir": "dist/types"');
   });
 });

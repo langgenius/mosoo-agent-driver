@@ -114,6 +114,7 @@
       "CMA_DEFAULT_BETA_HEADER_NAME",
       "CMA_DEFAULT_BETA_HEADER_VALUE",
       "CmaInvalidEventError",
+      "CmaSdkClient",
       "CmaSdkError",
       "CmaSessionTerminatedError",
       "CmaStoreConflictError",
@@ -128,7 +129,6 @@
       "createAgentDriverProviderCapabilities",
       "createCmaHttpHandler",
       "createCmaMemoryStore",
-      "createCmaSdkClient",
       "createDriverDiagnosticEvent",
       "createDriverId",
       "getExpectedDriverNativeRuntimeRefKind",
@@ -224,7 +224,7 @@
       "CmaSdkStreamOptions",
       "CmaSessionEventDispatchRecord"
     ],
-    "values": ["CmaSdkError", "createCmaSdkClient"]
+    "values": ["CmaSdkClient", "CmaSdkError"]
   },
   "./contract": {
     "types": [

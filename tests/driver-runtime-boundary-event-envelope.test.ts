@@ -84,7 +84,6 @@ describe("driver runtime boundary", () => {
       expect(terminalStarted).toBe(false);
       releaseAccepted.resolve();
       await run;
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(socket.updates.map((update) => update.status)).toEqual([
@@ -174,7 +173,6 @@ describe("driver runtime boundary", () => {
       expect(socket.updates.filter((update) => update.status === "accepted")).toHaveLength(1);
       releaseTerminal.resolve();
       await run;
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(terminalAttempts).toBe(2);
@@ -276,7 +274,6 @@ describe("driver runtime boundary", () => {
         label: `${kind} shared terminal failure`,
         timeoutMs: 1_500,
       });
-      await logger.destroy();
 
       expect(attemptsBeforeRelease).toBe(1);
       expect(outcome).toMatchObject({
@@ -377,7 +374,6 @@ describe("driver runtime boundary", () => {
       await terminalEntered.promise;
       releaseTerminal.resolve();
       await run;
-      await logger.destroy();
 
       expect(executeCalls).toBe(1);
       expect(terminalSnapshots).toHaveLength(2);
@@ -446,7 +442,6 @@ describe("driver runtime boundary", () => {
       });
 
       await dispatcher.run(socket, logger);
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(terminalAttempts).toEqual(["completed", "completed", "completed"]);

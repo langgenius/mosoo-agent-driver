@@ -21,8 +21,7 @@ import { join } from "node:path";
 
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { createBufferedSinkLogger } from "../src/observability";
-import type { Logger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { AcpFileSystem } from "../src/runtimes/acp/acp-file-system";
@@ -47,38 +46,26 @@ afterEach(async () => {
   pathScopes.clear();
 });
 
-function createContext(events: DriverEventInput[]): {
-  context: AgentDriverContext;
-  logger: Logger;
-} {
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-file-system-test",
-    sink: async () => {},
+function createContext(events: DriverEventInput[]): AgentDriverContext {
+  return createAgentDriverContext({
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async (input) => {
+        events.push(...input.events);
+        return {
+          accepted: input.events.map((event, index) => ({
+            seq: index + 1,
+            type: event.kind,
+          })),
+        };
+      },
+    },
+    logger: createDisabledLogger(),
+    payload: driverStartInput,
+    permission: {
+      request: async () => "reject_once",
+    },
   });
-
-  return {
-    context: createAgentDriverContext({
-      eventSink: {
-        currentRunId: () => null,
-        pushEvents: async (input) => {
-          events.push(...input.events);
-          return {
-            accepted: input.events.map((event, index) => ({
-              seq: index + 1,
-              type: event.kind,
-            })),
-          };
-        },
-      },
-      logger,
-      payload: driverStartInput,
-      permission: {
-        request: async () => "reject_once",
-      },
-    }),
-    logger,
-  };
 }
 
 describe("ACP file system bridge", () => {
@@ -120,7 +107,7 @@ describe("ACP file system bridge", () => {
     const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-"));
     const path = join(root, "nested", "note.txt");
     const events: DriverEventInput[] = [];
-    const { context, logger } = createContext(events);
+    const context = createContext(events);
 
     try {
       const fileSystem = createFileSystem(root);
@@ -145,7 +132,6 @@ describe("ACP file system bridge", () => {
       });
       expect(isDriverId(events[0]?.sourceEventId)).toBe(true);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -203,7 +189,7 @@ describe("ACP file system bridge", () => {
     const requestedRead = join(root, "read.txt");
     const requestedWrite = join(root, "write.txt");
     const events: DriverEventInput[] = [];
-    const { context, logger } = createContext(events);
+    const context = createContext(events);
     const pathScope = new AcpPathScope({ allowedRoots: [], cwd: root });
     const fileSystem = createFileSystem(root, pathScope);
 
@@ -227,7 +213,6 @@ describe("ACP file system bridge", () => {
       expect(await readFile(join(outside, "write.txt"), "utf8")).toBe("outside");
       expect(events[0]).toMatchObject({ payload: { path: join(retained, "write.txt") } });
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(retained, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
@@ -299,7 +284,7 @@ describe("ACP file system bridge", () => {
     const outsideLeaf = join(outside, "leaf.txt");
     const outsideAncestor = join(outside, "note.txt");
     const events: DriverEventInput[] = [];
-    const { context, logger } = createContext(events);
+    const context = createContext(events);
 
     class ExchangingPathScope extends AcpPathScope {
       override async openWritable(path: string, label: string) {
@@ -329,7 +314,6 @@ describe("ACP file system bridge", () => {
       expect(await readFile(outsideAncestor, "utf8")).toBe("outside ancestor");
       expect(events[0]).toMatchObject({ payload: { path: join(retained, "note.txt") } });
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
     }
@@ -339,7 +323,7 @@ describe("ACP file system bridge", () => {
     const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-mode-"));
     const path = join(root, "script.sh");
     const events: DriverEventInput[] = [];
-    const { context, logger } = createContext(events);
+    const context = createContext(events);
 
     try {
       await writeFile(path, "old");
@@ -349,7 +333,6 @@ describe("ACP file system bridge", () => {
       expect(await readFile(path, "utf8")).toBe("new");
       expect((await stat(path)).mode & 0o777).toBe(0o751);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });
@@ -358,7 +341,7 @@ describe("ACP file system bridge", () => {
     const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-abort-"));
     const path = join(root, "note.txt");
     const events: DriverEventInput[] = [];
-    const { context, logger } = createContext(events);
+    const context = createContext(events);
     const aborted = new DOMException("test abort", "AbortError");
     let checkpoints = 0;
     const signal = {
@@ -383,7 +366,6 @@ describe("ACP file system bridge", () => {
       expect((await readdir(root)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
       expect(events).toEqual([]);
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });

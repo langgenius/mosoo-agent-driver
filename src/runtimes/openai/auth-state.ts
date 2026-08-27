@@ -1,9 +1,8 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { JsonObject, JsonValue } from "../../protocol/json";
 import { isJsonObject } from "../../protocol/json";
+import { writeFileAtomicallyAtPath } from "../atomic-file";
 import { mergeProviderOptions } from "../provider-options";
 interface OpenAiApiKeyAuthStateInput {
   env: NodeJS.ProcessEnv;
@@ -118,43 +117,6 @@ function stringifyToml(object: Record<string, JsonValue>): string {
   return `${lines.join("\n")}\n`;
 }
 
-async function writeFileIfChanged(path: string, contents: string): Promise<boolean> {
-  const existing = await readFile(path, "utf8").catch(() => null);
-
-  if (existing === contents) {
-    return false;
-  }
-
-  await writeFileAtomically(path, contents);
-  return true;
-}
-
-async function writeFileAtomically(path: string, contents: string, mode = 0o666): Promise<void> {
-  const temporaryPath = `${path}.${randomUUID()}.tmp`;
-  let temporaryCreated = false;
-
-  try {
-    const temporary = await open(temporaryPath, "wx", mode);
-    temporaryCreated = true;
-    try {
-      await temporary.writeFile(contents, "utf8");
-      await temporary.sync();
-    } finally {
-      await temporary.close();
-    }
-    await rename(temporaryPath, path);
-    temporaryCreated = false;
-  } finally {
-    if (temporaryCreated) {
-      await unlink(temporaryPath).catch((error: unknown) => {
-        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-          throw error;
-        }
-      });
-    }
-  }
-}
-
 export async function materializeOpenAiApiKeyAuthState(
   input: OpenAiApiKeyAuthStateInput,
 ): Promise<OpenAiApiKeyAuthStateResult> {
@@ -169,8 +131,7 @@ export async function materializeOpenAiApiKeyAuthState(
     };
   }
 
-  await mkdir(input.runtimeHome, { recursive: true });
-  await writeFileAtomically(
+  await writeFileAtomicallyAtPath(
     authJsonPath,
     `${JSON.stringify(
       {
@@ -182,7 +143,7 @@ export async function materializeOpenAiApiKeyAuthState(
       null,
       2,
     )}\n`,
-    0o600,
+    { mode: 0o600 },
   );
 
   return {
@@ -233,8 +194,10 @@ export async function materializeOpenAiModelProviderConfig(
 
   const config = mergeProviderOptions(generatedConfig, input.providerOptions ?? {});
 
-  await mkdir(input.runtimeHome, { recursive: true });
-  const written = await writeFileIfChanged(configTomlPath, stringifyToml(config));
+  const written = await writeFileAtomicallyAtPath(configTomlPath, stringifyToml(config), {
+    mode: 0o666,
+    skipIfUnchanged: true,
+  });
 
   return {
     configTomlPath,

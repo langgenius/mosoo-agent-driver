@@ -215,8 +215,9 @@ describe("OpenAI app-server auth state", () => {
     expect(config["mcp_servers"]).toBeUndefined();
   });
 
-  test("skips unchanged generated config writes", async () => {
+  test("skips unchanged regular config writes but replaces an unchanged symlink", async () => {
     const runtimeHome = await createRuntimeHome();
+    const configTomlPath = join(runtimeHome, "config.toml");
     const input = {
       env: {
         OPENAI_API_KEY: "openai-key",
@@ -231,6 +232,18 @@ describe("OpenAI app-server auth state", () => {
     await expect(materializeOpenAiModelProviderConfig(input)).resolves.toMatchObject({
       written: false,
     });
+
+    const contents = await readFile(configTomlPath, "utf8");
+    const target = join(runtimeHome, "config-target.toml");
+    await rm(configTomlPath);
+    await writeFile(target, contents);
+    await symlink(target, configTomlPath);
+
+    await expect(materializeOpenAiModelProviderConfig(input)).resolves.toMatchObject({
+      written: true,
+    });
+    expect((await lstat(configTomlPath)).isSymbolicLink()).toBe(false);
+    expect(await readFile(target, "utf8")).toBe(contents);
   });
 
   test("fails OpenAI-compatible provider config when credentials are incomplete", async () => {

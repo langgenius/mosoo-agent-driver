@@ -14,8 +14,9 @@ import {
   directoryEntryPath,
   ensureAbsoluteRealDirectory,
   ensureRealDirectoryAt,
+  hasErrorCode,
   openAbsoluteRealDirectory,
-  openRealDirectory,
+  openOptionalRealDirectory,
   readDirectoryEntriesBounded,
   writeFileAtomically,
 } from "./atomic-file";
@@ -39,21 +40,6 @@ export interface SkillBootstrapArtifacts {
 
 function getSkillCatalogRoot(execution: DriverExecutionInput): string {
   return join(execution.session.sharedRootPath, ".mosoo", "skills");
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
-async function openOptionalRealDirectory(path: string, label: string): Promise<FileHandle | null> {
-  try {
-    return await openRealDirectory(path, label);
-  } catch (error) {
-    if (hasErrorCode(error, "ENOENT")) {
-      return null;
-    }
-    throw error;
-  }
 }
 
 async function openOptionalAbsoluteRealDirectory(
@@ -187,72 +173,51 @@ export async function exposeNativeSkillAliases(
     return [];
   }
 
+  await using aliasDirectory = aliasRoot.directory;
   const retainedAliases = new Set<string>();
-  let result: string[] | null = null;
-  let operationError: unknown = null;
-  try {
-    const entries = await readDirectoryEntriesBounded(
-      aliasRoot.directory,
-      "Native skill alias root",
-      MAX_NATIVE_SKILL_ALIAS_ENTRIES,
-      signal,
-    );
-    for (const entry of entries) {
-      signal.throwIfAborted();
-      const aliasPath = directoryEntryPath(aliasRoot.directory, entry.name);
-      const skill = desired.get(entry.name);
-
-      if (entry.isSymbolicLink()) {
-        const target = resolve(aliasRoot.path, await readlink(aliasPath));
-        if (skill !== undefined && target === resolve(skill.mountPath)) {
-          retainedAliases.add(entry.name);
-          continue;
-        }
-        if (isManagedNativeSkillAliasTarget(execution.session.sharedRootPath, target)) {
-          await unlink(aliasPath);
-          continue;
-        }
-      }
-      if (skill !== undefined) {
-        throw new Error(`Native skill alias "${entry.name}" collides with an existing path.`);
-      }
-    }
-
-    result = [];
-    for (const [skillName, skill] of desired) {
-      signal.throwIfAborted();
-      result.push(join(aliasRoot.path, skillName));
-      if (!retainedAliases.has(skillName)) {
-        await symlink(
-          relative(aliasRoot.path, resolve(skill.mountPath)),
-          directoryEntryPath(aliasRoot.directory, skillName),
-          "dir",
-        );
-      }
-    }
-    await aliasRoot.directory.sync();
+  const entries = await readDirectoryEntriesBounded(
+    aliasDirectory,
+    "Native skill alias root",
+    MAX_NATIVE_SKILL_ALIAS_ENTRIES,
+    signal,
+  );
+  for (const entry of entries) {
     signal.throwIfAborted();
-    await assertDirectoryIdentity(aliasRoot.directory, aliasRoot.path, "Native skill alias root");
-  } catch (error) {
-    operationError = error;
+    const aliasPath = directoryEntryPath(aliasDirectory, entry.name);
+    const skill = desired.get(entry.name);
+
+    if (entry.isSymbolicLink()) {
+      const target = resolve(aliasRoot.path, await readlink(aliasPath));
+      if (skill !== undefined && target === resolve(skill.mountPath)) {
+        retainedAliases.add(entry.name);
+        continue;
+      }
+      if (isManagedNativeSkillAliasTarget(execution.session.sharedRootPath, target)) {
+        await unlink(aliasPath);
+        continue;
+      }
+    }
+    if (skill !== undefined) {
+      throw new Error(`Native skill alias "${entry.name}" collides with an existing path.`);
+    }
   }
 
-  const closeFailures = await closeFileHandles([aliasRoot.directory]);
-  if (operationError !== null) {
-    if (closeFailures.length > 0) {
-      throw new AggregateError(
-        [operationError, ...closeFailures],
-        "Native skill alias update and cleanup failed.",
+  const result: string[] = [];
+  for (const [skillName, skill] of desired) {
+    signal.throwIfAborted();
+    result.push(join(aliasRoot.path, skillName));
+    if (!retainedAliases.has(skillName)) {
+      await symlink(
+        relative(aliasRoot.path, resolve(skill.mountPath)),
+        directoryEntryPath(aliasDirectory, skillName),
+        "dir",
       );
     }
-    throw operationError;
   }
-  if (closeFailures.length > 0) {
-    throw new AggregateError(closeFailures, "Failed to close the native skill alias root.");
-  }
-  if (result === null) {
-    throw new Error("Native skill aliases completed without a result.");
-  }
+  await aliasDirectory.sync();
+  signal.throwIfAborted();
+  await assertDirectoryIdentity(aliasDirectory, aliasRoot.path, "Native skill alias root");
+
   return result;
 }
 
@@ -330,57 +295,37 @@ async function removeSkillBootstrapArtifacts(
   if (sharedRootDirectory === null) {
     return;
   }
-  let mosooRootDirectory: FileHandle | null = null;
-  let skillCatalogRootDirectory: FileHandle | null = null;
-  let operationError: unknown = null;
+  await using ownedSharedRootDirectory = sharedRootDirectory;
+  const mosooRootDirectory = await openOptionalRealDirectory(
+    directoryEntryPath(ownedSharedRootDirectory, ".mosoo"),
+    "Skill bootstrap .mosoo root",
+  );
+  if (mosooRootDirectory === null) {
+    return;
+  }
+  await using ownedMosooRootDirectory = mosooRootDirectory;
+  const skillCatalogRootDirectory = await openOptionalRealDirectory(
+    directoryEntryPath(ownedMosooRootDirectory, "skills"),
+    "Skill bootstrap catalog root",
+  );
+  if (skillCatalogRootDirectory === null) {
+    return;
+  }
+  await using ownedSkillCatalogRootDirectory = skillCatalogRootDirectory;
 
-  try {
-    mosooRootDirectory = await openOptionalRealDirectory(
-      directoryEntryPath(sharedRootDirectory, ".mosoo"),
-      "Skill bootstrap .mosoo root",
-    );
-    if (mosooRootDirectory !== null) {
-      skillCatalogRootDirectory = await openOptionalRealDirectory(
-        directoryEntryPath(mosooRootDirectory, "skills"),
-        "Skill bootstrap catalog root",
-      );
-    }
-    if (skillCatalogRootDirectory !== null) {
-      await cleanupAtomicWriteTemporaryFiles(
-        skillCatalogRootDirectory,
-        ["manifest.json", "README.md"],
-        signal,
-      );
-      await unlinkManagedFile(skillCatalogRootDirectory, "manifest.json", signal);
-      await unlinkManagedFile(skillCatalogRootDirectory, "README.md", signal);
-      await skillCatalogRootDirectory.sync();
-      await assertDirectoryIdentity(
-        skillCatalogRootDirectory,
-        getSkillCatalogRoot(execution),
-        "Skill bootstrap catalog root",
-      );
-    }
-  } catch (error) {
-    operationError = error;
-  }
-
-  const closeFailures = await closeFileHandles([
-    skillCatalogRootDirectory,
-    mosooRootDirectory,
-    sharedRootDirectory,
-  ]);
-  if (operationError !== null) {
-    if (closeFailures.length > 0) {
-      throw new AggregateError(
-        [operationError, ...closeFailures],
-        "Skill bootstrap removal and cleanup failed.",
-      );
-    }
-    throw operationError;
-  }
-  if (closeFailures.length > 0) {
-    throw new AggregateError(closeFailures, "Failed to close skill bootstrap roots.");
-  }
+  await cleanupAtomicWriteTemporaryFiles(
+    ownedSkillCatalogRootDirectory,
+    ["manifest.json", "README.md"],
+    signal,
+  );
+  await unlinkManagedFile(ownedSkillCatalogRootDirectory, "manifest.json", signal);
+  await unlinkManagedFile(ownedSkillCatalogRootDirectory, "README.md", signal);
+  await ownedSkillCatalogRootDirectory.sync();
+  await assertDirectoryIdentity(
+    ownedSkillCatalogRootDirectory,
+    getSkillCatalogRoot(execution),
+    "Skill bootstrap catalog root",
+  );
 }
 
 function getSkillCatalogManifestEntries(

@@ -119,6 +119,67 @@ export async function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal
   }
 }
 
+export async function readBoundedStreamBytes(
+  body: ReadableStream<Uint8Array>,
+  maxBytes: number,
+  limitError: Error,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const reader = body.getReader();
+  let bytes = new Uint8Array(0);
+  let cancellation: Promise<void> | undefined;
+  let completed = false;
+  let size = 0;
+  const cancel = () =>
+    (cancellation ??= reader.cancel(signal?.reason).then(
+      () => undefined,
+      () => undefined,
+    ));
+  const onAbort = () => void cancel();
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    signal?.throwIfAborted();
+
+    while (true) {
+      const chunk = await raceWithAbort(reader.read(), signal);
+      signal?.throwIfAborted();
+
+      if (chunk.done) {
+        completed = true;
+        break;
+      }
+
+      if (chunk.value.byteLength > maxBytes - size) {
+        throw limitError;
+      }
+
+      const nextSize = size + chunk.value.byteLength;
+
+      if (nextSize > bytes.byteLength) {
+        const grown = new Uint8Array(
+          Math.min(maxBytes, Math.max(nextSize, bytes.byteLength * 2, 1_024)),
+        );
+        grown.set(bytes);
+        bytes = grown;
+      }
+
+      bytes.set(chunk.value, size);
+      size = nextSize;
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+
+    if (!completed) {
+      await cancel();
+    }
+
+    reader.releaseLock();
+  }
+
+  return bytes.subarray(0, size);
+}
+
 export function settlePromiseWithTimeout<T>(
   promise: Promise<T>,
   options: PromiseTimeoutOptions,

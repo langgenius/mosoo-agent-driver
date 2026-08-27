@@ -8,7 +8,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import type { DriverStartInput } from "../src/protocol/start";
@@ -119,11 +119,6 @@ function createHarness(
   const events: DriverEventInput[] = [];
   let currentRunId: RunId | null = null;
   let seq = 0;
-  const logger = createBufferedSinkLogger({
-    level: "error",
-    service: "claude-agent-sdk-driver-backend-test",
-    sink: async () => {},
-  });
   const payload =
     payloadOverride ??
     ({
@@ -154,7 +149,7 @@ function createHarness(
         };
       },
     },
-    logger,
+    logger: createDisabledLogger(),
     payload,
     permission: { request: async () => "allow_once" },
     ports: { skill: { materialize: async () => [] } },
@@ -164,7 +159,6 @@ function createHarness(
     backend: new ClaudeAgentSdkDriverBackend(payload, dependencies),
     context,
     events,
-    logger,
   };
 }
 
@@ -204,7 +198,6 @@ describe("Claude Agent SDK driver backend", () => {
     expect(harness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
     expect(harness.events.some((event) => event.kind === "run.failed")).toBe(true);
     expect(JSON.stringify(harness.events)).not.toContain(oversizedSessionId);
-    await harness.logger.destroy();
 
     const emptyHarness = createHarness({
       createQueryOptions: async () => ({}),
@@ -223,7 +216,6 @@ describe("Claude Agent SDK driver backend", () => {
     expect(emptyHarness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(
       false,
     );
-    await emptyHarness.logger.destroy();
   });
 
   test("consumes a ready prewarm for the first turn", async () => {
@@ -258,7 +250,6 @@ describe("Claude Agent SDK driver backend", () => {
     await nextEventLoopTurn();
     await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(prompts).toEqual(["first"]);
     expect(coldQueries).toBe(0);
@@ -310,7 +301,6 @@ describe("Claude Agent SDK driver backend", () => {
       DRIVER_TEST_IDS.secondRunId,
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(coldQueries).toBe(2);
     expect(warmQueries).toBe(0);
@@ -360,7 +350,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
     ).resolves.toBeUndefined();
     expect(cleanupRetries).toBe(1);
-    await harness.logger.destroy();
   });
 
   test("stop joins a prewarm that ignores cancellation until startup settles", async () => {
@@ -407,7 +396,6 @@ describe("Claude Agent SDK driver backend", () => {
     expect(stopped).toBe(false);
     processExit.resolve();
     await stopping;
-    await harness.logger.destroy();
   });
 
   test("stop joins a cooperatively aborted prewarm", async () => {
@@ -436,7 +424,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
     ).resolves.toBeUndefined();
     expect(warmSignal?.aborted).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("stop fails at its deadline and can retry when prewarm later settles", async () => {
@@ -476,7 +463,6 @@ describe("Claude Agent SDK driver backend", () => {
     });
     await expect(retry).resolves.toBeUndefined();
     expect(closes).toBe(1);
-    await harness.logger.destroy();
   });
 
   test("stop consumes a late prewarm rejection", async () => {
@@ -508,7 +494,6 @@ describe("Claude Agent SDK driver backend", () => {
     startup.reject(new Error("late startup failure"));
 
     await expect(stopping).resolves.toBeUndefined();
-    await harness.logger.destroy();
   });
 
   test("stop propagates a rejected prewarm process cleanup", async () => {
@@ -552,7 +537,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.stop(harness.context, "test.stop.retry", new AbortController().signal),
     ).resolves.toBeUndefined();
     expect(cleanupRetries).toBe(1);
-    await harness.logger.destroy();
   });
 
   test("retains a spontaneous prewarm process cleanup rejection", async () => {
@@ -581,7 +565,6 @@ describe("Claude Agent SDK driver backend", () => {
     await expect(
       harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
     ).rejects.toBe(cleanupError);
-    await harness.logger.destroy();
   });
 
   test("does not lose a permanent prewarm cleanup failure while retrying its sibling", async () => {
@@ -622,7 +605,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.stop(harness.context, "test.stop.retry", new AbortController().signal),
     ).rejects.toBe(permanentError);
     expect(cleanupRetries).toBe(1);
-    await harness.logger.destroy();
   });
 
   test("concurrent stops share the same prewarm join", async () => {
@@ -668,7 +650,6 @@ describe("Claude Agent SDK driver backend", () => {
 
     await Promise.all([first, second]);
     expect(closes).toBe(1);
-    await harness.logger.destroy();
   });
 
   test("stop drains prewarm cleanup after active turn cleanup fails", async () => {
@@ -752,7 +733,6 @@ describe("Claude Agent SDK driver backend", () => {
       { reason: activeCleanupError, status: "rejected" },
       { reason: activeCleanupError, status: "rejected" },
     ]);
-    await harness.logger.destroy();
 
     expect(
       harness.events.some((event) =>
@@ -806,7 +786,6 @@ describe("Claude Agent SDK driver backend", () => {
         { kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId },
       ]);
       await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-      await harness.logger.destroy();
     },
   );
 
@@ -826,7 +805,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
     ).rejects.toThrow("query options failed");
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(
       harness.events.filter((event) =>
@@ -883,7 +861,6 @@ describe("Claude Agent SDK driver backend", () => {
     processExit.resolve();
     await expect(handling).rejects.toThrow("query creation failed");
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(processTasks?.size).toBe(0);
     expect(harness.events.some((event) => event.kind === "run.failed")).toBe(true);
@@ -916,7 +893,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
     ).rejects.toThrow("event sink unavailable");
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(queryCalls).toBe(0);
     expect(
@@ -988,7 +964,6 @@ describe("Claude Agent SDK driver backend", () => {
     releaseLateProcess.resolve();
     await handling;
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(harness.events.some((event) => event.kind === "run.completed")).toBe(true);
   });
@@ -1052,7 +1027,6 @@ describe("Claude Agent SDK driver backend", () => {
     await expect(
       harness.backend.stop(harness.context, "test.stop.retry", new AbortController().signal),
     ).resolves.toBeUndefined();
-    await harness.logger.destroy();
 
     expect(cleanupRetries).toBe(1);
     expect(
@@ -1097,7 +1071,6 @@ describe("Claude Agent SDK driver backend", () => {
       await expect(
         harness.backend.stop(harness.context, "test.complete", new AbortController().signal),
       ).resolves.toBeUndefined();
-      await harness.logger.destroy();
 
       expect(
         harness.events.some((event) =>
@@ -1195,7 +1168,6 @@ describe("Claude Agent SDK driver backend", () => {
     await cancellation;
     await expect(handling).rejects.toBeInstanceOf(DriverTurnCancelledError);
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(closes).toBe(1);
     expect(
@@ -1289,7 +1261,6 @@ describe("Claude Agent SDK driver backend", () => {
       { reason: cleanupError, status: "rejected" },
       { reason: cleanupError, status: "rejected" },
     ]);
-    await harness.logger.destroy();
 
     expect(
       harness.events.some((event) =>
@@ -1329,7 +1300,6 @@ describe("Claude Agent SDK driver backend", () => {
     releaseFinish.resolve();
     await expect(handling).resolves.toBeUndefined();
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(closes).toBe(1);
     expect(
@@ -1374,7 +1344,6 @@ describe("Claude Agent SDK driver backend", () => {
         harness.backend.handleInput(harness.context, { text: "finish" }, DRIVER_TEST_IDS.runId),
       ).rejects.toThrow("terminal delivery unavailable");
       await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-      await harness.logger.destroy();
 
       expect(terminalAttempts).toEqual([[terminal], [terminal]]);
     },
@@ -1411,7 +1380,6 @@ describe("Claude Agent SDK driver backend", () => {
     await stopping;
     await optionsReturned.promise;
     await Promise.resolve();
-    await harness.logger.destroy();
 
     expect(startupCalls).toBe(0);
   });
@@ -1432,7 +1400,6 @@ describe("Claude Agent SDK driver backend", () => {
       harness.backend.handleInput(harness.context, { text: "second" }, DRIVER_TEST_IDS.secondRunId),
     ).rejects.toThrow("different native session");
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(
       harness.events.filter((event) =>
@@ -1486,7 +1453,6 @@ describe("Claude Agent SDK driver backend", () => {
       DRIVER_TEST_IDS.secondRunId,
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(optionSessionIds).toEqual([null, "native-session-1"]);
     expect(
@@ -1548,7 +1514,6 @@ describe("Claude Agent SDK driver backend", () => {
       DRIVER_TEST_IDS.secondRunId,
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(lateFrameRead).toBe(false);
     expect(
@@ -1618,7 +1583,6 @@ describe("Claude Agent SDK driver backend", () => {
       DRIVER_TEST_IDS.secondRunId,
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain("<conversation_history>");
@@ -1658,7 +1622,6 @@ describe("Claude Agent SDK driver backend", () => {
       DRIVER_TEST_IDS.runId,
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
-    await harness.logger.destroy();
 
     expect(prompts).toEqual(["add a page"]);
   });

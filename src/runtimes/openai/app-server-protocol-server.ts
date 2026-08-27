@@ -12,11 +12,6 @@ import type {
 } from "./app-server-protocol-types";
 import { validateTurnStatusError } from "./app-server-turn-validation";
 
-interface MethodDispatcher<Method extends string> {
-  has(method: string): method is Method;
-  parse(method: Method, value: unknown): JsonObject;
-}
-
 function expectObject(value: unknown, label: string): JsonObject {
   if (!isRecord(value)) {
     throw new TypeError(`${label} must be an object.`);
@@ -45,7 +40,7 @@ function branchMethod(branch: JsonObject): string {
   return variants[0]!;
 }
 
-function createMethodDispatcher<Method extends string>(value: unknown): MethodDispatcher<Method> {
+function createMethodSchemas(value: unknown): ReadonlyMap<string, z.ZodType<JsonObject>> {
   const root = expectObject(value, "Root method schema");
   const branches = root["oneOf"];
 
@@ -80,35 +75,29 @@ function createMethodDispatcher<Method extends string>(value: unknown): MethodDi
     schemas.set(method, schema);
   }
 
-  return {
-    has: (method: string): method is Method => schemas.has(method),
-    parse: (method, input) => schemas.get(method)!.parse(input),
-  };
+  return schemas;
 }
 
-const serverNotificationDispatcher = createMethodDispatcher<ServerNotificationMethod>(
-  serverNotificationJsonSchema,
-);
-const serverRequestDispatcher =
-  createMethodDispatcher<ServerRequestMethod>(serverRequestJsonSchema);
+const serverNotificationSchemas = createMethodSchemas(serverNotificationJsonSchema);
+const serverRequestSchemas = createMethodSchemas(serverRequestJsonSchema);
 
 export function isServerNotificationMethod(method: string): method is ServerNotificationMethod {
-  return serverNotificationDispatcher.has(method);
+  return serverNotificationSchemas.has(method);
 }
 
 export function isServerRequestMethod(method: string): method is ServerRequestMethod {
-  return serverRequestDispatcher.has(method);
+  return serverRequestSchemas.has(method);
 }
 
 export function parseServerNotification(value: unknown): ParsedServerNotification | null {
   const envelope = isRecord(value) ? value : null;
   const method = envelope?.["method"];
 
-  if (typeof method !== "string" || !serverNotificationDispatcher.has(method)) {
+  if (typeof method !== "string" || !isServerNotificationMethod(method)) {
     return null;
   }
 
-  const parsed = serverNotificationDispatcher.parse(method, value);
+  const parsed = serverNotificationSchemas.get(method)!.parse(value);
   const params = parsed["params"];
 
   if (!isRecord(params)) {
@@ -137,11 +126,11 @@ export function parseServerRequest(value: unknown): ParsedServerRequest | null {
   const envelope = isRecord(value) ? value : null;
   const method = envelope?.["method"];
 
-  if (typeof method !== "string" || !serverRequestDispatcher.has(method)) {
+  if (typeof method !== "string" || !isServerRequestMethod(method)) {
     return null;
   }
 
-  const parsed = serverRequestDispatcher.parse(method, value);
+  const parsed = serverRequestSchemas.get(method)!.parse(value);
   const id = parsed["id"];
   const params = parsed["params"];
 

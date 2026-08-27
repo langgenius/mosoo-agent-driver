@@ -6,14 +6,7 @@ import threadInjectItemsResponseJsonSchema from "./generated-json-schema/ThreadI
 import threadResumeResponseJsonSchema from "./generated-json-schema/ThreadResumeResponse.json" with { type: "json" };
 import threadStartResponseJsonSchema from "./generated-json-schema/ThreadStartResponse.json" with { type: "json" };
 import turnStartResponseJsonSchema from "./generated-json-schema/TurnStartResponse.json" with { type: "json" };
-import type {
-  InitializeResponse,
-  ThreadBackgroundTerminalsCleanResponse,
-  ThreadInjectItemsResponse,
-  ThreadResumeResponse,
-  ThreadStartResponse,
-  TurnStartResponse,
-} from "./app-server-protocol-types";
+import type { ClientRequestMethod, ClientRequestResult } from "./app-server-protocol-types";
 import { validateTurnStatusError } from "./app-server-turn-validation";
 
 function fromGeneratedJsonSchema<Output>(schema: unknown): z.ZodType<Output> {
@@ -37,33 +30,28 @@ export const jsonRpcResponseSchema = z.union([
   }),
 ]);
 
-export const initializeResponseSchema = fromGeneratedJsonSchema<InitializeResponse>(
-  initializeResponseJsonSchema,
-);
-export const threadBackgroundTerminalsCleanResponseSchema =
-  fromGeneratedJsonSchema<ThreadBackgroundTerminalsCleanResponse>(
+export const CLIENT_RESULT_SCHEMAS: {
+  readonly [Method in ClientRequestMethod]: z.ZodType<ClientRequestResult[Method]>;
+} = {
+  initialize: fromGeneratedJsonSchema(initializeResponseJsonSchema),
+  "thread/backgroundTerminals/clean": fromGeneratedJsonSchema(
     threadBackgroundTerminalsCleanResponseJsonSchema,
-  );
-export const threadInjectItemsResponseSchema = fromGeneratedJsonSchema<ThreadInjectItemsResponse>(
-  threadInjectItemsResponseJsonSchema,
-);
-export const threadResumeResponseSchema = fromGeneratedJsonSchema<ThreadResumeResponse>(
-  threadResumeResponseJsonSchema,
-);
-export const threadStartResponseSchema = fromGeneratedJsonSchema<ThreadStartResponse>(
-  threadStartResponseJsonSchema,
-);
-export const turnStartResponseSchema = fromGeneratedJsonSchema<TurnStartResponse>(
-  turnStartResponseJsonSchema,
-).superRefine((response, context) => {
-  const message = validateTurnStatusError(response.turn, false);
+  ),
+  "thread/inject_items": fromGeneratedJsonSchema(threadInjectItemsResponseJsonSchema),
+  "thread/resume": fromGeneratedJsonSchema(threadResumeResponseJsonSchema),
+  "thread/start": fromGeneratedJsonSchema(threadStartResponseJsonSchema),
+  "turn/start": fromGeneratedJsonSchema<ClientRequestResult["turn/start"]>(
+    turnStartResponseJsonSchema,
+  ).superRefine((response, context) => {
+    const message = validateTurnStatusError(response.turn, false);
 
-  if (message !== null) {
-    context.addIssue({
-      code: "custom",
-      input: response.turn,
-      message,
-      path: ["turn", "error"],
-    });
-  }
-});
+    if (message !== null) {
+      context.addIssue({
+        code: "custom",
+        input: response.turn,
+        message,
+        path: ["turn", "error"],
+      });
+    }
+  }),
+};

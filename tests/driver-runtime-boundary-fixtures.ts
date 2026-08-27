@@ -5,7 +5,7 @@ import { DriverPermissionBroker } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeIo } from "../src/core/driver-runtime-io";
 import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { AgentDriverMcpPort } from "../src/host-ports";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type {
   McpExecuteCommand,
@@ -170,11 +170,7 @@ export function createDispatcher(input: {
   shutdownSignal?: AbortSignal;
   shutdown?: (socket: DriverRuntimeIo, reason: string) => Promise<void>;
 }) {
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "driver-runtime-boundary-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
   const commandReads = {
     count: 0,
   };

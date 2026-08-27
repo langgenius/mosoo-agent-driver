@@ -40,7 +40,6 @@ interface DriverCommandDispatcherOptions {
 const COMMAND_POLL_INTERVAL_MS = 250;
 export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
 const ACTIVE_INPUT_SETTLE_GRACE_MS = ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS;
-const EXTERNAL_TOOL_EFFECT_COMPLETE_ATTEMPTS = 2;
 const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
@@ -579,6 +578,7 @@ export class DriverCommandDispatcher {
     ) {
       throw new Error("Driver external tool effect ledger is not configured.");
     }
+    const completeExternalToolEffect = effectLedger.completeExternalToolEffect.bind(effectLedger);
 
     try {
       await pushLosslessEvents(socket, [
@@ -621,27 +621,17 @@ export class DriverCommandDispatcher {
         const execution = await prepared.execute(claim);
         const { providerReceiptJson, ...executionResult } = execution;
         result = executionResult;
-        let completionFailure: { error: unknown } | null = null;
-        for (let attempt = 0; attempt < EXTERNAL_TOOL_EFFECT_COMPLETE_ATTEMPTS; attempt += 1) {
-          try {
-            await effectLedger.completeExternalToolEffect(
-              {
-                commandId: command.commandId,
-                ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
-                result,
-              },
-              AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS),
-            );
-            durableResult = result;
-            completionFailure = null;
-            break;
-          } catch (error) {
-            completionFailure = { error };
-          }
-        }
-        if (completionFailure !== null) {
-          throw completionFailure.error;
-        }
+        const complete = () =>
+          completeExternalToolEffect(
+            {
+              commandId: command.commandId,
+              ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
+              result,
+            },
+            AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS),
+          );
+        await Promise.resolve().then(complete).catch(complete);
+        durableResult = result;
       }
 
       await pushLosslessEvents(socket, [

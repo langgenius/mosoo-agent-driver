@@ -10,7 +10,7 @@ import {
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
 import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
@@ -505,11 +505,7 @@ async function createHarness(
     runtimeTransport: "acp-fallback",
   } satisfies DriverBootPayload;
   const payload = createDriverStartInputFromBootPayload(boot);
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-driver-backend-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
   let acceptedSeq = 0;
   const lifecycleFailures: Error[] = [];
   const lifecycleFailure = Promise.withResolvers<Error>();
@@ -610,7 +606,6 @@ async function createHarness(
     async destroy() {
       block?.release.reject(new Error("test cleanup"));
       await backend.stop(context, "test cleanup", new AbortController().signal).catch(() => {});
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     },
     failNext(kind: string) {
@@ -663,11 +658,7 @@ describe("ACP driver backend lifecycle", () => {
       runtimeTransport: "acp-fallback",
     } satisfies DriverBootPayload;
     const payload = createDriverStartInputFromBootPayload(boot);
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "acp-root-init-failure-test",
-      sink: async () => {},
-    });
+    const logger = createDisabledLogger();
     let hostSnapshots = 0;
     let materializations = 0;
     const context = createAgentDriverContext({
@@ -709,7 +700,6 @@ describe("ACP driver backend lifecycle", () => {
       ).resolves.toEqual([undefined, undefined]);
     } finally {
       await backend.stop(context, "test cleanup", new AbortController().signal).catch(() => {});
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });

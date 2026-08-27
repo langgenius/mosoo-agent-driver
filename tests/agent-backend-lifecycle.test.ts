@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { AgentBackendLifecycle } from "../src/core/agent-backend-lifecycle";
@@ -59,8 +59,6 @@ describe("AgentBackendLifecycle", () => {
   });
 
   test("bounds a final stop and serializes its retry behind late cleanup", async () => {
-    type ManualTimer = { active: boolean; delay: number; run: () => void };
-
     const backend = createBackend();
     const startEntered = Promise.withResolvers<void>();
     const releaseStart = Promise.withResolvers<void>();
@@ -107,52 +105,18 @@ describe("AgentBackendLifecycle", () => {
       startTimeoutMs: 10_000,
       stopTimeoutMs: 1_000,
     });
-    const start = lifecycle.start();
-    await startEntered.promise;
-
-    const nativeClearTimeout = globalThis.clearTimeout;
-    const nativeNow = Date.now;
-    const nativeSetTimeout = globalThis.setTimeout;
-    const timers = new Set<ManualTimer>();
-    let now = 0;
-    Date.now = () => now;
-    globalThis.setTimeout = ((
-      callback: (...args: unknown[]) => void,
-      delay = 0,
-      ...args: unknown[]
-    ) => {
-      const timer: ManualTimer = {
-        active: true,
-        delay,
-        run: () => {
-          if (timer.active) {
-            callback(...args);
-          }
-        },
-      };
-      timers.add(timer);
-      return timer as unknown as ReturnType<typeof setTimeout>;
-    }) as typeof setTimeout;
-    globalThis.clearTimeout = ((handle: ReturnType<typeof setTimeout>) => {
-      const timer = handle as unknown as ManualTimer;
-      if (timers.has(timer)) {
-        timer.active = false;
-      } else {
-        nativeClearTimeout(handle);
-      }
-    }) as typeof clearTimeout;
+    jest.useFakeTimers({ now: 0 });
 
     try {
+      const start = lifecycle.start();
+      await startEntered.promise;
       const shutdown = lifecycle.shutdown("test shutdown");
       await firstStopEntered.promise;
-      now = 400;
+      jest.setSystemTime(400);
       releaseStart.resolve();
       await start;
       await finalStopEntered.promise;
-
-      const [finalTimer] = [...timers].filter((timer) => timer.active);
-      expect(finalTimer?.delay).toBe(600);
-      finalTimer?.run();
+      jest.advanceTimersByTime(600);
 
       await finalStopAborted.promise;
       await expect(shutdown).rejects.toThrow("test final stop timed out after 600ms");
@@ -167,9 +131,7 @@ describe("AgentBackendLifecycle", () => {
     } finally {
       releaseStart.resolve();
       releaseFinalStop.resolve();
-      Date.now = nativeNow;
-      globalThis.clearTimeout = nativeClearTimeout;
-      globalThis.setTimeout = nativeSetTimeout;
+      jest.useRealTimers();
     }
   });
 });

@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import {
   ACP_PROTOCOL_VERSION,
   appendOpenCodeInstruction,
@@ -309,11 +309,6 @@ describe("ACP runtime configuration", () => {
         },
       },
     };
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "acp-configuration-test",
-      sink: async () => {},
-    });
     const backend = new AcpDriverBackend(payload);
     const context = createAgentDriverContext({
       eventSink: {
@@ -321,7 +316,7 @@ describe("ACP runtime configuration", () => {
         currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
-      logger,
+      logger: createDisabledLogger(),
       payload,
       permission: {
         request: async () => "reject_once",
@@ -333,7 +328,6 @@ describe("ACP runtime configuration", () => {
         "ACP fallback requires a host integration snapshot.",
       );
     } finally {
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     }
   });

@@ -4,7 +4,7 @@ import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import type { AgentDriverPermissionPort, DriverPermissionRequest } from "../src/host-ports";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
@@ -61,11 +61,6 @@ function createPublisherHarness(
   const partialAttempts: DriverEventInput[][] = [];
   const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
   let nextSeq = 1;
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-event-bridge-publisher-test",
-    sink: async () => {},
-  });
   const context: AgentDriverContext = createAgentDriverContext({
     eventSink: {
       currentRunId: () => DRIVER_TEST_IDS.runId,
@@ -103,7 +98,7 @@ function createPublisherHarness(
         };
       },
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: bootPayload,
     permission: {
       request: options.requestPermission ?? (async () => "allow_once"),
@@ -119,7 +114,7 @@ function createPublisherHarness(
     requireThreadId: () => threadId,
   });
 
-  return { bridge, context, delivered, logger, partialAttempts };
+  return { bridge, context, delivered, partialAttempts };
 }
 
 describe("OpenAi app-server event bridge", () => {
@@ -172,7 +167,6 @@ describe("OpenAi app-server event bridge", () => {
       }),
     ]);
     harness.bridge.rejectTurn("turn-1", new Error("test complete"));
-    await harness.logger.destroy();
   });
 
   test("replays usage after delivery rejection before committing its baseline", async () => {
@@ -210,7 +204,6 @@ describe("OpenAi app-server event bridge", () => {
 
     expect(harness.events().filter((event) => event.kind === "usage.updated")).toHaveLength(1);
     harness.bridge.rejectTurn("turn-1", new Error("test complete"));
-    await harness.logger.destroy();
   });
 
   test("attributes cumulative usage growth across turns without replaying the previous total", async () => {
@@ -257,7 +250,6 @@ describe("OpenAi app-server event bridge", () => {
       expect.objectContaining({ size: 200_000, totalTokens: 30, used: 30 }),
     ]);
     harness.bridge.rejectTurn("turn-2", new Error("test complete"));
-    await harness.logger.destroy();
   });
 
   test.each([
@@ -267,7 +259,7 @@ describe("OpenAi app-server event bridge", () => {
   ] as const)(
     "%s turns never emit resume metadata after the terminal event",
     async (outcome, terminalKind, publishesResume) => {
-      const { bridge, context, events, logger } = createHarness();
+      const { bridge, context, events } = createHarness();
       const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
       void trackedTurn.catch(() => {});
 
@@ -299,7 +291,6 @@ describe("OpenAi app-server event bridge", () => {
       expect(resumeIndexes).toHaveLength(publishesResume ? 1 : 0);
       expect(resumeIndexes.every((index) => index < terminalIndex)).toBe(true);
       expect(allEvents.slice(terminalIndex + 1)).toEqual([]);
-      await logger.destroy();
     },
   );
 
@@ -376,11 +367,10 @@ describe("OpenAi app-server event bridge", () => {
       { kind: "diagnostic.reported", runId: DRIVER_TEST_IDS.runId },
       { kind: "run.completed", runId: DRIVER_TEST_IDS.runId },
     ]);
-    await harness.logger.destroy();
   });
 
   test("bounds a large turn diff before real CMA admission", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const diff = "x".repeat(1_100_000);
@@ -403,11 +393,10 @@ describe("OpenAi app-server event bridge", () => {
     });
     expect(JSON.stringify(diagnostic)).not.toContain(diff.slice(0, 1_024));
     bridge.rejectTurn("turn-1", new Error("test complete"));
-    await logger.destroy();
   });
 
   test("bounds non-durable official telemetry before real CMA admission", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const large = "x".repeat(1_100_000);
     const notifications = [
       parseServerNotification({
@@ -496,13 +485,12 @@ describe("OpenAi app-server event bridge", () => {
       true,
     );
     expect(JSON.stringify(delivered)).not.toContain(large);
-    await logger.destroy();
   });
 
   test("maps official approval identities and bounds terminal telemetry before CMA", async () => {
     const permission = Promise.withResolvers<DriverPermissionRequest>();
     const nativeThreadId = `thread-${"i".repeat(300)}`;
-    const { bridge, context, delivered, logger } = createPublisherHarness({
+    const { bridge, context, delivered } = createPublisherHarness({
       requestPermission: async (input) => {
         permission.resolve(input);
         return "allow_once";
@@ -686,11 +674,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(errors).toEqual([]);
     bridge.rejectTurn(nativeTurnId, new Error("test complete"));
     await handler.abortAll(new Error("test complete"));
-    await logger.destroy();
   });
 
   test("chunks large user-facing warnings and bounds world-writable samples for CMA", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const large = "x".repeat(1_100_000);
     const notifications = [
       parseServerNotification({
@@ -736,11 +723,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(delivered.every((event) => Buffer.byteLength(JSON.stringify(event)) < 1_048_576)).toBe(
       true,
     );
-    await logger.destroy();
   });
 
   test("bounds an official failed-turn error before terminal CMA admission", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const large = "x".repeat(1_100_000);
     const notification = parseServerNotification({
@@ -777,11 +763,10 @@ describe("OpenAi app-server event bridge", () => {
       },
     });
     expect(Buffer.byteLength(JSON.stringify(terminal))).toBeLessThan(1_048_576);
-    await logger.destroy();
   });
 
   test("removes OpenAI private citation markup from streamed and final assistant text", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const privateCitation = "\uE200cite\uE202turn7search12\uE202turn8view0\uE201";
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
@@ -825,7 +810,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const allEvents = events();
     const streamedText = allEvents
@@ -846,7 +830,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("flushes incomplete private markup when an item completes without a text snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "before\uE200cite\uE202turn7search12",
@@ -862,7 +846,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     const streamedText = events()
       .filter((event) => event.kind === "message.delta")
@@ -873,7 +856,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("does not fall back to progress when the final turn item is incomplete", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: {
@@ -895,7 +878,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
@@ -908,7 +890,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("uses the last completed assistant snapshot when turn items are omitted", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "PROGRESS",
@@ -947,7 +929,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
@@ -959,7 +940,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("uses completed snapshots when terminal items are not loaded", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: { id: "message-final", text: "FINAL", type: "agentMessage" },
@@ -986,7 +967,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
@@ -998,7 +978,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("does not fall back when a full terminal item list has no assistant", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: { id: "message-progress", text: "PROGRESS", type: "agentMessage" },
@@ -1014,7 +994,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
@@ -1026,7 +1005,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("uses first-seen item order when older completions arrive late", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     for (const [itemId, delta] of [
       ["message-progress", "PROGRESS"],
@@ -1053,7 +1032,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turn: { id: "turn-1", status: "completed" },
     });
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
 
@@ -1065,7 +1043,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("publishes more than 31 open tool closures before the run terminal", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const toolCount = 40;
 
@@ -1091,7 +1069,6 @@ describe("OpenAi app-server event bridge", () => {
       },
     });
     await expect(completion).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(
       delivered.filter(
@@ -1112,7 +1089,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("publishes a final snapshot larger than the terminal byte limit by reference", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const finalText = "x".repeat(1_100_000);
 
@@ -1135,7 +1112,6 @@ describe("OpenAi app-server event bridge", () => {
       },
     });
     await expect(completion).resolves.toBeUndefined();
-    await logger.destroy();
 
     expectRunFinalReferences(delivered, finalText);
     expect(delivered.at(-1)?.kind).toBe("run.completed");
@@ -1143,7 +1119,7 @@ describe("OpenAi app-server event bridge", () => {
 
   test("commits a chunked snapshot once after a partial transport retry", async () => {
     const sourcePrefix = "openai.item.completed:turn-1:message-partial:";
-    const { bridge, context, delivered, logger, partialAttempts } = createPublisherHarness({
+    const { bridge, context, delivered, partialAttempts } = createPublisherHarness({
       partialSourcePrefix: sourcePrefix,
     });
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
@@ -1186,11 +1162,10 @@ describe("OpenAi app-server event bridge", () => {
     ).toHaveLength(1);
     expectRunFinalReferences(delivered, finalText);
     expect(delivered.at(-1)?.kind).toBe("run.completed");
-    await logger.destroy();
   });
 
   test("publishes a multi-byte final snapshot through CMA-safe lossless chunks", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const finalText = "界".repeat(400_000);
 
@@ -1224,11 +1199,10 @@ describe("OpenAi app-server event bridge", () => {
       memoryCitation: { source: "memory-1" },
       phase: "final",
     });
-    await logger.destroy();
   });
 
   test("publishes a large command result once without exceeding CMA admission", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const output = "x".repeat(525_000);
 
     await bridge.handleNotification(context, "item/completed", {
@@ -1251,11 +1225,10 @@ describe("OpenAi app-server event bridge", () => {
     );
     expect(readEventPayloadString(completion!, "rawOutput")).toBe(output);
     expect(completion?.payload).not.toHaveProperty("content");
-    await logger.destroy();
   });
 
   test("publishes a large dynamic result once through structured output", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const text = "x".repeat(600_000);
     const notification = parseServerNotification({
       method: "item/completed",
@@ -1290,11 +1263,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(completion?.payload).toMatchObject({
       structuredOutput: { contentItems: [{ text, type: "inputText" }] },
     });
-    await logger.destroy();
   });
 
   test("fails closed when one dynamic structured result exceeds CMA admission", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const notification = parseServerNotification({
@@ -1336,11 +1308,10 @@ describe("OpenAi app-server event bridge", () => {
           readEventPayloadString(event, "status") === "completed",
       ),
     ).toBeUndefined();
-    await logger.destroy();
   });
 
   test("fails the active turn instead of claiming an oversized tool result completed", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const output = "x".repeat(1_100_000);
@@ -1386,11 +1357,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(delivered.find((event) => event.kind === "run.failed")?.payload).toMatchObject({
       error: { message: expect.stringContaining("UTF-8 bytes") },
     });
-    await logger.destroy();
   });
 
   test("budgets the first message chunk around large citation metadata", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const text = "a".repeat(512 * 1_024);
     const notification = parseServerNotification({
@@ -1434,11 +1404,10 @@ describe("OpenAi app-server event bridge", () => {
           (event.kind === "message.added" || event.kind === "message.delta"),
       ).length,
     ).toBeGreaterThan(1);
-    await logger.destroy();
   });
 
   test("budgets snapshot chunks after adding a long provider item identity", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const itemId = `message-${"i".repeat(100_000)}`;
     const text = "a".repeat(512 * 1_024);
@@ -1476,11 +1445,10 @@ describe("OpenAi app-server event bridge", () => {
     });
     await expect(trackedTurn).resolves.toBeUndefined();
     expectRunFinalReferences(delivered, text);
-    await logger.destroy();
   });
 
   test("maps long provider reasoning identity before durable CMA delivery", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const itemId = `reasoning-${"i".repeat(262_000)}`;
     const text = "x".repeat(512 * 1_024);
@@ -1516,11 +1484,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(reasoningEvents.some((event) => event.sourceEventId?.includes(itemId) === true)).toBe(
       false,
     );
-    await logger.destroy();
   });
 
   test("maps long provider item and tool identities before durable CMA delivery", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const contextItemId = `compact-${"i".repeat(525_000)}`;
     const toolItemId = `tool-${"i".repeat(525_000)}`;
@@ -1596,11 +1563,10 @@ describe("OpenAi app-server event bridge", () => {
           event.sourceEventId?.includes(toolItemId) === true,
       ),
     ).toBe(false);
-    await logger.destroy();
   });
 
   test("fails closed before CMA when one official plan update exceeds durable capacity", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const notification = parseServerNotification({
@@ -1626,7 +1592,6 @@ describe("OpenAi app-server event bridge", () => {
     await expect(trackedTurn).rejects.toThrow("durable event capacity");
     expect(delivered.some((event) => event.kind === "plan.updated")).toBe(false);
     expect(delivered.at(-1)?.kind).toBe("run.failed");
-    await logger.destroy();
   });
 
   test.each([
@@ -1663,7 +1628,7 @@ describe("OpenAi app-server event bridge", () => {
       },
     ],
   ] as const)("fails %s start before poisoning CMA terminal delivery", async (_label, item) => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const notification = parseServerNotification({
@@ -1685,11 +1650,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(delivered.some((event) => event.kind === "item.started")).toBe(false);
     expect(delivered.some((event) => event.kind === "tool.call.updated")).toBe(false);
     expect(delivered.at(-1)?.kind).toBe("run.failed");
-    await logger.destroy();
   });
 
   test("completes a large renamed file patch without duplicating its diff", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const diff = "x".repeat(1_050_000);
@@ -1757,11 +1721,10 @@ describe("OpenAi app-server event bridge", () => {
 
     await bridge.failActiveTurns(context, new Error("test complete"));
     await expect(trackedTurn).rejects.toThrow("test complete");
-    await logger.destroy();
   });
 
   test("fails closed when citation metadata alone exceeds CMA snapshot capacity", async () => {
-    const { bridge, context, delivered, logger } = createPublisherHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void trackedTurn.catch(() => {});
     const notification = parseServerNotification({
@@ -1806,11 +1769,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(delivered.find((event) => event.kind === "message.failed")).toBeDefined();
     expect(delivered.find((event) => event.kind === "run.failed")).toBeDefined();
     expect(JSON.stringify(delivered)).not.toContain("memory-thread");
-    await logger.destroy();
   });
 
   test("completed turns app final items before run finish", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/completed", {
       threadId: "thread-1",
@@ -1826,7 +1788,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([

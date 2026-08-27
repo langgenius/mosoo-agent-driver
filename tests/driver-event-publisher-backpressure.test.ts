@@ -1,65 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
-import type { RunId } from "../src/protocol/id";
-import type { DriverEventBatchOutput } from "../src/protocol/orpc";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
-import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
-import { bootPayload } from "./driver-runtime-boundary-fixtures";
-
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "driver-event-publisher-test",
-    sink: async () => {},
-  });
-}
-
-function createEvent(kind: "message.started" | "message.completed"): DriverEventInput {
-  return {
-    kind,
-    payload: {
-      messageId: "message-1",
-      ...(kind === "message.started" ? { role: "agent" } : { stopReason: "end_turn" }),
-    },
-  };
-}
-
-function createDelta(contentDelta: string): DriverEventInput {
-  return {
-    delivery: "best_effort",
-    kind: "message.delta",
-    payload: {
-      contentDelta,
-      messageId: "message-1",
-      role: "agent",
-    },
-  };
-}
-
-function kinds(batches: readonly (readonly DriverEventInput[])[]): string[][] {
-  return batches.map((batch) => batch.map((event) => event.kind));
-}
-
-function createContext(input: {
-  currentRunId?: () => RunId | null;
-  pushEvents: (events: DriverEventInput[], signal?: AbortSignal) => Promise<DriverEventBatchOutput>;
-}) {
-  return createAgentDriverContext({
-    eventSink: {
-      commandUpdate: async () => {},
-      currentRunId: input.currentRunId ?? (() => DRIVER_TEST_IDS.runId),
-      pushEvents: async ({ events, signal }) => input.pushEvents(events, signal),
-    },
-    logger: createTestLogger(),
-    payload: bootPayload,
-    permission: {
-      request: async () => "reject_once",
-    },
-  });
-}
+import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
 
 describe("DriverEventPublisher", () => {
   test("resolves only fully accepted callers after a coalesced partial failure", async () => {
@@ -92,7 +35,6 @@ describe("DriverEventPublisher", () => {
       ["message.started", "message.completed"],
       ["message.completed"],
     ]);
-    await context.logger.destroy();
   });
 
   test.each([
@@ -149,7 +91,6 @@ describe("DriverEventPublisher", () => {
       expect(attempts[1]?.map((event) => event.sourceEventId)).toEqual(
         attempts[0]?.map((event) => event.sourceEventId),
       );
-      await context.logger.destroy();
     },
   );
 });

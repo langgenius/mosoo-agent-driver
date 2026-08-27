@@ -1,24 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 
-import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
+import { isRecord } from "../src/runtimes/openai/app-server-json";
 import {
-  CLIENT_REQUEST_RESULT_PARSERS,
+  CLIENT_RESULT_SCHEMAS,
   isServerRequestMethod,
   parseServerNotification,
 } from "../src/runtimes/openai/app-server-protocol";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  readonly events: DriverEventInput[];
-  readonly reason: string;
-}
+import { createOpenAiBridgeHarness as createHarness } from "./openai-app-server-event-bridge-fixture";
+import {
+  normalizeOpenAiProviderEvents as normalizeBridgeEvents,
+  readProviderFixture,
+} from "./provider-fixture-test-helpers";
 
 interface ProviderNotificationFixture {
   readonly method: string;
@@ -48,221 +44,32 @@ const providerFixtureNames = [
   "unknown-notification-ignored",
 ] as const;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readJsonFixture(path: string): unknown {
-  return JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
-}
-
-function readTrackTurnFixture(value: unknown): TrackTurnFixture | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-
-  if (!isRecord(value)) {
-    throw new Error("Provider fixture trackTurnAfterNotifications must be an object.");
-  }
-
-  const expectation = value["expectation"];
-  const turnId = value["turnId"];
-
-  if ((expectation !== "reject" && expectation !== "resolve") || typeof turnId !== "string") {
-    throw new Error("Provider fixture trackTurnAfterNotifications is malformed.");
-  }
-
-  return {
-    expectation,
-    turnId,
-  };
-}
-
-function readProviderNotificationFixture(value: unknown): ProviderNotificationFixture {
-  if (!isRecord(value)) {
-    throw new Error("Provider fixture notification must be an object.");
-  }
-
-  const method = value["method"];
-
-  if (typeof method !== "string") {
-    throw new Error("Provider fixture notification method must be a string.");
-  }
-
-  return {
-    method,
-    params: value["params"],
-  };
-}
-
 function readProviderFixtureCase(path: string): ProviderFixtureCase {
-  const fixture = readJsonFixture(path);
-
-  if (!isRecord(fixture)) {
-    throw new Error("Provider fixture must be an object.");
-  }
-
-  const notifications = fixture["notifications"];
-  const expectedEvents = fixture["expectedEvents"];
-
-  if (!Array.isArray(notifications) || !Array.isArray(expectedEvents)) {
-    throw new Error("Provider fixture must include notifications and expectedEvents arrays.");
-  }
-
-  return {
-    expectedEvents,
-    notifications: notifications.map(readProviderNotificationFixture),
-    trackTurnBeforeNotifications: readTrackTurnFixture(fixture["trackTurnBeforeNotifications"]),
-    trackTurnAfterNotifications: readTrackTurnFixture(fixture["trackTurnAfterNotifications"]),
-  };
-}
-
-function isIsoTimestamp(value: string): boolean {
-  return value.endsWith("Z") && !Number.isNaN(Date.parse(value));
-}
-
-function collectDriverIds(value: unknown, aliases: Map<string, string>, fieldName?: string): void {
-  if (typeof value === "string") {
-    const candidates = fieldName === "sourceEventId" ? value.split(":") : [value];
-    for (const candidate of candidates) {
-      if (isDriverId(candidate) && !aliases.has(candidate)) {
-        aliases.set(
-          candidate,
-          aliases.size === 0 ? "<driver-id>" : `<driver-id-${aliases.size + 1}>`,
-        );
-      }
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      collectDriverIds(entry, aliases);
-    }
-    return;
-  }
-
-  if (isRecord(value)) {
-    for (const [key, entry] of Object.entries(value)) {
-      collectDriverIds(entry, aliases, key);
-    }
-  }
-}
-
-function normalizeBridgeValue(
-  value: unknown,
-  aliases: ReadonlyMap<string, string>,
-  fieldName?: string,
-): unknown {
-  if (typeof value === "string") {
-    const alias = aliases.get(value);
-    if (alias !== undefined) {
-      return alias;
-    }
-
-    if (fieldName !== undefined && fieldName.endsWith("At") && isIsoTimestamp(value)) {
-      return "<iso-timestamp>";
-    }
-
-    if (fieldName === "sourceEventId") {
-      return value
-        .split(":")
-        .map((part) => aliases.get(part) ?? part)
-        .join(":");
-    }
-
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeBridgeValue(entry, aliases));
-  }
-
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => [key, normalizeBridgeValue(entry, aliases, key)]),
-  );
-}
-
-function normalizeBridgeEvent(
-  event: DriverEventInput,
-  aliases: ReadonlyMap<string, string>,
-): Record<string, unknown> {
-  const eventRecord = event as unknown as Record<string, unknown>;
-  const normalized: Record<string, unknown> = {
-    kind: event.kind,
-    payload: normalizeBridgeValue(event.payload, aliases),
-  };
-
-  for (const field of ["delivery", "native", "runId", "sourceEventId", "visibility"] as const) {
-    if (eventRecord[field] !== undefined) {
-      normalized[field] = normalizeBridgeValue(eventRecord[field], aliases, field);
-    }
-  }
-
-  return normalized;
-}
-
-function normalizeBridgeEvents(events: readonly DriverEventInput[]): Record<string, unknown>[] {
-  const aliases = new Map<string, string>();
-  for (const event of events) {
-    collectDriverIds(event, aliases);
-  }
-  return events.map((event) => normalizeBridgeEvent(event, aliases));
-}
-
-function createHarness(input: { sharedRootPath?: string } = {}) {
-  const batches: EventBatch[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-provider-fixtures-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      currentRunId: () => DRIVER_TEST_IDS.runId,
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: {
-      ...bootPayload,
-      execution: {
-        ...bootPayload.execution,
-        session: {
-          ...bootPayload.execution.session,
-          sharedRootPath: input.sharedRootPath ?? bootPayload.execution.session.sharedRootPath,
-        },
-      },
-    },
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const push = async (_context: AgentDriverContext, reason: string, events: DriverEventInput[]) => {
-    batches.push({ events, reason });
-  };
-  const bridge = new OpenAiAppServerEventBridge({
-    push,
-    pushSession: push,
-    pushTerminal: async (pushContext, reason, closures, terminal) => {
-      for (const closure of closures) {
-        await push(pushContext, `${reason}.items`, [closure]);
-      }
-      await push(pushContext, reason, [terminal]);
-    },
-    requireThreadId: () => "thread-1",
+  const fixture = readProviderFixture<ProviderFixtureCase>(path, {
+    arrays: ["expectedEvents", "notifications"],
   });
 
-  return {
-    batches,
-    bridge,
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    logger,
-  };
+  for (const notification of fixture.notifications) {
+    if (!isRecord(notification) || typeof notification["method"] !== "string") {
+      throw new TypeError(`Provider fixture ${path} has a malformed notification.`);
+    }
+  }
+
+  for (const trackTurn of [
+    fixture.trackTurnBeforeNotifications,
+    fixture.trackTurnAfterNotifications,
+  ]) {
+    if (
+      trackTurn !== undefined &&
+      (!isRecord(trackTurn) ||
+        (trackTurn["expectation"] !== "reject" && trackTurn["expectation"] !== "resolve") ||
+        typeof trackTurn["turnId"] !== "string")
+    ) {
+      throw new TypeError(`Provider fixture ${path} has malformed turn tracking.`);
+    }
+  }
+
+  return fixture;
 }
 
 async function dispatchProviderNotification(
@@ -577,7 +384,7 @@ describe("OpenAI app-server provider fixtures", () => {
   });
 
   test("classifies unused MCP-stream and realtime timeline notifications explicitly", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const realtimeItem = {
       id: "realtime-item-1",
       realtimeSessionId: "realtime-1",
@@ -611,7 +418,6 @@ describe("OpenAI app-server provider fixtures", () => {
     }
 
     expect(events()).toEqual([]);
-    await logger.destroy();
   });
 
   test.each([undefined, "unknown", "inProgress"])(
@@ -663,7 +469,7 @@ describe("OpenAI app-server provider fixtures", () => {
       };
       delete turn[missing];
 
-      expect(() => CLIENT_REQUEST_RESULT_PARSERS["turn/start"]({ turn })).toThrow(missing);
+      expect(() => CLIENT_RESULT_SCHEMAS["turn/start"].parse({ turn })).toThrow(missing);
     },
   );
 
@@ -678,7 +484,7 @@ describe("OpenAI app-server provider fixtures", () => {
       };
       delete response[missing];
 
-      expect(() => CLIENT_REQUEST_RESULT_PARSERS.initialize(response)).toThrow(missing);
+      expect(() => CLIENT_RESULT_SCHEMAS.initialize.parse(response)).toThrow(missing);
     },
   );
 
@@ -690,7 +496,7 @@ describe("OpenAI app-server provider fixtures", () => {
       userAgent: "test-app-server/0.150.1",
     };
 
-    expect(CLIENT_REQUEST_RESULT_PARSERS.initialize(response)).toEqual(response);
+    expect(CLIENT_RESULT_SCHEMAS.initialize.parse(response)).toEqual(response);
   });
 
   test.each([
@@ -705,15 +511,15 @@ describe("OpenAI app-server provider fixtures", () => {
     const response: Record<string, unknown> = { ...createThreadStartFixture() };
     delete response[missing];
 
-    expect(() => CLIENT_REQUEST_RESULT_PARSERS["thread/start"](response)).toThrow(missing);
+    expect(() => CLIENT_RESULT_SCHEMAS["thread/start"].parse(response)).toThrow(missing);
   });
 
   test("preserves the complete thread/start response and rejects a sparse thread", () => {
     const response = createThreadStartFixture();
 
-    expect(CLIENT_REQUEST_RESULT_PARSERS["thread/start"](response)).toEqual(response);
+    expect(CLIENT_RESULT_SCHEMAS["thread/start"].parse(response)).toEqual(response);
     expect(() =>
-      CLIENT_REQUEST_RESULT_PARSERS["thread/start"]({
+      CLIENT_RESULT_SCHEMAS["thread/start"].parse({
         ...response,
         thread: { id: "thread-1" },
       }),
@@ -736,14 +542,14 @@ describe("OpenAI app-server provider fixtures", () => {
       delete response["reasoningEffort"];
       delete response["serviceTier"];
 
-      expect(CLIENT_REQUEST_RESULT_PARSERS[method](response)).toEqual(response);
+      expect(CLIENT_RESULT_SCHEMAS[method].parse(response)).toEqual(response);
     },
   );
 
   test("applies the official thread/resume pagination defaults", () => {
     const response = createThreadStartFixture();
 
-    expect(CLIENT_REQUEST_RESULT_PARSERS["thread/resume"](response)).toEqual({
+    expect(CLIENT_RESULT_SCHEMAS["thread/resume"].parse(response)).toEqual({
       ...response,
       initialTurnsPage: null,
       itemsBackwardsCursor: null,
@@ -763,7 +569,7 @@ describe("OpenAI app-server provider fixtures", () => {
       turnsBackwardsCursor: "turn-head",
     };
 
-    expect(CLIENT_REQUEST_RESULT_PARSERS["thread/resume"](response)).toEqual(response);
+    expect(CLIENT_RESULT_SCHEMAS["thread/resume"].parse(response)).toEqual(response);
   });
 
   test("preserves structured turn errors and rejects unknown thread items", () => {
@@ -777,9 +583,9 @@ describe("OpenAI app-server provider fixtures", () => {
       status: "failed",
     };
 
-    expect(CLIENT_REQUEST_RESULT_PARSERS["turn/start"]({ turn })).toEqual({ turn });
+    expect(CLIENT_RESULT_SCHEMAS["turn/start"].parse({ turn })).toEqual({ turn });
     expect(() =>
-      CLIENT_REQUEST_RESULT_PARSERS["turn/start"]({
+      CLIENT_RESULT_SCHEMAS["turn/start"].parse({
         turn: { ...createTurnFixture(), items: [{ id: "item-1", type: "futureItem" }] },
       }),
     ).toThrow("Invalid input");
@@ -792,7 +598,7 @@ describe("OpenAI app-server provider fixtures", () => {
     ["inProgress", { message: "unexpected" }],
   ] as const)("rejects turn/start status %s with contradictory error", (status, error) => {
     expect(() =>
-      CLIENT_REQUEST_RESULT_PARSERS["turn/start"]({
+      CLIENT_RESULT_SCHEMAS["turn/start"].parse({
         turn: { error, id: "turn-1", items: [], status },
       }),
     ).toThrow("turn.error must be present exactly when the turn failed");
@@ -800,7 +606,7 @@ describe("OpenAI app-server provider fixtures", () => {
 
   test("accepts an in-progress turn/start without an error", () => {
     expect(
-      CLIENT_REQUEST_RESULT_PARSERS["turn/start"]({
+      CLIENT_RESULT_SCHEMAS["turn/start"].parse({
         turn: { id: "turn-1", items: [], status: "inProgress" },
       }),
     ).toMatchObject({ turn: { status: "inProgress" } });
@@ -823,7 +629,7 @@ describe("OpenAI app-server provider fixtures", () => {
   });
 
   test("rejects a non-object thread/inject_items response", () => {
-    expect(() => CLIENT_REQUEST_RESULT_PARSERS["thread/inject_items"](null)).toThrow(
+    expect(() => CLIENT_RESULT_SCHEMAS["thread/inject_items"].parse(null)).toThrow(
       "expected object",
     );
   });
@@ -873,7 +679,7 @@ describe("OpenAI app-server provider fixtures", () => {
   });
 
   test("maps official collaboration items to complete tool lifecycles", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const cases = [
       {
         agentStatus: "completed",
@@ -980,8 +786,6 @@ describe("OpenAI app-server provider fixtures", () => {
         },
       });
     }
-
-    await logger.destroy();
   });
 
   test.each([
@@ -990,7 +794,7 @@ describe("OpenAI app-server provider fixtures", () => {
     ["interruptAgent", "Interrupt agent"],
     ["listAgents", "List agents"],
   ] as const)("maps the new %s collaboration tool lifecycle", async (tool, title) => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const baseItem = {
       agentsStates: {},
       id: `collab-${tool}`,
@@ -1034,11 +838,10 @@ describe("OpenAI app-server provider fixtures", () => {
         payload: expect.objectContaining({ status: "completed" }),
       }),
     );
-    await logger.destroy();
   });
 
   test("maps official sleep items to tool lifecycle", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const item = { durationMs: 2_000, id: "sleep-1", type: "sleep" } as const;
 
     for (const method of ["item/started", "item/completed"] as const) {
@@ -1067,11 +870,10 @@ describe("OpenAI app-server provider fixtures", () => {
       updates.map((event) => (isRecord(event.payload) ? event.payload["status"] : null)),
     ).toEqual(["running", "completed"]);
     expect(updates.at(-1)).toMatchObject({ payload: { rawOutput: "Slept for 2000 ms." } });
-    await logger.destroy();
   });
 
   test("preserves command, MCP, and dynamic tool inputs and structured results", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const items = [
       {
         aggregatedOutput: "ok\n",
@@ -1171,13 +973,12 @@ describe("OpenAI app-server provider fixtures", () => {
         success: true,
       },
     });
-    await logger.destroy();
   });
 
   test("fails closed when no durable image transport is available", async () => {
     const pngBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await expect(
       dispatchProviderNotification(
@@ -1202,11 +1003,10 @@ describe("OpenAI app-server provider fixtures", () => {
       ),
     ).rejects.toThrow("without a supported durable image transport");
     expect(JSON.stringify(events())).not.toContain("/untrusted/provider.png");
-    await logger.destroy();
   });
 
   test("maps the remaining official ThreadItem variants without silent data loss", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const completedItems = [
       {
         action: { queries: ["OpenAI app-server 0.147"], query: null, type: "search" },
@@ -1289,13 +1089,12 @@ describe("OpenAI app-server provider fixtures", () => {
       );
     }
     expect(events()).toHaveLength(eventCount);
-    await logger.destroy();
   });
 
   test.each(["started", "interacted", "interrupted", "completed"] as const)(
     "publishes official %s sub-agent activity from completion-only delivery",
     async (activityKind) => {
-      const { bridge, context, events, logger } = createHarness();
+      const { bridge, context, events } = createHarness();
       const item = {
         agentPath: "/root/worker",
         agentThreadId: "agent-1",
@@ -1335,12 +1134,11 @@ describe("OpenAI app-server provider fixtures", () => {
           sourceEventId: `openai.item.completed:turn-1:activity-${activityKind}:0`,
         },
       ]);
-      await logger.destroy();
     },
   );
 
   test("publishes sub-agent activity from a terminal turn snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await dispatchProviderNotification(
       {
@@ -1378,7 +1176,6 @@ describe("OpenAI app-server provider fixtures", () => {
       },
       sourceEventId: "openai.item.completed:turn-snapshot:activity-replayed:0",
     });
-    await logger.destroy();
   });
 
   test.each([
@@ -1391,7 +1188,7 @@ describe("OpenAI app-server provider fixtures", () => {
   ] as const)(
     "fails closed on a schema-valid nonterminal %s completion before mutating state",
     async (type, runningStatus) => {
-      const { bridge, context, events, logger } = createHarness();
+      const { bridge, context, events } = createHarness();
       const id = `nonterminal-${type}`;
 
       await expect(
@@ -1432,12 +1229,11 @@ describe("OpenAI app-server provider fixtures", () => {
           payload: expect.objectContaining({ status: "failed", toolCallId: id }),
         }),
       );
-      await logger.destroy();
     },
   );
 
   test("rejects completed images and diagnoses provider-declared image failure", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await expect(
       dispatchProviderNotification(
@@ -1511,14 +1307,13 @@ describe("OpenAI app-server provider fixtures", () => {
       }),
     );
     expect(JSON.stringify(events())).not.toContain("/untrusted/failed.png");
-    await logger.destroy();
   });
 
   test.each(providerFixtureNames)("apps provider-native fixture %s", async (name) => {
     const fixture = readProviderFixtureCase(
       `./fixtures/providers/openai-app-server/cases/${name}.json`,
     );
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     const trackedTurn = fixture.trackTurnBeforeNotifications;
     const trackedCompletion =
@@ -1538,7 +1333,6 @@ describe("OpenAI app-server provider fixtures", () => {
       }
     }
     await assertTrackTurnFixture(bridge, fixture.trackTurnAfterNotifications);
-    await logger.destroy();
 
     expect(normalizeBridgeEvents(events())).toEqual(fixture.expectedEvents);
   });

@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverBootPayload } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId } from "../src/protocol/id";
@@ -51,17 +51,12 @@ function createCmaHarness() {
   const sessionId = createDriverId() as SessionId;
   const events: DriverEventInput[] = [];
   const sseFrameBytes: number[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "claude-agent-sdk-durability-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => runId,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: bootPayload,
     permission: { request: async () => "allow_once" },
   });
@@ -91,7 +86,7 @@ function createCmaHarness() {
     replaceNativeSessionId: async () => {},
   });
 
-  return { context, events, logger, runId, sseFrameBytes, translator };
+  return { context, events, runId, sseFrameBytes, translator };
 }
 
 describe("Claude Agent SDK durable event boundaries", () => {
@@ -117,7 +112,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     expect(messageText(harness.events, finalMessageId as string)).toBe(text);
     expect(payload(terminal!)).not.toHaveProperty("finalMessageText");
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("rejects oversized structured output before choosing completed closures", async () => {
@@ -146,7 +140,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     expect(harness.events.map(({ kind }) => kind)).not.toContain("run.completed");
     expect(harness.events.map(({ kind }) => kind)).not.toContain("message.completed");
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("keeps accepted structured output inside the real CMA and SSE boundary", async () => {
@@ -160,7 +153,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
 
     expect(harness.events.map(({ kind }) => kind)).toContain("run.completed");
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("bounds oversized provider errors before terminal delivery", async () => {
@@ -192,7 +184,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     });
     expect(JSON.stringify(failed)).not.toContain(providerError);
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("bounds oversized cancellation reasons before terminal delivery", async () => {
@@ -209,7 +200,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     });
     expect(JSON.stringify(cancelled)).not.toContain(reason);
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("stores one copy of a large tool result and fails closed on oversized structured output", async () => {
@@ -246,7 +236,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     expect(acceptedResult).toBeDefined();
     expect(payload(acceptedResult!)).not.toHaveProperty("rawOutput");
     expect(accepted.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await accepted.logger.destroy();
 
     const rejected = createCmaHarness();
     await rejected.translator.handleSdkMessage(
@@ -311,7 +300,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
       payload(rejected.events.find((event) => event.kind === "run.failed")!)["error"],
     ).toMatchObject({ code: "claude.tool_result_too_large" });
     expect(rejected.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await rejected.logger.destroy();
   });
 
   test("rejects an oversized tool input before it can poison terminal delivery", async () => {
@@ -324,11 +312,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     const events: DriverEventInput[] = [];
     const sseFrameBytes: number[] = [];
     const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "claude-agent-sdk-published-durability-test",
-      sink: async () => {},
-    });
     let activeRunId: RunId | null = runId;
     let sequence = 0;
     const context = createAgentDriverContext({
@@ -358,7 +341,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
           };
         },
       },
-      logger,
+      logger: createDisabledLogger(),
       payload: createDriverStartInputFromBootPayload(claudeBootPayload),
       permission: { request: async () => "allow_once" },
     });
@@ -403,7 +386,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     expect(events.some((event) => event.kind === "run.failed")).toBe(true);
     expect(events.some((event) => payload(event)["rawInput"] !== undefined)).toBe(false);
     expect(sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await logger.destroy();
   });
 
   test("closes a retained background task start before terminal failure", async () => {
@@ -414,11 +396,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
       runtimeTransport: "claude-agent-sdk",
     } satisfies DriverBootPayload;
     const events: DriverEventInput[] = [];
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "claude-agent-sdk-task-retention-test",
-      sink: async () => {},
-    });
     let activeRunId: RunId | null = runId;
     let acceptDelivery = false;
     let sequence = 0;
@@ -441,7 +418,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
           };
         },
       },
-      logger,
+      logger: createDisabledLogger(),
       payload: createDriverStartInputFromBootPayload(claudeBootPayload),
       permission: { request: async () => "allow_once" },
     });
@@ -485,7 +462,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
       { active: false, taskId: "task-1" },
     ]);
     expect(events.at(-1)?.kind).toBe("run.failed");
-    await logger.destroy();
   });
 
   test("maps oversized native tool IDs and rejects oversized tool names before durable state", async () => {
@@ -551,7 +527,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
     ).toBe(true);
     expect(JSON.stringify(accepted.events)).not.toContain(nativeToolCallId);
     expect(accepted.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await accepted.logger.destroy();
 
     const rejected = createCmaHarness();
     const oversizedName = "n".repeat(1_100_000);
@@ -585,7 +560,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
       payload(rejected.events.find((event) => event.kind === "run.failed")!)["error"],
     ).toMatchObject({ code: "claude.tool_start_too_large" });
     expect(JSON.stringify(rejected.events)).not.toContain(oversizedName);
-    await rejected.logger.destroy();
   });
 
   test("rejects oversized file paths before publishing a partial durable batch", async () => {
@@ -618,7 +592,6 @@ describe("Claude Agent SDK durable event boundaries", () => {
       payload(harness.events.find((event) => event.kind === "run.failed")!)["error"],
     ).toMatchObject({ code: "claude.files_persisted_too_large" });
     expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await harness.logger.destroy();
   });
 
   test("bounds mirror errors and commits thought and retraction state only after delivery", async () => {
@@ -642,21 +615,15 @@ describe("Claude Agent SDK durable event boundaries", () => {
       severity: "error",
     });
     expect(mirror.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
-    await mirror.logger.destroy();
 
     const reasons: string[] = [];
     const replayedEvents: DriverEventInput[] = [];
     let rejectThought = true;
     let rejectToolRetraction = true;
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "claude-agent-sdk-replay-test",
-      sink: async () => {},
-    });
     const runId = createDriverId() as RunId;
     const context = createAgentDriverContext({
       eventSink: { currentRunId: () => runId, pushEvents: async () => ({ accepted: [] }) },
-      logger,
+      logger: createDisabledLogger(),
       payload: bootPayload,
       permission: { request: async () => "allow_once" },
     });
@@ -743,6 +710,5 @@ describe("Claude Agent SDK durable event boundaries", () => {
           payload(event)["status"] === "cancelled",
       ),
     ).toHaveLength(1);
-    await logger.destroy();
   });
 });

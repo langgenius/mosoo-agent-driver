@@ -41,10 +41,9 @@ export type {
   CmaHttpHandler,
   CmaHttpHandlerOptions,
 } from "./surfaces/cma-http";
-export { CmaSdkError, createCmaSdkClient } from "./surfaces/cma-sdk";
+export { CmaSdkClient, CmaSdkError } from "./surfaces/cma-sdk";
 export type {
   CmaSdkBetaHeader,
-  CmaSdkClient,
   CmaSdkClientOptions,
   CmaSdkFetch,
   CmaSdkRequestOptions,

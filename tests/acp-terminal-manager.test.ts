@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, symlink } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId } from "../src/protocol/id";
 import { spawnLinuxProcessTreeWatchdog } from "../src/runtimes/child-process";
@@ -24,17 +24,12 @@ function createHarness(
   cwd = process.cwd(),
 ) {
   const events: DriverEventInput[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-terminal-manager-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: { request: async () => "reject_once" },
   });
@@ -56,7 +51,7 @@ function createHarness(
     ...(spawnWatchdog === undefined ? {} : { spawnWatchdog }),
   });
 
-  return { context, events, logger, manager };
+  return { context, events, manager };
 }
 
 function isProcessRunning(pid: number): boolean {
@@ -133,7 +128,6 @@ describe("ACP terminal manager", () => {
       });
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
       await rm(root, { force: true, recursive: true });
       await rm(outside, { force: true, recursive: true });
     }
@@ -161,7 +155,6 @@ describe("ACP terminal manager", () => {
       await harness.manager.release(harness.context, { terminalId });
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -198,7 +191,6 @@ describe("ACP terminal manager", () => {
     } finally {
       cleanup.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -233,7 +225,6 @@ describe("ACP terminal manager", () => {
     } finally {
       cleanup.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -281,7 +272,6 @@ describe("ACP terminal manager", () => {
     } finally {
       allowExit.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -322,7 +312,6 @@ describe("ACP terminal manager", () => {
         if (pid > 0 && isProcessRunning(pid)) {
           process.kill(pid, "SIGKILL");
         }
-        await harness.logger.destroy();
         await rm(directory, { force: true, recursive: true });
       }
     },
@@ -359,7 +348,6 @@ describe("ACP terminal manager", () => {
         expect(() => harness.manager.output(terminal)).toThrow("does not exist");
       } finally {
         await harness.manager.stopAll(harness.context).catch(() => {});
-        await harness.logger.destroy();
       }
     },
   );
@@ -427,7 +415,6 @@ setInterval(() => {}, 1_000);
           process.kill(pid, "SIGKILL");
         }
       }
-      await harness.logger.destroy();
       await rm(directory, { force: true, recursive: true });
     }
   }, 7_000);
@@ -473,7 +460,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
           process.kill(pid, "SIGKILL");
         }
       }
-      await harness.logger.destroy();
       await rm(directory, { force: true, recursive: true });
     }
   });
@@ -501,23 +487,18 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       expect(supervisors.size).toBe(1);
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
   test("rejects terminal buffers above the deployment hard limit", async () => {
     const harness = createHarness();
 
-    try {
-      await expect(
-        harness.manager.create(harness.context, {
-          command: process.execPath,
-          outputByteLimit: 1_024 * 1_024 + 1,
-        }),
-      ).rejects.toThrow("exceeds 1048576 bytes");
-    } finally {
-      await harness.logger.destroy();
-    }
+    await expect(
+      harness.manager.create(harness.context, {
+        command: process.execPath,
+        outputByteLimit: 1_024 * 1_024 + 1,
+      }),
+    ).rejects.toThrow("exceeds 1048576 bytes");
   });
 
   test("bounds retained terminals and restores capacity after release", async () => {
@@ -541,7 +522,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, second);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -574,7 +554,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, next);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -604,7 +583,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       expect(() => harness.manager.output(second)).toThrow("does not exist");
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -629,7 +607,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, terminal);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -650,7 +627,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, terminal);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -675,7 +651,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, terminal);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -692,7 +667,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       ).rejects.toThrow("stopping");
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -724,7 +698,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     } finally {
       release.resolve();
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -769,7 +742,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     } finally {
       release.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -823,7 +795,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     } finally {
       release.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -881,7 +852,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       failRelease = false;
       releaseCreated.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -911,7 +881,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       }
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -932,7 +901,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.release(harness.context, terminal);
     } finally {
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 
@@ -976,7 +944,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
         expect(() => harness.manager.output(terminal)).toThrow("does not exist");
       } finally {
         await harness.manager.stopAll(harness.context);
-        await harness.logger.destroy();
       }
     },
   );
@@ -1020,7 +987,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       });
     } finally {
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -1058,7 +1024,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     } finally {
       cleanup.resolve();
       await harness.manager.stopAll(harness.context).catch(() => {});
-      await harness.logger.destroy();
     }
   }, 5_000);
 
@@ -1100,7 +1065,6 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     } finally {
       allowRelease.resolve();
       await harness.manager.stopAll(harness.context);
-      await harness.logger.destroy();
     }
   });
 });

@@ -1,22 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
 import type { MessageId, RunId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
-import { isRecord, messageText } from "./claude-agent-sdk-test-helpers";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  readonly events: DriverEventInput[];
-  readonly reason: string;
-}
+import {
+  createClaudeAgentSdkHarness as createHarness,
+  isRecord,
+  messageText,
+} from "./claude-agent-sdk-test-helpers";
+import {
+  normalizeClaudeProviderEvents as normalizeClaudeEvents,
+  readProviderFixture,
+} from "./provider-fixture-test-helpers";
 
 interface ClaudeProviderFixtureCase {
   readonly expectedEvents: readonly unknown[];
@@ -33,159 +28,21 @@ const claudeFixtureNames = [
   "unknown-message-diagnostic",
 ] as const;
 
-function readJsonFixture(path: string): unknown {
-  return JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
-}
-
 function readClaudeProviderFixtureCase(path: string): ClaudeProviderFixtureCase {
-  const fixture = readJsonFixture(path);
-
-  if (!isRecord(fixture)) {
-    throw new Error("Claude provider fixture must be an object.");
-  }
-
-  const messages = fixture["messages"];
-  const expectedEvents = fixture["expectedEvents"];
-  const expectedNativeSessionIds = fixture["expectedNativeSessionIds"] ?? [];
-  const runId = fixture["runId"];
+  const fixture = readProviderFixture<ClaudeProviderFixtureCase>(path, {
+    arrays: ["expectedEvents", "messages"],
+    strings: ["runId"],
+  });
+  const expectedNativeSessionIds = fixture.expectedNativeSessionIds ?? [];
 
   if (
-    !Array.isArray(messages) ||
-    !Array.isArray(expectedEvents) ||
     !Array.isArray(expectedNativeSessionIds) ||
-    typeof runId !== "string"
+    !expectedNativeSessionIds.every((entry) => typeof entry === "string")
   ) {
-    throw new Error("Claude provider fixture shape is malformed.");
+    throw new TypeError(`Provider fixture ${path} has malformed native session IDs.`);
   }
 
-  if (!expectedNativeSessionIds.every((entry) => typeof entry === "string")) {
-    throw new Error("Claude provider fixture expectedNativeSessionIds must be strings.");
-  }
-
-  return {
-    expectedEvents,
-    expectedNativeSessionIds,
-    messages,
-    runId: runId as RunId,
-  };
-}
-
-function collectDriverIds(value: unknown, aliases: Map<string, string>): void {
-  if (typeof value === "string") {
-    if (isDriverId(value) && !aliases.has(value)) {
-      aliases.set(value, aliases.size === 0 ? "<driver-id>" : `<driver-id-${aliases.size + 1}>`);
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      collectDriverIds(entry, aliases);
-    }
-    return;
-  }
-
-  if (!isRecord(value)) {
-    return;
-  }
-
-  for (const entry of Object.values(value)) {
-    collectDriverIds(entry, aliases);
-  }
-}
-
-function isIsoTimestamp(value: string): boolean {
-  return value.endsWith("Z") && !Number.isNaN(Date.parse(value));
-}
-
-function normalizeClaudeValue(
-  value: unknown,
-  driverIdAliases: ReadonlyMap<string, string>,
-  fieldName?: string,
-): unknown {
-  if (typeof value === "string") {
-    for (const [driverId, alias] of driverIdAliases) {
-      if (value === driverId) {
-        return alias;
-      }
-
-      if (value.startsWith(`${driverId}:`)) {
-        return `${alias}${value.slice(driverId.length)}`;
-      }
-    }
-
-    if (fieldName !== undefined && fieldName.endsWith("At") && isIsoTimestamp(value)) {
-      return "<iso-timestamp>";
-    }
-
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeClaudeValue(entry, driverIdAliases));
-  }
-
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  const entries = Object.entries(value).flatMap(([key, entry]): [string, unknown][] =>
-    entry === undefined ? [] : [[key, normalizeClaudeValue(entry, driverIdAliases, key)]],
-  );
-
-  return Object.fromEntries(entries);
-}
-
-function normalizeClaudeEvents(events: readonly DriverEventInput[]): unknown[] {
-  const driverIdAliases = new Map<string, string>();
-
-  for (const event of events) {
-    collectDriverIds(event, driverIdAliases);
-  }
-
-  return events.map((event) => normalizeClaudeValue(event, driverIdAliases));
-}
-
-function createHarness() {
-  const batches: EventBatch[] = [];
-  const nativeSessionIds: string[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "claude-agent-sdk-provider-fixtures-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      currentRunId: () => "run-1" as RunId,
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: bootPayload,
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const translator = new ClaudeAgentSdkMessageTranslator({
-    publicToolCallId: (nativeToolCallId) => nativeToolCallId,
-    push: async (_context, reason, events) => {
-      batches.push({ events, reason });
-    },
-    pushTerminal: async (_context, reason, closures, terminal) => {
-      batches.push({ events: [...closures, terminal], reason });
-    },
-    recordNativeSessionId: async (_context, sessionId) => {
-      nativeSessionIds.push(sessionId);
-    },
-    replaceNativeSessionId: async () => {},
-  });
-
-  return {
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    logger,
-    nativeSessionIds,
-    translator,
-  };
+  return { ...fixture, expectedNativeSessionIds };
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
@@ -228,7 +85,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // Real SDK wire shape: every envelope (each stream chunk and the complete
     // assistant replay) carries a distinct uuid; only the API message id inside
     // message_start / assistant.message is stable across the whole message.
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -297,7 +154,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const startedEvents = events().filter((event) => event.kind === "message.started");
     const completedEvents = events().filter((event) => event.kind === "message.completed");
@@ -326,7 +182,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("scopes interleaved subagent stream chunks away from the main message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -378,7 +234,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const textByMessageId = new Map<string, string>();
 
@@ -399,7 +254,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("does not promote a replayed stream-only message stop to canonical final", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -435,7 +290,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const liveText = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {
@@ -456,7 +310,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("materializes a result-only native resume completion", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: { type: "message_stop" },
@@ -476,7 +330,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const translated = events();
     const started = translated.filter((event) => event.kind === "message.started");
@@ -501,7 +354,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("keeps structured output as the canonical final payload", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -519,7 +372,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events().map(({ kind }) => kind)).not.toContain("message.added");
     expect(events()).toContainEqual({
@@ -533,7 +385,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed for a non-JSON structured output", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -551,7 +403,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -565,7 +416,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("retracts a superseded refusal before publishing its replacement", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -604,7 +455,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const snapshots = events().flatMap((event) => {
       if (event.kind !== "message.added" || !isRecord(event.payload)) {
@@ -644,7 +494,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("applies refusal fallback retractions idempotently to messages and tool results", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const fallback = {
       content: "Retrying with fallback model.",
       direction: "retry",
@@ -726,7 +576,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const retractedMessages = events().filter(
       (event) =>
@@ -771,7 +620,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("keeps assistant envelopes distinct when they share an API message id", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: { content: [{ text: "first", type: "text" }], id: "shared-native" },
@@ -803,7 +652,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const snapshots = events().flatMap((event) => {
       if (event.kind !== "message.added" || !isRecord(event.payload)) {
@@ -827,7 +675,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("turns provider-aborted result frames into runtime cancellation", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -845,7 +693,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -857,7 +704,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("does not let a late older assistant completion replace the final message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -894,7 +741,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -907,7 +753,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed when a newer assistant is still incomplete at result success", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -937,7 +783,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -950,7 +795,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed when an older full frame arrives after a newer incomplete message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -980,7 +825,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -997,7 +841,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // scope comes from the burst anchor: parallel tool blocks of one message
     // are told apart by content-block index, and a message_stop boundary
     // separates one message's thought stream from the next.
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const stream = (uuid: string, event: Record<string, unknown>) =>
       ({ event, type: "stream_event", uuid }) as unknown as SDKMessage;
     const messages = [
@@ -1058,7 +902,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const toolArguments = events().flatMap((event) => {
       if (event.kind !== "tool.call.updated" || !isRecord(event.payload)) {
@@ -1099,13 +942,11 @@ describe("Claude Agent SDK provider fixtures", () => {
     const fixture = readClaudeProviderFixtureCase(
       `./fixtures/providers/claude-agent-sdk/cases/${name}.json`,
     );
-    const { context, events, logger, nativeSessionIds, translator } = createHarness();
+    const { context, events, nativeSessionIds, translator } = createHarness();
 
     for (const message of fixture.messages) {
       await translator.handleSdkMessage(context, message as SDKMessage, fixture.runId);
     }
-
-    await logger.destroy();
 
     expect(nativeSessionIds).toEqual(fixture.expectedNativeSessionIds);
     expect(normalizeClaudeEvents(events())).toEqual(fixture.expectedEvents);

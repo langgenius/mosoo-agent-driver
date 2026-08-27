@@ -8,7 +8,7 @@ import {
 
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
@@ -116,11 +116,7 @@ describe("ACP runtime event translation", () => {
     const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
     const canonicalEvents: DriverEventInput[] = [];
     let cmaRecordCount = 0;
-    const logger = createBufferedSinkLogger({
-      level: "debug",
-      service: "acp-terminal-boundary-test",
-      sink: async () => {},
-    });
+    const logger = createDisabledLogger();
     let sequence = 0;
     const context = createAgentDriverContext({
       eventSink: {
@@ -151,16 +147,12 @@ describe("ACP runtime event translation", () => {
       permission: { request: async () => "reject_once" },
     });
 
-    try {
-      await new DriverEventPublisher("acp-fallback", () => "native-session-1").pushTerminal(
-        context,
-        "driver.acp.prompt.failed",
-        closures,
-        terminal,
-      );
-    } finally {
-      await logger.destroy();
-    }
+    await new DriverEventPublisher("acp-fallback", () => "native-session-1").pushTerminal(
+      context,
+      "driver.acp.prompt.failed",
+      closures,
+      terminal,
+    );
 
     const boundedMessage =
       "ACP failure exceeded durable event capacity (originalMessageUtf8Bytes=1100000).";

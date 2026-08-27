@@ -14,6 +14,7 @@ import {
   CMA_ENVIRONMENT_PACKAGE_MANAGERS,
   createDefaultCmaEnvironmentConfig,
 } from "../../stores/cma-environment";
+import { readBoundedStreamBytes } from "../../utils/async";
 import { CmaHttpCapabilityGapError, CmaHttpRequestError } from "./contract";
 
 const createAgentFields = new Set(["id", "metadata", "name"]);
@@ -169,67 +170,33 @@ function readRequiredRecord(
 
 export async function readCmaJsonBody(request: Request): Promise<unknown> {
   const contentLength = request.headers.get("content-length");
+  const limitError = new CmaHttpRequestError(
+    413,
+    "CMA_REQUEST_BODY_TOO_LARGE",
+    `Request body exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
+  );
 
   if (contentLength !== null && Number(contentLength) > CMA_MAX_EVENT_BYTES) {
-    throw new CmaHttpRequestError(
-      413,
-      "CMA_REQUEST_BODY_TOO_LARGE",
-      `Request body exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
-    );
+    throw limitError;
   }
 
-  const reader = request.body?.getReader();
-
-  if (!reader) {
+  if (!request.body) {
     throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
   }
 
-  let body = new Uint8Array(0);
-  let size = 0;
-
   try {
-    while (true) {
-      const chunk = await reader.read();
-
-      if (chunk.done) {
-        break;
-      }
-
-      const nextSize = size + chunk.value.byteLength;
-
-      if (nextSize > CMA_MAX_EVENT_BYTES) {
-        await reader.cancel().catch(() => undefined);
-        throw new CmaHttpRequestError(
-          413,
-          "CMA_REQUEST_BODY_TOO_LARGE",
-          `Request body exceeds ${CMA_MAX_EVENT_BYTES} UTF-8 bytes.`,
-        );
-      }
-
-      if (nextSize > body.byteLength) {
-        const grown = new Uint8Array(
-          Math.min(CMA_MAX_EVENT_BYTES, Math.max(nextSize, body.byteLength * 2, 1_024)),
-        );
-        grown.set(body);
-        body = grown;
-      }
-
-      body.set(chunk.value, size);
-      size = nextSize;
-    }
+    const body = await readBoundedStreamBytes(
+      request.body,
+      CMA_MAX_EVENT_BYTES,
+      limitError,
+      request.signal,
+    );
+    return JSON.parse(new TextDecoder().decode(body)) as unknown;
   } catch (error) {
     if (error instanceof CmaHttpRequestError) {
       throw error;
     }
 
-    throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
-  } finally {
-    reader.releaseLock();
-  }
-
-  try {
-    return JSON.parse(new TextDecoder().decode(body.subarray(0, size))) as unknown;
-  } catch {
     throw new CmaHttpRequestError(400, "CMA_INVALID_JSON", "Request body must be valid JSON.");
   }
 }

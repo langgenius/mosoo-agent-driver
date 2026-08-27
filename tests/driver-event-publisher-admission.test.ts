@@ -6,45 +6,13 @@ import {
   withSourceEventIds,
 } from "../src/core/driver-runtime-io";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
-import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import type { RunId } from "../src/protocol/id";
 import type { DriverEventBatchOutput } from "../src/protocol/orpc";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
-import { bootPayload } from "./driver-runtime-boundary-fixtures";
-
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "driver-event-publisher-test",
-    sink: async () => {},
-  });
-}
-
-function createEvent(kind: "message.started" | "message.completed"): DriverEventInput {
-  return {
-    kind,
-    payload: {
-      messageId: "message-1",
-      ...(kind === "message.started" ? { role: "agent" } : { stopReason: "end_turn" }),
-    },
-  };
-}
-
-function createDelta(contentDelta: string): DriverEventInput {
-  return {
-    delivery: "best_effort",
-    kind: "message.delta",
-    payload: {
-      contentDelta,
-      messageId: "message-1",
-      role: "agent",
-    },
-  };
-}
+import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
 
 function createRunTerminal(
   kind: "run.cancelled" | "run.completed" | "run.failed",
@@ -61,10 +29,6 @@ function createRunTerminal(
   };
 }
 
-function kinds(batches: readonly (readonly DriverEventInput[])[]): string[][] {
-  return batches.map((batch) => batch.map((event) => event.kind));
-}
-
 function acceptEvents(
   events: readonly DriverEventInput[],
   sequence: (index: number) => number = (index) => index + 1,
@@ -76,24 +40,6 @@ function acceptEvents(
       type: event.kind,
     })),
   };
-}
-
-function createContext(input: {
-  currentRunId?: () => RunId | null;
-  pushEvents: (events: DriverEventInput[], signal?: AbortSignal) => Promise<DriverEventBatchOutput>;
-}) {
-  return createAgentDriverContext({
-    eventSink: {
-      commandUpdate: async () => {},
-      currentRunId: input.currentRunId ?? (() => DRIVER_TEST_IDS.runId),
-      pushEvents: async ({ events, signal }) => input.pushEvents(events, signal),
-    },
-    logger: createTestLogger(),
-    payload: bootPayload,
-    permission: {
-      request: async () => "reject_once",
-    },
-  });
 }
 
 describe("DriverEventPublisher", () => {
@@ -254,7 +200,6 @@ describe("DriverEventPublisher", () => {
     expect(isDriverId(attempts[0]?.[0]?.sourceEventId)).toBe(true);
     expect(isDriverId(attempts[1]?.[1]?.sourceEventId)).toBe(true);
     expect(publisher.lastAcceptedSeq()).toBe(41);
-    await context.logger.destroy();
   });
 
   test("rejects new events when failed delivery fills the bounded queue", async () => {
@@ -270,7 +215,6 @@ describe("DriverEventPublisher", () => {
     await expect(
       publisher.push(context, "overflow", [createEvent("message.completed")]),
     ).rejects.toThrow("Driver event queue exceeds 1024 events.");
-    await context.logger.destroy();
   });
 
   test("does not let a timed-out best-effort lane poison later lossless delivery", async () => {
@@ -305,7 +249,6 @@ describe("DriverEventPublisher", () => {
       ]);
     } finally {
       AbortSignal.timeout = nativeTimeout;
-      await context.logger.destroy();
     }
 
     expect(signals).toHaveLength(3);
@@ -319,39 +262,31 @@ describe("DriverEventPublisher", () => {
     const releaseFirstSend = Promise.withResolvers<void>();
     const attempts: DriverEventInput[][] = [];
     let activeRunId = DRIVER_TEST_IDS.runId as RunId;
-    const logger = createTestLogger();
-    const context = createAgentDriverContext({
-      eventSink: {
-        currentRunId: () => activeRunId,
-        pushEvents: async ({ events }) => {
-          const canonical = events.flatMap((event) =>
-            toDriverEventEnvelopes(driverBootPayload, event, activeRunId),
-          );
-          attempts.push(canonical.map(({ event }) => event));
+    const context = createContext({
+      currentRunId: () => activeRunId,
+      pushEvents: async (events) => {
+        const canonical = events.flatMap((event) =>
+          toDriverEventEnvelopes(driverBootPayload, event, activeRunId),
+        );
+        attempts.push(canonical.map(({ event }) => event));
 
-          if (attempts.length === 1) {
-            firstSendEntered.resolve();
-            await releaseFirstSend.promise;
-          }
+        if (attempts.length === 1) {
+          firstSendEntered.resolve();
+          await releaseFirstSend.promise;
+        }
 
-          if (attempts.length === 2) {
-            activeRunId = DRIVER_TEST_IDS.thirdRunId;
-          }
+        if (attempts.length === 2) {
+          activeRunId = DRIVER_TEST_IDS.thirdRunId;
+        }
 
-          const accepted = attempts.length === 2 ? canonical.slice(0, 1) : canonical;
-          return {
-            accepted: accepted.map((envelope, index) => ({
-              eventId: envelope.eventId,
-              seq: attempts.length * 10 + index,
-              type: envelope.event.kind,
-            })),
-          };
-        },
-      },
-      logger,
-      payload: bootPayload,
-      permission: {
-        request: async () => "reject_once",
+        const accepted = attempts.length === 2 ? canonical.slice(0, 1) : canonical;
+        return {
+          accepted: accepted.map((envelope, index) => ({
+            eventId: envelope.eventId,
+            seq: attempts.length * 10 + index,
+            type: envelope.event.kind,
+          })),
+        };
       },
     });
     const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
@@ -371,7 +306,6 @@ describe("DriverEventPublisher", () => {
       [DRIVER_TEST_IDS.runId],
     ]);
     expect(attempts[2]?.[0]?.sourceEventId).toBe(attempts[1]?.[1]?.sourceEventId);
-    await logger.destroy();
   });
 
   test("does not block best-effort producers on transport acknowledgements", async () => {
@@ -392,8 +326,6 @@ describe("DriverEventPublisher", () => {
     await first;
     releaseFirstSend.resolve();
     await publisher.push(context, "flush", [createEvent("message.completed")]);
-
-    await context.logger.destroy();
   });
 
   test("delivers terminal closures one at a time before the run terminal", async () => {
@@ -419,7 +351,6 @@ describe("DriverEventPublisher", () => {
       true,
     );
     expect(attempts.at(-1)?.[0]?.kind).toBe("run.completed");
-    await context.logger.destroy();
   });
 
   test("bounds the whole terminal settlement by one delivery deadline", async () => {
@@ -488,7 +419,6 @@ describe("DriverEventPublisher", () => {
       await expect(terminal).resolves.toBeUndefined();
       expect(acceptedKinds).toEqual(["message.completed", "message.completed", "run.completed"]);
     } finally {
-      await context.logger.destroy();
     }
   });
 
@@ -530,7 +460,6 @@ describe("DriverEventPublisher", () => {
     } finally {
       releaseDrain.resolve();
       await ordinary;
-      await context.logger.destroy();
     }
   });
 
@@ -563,7 +492,6 @@ describe("DriverEventPublisher", () => {
       ["run.completed"],
     ]);
     expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
-    await context.logger.destroy();
   });
 
   test("reuses a retained closure identity when the terminal call is retried", async () => {
@@ -601,7 +529,6 @@ describe("DriverEventPublisher", () => {
     ]);
     expect(new Set(attempts.slice(0, 3).map(([event]) => event?.sourceEventId)).size).toBe(1);
     expect(kinds([accepted])).toEqual([["message.completed", "run.completed"]]);
-    await context.logger.destroy();
   });
 
   test("joins one in-flight terminal operation and rejects a different occurrence", async () => {
@@ -640,7 +567,6 @@ describe("DriverEventPublisher", () => {
     await Promise.all([first, joined]);
 
     expect(kinds(attempts)).toEqual([["message.completed"], ["run.completed"]]);
-    await context.logger.destroy();
   });
 
   test("continues a partially delivered terminal operation without duplicating closures", async () => {
@@ -684,7 +610,6 @@ describe("DriverEventPublisher", () => {
       ),
     ).toHaveLength(1);
     expect(new Set(attempts.slice(1, 4).map(([event]) => event?.sourceEventId)).size).toBe(1);
-    await context.logger.destroy();
   });
 
   test("keeps a failed terminal settlement reserved until the same run retries it", async () => {
@@ -738,7 +663,6 @@ describe("DriverEventPublisher", () => {
       ["run.completed"],
     ]);
     expect(attempts.flat().some((event) => event.kind === "agent.task.updated")).toBe(false);
-    await context.logger.destroy();
   });
 
   test("does not let a session push cross a terminal installed at its await boundary", async () => {
@@ -766,7 +690,6 @@ describe("DriverEventPublisher", () => {
     await expect(session).rejects.toThrow("terminal settlement slot is full");
     await terminal;
     expect(kinds(attempts)).toEqual([["run.completed"]]);
-    await context.logger.destroy();
   });
 
   test("adopts the identity of a matching generic pending closure", async () => {
@@ -802,7 +725,6 @@ describe("DriverEventPublisher", () => {
       ["run.completed"],
     ]);
     expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
-    await context.logger.destroy();
   });
 
   test("does not duplicate a matching closure already in flight", async () => {
@@ -839,7 +761,6 @@ describe("DriverEventPublisher", () => {
     await Promise.all([ordinary, terminal]);
 
     expect(kinds(attempts)).toEqual([["message.completed"], ["run.completed"]]);
-    await context.logger.destroy();
   });
 
   test("does not resend an accepted in-flight closure while its suffix is blocked", async () => {
@@ -905,7 +826,6 @@ describe("DriverEventPublisher", () => {
     expect(
       accepted.filter((event) => event.sourceEventId === attempts[0]![0]!.sourceEventId),
     ).toHaveLength(1);
-    await context.logger.destroy();
   });
 
   test("does not revive a matching in-flight closure rejected by the sink", async () => {
@@ -941,7 +861,6 @@ describe("DriverEventPublisher", () => {
     await expect(ordinary).rejects.toThrow("closure rejected");
     await expect(terminal).rejects.toThrow("closure rejected");
     expect(kinds(attempts)).toEqual([["message.completed"]]);
-    await context.logger.destroy();
   });
 
   test("does not revive a rejected closure while its in-flight suffix is blocked", async () => {
@@ -986,7 +905,6 @@ describe("DriverEventPublisher", () => {
       ["message.completed", "message.started"],
       ["message.started"],
     ]);
-    await context.logger.destroy();
   });
 
   test("does not treat a rejected pending terminal retry as accepted", async () => {
@@ -1012,7 +930,6 @@ describe("DriverEventPublisher", () => {
     ).rejects.toThrow("terminal rejected");
     expect(kinds(attempts)).toEqual([["run.completed"], ["run.completed"]]);
     expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
-    await context.logger.destroy();
   });
 
   test.each([
@@ -1067,8 +984,6 @@ describe("DriverEventPublisher", () => {
         await expect(terminal).resolves.toBeUndefined();
         expect(attempts.at(-1)?.[0]?.kind).toBe("run.completed");
       }
-
-      await context.logger.destroy();
     },
   );
 
@@ -1111,7 +1026,6 @@ describe("DriverEventPublisher", () => {
       await retryEntered.promise;
     } finally {
       releaseRetry.resolve();
-      await context.logger.destroy();
     }
 
     expect(attempts.flat().some((event) => event.kind === "run.completed")).toBe(false);
@@ -1164,7 +1078,6 @@ describe("DriverEventPublisher", () => {
     await expect(pending).rejects.toThrow("initial transport failure");
     await expect(terminal).rejects.toThrow("unsupported");
     expect(attempts.flat().some((event) => event.kind === "run.completed")).toBe(false);
-    await context.logger.destroy();
   });
 
   test("rejects aggregate terminal bytes before delivering any event", async () => {
@@ -1189,7 +1102,6 @@ describe("DriverEventPublisher", () => {
       publisher.pushTerminal(context, "terminal", closures, createRunTerminal("run.completed")),
     ).toThrow("run terminal batch exceeds 1048576 UTF-8 bytes");
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects aggregate terminal count before reading payloads", async () => {
@@ -1220,7 +1132,6 @@ describe("DriverEventPublisher", () => {
     ).toThrow("exceeds 1024 events");
     expect(payloadReads).toBe(0);
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects an oversized run terminal before delivering closures", async () => {
@@ -1241,7 +1152,6 @@ describe("DriverEventPublisher", () => {
       publisher.pushTerminal(context, "terminal", [createEvent("message.completed")], terminal),
     ).toThrow("run terminal batch exceeds 1048576 UTF-8 bytes");
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects a non-run terminal before delivering closures", async () => {
@@ -1263,7 +1173,6 @@ describe("DriverEventPublisher", () => {
       ),
     ).toThrow("requires a run terminal event");
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test.each([
@@ -1294,7 +1203,6 @@ describe("DriverEventPublisher", () => {
       "requires unique source event IDs",
     );
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects duplicate source IDs in an ordinary push before delivery", async () => {
@@ -1314,7 +1222,6 @@ describe("DriverEventPublisher", () => {
       ]),
     ).rejects.toThrow("requires unique source event IDs");
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("does not confuse a pending event with a different terminal closure sharing its ID", async () => {
@@ -1347,7 +1254,6 @@ describe("DriverEventPublisher", () => {
 
     expect(attempts.flat().some((event) => event.kind === "message.completed")).toBe(false);
     expect(attempts.flat().some((event) => event.kind === "run.completed")).toBe(false);
-    await context.logger.destroy();
   });
 
   test.each([
@@ -1370,7 +1276,6 @@ describe("DriverEventPublisher", () => {
 
     expect(() => publisher.pushTerminal(context, "terminal", closures, terminal)).toThrow();
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects or drops events queued after a run terminal", async () => {
@@ -1394,7 +1299,6 @@ describe("DriverEventPublisher", () => {
     await expect(lossless).rejects.toThrow("run terminal settlement slot is full");
     await expect(Promise.all([terminal, bestEffort])).resolves.toEqual([undefined, undefined]);
     expect(kinds(attempts)).toEqual([["run.completed"]]);
-    await context.logger.destroy();
   });
 
   test("requires the unique terminal entry point and an attributable run", async () => {
@@ -1416,7 +1320,6 @@ describe("DriverEventPublisher", () => {
       "requires an active run",
     );
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 
   test("settles sequential runs after the active run changes", async () => {
@@ -1446,7 +1349,6 @@ describe("DriverEventPublisher", () => {
       ["message.started", null],
       ["run.completed", DRIVER_TEST_IDS.secondRunId],
     ]);
-    await context.logger.destroy();
   });
 
   test("keeps session events unscoped without reopening a settled run", async () => {
@@ -1488,7 +1390,6 @@ describe("DriverEventPublisher", () => {
       ["agent.task.updated", null],
       ["agent.task.updated", null],
     ]);
-    await context.logger.destroy();
   });
 
   test("does not let another run displace an in-flight settlement", async () => {
@@ -1522,7 +1423,6 @@ describe("DriverEventPublisher", () => {
     await first;
 
     expect(attempts).toHaveLength(1);
-    await context.logger.destroy();
   });
 
   test("rejects an operation that targets a run other than the active run", async () => {
@@ -1543,6 +1443,5 @@ describe("DriverEventPublisher", () => {
       }),
     ).toThrow("must target the active run");
     expect(sends).toBe(0);
-    await context.logger.destroy();
   });
 });

@@ -9,8 +9,7 @@ import {
   CMA_DEFAULT_BETA_HEADER_VALUE,
   createCmaHttpHandler,
 } from "../src/surfaces/cma-http";
-import type { CmaSdkError } from "../src/surfaces/cma-sdk";
-import { createCmaSdkClient } from "../src/surfaces/cma-sdk";
+import { CmaSdkClient, type CmaSdkError } from "../src/surfaces/cma-sdk";
 import { promiseWithTimeout } from "../src/utils/async";
 
 describe("CMA SDK client", () => {
@@ -21,7 +20,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => {
         const request = new Request(input, init);
@@ -48,7 +47,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -66,7 +65,7 @@ describe("CMA SDK client", () => {
       const entered = Promise.withResolvers<void>();
       const reason = new Error(`${scope} cancelled`);
       let fetchSignal: AbortSignal | undefined;
-      const client = createCmaSdkClient({
+      const client = new CmaSdkClient({
         baseUrl: "https://driver.test",
         fetch: async (_input, init) => {
           fetchSignal = init?.signal ?? undefined;
@@ -89,7 +88,7 @@ describe("CMA SDK client", () => {
 
   test("times out an unresponsive fetch", async () => {
     let fetchSignal: AbortSignal | undefined;
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (_input, init) => {
         fetchSignal = init?.signal ?? undefined;
@@ -109,7 +108,7 @@ describe("CMA SDK client", () => {
 
   test("bounds and cancels JSON response bodies", async () => {
     let canceled = false;
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async () =>
         new Response(
@@ -144,7 +143,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -192,7 +191,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -266,7 +265,7 @@ describe("CMA SDK client", () => {
       .map((event) => `data: ${JSON.stringify(event)}${lineEnding}${blankLineEnding}`)
       .join("");
     const bytes = new TextEncoder().encode(frames);
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async () =>
         new Response(
@@ -317,7 +316,7 @@ describe("CMA SDK client", () => {
       const contentBytes = CMA_MAX_EVENT_BYTES + extraBytes - encoder.encode(emptyFrame).byteLength;
       const frame = `data: ${JSON.stringify(record(`界${"x".repeat(contentBytes - 3)}`))}\n\r\n`;
       const bytes = encoder.encode(frame);
-      const client = createCmaSdkClient({
+      const client = new CmaSdkClient({
         baseUrl: "https://driver.test",
         fetch: async () =>
           new Response(
@@ -382,7 +381,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -401,7 +400,7 @@ describe("CMA SDK client", () => {
     let canceled = false;
     let sent = false;
     const bytes = new Uint8Array(CMA_MAX_EVENT_BYTES + 1).fill("x".charCodeAt(0));
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async () =>
         new Response(
@@ -434,7 +433,7 @@ describe("CMA SDK client", () => {
     const cleanup = Promise.withResolvers<void>();
     const readEntered = Promise.withResolvers<void>();
     let fetchSignal: AbortSignal | undefined;
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (_input, init) => {
         fetchSignal = init?.signal ?? undefined;

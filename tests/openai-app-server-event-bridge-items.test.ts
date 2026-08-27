@@ -106,7 +106,7 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("closes visible message, tool, and run state when a turn is cancelled", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "item/started", {
@@ -143,11 +143,10 @@ describe("OpenAi app-server event bridge", () => {
       turnId: "turn-1",
     });
     expect(events()).toHaveLength(terminalEventCount);
-    await logger.destroy();
   });
 
   test("accepts only a completed sub-agent activity after its parent turn terminal", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "turn/completed", {
@@ -191,11 +190,10 @@ describe("OpenAi app-server event bridge", () => {
       turnId: "turn-1",
     });
     expect(events()).toHaveLength(terminalEventCount + 1);
-    await logger.destroy();
   });
 
   test("closes open item state when the provider interrupts a turn", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "item/started", {
@@ -219,11 +217,10 @@ describe("OpenAi app-server event bridge", () => {
         runId: DRIVER_TEST_IDS.runId,
       },
     ]);
-    await logger.destroy();
   });
 
   test("closes open item state before a failed turn", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "item/started", {
@@ -252,11 +249,10 @@ describe("OpenAi app-server event bridge", () => {
       { kind: "item.completed", payload: { itemId: "tool-1", status: "failed" } },
       { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
     ]);
-    await logger.destroy();
   });
 
   test("closes open item state before a successful turn without loaded items", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
 
     await bridge.handleNotification(context, "item/started", {
@@ -277,7 +273,6 @@ describe("OpenAi app-server event bridge", () => {
       { kind: "item.completed", payload: { itemId: "tool-1", status: "completed" } },
       { kind: "run.completed", runId: DRIVER_TEST_IDS.runId },
     ]);
-    await logger.destroy();
   });
 
   test("drains pending item delivery before cancellation and leaves the next turn clean", async () => {
@@ -344,7 +339,6 @@ describe("OpenAi app-server event bridge", () => {
             event.kind === "item.started" && readEventPayloadString(event, "itemId") === "tool-1",
         ),
     ).toHaveLength(2);
-    await harness.logger.destroy();
   });
 
   test.each([
@@ -352,7 +346,7 @@ describe("OpenAi app-server event bridge", () => {
     ["failed", "failed"],
     ["declined", "failed"],
   ] as const)("maps completed native tool status %s to %s", async (nativeStatus, status) => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: {
@@ -373,7 +367,6 @@ describe("OpenAi app-server event bridge", () => {
     expect(events().find((event) => event.kind === "item.completed")?.payload).toMatchObject({
       status,
     });
-    await logger.destroy();
   });
 
   test("replays an item completion after delivery rejection before committing state", async () => {
@@ -407,7 +400,6 @@ describe("OpenAi app-server event bridge", () => {
         .events()
         .filter((event) => event.kind === "message.added" || event.kind === "message.completed"),
     ).toHaveLength(2);
-    await harness.logger.destroy();
   });
 
   test("replays a plan delta after delivery rejection without duplicating content", async () => {
@@ -444,7 +436,6 @@ describe("OpenAi app-server event bridge", () => {
         .map((batch) => batch.events[0]?.sourceEventId),
     ).toEqual(["openai.plan.delta:turn-1:plan-1:0", "openai.plan.delta:turn-1:plan-1:0"]);
     expect(JSON.stringify(accepted)).not.toContain("stepstep");
-    await harness.logger.destroy();
   });
 
   test("retries message start with the same identity after delivery rejection", async () => {
@@ -477,7 +468,6 @@ describe("OpenAi app-server event bridge", () => {
         .filter((event) => event.kind === "message.delta")
         .map((event) => readEventPayloadString(event, "contentDelta")),
     ).toEqual(["hello"]);
-    await harness.logger.destroy();
   });
 
   test("replays terminal closures after rejection before settling the turn", async () => {
@@ -509,7 +499,6 @@ describe("OpenAi app-server event bridge", () => {
         .map((event) => readEventPayloadString(event, "status")),
     ).toEqual(["running", "completed"]);
     expect(harness.events().filter((event) => event.kind === "run.completed")).toHaveLength(1);
-    await harness.logger.destroy();
   });
 
   test("replays cancellation closures after rejection before rejecting the turn", async () => {
@@ -531,7 +520,6 @@ describe("OpenAi app-server event bridge", () => {
     expect(harness.terminalAttempts).toHaveLength(2);
     expect(harness.terminalAttempts[0]!.closures).toEqual(harness.terminalAttempts[1]!.closures);
     expect(harness.events().filter((event) => event.kind === "run.cancelled")).toHaveLength(1);
-    await harness.logger.destroy();
   });
 
   test("waits for a failed concurrent settlement before claiming cancellation", async () => {
@@ -566,11 +554,10 @@ describe("OpenAi app-server event bridge", () => {
       "run.completed",
       "run.cancelled",
     ]);
-    await harness.logger.destroy();
   });
 
   test("orders cancellation after an in-flight item update", async () => {
-    const { bridge, context, events, heldPush, logger, releasePush } = createHarness({
+    const { bridge, context, events, heldPush, releasePush } = createHarness({
       holdReason: "driver.openai.message.started",
     });
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
@@ -602,11 +589,10 @@ describe("OpenAi app-server event bridge", () => {
           readEventPayloadString(event, "status") === "running",
       ),
     ).toBeLessThan(events().findLastIndex((event) => event.kind === "run.cancelled"));
-    await logger.destroy();
   });
 
   test("maps hooks and automatic approval reviews to their exact lifecycle events", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     const hookRun = {
       displayOrder: 0,
@@ -659,11 +645,10 @@ describe("OpenAi app-server event bridge", () => {
       "permission.review.completed",
     ]);
     expect(events()[2]?.payload).toMatchObject({ reviewId: "review-1", targetItemId: "tool-1" });
-    await logger.destroy();
   });
 
   test("preserves bounded permission profiles in automatic approval reviews", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const permissions = {
       fileSystem: { read: ["/workspace"], write: ["/tmp"] },
       network: { enabled: true },
@@ -737,11 +722,10 @@ describe("OpenAi app-server event bridge", () => {
       review: { riskLevel: "high", status: "denied", userAuthorization: "high" },
     });
     expect(JSON.stringify(events().slice(1))).not.toContain("secret input");
-    await logger.destroy();
   });
 
   test("keeps mapped MCP progress and terminal interaction visible", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const nativeItemId = `mcp-${"x".repeat(300)}`;
     const nativeCommandId = `command-${"y".repeat(300)}`;
 
@@ -846,11 +830,10 @@ describe("OpenAi app-server event bridge", () => {
       },
     });
     expect(JSON.stringify(events())).not.toContain("y\\n");
-    await logger.destroy();
   });
 
   test("publishes model, MCP server, and user-facing warning notifications", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await handleOfficialNotification(bridge, context, "mcpServer/startupStatus/updated", {
       error: null,
@@ -922,6 +905,5 @@ describe("OpenAi app-server event bridge", () => {
     expect(worldWritableContent).toContain("C:\\unsafe-one");
     expect(worldWritableContent).toContain("2 additional affected paths");
     expect(worldWritableContent).toContain("scan did not complete");
-    await logger.destroy();
   });
 });

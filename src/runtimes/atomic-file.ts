@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { constants, type Dirent } from "node:fs";
 import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
-function hasErrorCode(error: unknown, code: string): boolean {
+export function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
@@ -12,6 +12,7 @@ const activeAtomicWriteTemporaryFiles = new Set<string>();
 const ATOMIC_WRITE_TEMPORARY_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_ATOMIC_WRITE_TEMPORARY_SCAN_ENTRIES = 256;
+const NON_ABORTING_SIGNAL = AbortSignal.any([]);
 
 export async function closeFileHandles(
   handles: readonly (FileHandle | null | undefined)[],
@@ -55,24 +56,40 @@ export async function openRealDirectory(path: string, label: string): Promise<Fi
     throw new Error(`${label} requires Linux /proc filesystem capabilities.`);
   }
 
-  let directory: FileHandle;
-
   try {
-    directory = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    return await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   } catch (error) {
     if (hasErrorCode(error, "ELOOP") || hasErrorCode(error, "ENOTDIR")) {
       throw new Error(`${label} must be a real directory: ${path}.`, { cause: error });
     }
     throw error;
   }
+}
 
+export async function openOptionalRealDirectory(
+  path: string,
+  label: string,
+): Promise<FileHandle | null> {
   try {
-    if (!(await directory.stat()).isDirectory()) {
-      throw new Error(`${label} must be a real directory: ${path}.`);
-    }
-    return directory;
+    return await openRealDirectory(path, label);
   } catch (error) {
-    return closeFileHandlesAndThrow(error, [directory], `Failed to open ${path}.`);
+    if (hasErrorCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function readPathStats(
+  path: string,
+): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
   }
 }
 
@@ -111,17 +128,17 @@ export async function ensureRealDirectoryAt(
   }
 }
 
-async function walkAbsoluteRealDirectory(
-  path: string,
+async function walkRealDirectory(
+  startPath: string,
+  segments: readonly string[],
   label: string,
   create: boolean,
   signal?: AbortSignal,
 ): Promise<FileHandle> {
   signal?.throwIfAborted();
-  const absolutePath = resolve(path);
-  let directory = await openRealDirectory("/", label);
+  let directory = await openRealDirectory(startPath, label);
 
-  for (const segment of absolutePath.split("/").filter(Boolean)) {
+  for (const segment of segments) {
     let next: FileHandle;
     try {
       signal?.throwIfAborted();
@@ -129,15 +146,15 @@ async function walkAbsoluteRealDirectory(
         ? await ensureRealDirectoryAt(directory, segment, label, signal)
         : await openRealDirectory(directoryEntryPath(directory, segment), label);
     } catch (error) {
-      return closeFileHandlesAndThrow(error, [directory], `Failed to walk ${absolutePath}.`);
+      return closeFileHandlesAndThrow(error, [directory], `Failed to walk ${startPath}.`);
     }
 
     const closeFailures = await closeFileHandles([directory]);
     if (closeFailures.length > 0) {
       return closeFileHandlesAndThrow(
-        new AggregateError(closeFailures, `Failed to close an ancestor of ${absolutePath}.`),
+        new AggregateError(closeFailures, `Failed to close an ancestor of ${startPath}.`),
         [next],
-        `Failed to walk ${absolutePath}.`,
+        `Failed to walk ${startPath}.`,
       );
     }
     directory = next;
@@ -147,7 +164,8 @@ async function walkAbsoluteRealDirectory(
 }
 
 export function openAbsoluteRealDirectory(path: string, label: string): Promise<FileHandle> {
-  return walkAbsoluteRealDirectory(path, label, false);
+  const absolutePath = resolve(path);
+  return walkRealDirectory("/", absolutePath.split("/").filter(Boolean), label, false);
 }
 
 export function ensureAbsoluteRealDirectory(
@@ -155,7 +173,24 @@ export function ensureAbsoluteRealDirectory(
   label: string,
   signal?: AbortSignal,
 ): Promise<FileHandle> {
-  return walkAbsoluteRealDirectory(path, label, true, signal);
+  const absolutePath = resolve(path);
+  return walkRealDirectory("/", absolutePath.split("/").filter(Boolean), label, true, signal);
+}
+
+export function openRelativeRealDirectory(
+  root: FileHandle,
+  path: string,
+  label: string,
+  create: boolean,
+  signal?: AbortSignal,
+): Promise<FileHandle> {
+  return walkRealDirectory(
+    `${openedDirectoryPath(root)}/.`,
+    path === "." ? [] : path.split("/"),
+    label,
+    create,
+    signal,
+  );
 }
 
 export async function assertDirectoryIdentity(
@@ -164,16 +199,7 @@ export async function assertDirectoryIdentity(
   label: string,
 ): Promise<void> {
   const openedStats = await directory.stat();
-  let pathStats: Awaited<ReturnType<typeof lstat>> | null;
-
-  try {
-    pathStats = await lstat(path);
-  } catch (error) {
-    if (!hasErrorCode(error, "ENOENT")) {
-      throw error;
-    }
-    pathStats = null;
-  }
+  const pathStats = await readPathStats(path);
 
   if (
     pathStats === null ||
@@ -184,13 +210,6 @@ export async function assertDirectoryIdentity(
   ) {
     throw new Error(`${label} changed while managed files were being written: ${path}.`);
   }
-}
-
-export async function isActiveAtomicWriteTemporaryFile(
-  directory: FileHandle,
-  name: string,
-): Promise<boolean> {
-  return activeAtomicWriteTemporaryFiles.has(await atomicWriteTemporaryFileKey(directory, name));
 }
 
 export async function cleanupAtomicWriteTemporaryFiles(
@@ -216,7 +235,10 @@ export async function cleanupAtomicWriteTemporaryFiles(
         entry.name.endsWith(".tmp") &&
         ATOMIC_WRITE_TEMPORARY_ID_PATTERN.test(entry.name.slice(name.length + 2, -".tmp".length)),
     );
-    if (target === undefined || (await isActiveAtomicWriteTemporaryFile(directory, entry.name))) {
+    if (
+      target === undefined ||
+      activeAtomicWriteTemporaryFiles.has(await atomicWriteTemporaryFileKey(directory, entry.name))
+    ) {
       continue;
     }
     if (entry.isDirectory() && !entry.isSymbolicLink()) {
@@ -290,4 +312,42 @@ export async function writeFileAtomically(
   } finally {
     activeAtomicWriteTemporaryFiles.delete(temporaryKey);
   }
+}
+
+export async function writeFileAtomicallyAtPath(
+  path: string,
+  contents: string,
+  options: { mode: number; skipIfUnchanged?: boolean },
+): Promise<boolean> {
+  const absolutePath = resolve(path);
+  const directoryPath = dirname(absolutePath);
+  const name = basename(absolutePath);
+  await using directory = await ensureAbsoluteRealDirectory(
+    directoryPath,
+    "Atomic file parent",
+    NON_ABORTING_SIGNAL,
+  );
+  await cleanupAtomicWriteTemporaryFiles(directory, [name], NON_ABORTING_SIGNAL);
+
+  let written = true;
+  if (options.skipIfUnchanged === true) {
+    const existing = await (async (): Promise<string | null> => {
+      try {
+        await using file = await open(
+          directoryEntryPath(directory, name),
+          constants.O_RDONLY | constants.O_NOFOLLOW,
+        );
+        return (await file.stat()).isFile() ? await file.readFile("utf8") : null;
+      } catch {
+        return null;
+      }
+    })();
+    written = existing !== contents;
+  }
+
+  if (written) {
+    await writeFileAtomically(directory, name, contents, options.mode, NON_ABORTING_SIGNAL);
+  }
+  await assertDirectoryIdentity(directory, directoryPath, "Atomic file parent");
+  return written;
 }

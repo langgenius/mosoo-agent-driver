@@ -37,10 +37,6 @@ type DeferredCleanup =
   | { after: Promise<void>; kind: "final_stop" }
   | { generation: number; kind: "late_stop"; task: Promise<void> };
 
-type StopOperation = {
-  settled: Promise<void>;
-};
-
 export class AgentBackendLifecycle {
   readonly #backend: AgentDriverBackend;
   readonly #createContext: () => AgentDriverContext;
@@ -53,7 +49,7 @@ export class AgentBackendLifecycle {
   readonly #startTimeoutMs: number;
   readonly #stopTimeoutMs: number;
   #cleanupOwner: CleanupOwner | null = null;
-  #inFlightStop: StopOperation | null = null;
+  #inFlightStop: Promise<void> | null = null;
   #startController: AbortController | null = null;
   #startupStopTask: Promise<void> | null = null;
   #startTask: Promise<void> | null = null;
@@ -170,7 +166,7 @@ export class AgentBackendLifecycle {
       timeoutMs: this.#remaining(owner),
     });
     if (startResult.status === "timed_out") {
-      const stopSettled = this.#inFlightStop?.settled ?? Promise.resolve();
+      const stopSettled = this.#inFlightStop ?? Promise.resolve();
       owner.deferred = {
         after: Promise.allSettled([startTask, stopSettled]).then(() => {}),
         kind: "final_stop",
@@ -188,13 +184,13 @@ export class AgentBackendLifecycle {
   async #stop(owner: CleanupOwner, reason: string, label: string, final: boolean): Promise<void> {
     const previous = this.#inFlightStop;
     if (previous !== null) {
-      const previousResult = await settlePromiseWithTimeout(previous.settled, {
+      const previousResult = await settlePromiseWithTimeout(previous, {
         label,
         timeoutMs: this.#remaining(owner),
       });
       if (previousResult.status !== "completed") {
         if (final && previousResult.status === "timed_out") {
-          owner.deferred = { after: previous.settled, kind: "final_stop" };
+          owner.deferred = { after: previous, kind: "final_stop" };
         }
         throw previousResult.error;
       }
@@ -205,14 +201,12 @@ export class AgentBackendLifecycle {
     const task = Promise.resolve().then(() =>
       this.#runStop(this.#backend, this.#createContext(), reason, controller.signal),
     );
-    const operation: StopOperation = {
-      settled: Promise.resolve(),
-    };
-    operation.settled = task.then(
-      () => this.#clearStop(operation),
-      () => this.#clearStop(operation),
+    let settled: Promise<void>;
+    settled = task.then(
+      (): void => this.#clearStop(settled),
+      (): void => this.#clearStop(settled),
     );
-    this.#inFlightStop = operation;
+    this.#inFlightStop = settled;
 
     const result = await settlePromiseWithTimeout(task, {
       label,
@@ -230,7 +224,7 @@ export class AgentBackendLifecycle {
     throw result.error;
   }
 
-  #clearStop(operation: StopOperation): void {
+  #clearStop(operation: Promise<void>): void {
     if (this.#inFlightStop === operation) {
       this.#inFlightStop = null;
     }

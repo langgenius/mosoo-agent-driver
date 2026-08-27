@@ -66,7 +66,6 @@ describe("driver runtime boundary", () => {
     expect(socket.completedRunReasons).toEqual([]);
     releaseCleanup.resolve();
     await run;
-    await logger.destroy();
 
     expect(terminalAttempts).toBe(3);
     expect(order).toEqual(["cleanup", "control.completeRun"]);
@@ -152,7 +151,6 @@ describe("driver runtime boundary", () => {
     await Bun.sleep(5_100);
     releaseRequested.resolve();
     await expect(Promise.all([permission!, run])).resolves.toEqual(["reject_once", undefined]);
-    await logger.destroy();
     expect(
       order.filter((kind) =>
         ["permission.resolved", "run.cancelled", "cleanup", "control.completeRun"].includes(kind),
@@ -204,7 +202,6 @@ describe("driver runtime boundary", () => {
     });
 
     await expect(dispatcher.run(socket, logger)).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(socket.failedRuns).toHaveLength(1);
     expect(socket.completedRunReasons).toEqual([]);
@@ -272,7 +269,6 @@ describe("driver runtime boundary", () => {
     });
 
     await expect(dispatcher.run(socket, logger)).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(socket.failedRuns).toHaveLength(1);
     expect(
@@ -342,7 +338,6 @@ describe("driver runtime boundary", () => {
     await Bun.sleep(0);
     releaseCancelAccepted.resolve();
     await run;
-    await logger.destroy();
 
     expect(cancellationRequested).toBe(true);
     expect(sideEffects).toBe(0);
@@ -379,7 +374,6 @@ describe("driver runtime boundary", () => {
     });
 
     await expect(dispatcher.run(socket, logger)).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(socket.failedRuns).toEqual([]);
     expect(runtimeState.status()).toBe("failed");
@@ -412,7 +406,6 @@ describe("driver runtime boundary", () => {
     });
 
     await expect(dispatcher.run(socket, logger)).resolves.toBeUndefined();
-    await logger.destroy();
 
     expect(cleanupAttempts).toBe(2);
     expect(socket.failedRuns).toHaveLength(1);
@@ -475,7 +468,6 @@ describe("driver runtime boundary", () => {
       });
 
       await dispatcher.run(socket, logger);
-      await logger.destroy();
 
       expect(attempts).toBe(2);
       expect(socket.completedRunReasons).toHaveLength(runStatus === "completed" ? 1 : 0);
@@ -527,7 +519,6 @@ describe("driver runtime boundary", () => {
         label: `session stop run terminal that ${failureMode}`,
         timeoutMs: 1_500,
       });
-      await logger.destroy();
 
       expect(outcome.status).toBe("completed");
       expect(attempts).toBe(3);
@@ -598,7 +589,6 @@ describe("driver runtime boundary", () => {
       await expect(dispatcher.run(socket, logger)).rejects.toThrow(
         "terminal status could not be delivered",
       );
-      await logger.destroy();
 
       expect(terminalAttempts).toBe(3);
       expect(runtimeState.status()).toBe("failed");
@@ -646,7 +636,6 @@ describe("driver runtime boundary", () => {
     await expect(dispatcher.run(socket, logger)).rejects.toThrow(
       "terminal status could not be delivered",
     );
-    await logger.destroy();
 
     expect(terminalAttempts).toBe(1);
     expect(socket.completedRunReasons).toHaveLength(1);
@@ -741,7 +730,6 @@ describe("driver runtime boundary", () => {
         label: `${kind} slow terminal acknowledgement`,
         timeoutMs: 1_500,
       });
-      await logger.destroy();
 
       expect(outcome.status).toBe("completed");
       expect(terminalAttempts).toBe(1);
@@ -766,7 +754,6 @@ describe("driver runtime boundary", () => {
     });
 
     await expect(dispatcher.run(socket, logger)).rejects.toThrow("history capacity");
-    await logger.destroy();
 
     expect(backend.cancelledReasons).toHaveLength(1_024);
     expect(backend.cancelledReasons[0]).toBe("reason-0");
@@ -790,7 +777,6 @@ describe("driver runtime boundary", () => {
     });
 
     await dispatcher.run(socket, logger);
-    await logger.destroy();
 
     expect(runtimeState.status()).toBe("stopped");
     expect(socket.completedRunReasons).toEqual(["completed"]);

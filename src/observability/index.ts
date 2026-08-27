@@ -348,6 +348,10 @@ function createBaseLogger(options: BaseLoggerOptions): Logger {
   return createLogger(config);
 }
 
+export function createDisabledLogger(): Logger {
+  return createLogger({ enabled: false, transports: [] });
+}
+
 export function createBufferedSinkLogger(options: CreateBufferedSinkLoggerOptions): Logger {
   const logger = createBaseLogger(options);
   const level = options.level ?? "info";

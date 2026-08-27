@@ -102,7 +102,7 @@ import { expect, test } from "bun:test";
 
 import { createCmaMemoryStore } from "@mosoo/agent-driver";
 import { createCmaHttpHandler } from "@mosoo/agent-driver/cma-http";
-import { createCmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
+import { CmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
 
 test("create an agent, environment, and session over the CMA surface", async () => {
   // 1. An in-memory store stands in for the host's persistence port.
@@ -119,7 +119,7 @@ test("create an agent, environment, and session over the CMA surface", async () 
   // 3. The client talks to the handler directly through fetch — point
   //    baseUrl at a server that explicitly embeds this preview. The default beta header
   //    (anthropic-beta: managed-agents-2026-04-01) is sent automatically.
-  const client = createCmaSdkClient({
+  const client = new CmaSdkClient({
     baseUrl: "https://driver.local",
     fetch: async (input, init) => handler(new Request(input, init)),
   });

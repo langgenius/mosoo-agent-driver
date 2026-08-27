@@ -21,7 +21,7 @@ import {
 } from "../src/runtimes/acp/acp-configuration";
 import { limitAcpInput } from "../src/runtimes/acp/acp-input-limit";
 import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
 import type { DriverStartInput } from "../src/protocol/start";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -227,11 +227,7 @@ Check the diff.`,
       sharedRootPath: root,
     },
   };
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "opencode-acp-contract-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
 
   try {
     await exposeNativeSkillAliases(
@@ -263,7 +259,6 @@ Check the diff.`,
       false,
     );
   } finally {
-    await logger.destroy();
     await rm(root, { force: true, recursive: true });
   }
 });

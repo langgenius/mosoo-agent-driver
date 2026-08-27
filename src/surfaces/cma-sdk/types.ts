@@ -1,14 +1,5 @@
-import type { CmaInboundEvent } from "../../projections/cma";
 import type { RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
-import type {
-  CmaAgentRecord,
-  CmaCreateAgentInput,
-  CmaCreateEnvironmentInput,
-  CmaCreateSessionInput,
-  CmaEnvironmentRecord,
-  CmaSessionEventRecord,
-  CmaSessionRecord,
-} from "../../stores/cma-store";
+import type { CmaSessionEventRecord } from "../../stores/cma-store";
 
 export type CmaSdkFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -40,38 +31,6 @@ export interface CmaSessionEventDispatchRecord {
   readonly event: CmaSessionEventRecord;
   readonly result: RuntimeCommandResult | null;
   readonly status: "accepted";
-}
-
-export interface CmaSdkClient {
-  archiveEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<CmaEnvironmentRecord>;
-  createAgent(input: CmaCreateAgentInput, options?: CmaSdkRequestOptions): Promise<CmaAgentRecord>;
-  createEnvironment(
-    input: CmaCreateEnvironmentInput,
-    options?: CmaSdkRequestOptions,
-  ): Promise<CmaEnvironmentRecord>;
-  createSession(
-    input: CmaCreateSessionInput,
-    options?: CmaSdkRequestOptions,
-  ): Promise<CmaSessionRecord>;
-  deleteEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<void>;
-  getAgent(id: string, options?: CmaSdkRequestOptions): Promise<CmaAgentRecord>;
-  getEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<CmaEnvironmentRecord>;
-  getSession(id: string, options?: CmaSdkRequestOptions): Promise<CmaSessionRecord>;
-  listAgents(options?: CmaSdkRequestOptions): Promise<readonly CmaAgentRecord[]>;
-  listEnvironments(options?: CmaSdkRequestOptions): Promise<readonly CmaEnvironmentRecord[]>;
-  listSessionEvents(
-    sessionId: string,
-    options?: CmaSdkRequestOptions,
-  ): Promise<readonly CmaSessionEventRecord[]>;
-  sendSessionEvent(
-    sessionId: string,
-    event: CmaInboundEvent,
-    options?: CmaSdkRequestOptions,
-  ): Promise<CmaSessionEventDispatchRecord>;
-  streamSessionEvents(
-    sessionId: string,
-    options?: CmaSdkStreamOptions,
-  ): AsyncIterable<CmaSessionEventRecord>;
 }
 
 export class CmaSdkError extends Error {

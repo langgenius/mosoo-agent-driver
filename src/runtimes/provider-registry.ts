@@ -13,7 +13,7 @@ export interface AgentDriverProviderDescriptor {
   readonly runtime: DriverRuntime;
 }
 
-const TEXT_TOOL_CAPABILITIES = [
+const PROVIDER_CAPABILITIES = [
   { id: "custom_tool_execute", status: "unsupported", version: 1 },
   { id: "file_change", status: "supported", version: 1 },
   { id: "input_start", status: "supported", version: 1 },
@@ -25,35 +25,25 @@ const TEXT_TOOL_CAPABILITIES = [
   { id: "turn_cancel", status: "supported", version: 1 },
   { id: "usage", status: "supported", version: 1 },
   { id: "visible_activity", status: "supported", version: 1 },
+  { id: "native_resume", status: "supported", version: 1 },
+  { id: "thinking_stream", status: "supported", version: 1 },
 ] as const satisfies readonly DriverCapability[];
 
 const PROVIDERS = [
   {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "supported", version: 1 },
-    ],
+    capabilities: PROVIDER_CAPABILITIES,
     createBackend: (payload) => new OpenAiAppServerDriverBackend(payload),
     id: "openai-app-server",
     runtime: "openai-runtime",
   },
   {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "supported", version: 1 },
-    ],
+    capabilities: PROVIDER_CAPABILITIES,
     createBackend: (payload) => new ClaudeAgentSdkDriverBackend(payload),
     id: "claude-agent-sdk",
     runtime: "claude-agent-sdk",
   },
   {
-    capabilities: [
-      ...TEXT_TOOL_CAPABILITIES,
-      { id: "native_resume", status: "supported", version: 1 },
-      { id: "thinking_stream", status: "supported", version: 1 },
-    ],
+    capabilities: PROVIDER_CAPABILITIES,
     createBackend: (payload) => new AcpDriverBackend(payload),
     id: "acp-fallback",
     runtime: "acp-fallback",
@@ -72,19 +62,11 @@ export function createAgentDriverProviderCapabilities(input: {
   permissionRequestStatus: DriverCapability["status"];
   provider: AgentDriverProviderDescriptor;
 }): readonly DriverCapability[] {
-  const capabilitiesById = new Map<DriverCapability["id"], DriverCapability>();
-
-  for (const capability of input.provider.capabilities) {
-    capabilitiesById.set(capability.id, capability);
-  }
-
-  capabilitiesById.set("permission_request", {
-    id: "permission_request",
-    status: input.permissionRequestStatus,
-    version: 1,
-  });
-
-  return [...capabilitiesById.values()];
+  return input.provider.capabilities.map((capability) =>
+    capability.id === "permission_request"
+      ? { ...capability, status: input.permissionRequestStatus }
+      : capability,
+  );
 }
 
 function resolveProviderForStartInput(input: DriverStartInput): AgentDriverProviderDescriptor {

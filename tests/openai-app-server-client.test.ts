@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 
 import type { AgentDriverPermissionPort } from "../src/host-ports";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverExecutionEnvironment } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
@@ -58,17 +58,12 @@ async function createClientHarness(
       },
     },
   });
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-client-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload,
     permission: { request: requestPermission },
   });
@@ -84,7 +79,7 @@ async function createClientHarness(
     mapToolCallId: (toolCallId) => toolCallId,
   });
 
-  return { client, directory, logger, protocolError: protocolError.promise, protocolErrors };
+  return { client, directory, protocolError: protocolError.promise, protocolErrors };
 }
 
 afterEach(async () => {
@@ -147,7 +142,6 @@ setInterval(() => {}, 1000);
       ).toEqual({ method: "initialized" });
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -194,7 +188,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors).toHaveLength(1);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -238,7 +231,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors[0]?.message).toContain(message);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -285,7 +277,6 @@ setInterval(() => {}, 1000);
     } finally {
       notificationGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -314,7 +305,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors[0]?.message).toContain("response envelope is invalid");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -338,7 +328,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors).toHaveLength(1);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -385,7 +374,6 @@ setInterval(() => {}, 1000);
       expect(handled).toEqual([]);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -447,7 +435,6 @@ setInterval(() => {}, 1000);
       await permissionAborted.promise;
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -469,7 +456,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors).toEqual([]);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -494,7 +480,6 @@ setInterval(() => {}, 1000);
       ).rejects.toThrow("stopping");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -531,7 +516,6 @@ setInterval(() => {}, 1000);
       expect(harness.protocolErrors).toHaveLength(1);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -548,7 +532,6 @@ setInterval(() => {}, 1000);
         await expect(harness.client.stop()).resolves.toBeUndefined();
       } finally {
         await harness.client.stop();
-        await harness.logger.destroy();
       }
     },
   );
@@ -612,7 +595,6 @@ setInterval(() => {}, 1000);
           } catch {}
         }
         await harness.client.stop().catch(() => {});
-        await harness.logger.destroy();
       }
     },
   );
@@ -635,7 +617,6 @@ setInterval(() => {}, 1000);
       expect(await Bun.file(join(harness.directory, "spawned")).exists()).toBe(false);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -678,7 +659,6 @@ setTimeout(() => process.exit(0), 500);
       ).toHaveLength(1);
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -718,7 +698,6 @@ setInterval(() => {}, 1000);
       await expect(stop).resolves.toBeUndefined();
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -762,7 +741,6 @@ process.stdin.on("data", (chunk) => {
       expect(harness.protocolErrors[0]?.message).toBe("OpenAi app-server exited with code 17.");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -842,7 +820,6 @@ setInterval(() => {}, 1000);
     } finally {
       permissionGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -931,7 +908,6 @@ setInterval(() => {}, 1000);
     } finally {
       permissionGate.resolve();
       await harness.client.stop().catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -983,7 +959,6 @@ setInterval(() => {}, 1000);
       expect(protocolError.message).toContain("code 17");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1037,7 +1012,6 @@ setInterval(() => {}, 1000);
     } finally {
       permissionGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1088,7 +1062,6 @@ process.stdin.on("data", (chunk) => {
     } finally {
       terminalGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1152,7 +1125,6 @@ process.stdin.on("data", (chunk) => {
         watchdogCleanup.resolve();
         watchdogSpy.mockRestore();
         await harness.client.stop().catch(() => {});
-        await harness.logger.destroy();
       }
     },
   );
@@ -1189,7 +1161,6 @@ sleep 10
       expect(harness.protocolErrors[0]?.message).toContain("EPIPE");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1237,7 +1208,6 @@ setInterval(() => {}, 1000);
         expect(harness.protocolErrors[0]?.message).toContain(expectedExit);
       } finally {
         await harness.client.stop();
-        await harness.logger.destroy();
       }
     },
   );
@@ -1311,7 +1281,6 @@ setInterval(() => {}, 1000);
       notificationGate.resolve();
       secondNotificationGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1347,7 +1316,6 @@ setInterval(() => {}, 1000);
       await expect(harness.client.start()).rejects.toThrow("cannot be started more than once");
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1403,7 +1371,6 @@ process.stdin.on("data", (chunk) => {
       }
 
       await harness.client.stop().catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1466,7 +1433,6 @@ setInterval(() => {}, 1000);
       }
 
       await harness.client.stop().catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1546,7 +1512,6 @@ setInterval(() => {}, 1000);
       }
 
       await harness.client.stop().catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1609,8 +1574,6 @@ setInterval(() => {}, 1000);
           nativeKill(descendantPid, "SIGKILL");
         } catch {}
       }
-
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1654,7 +1617,6 @@ setInterval(() => {}, 1000);
       });
     } finally {
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 
@@ -1728,7 +1690,6 @@ setInterval(() => {}, 1000);
     } finally {
       notificationGate.resolve();
       await harness.client.stop();
-      await harness.logger.destroy();
     }
   });
 });

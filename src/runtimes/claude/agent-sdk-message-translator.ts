@@ -84,12 +84,12 @@ export class ClaudeAgentSdkMessageTranslator {
 
   async #cancelOpenTurn(context: AgentDriverContext): Promise<void> {
     for (const [messageId, thoughtId] of this.#state.activeThoughts()) {
-      await this.#events.cancelThought(context, thoughtId);
+      await this.#events.settleThought(context, thoughtId, "cancelled");
       this.#state.deleteThoughtId(messageId);
     }
 
     for (const [messageId, runId] of this.#state.assistantMessages()) {
-      await this.#events.cancelMessage(context, messageId);
+      await this.#events.settleMessage(context, messageId, { status: "cancelled" });
       this.#state.completeAssistantMessage(runId, messageId, false);
     }
 
@@ -153,7 +153,7 @@ export class ClaudeAgentSdkMessageTranslator {
     const thoughtId = this.#state.thoughtIdForMessage(messageId);
 
     if (thoughtId !== undefined) {
-      await this.#events.endThought(context, thoughtId);
+      await this.#events.settleThought(context, thoughtId, "completed");
       this.#state.deleteThoughtId(messageId);
     }
   }
@@ -299,11 +299,11 @@ export class ClaudeAgentSdkMessageTranslator {
     if (outcome.status === "cancelled") {
       const thoughtId = this.#state.thoughtIdForMessage(messageId);
       if (thoughtId !== undefined) {
-        await this.#events.cancelThought(context, thoughtId);
+        await this.#events.settleThought(context, thoughtId, "cancelled");
         this.#state.deleteThoughtId(messageId);
       }
       await this.#events.ensureMessageStarted(context, messageId);
-      await this.#events.cancelMessage(context, messageId);
+      await this.#events.settleMessage(context, messageId, { status: "cancelled" });
       this.#state.completeAssistantMessage(runId, messageId, false);
       return;
     }
@@ -311,10 +311,13 @@ export class ClaudeAgentSdkMessageTranslator {
     if (outcome.status === "failed") {
       await this.#endThought(context, messageId);
       await this.#events.ensureMessageStarted(context, messageId);
-      await this.#events.failMessage(context, messageId, {
-        code: `claude.${outcome.code}`,
-        message: outcome.message,
-        retryable: outcome.retryable,
+      await this.#events.settleMessage(context, messageId, {
+        error: {
+          code: `claude.${outcome.code}`,
+          message: outcome.message,
+          retryable: outcome.retryable,
+        },
+        status: "failed",
       });
       this.#state.completeAssistantMessage(runId, messageId, false);
       return;
@@ -576,7 +579,7 @@ export class ClaudeAgentSdkMessageTranslator {
     runId: RunId,
     messageId: MessageId,
   ): Promise<void> {
-    const ended = await this.#events.endMessage(context, messageId);
+    const ended = await this.#events.settleMessage(context, messageId, { status: "completed" });
     this.#state.completeAssistantMessage(runId, messageId, ended);
   }
 
@@ -709,7 +712,7 @@ export class ClaudeAgentSdkMessageTranslator {
       if (messageId !== null) {
         const thoughtId = this.#state.thoughtIdForMessage(messageId);
         if (thoughtId !== undefined) {
-          await this.#events.cancelThought(context, thoughtId);
+          await this.#events.settleThought(context, thoughtId, "cancelled");
           this.#state.deleteThoughtId(messageId);
         }
         await this.#events.retractMessage(context, messageId);
@@ -742,7 +745,7 @@ export class ClaudeAgentSdkMessageTranslator {
 
     const messageId = this.#state.auxiliaryMessageId(runId, nativeMessageId);
     if (await this.#events.pushMessageSnapshot(context, messageId, content, metadata)) {
-      await this.#events.endMessage(context, messageId);
+      await this.#events.settleMessage(context, messageId, { status: "completed" });
     }
   }
 
@@ -822,18 +825,24 @@ export class ClaudeAgentSdkMessageTranslator {
       aggregateClaudeModelUsage(message.modelUsage),
       message.total_cost_usd,
     );
-
-    if (cancelled) {
+    const finishResult = async (
+      toolStatus: "cancelled" | "completed" | "failed",
+      terminal: DriverEventInput,
+      reason: string,
+    ): Promise<void> => {
       try {
-        await this.finishTurnWithTerminal(
-          context,
-          "cancelled",
-          this.#events.runCancelled(runId, message.terminal_reason ?? "provider.aborted"),
-          "driver.claude.turn.cancelled",
-        );
+        await this.finishTurnWithTerminal(context, toolStatus, terminal, reason);
       } catch (error) {
         throw new ClaudeTerminalWriteError(error);
       }
+    };
+
+    if (cancelled) {
+      await finishResult(
+        "cancelled",
+        this.#events.runCancelled(runId, message.terminal_reason ?? "provider.aborted"),
+        "driver.claude.turn.cancelled",
+      );
       return;
     }
 
@@ -845,21 +854,16 @@ export class ClaudeAgentSdkMessageTranslator {
           : jsonValueSchema.safeParse(message.structured_output);
 
       if (structuredOutput !== undefined && !structuredOutput.success) {
-        try {
-          await this.finishTurnWithTerminal(
-            context,
-            "failed",
-            this.#events.runError(
-              runId,
-              "claude.invalid_structured_output",
-              "Claude Agent SDK returned a non-JSON structured output.",
-              false,
-            ),
-            "driver.claude.turn.failed",
-          );
-        } catch (error) {
-          throw new ClaudeTerminalWriteError(error);
-        }
+        await finishResult(
+          "failed",
+          this.#events.runError(
+            runId,
+            "claude.invalid_structured_output",
+            "Claude Agent SDK returned a non-JSON structured output.",
+            false,
+          ),
+          "driver.claude.turn.failed",
+        );
         return;
       }
 
@@ -870,21 +874,16 @@ export class ClaudeAgentSdkMessageTranslator {
           MAX_CLAUDE_STRUCTURED_TERMINAL_BYTES;
 
       if (structuredOutputTooLarge) {
-        try {
-          await this.finishTurnWithTerminal(
-            context,
-            "failed",
-            this.#events.runError(
-              runId,
-              "claude.structured_output_too_large",
-              "Claude Agent SDK structured output exceeds the runtime terminal event limit.",
-              false,
-            ),
-            "driver.claude.turn.failed",
-          );
-        } catch (error) {
-          throw new ClaudeTerminalWriteError(error);
-        }
+        await finishResult(
+          "failed",
+          this.#events.runError(
+            runId,
+            "claude.structured_output_too_large",
+            "Claude Agent SDK structured output exceeds the runtime terminal event limit.",
+            false,
+          ),
+          "driver.claude.turn.failed",
+        );
         return;
       }
 
@@ -909,36 +908,26 @@ export class ClaudeAgentSdkMessageTranslator {
           ? null
           : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
 
-      try {
-        await this.finishTurnWithTerminal(
-          context,
-          "completed",
-          this.#events.runFinished(runId, finalMessage, structuredOutput?.data),
-          "driver.claude.turn.completed",
-        );
-      } catch (error) {
-        throw new ClaudeTerminalWriteError(error);
-      }
+      await finishResult(
+        "completed",
+        this.#events.runFinished(runId, finalMessage, structuredOutput?.data),
+        "driver.claude.turn.completed",
+      );
       return;
     }
 
-    try {
-      await this.finishTurnWithTerminal(
-        context,
-        "failed",
-        this.#events.runError(
-          runId,
-          message.subtype === "success" ? "claude.api_error" : `claude.${message.subtype}`,
-          message.subtype === "success"
-            ? message.result || "Claude Agent SDK API request failed."
-            : message.errors.join("\n") || "Claude Agent SDK turn failed.",
-          isClaudeResultRetryable(message),
-          claudeResultErrorDetails(message),
-        ),
-        "driver.claude.turn.failed",
-      );
-    } catch (error) {
-      throw new ClaudeTerminalWriteError(error);
-    }
+    await finishResult(
+      "failed",
+      this.#events.runError(
+        runId,
+        message.subtype === "success" ? "claude.api_error" : `claude.${message.subtype}`,
+        message.subtype === "success"
+          ? message.result || "Claude Agent SDK API request failed."
+          : message.errors.join("\n") || "Claude Agent SDK turn failed.",
+        isClaudeResultRetryable(message),
+        claudeResultErrorDetails(message),
+      ),
+      "driver.claude.turn.failed",
+    );
   }
 }

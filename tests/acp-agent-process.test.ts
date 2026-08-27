@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   startAcpAgentProcess,
@@ -19,22 +19,17 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
 
 function createHarness() {
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-agent-process-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: { request: async () => "reject_once" },
   });
 
-  return { context, logger };
+  return { context };
 }
 
 function createPayload(root: string) {
@@ -185,7 +180,6 @@ describe("ACP agent process lifecycle", () => {
         child.kill("SIGKILL");
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   });
 
@@ -203,7 +197,6 @@ describe("ACP agent process lifecycle", () => {
       expect(process.child.signalCode).toBe(exitSignal);
     } finally {
       await process.dispose();
-      await harness.logger.destroy();
     }
   });
 
@@ -228,7 +221,6 @@ describe("ACP agent process lifecycle", () => {
     } finally {
       cleanup.resolve();
       await process.dispose();
-      await harness.logger.destroy();
     }
   });
 
@@ -281,7 +273,6 @@ describe("ACP agent process lifecycle", () => {
           child.kill("SIGKILL");
         }
         await rm(root, { force: true, recursive: true });
-        await harness.logger.destroy();
       }
     },
   );
@@ -321,7 +312,6 @@ describe("ACP agent process lifecycle", () => {
       } finally {
         cleanup.resolve();
         await agent.dispose();
-        await harness.logger.destroy();
       }
     },
   );
@@ -423,7 +413,6 @@ setInterval(() => {}, 1_000);
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 7_000);
 
@@ -503,7 +492,6 @@ setInterval(() => {}, 1_000);
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 7_000);
 
@@ -567,7 +555,6 @@ setInterval(() => {}, 1_000);
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 5_000);
 });

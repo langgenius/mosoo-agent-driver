@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import type { DriverPermissionRequest } from "../src/host-ports";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { OpenAiAppServerRequestHandler } from "../src/runtimes/openai/app-server-request-handler";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
@@ -14,17 +14,12 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
   const responses: Array<{ id: string | number; result: unknown }> = [];
   const rejections: Array<{ id: string | number; message: string }> = [];
   const errors: Error[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "error",
-    service: "openai-request-handler-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: {
       request: async (input, signal) => {
@@ -140,24 +135,18 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
     expect(errors).toEqual([]);
   } finally {
     await handler.abortAll(new Error("test complete"));
-    await logger.destroy();
   }
 });
 
 test("OpenAI writeStdin approval uses terminal-input semantics", async () => {
   const permission = Promise.withResolvers<DriverPermissionRequest>();
   const response = Promise.withResolvers<unknown>();
-  const logger = createBufferedSinkLogger({
-    level: "error",
-    service: "openai-request-handler-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: {
       request: async (input) => {
@@ -186,7 +175,6 @@ test("OpenAI writeStdin approval uses terminal-input semantics", async () => {
     title: "Approve terminal input",
     toolCallId: "command-1",
   });
-  await logger.destroy();
 });
 
 test("OpenAI server request cancellation propagates permission delivery failures", async () => {
@@ -198,17 +186,12 @@ test("OpenAI server request cancellation propagates permission delivery failures
     new Error("event sink unavailable"),
   );
   const handledErrors: Error[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "error",
-    service: "openai-request-handler-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: {
       request: async (_input, signal) => {
@@ -252,6 +235,5 @@ test("OpenAI server request cancellation propagates permission delivery failures
   } finally {
     deliveryGate.resolve();
     await handler.abortAll(new Error("test complete"));
-    await logger.destroy();
   }
 });

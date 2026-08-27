@@ -83,7 +83,7 @@
     "test:live:opencode": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=opencode bun test tests/driver-artifact-live.test.ts",
     "bench": "bun bench/ttft-bench.ts",
     "build": "vp run build:types && bun build src/bin/driver.ts --target bun --outfile dist/driver.mjs",
-    "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
+    "build:types": "vp pack",
     "build:image": "vp run build && buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .",
     "test:image:environment": "podman run --pull=never --rm --entrypoint node agent-driver:local /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
     "check": "vp check && vp run tc && vp run test && vp run build",

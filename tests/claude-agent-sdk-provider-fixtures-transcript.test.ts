@@ -2,69 +2,16 @@ import { describe, expect, test } from "bun:test";
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
-import { isRecord, messageText } from "./claude-agent-sdk-test-helpers";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  readonly events: DriverEventInput[];
-  readonly reason: string;
-}
-
-function createHarness(publicToolCallId: (nativeToolCallId: string) => string = (id) => id) {
-  const batches: EventBatch[] = [];
-  const nativeSessionIds: string[] = [];
-  const nativeSessionResets: Array<readonly [string, string]> = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "claude-agent-sdk-provider-fixtures-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      currentRunId: () => "run-1" as RunId,
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: bootPayload,
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const translator = new ClaudeAgentSdkMessageTranslator({
-    publicToolCallId,
-    push: async (_context, reason, events) => {
-      batches.push({ events, reason });
-    },
-    pushTerminal: async (_context, reason, closures, terminal) => {
-      batches.push({ events: [...closures, terminal], reason });
-    },
-    recordNativeSessionId: async (_context, sessionId) => {
-      nativeSessionIds.push(sessionId);
-    },
-    replaceNativeSessionId: async (_context, previousSessionId, nextSessionId) => {
-      nativeSessionResets.push([previousSessionId, nextSessionId]);
-    },
-  });
-
-  return {
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    logger,
-    nativeSessionIds,
-    nativeSessionResets,
-    translator,
-  };
-}
+import {
+  createClaudeAgentSdkHarness as createHarness,
+  isRecord,
+  messageText,
+} from "./claude-agent-sdk-test-helpers";
 
 describe("Claude Agent SDK provider fixtures", () => {
   test("projects visible task activity without leaking task internals", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         description: "Inspect the repository",
@@ -141,7 +88,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const taskEvents = events().filter((event) => event.kind === "agent.task.updated");
     expect(taskEvents).toHaveLength(2);
@@ -164,7 +110,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("closes visible tasks before the run terminal and resets them between turns", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -233,11 +179,10 @@ describe("Claude Agent SDK provider fixtures", () => {
         title: "Inspect the repository again",
       },
     });
-    await logger.destroy();
   });
 
   test("projects informational, local command, mirror failure, and conversation reset frames", async () => {
-    const { context, events, logger, nativeSessionResets, translator } = createHarness();
+    const { context, events, nativeSessionResets, translator } = createHarness();
     const messages = [
       {
         content: "A stop hook blocked continuation.",
@@ -279,7 +224,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -326,7 +270,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("cancels a truncated assistant frame", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -338,7 +282,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     const transcript = events();
     expect(transcript).toContainEqual(
@@ -354,7 +297,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails an assistant frame carrying an SDK error", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -366,7 +309,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -383,7 +325,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails a terminating API error carried by a success result", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -404,7 +346,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -422,7 +363,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("marks an SDK tool error as failed", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -450,7 +391,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -461,7 +401,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("classifies wrapper-level tool non-execution metadata", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -499,7 +439,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -518,7 +457,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("materializes authoritative result permission denials without a tool result", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
 
     await translator.handleSdkMessage(
       context,
@@ -551,7 +490,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       } as unknown as SDKMessage,
       "run-1" as RunId,
     );
-    await logger.destroy();
 
     expect(events()).toContainEqual(
       expect.objectContaining({
@@ -572,7 +510,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("lets result permission denials override earlier tool terminals", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -619,7 +557,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     for (const toolCallId of ["tool-completed", "tool-cancelled"]) {
       const statuses = events().flatMap((event) => {
@@ -644,7 +581,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("rotates assistant identity across a tool boundary and marks the final message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -689,7 +626,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const textMessages = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {
@@ -715,7 +651,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("uses the complete assistant message to repair an incomplete stream snapshot", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -758,7 +694,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -790,7 +725,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("drops thought and tool updates after their terminal events", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -875,7 +810,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const translated = events();
     const thoughtCompletedIndex = translated.findIndex(
@@ -901,7 +835,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("ignores streamed text arriving after its assistant message completed", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         message: {
@@ -932,7 +866,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const translated = events();
     const completed = translated.find((event) => event.kind === "message.completed");
@@ -963,7 +896,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("repairs streamed tool input with a lossless assistant snapshot", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -995,7 +928,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     expect(
       events().filter(
@@ -1015,7 +947,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   test.each(["success", "error"] as const)(
     "closes every open item before a %s result terminal",
     async (outcome) => {
-      const { context, events, logger, translator } = createHarness();
+      const { context, events, translator } = createHarness();
       const messages = [
         {
           event: {
@@ -1066,7 +998,6 @@ describe("Claude Agent SDK provider fixtures", () => {
       for (const message of messages) {
         await translator.handleSdkMessage(context, message, "run-1" as RunId);
       }
-      await logger.destroy();
 
       const translated = events();
       const terminalIndex = translated.findIndex((event) =>
@@ -1098,7 +1029,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // envelope uuid, and the aggregated assistant envelope (with the native
     // message id) arrives before message_stop. The reply must stay one
     // message instead of rendering as "P" / "ong. …" / full-text duplicates.
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -1149,7 +1080,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const translated = events();
     const textMessages = translated.flatMap((event) => {
@@ -1195,7 +1125,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   test("anchors uuid-fractured stream fragments to one closed assistant message", async () => {
     // One scope streams one message at a time; per-envelope uuids must not
     // fracture a burst whose message_start frame was lost (YEF-884).
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -1228,7 +1158,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const translated = events();
     const started = translated
@@ -1253,7 +1182,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // envelope uuid; the aggregated assistant envelope that follows in the
     // same scope is that burst's own aggregation and must not mint a
     // duplicate message (YEF-884).
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -1288,7 +1217,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const textMessages = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {
@@ -1318,7 +1246,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("keeps a confirmed streamed assistant replay on its original message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const assistant = {
       message: {
         content: [{ text: "canonical", type: "text" }],
@@ -1364,7 +1292,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const started = events().filter((event) => event.kind === "message.started");
     const completed = events().filter((event) => event.kind === "message.completed");
@@ -1385,7 +1312,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("keeps distinct live assistant envelopes that share a native message id", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: { message: { id: "shared-native" }, type: "message_start" },
@@ -1431,7 +1358,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const snapshots = events().filter((event) => event.kind === "message.added");
     const messageIds = snapshots.flatMap((event) =>
@@ -1454,7 +1380,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // A message_start frame proves the streamed message's native id, so an
     // assistant envelope with a different native id is a genuinely separate
     // message even when the text repeats.
-    const { context, events, logger, translator } = createHarness();
+    const { context, events, translator } = createHarness();
     const messages = [
       {
         event: {
@@ -1498,7 +1424,6 @@ describe("Claude Agent SDK provider fixtures", () => {
     for (const message of messages) {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
-    await logger.destroy();
 
     const textMessages = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {

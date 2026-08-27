@@ -1,5 +1,6 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
+import type { ProtocolError } from "../../contract";
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId, RunId } from "../../protocol/id";
 import type { JsonValue } from "../../protocol/json";
@@ -90,6 +91,10 @@ export interface ClaudeTurnClosure {
   readonly events: readonly DriverEventInput[];
 }
 
+type ClaudeMessageSettlement =
+  | { readonly status: "cancelled" | "completed" }
+  | { readonly error: ProtocolError; readonly status: "failed" };
+
 export class ClaudeAgentSdkEventWriter {
   readonly #messageEnded = new Set<string>();
   readonly #messageRetracted = new Set<string>();
@@ -128,35 +133,32 @@ export class ClaudeAgentSdkEventWriter {
     return this.#toolParentMessage.get(toolCallId) ?? null;
   }
 
-  async endMessage(context: AgentDriverContext, messageId: string): Promise<boolean> {
+  async settleMessage(
+    context: AgentDriverContext,
+    messageId: string,
+    settlement: ClaudeMessageSettlement,
+  ): Promise<boolean> {
     if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
       return false;
     }
 
-    await this.#options.push(context, "driver.claude.message.ended", [
-      {
-        kind: "message.completed",
-        payload: {
-          messageId,
-          role: "agent",
-        },
-      },
-    ]);
-    this.#messageEnded.add(messageId);
-    return true;
-  }
-
-  async cancelMessage(context: AgentDriverContext, messageId: string): Promise<boolean> {
-    if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
-      return false;
-    }
-
-    await this.#options.push(context, "driver.claude.message.cancelled", [
-      {
-        kind: "message.cancelled",
-        payload: { messageId, role: "agent" },
-      },
-    ]);
+    const event: DriverEventInput =
+      settlement.status === "failed"
+        ? {
+            kind: "message.failed",
+            payload: { error: settlement.error, messageId, role: "agent" },
+          }
+        : {
+            kind: settlement.status === "completed" ? "message.completed" : "message.cancelled",
+            payload: { messageId, role: "agent" },
+          };
+    await this.#options.push(
+      context,
+      settlement.status === "completed"
+        ? "driver.claude.message.ended"
+        : `driver.claude.message.${settlement.status}`,
+      [event],
+    );
     this.#messageEnded.add(messageId);
     return true;
   }
@@ -198,25 +200,6 @@ export class ClaudeAgentSdkEventWriter {
     ]);
     this.#toolRetracted.add(toolCallId);
     this.#toolEnded.add(toolCallId);
-  }
-
-  async failMessage(
-    context: AgentDriverContext,
-    messageId: string,
-    error: { readonly code: string; readonly message: string; readonly retryable: boolean },
-  ): Promise<boolean> {
-    if (!this.#messageStarted.has(messageId) || this.#messageEnded.has(messageId)) {
-      return false;
-    }
-
-    await this.#options.push(context, "driver.claude.message.failed", [
-      {
-        kind: "message.failed",
-        payload: { error, messageId, role: "agent" },
-      },
-    ]);
-    this.#messageEnded.add(messageId);
-    return true;
   }
 
   async ensureMessageStarted(context: AgentDriverContext, messageId: string): Promise<void> {
@@ -517,31 +500,18 @@ export class ClaudeAgentSdkEventWriter {
     ]);
   }
 
-  async endThought(context: AgentDriverContext, thoughtId: string): Promise<void> {
+  async settleThought(
+    context: AgentDriverContext,
+    thoughtId: string,
+    status: "cancelled" | "completed",
+  ): Promise<void> {
     if (!this.#thoughtStarted.has(thoughtId) || this.#thoughtEnded.has(thoughtId)) {
       return;
     }
 
-    await this.#options.push(context, "driver.claude.thought.completed", [
+    await this.#options.push(context, `driver.claude.thought.${status}`, [
       {
-        kind: "thought.completed",
-        payload: {
-          channel: "summary",
-          thoughtId,
-        },
-      },
-    ]);
-    this.#thoughtEnded.add(thoughtId);
-  }
-
-  async cancelThought(context: AgentDriverContext, thoughtId: string): Promise<void> {
-    if (!this.#thoughtStarted.has(thoughtId) || this.#thoughtEnded.has(thoughtId)) {
-      return;
-    }
-
-    await this.#options.push(context, "driver.claude.thought.cancelled", [
-      {
-        kind: "thought.cancelled",
+        kind: status === "completed" ? "thought.completed" : "thought.cancelled",
         payload: { channel: "summary", thoughtId },
       },
     ]);

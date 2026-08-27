@@ -2,7 +2,7 @@ import { expect } from "bun:test";
 
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
@@ -60,17 +60,12 @@ export function createOpenAiBridgeHarness(
   const releasePush = Promise.withResolvers<void>();
   const terminalHeld = Promise.withResolvers<void>();
   const releaseTerminal = Promise.withResolvers<void>();
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-event-bridge-test",
-    sink: async () => {},
-  });
   const context: AgentDriverContext = createAgentDriverContext({
     eventSink: {
       currentRunId: () => DRIVER_TEST_IDS.runId,
       pushEvents: async () => ({ accepted: [] }),
     },
-    logger,
+    logger: createDisabledLogger(),
     payload: bootPayload,
     permission: {
       request: async () => "allow_once",
@@ -122,7 +117,6 @@ export function createOpenAiBridgeHarness(
     context,
     events: () => batches.flatMap((batch) => batch.events),
     heldPush: heldPush.promise,
-    logger,
     releasePush: releasePush.resolve,
     releaseTerminal: releaseTerminal.resolve,
     terminalHeld: terminalHeld.promise,

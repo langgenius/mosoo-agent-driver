@@ -86,19 +86,10 @@ export class AcpAssistantTranscriptState {
   }
 
   begin(input: AcpAssistantTranscriptStateInput): void {
-    this.#activeAssistantMessage = null;
-    this.#lastCompletedAssistantMessage = null;
+    this.clear();
     this.#promptMessageId = input.messageId;
     this.#runId = input.runId;
-    this.#sequence = 0;
-    this.#settledAssistantNativeMessageIds.clear();
-    this.#settledAssistantNativeMessageIdBytes = 0;
-    this.#thoughtCompleted = false;
-    this.#thoughtFallbackText = "";
-    this.#thoughtFallbackNativeMessageId = null;
     this.#thoughtId = `${input.messageId}:thought`;
-    this.#thoughtStarted = false;
-    this.#tools.clear();
   }
 
   clear(): void {
@@ -778,6 +769,14 @@ export class AcpAssistantTranscriptState {
       return null;
     }
 
+    return this.#startUnsettledMessage(nativeMessageId);
+  }
+
+  #startAnonymousMessage(): AcpAssistantMessageStart {
+    return this.#startUnsettledMessage(null);
+  }
+
+  #startUnsettledMessage(nativeMessageId: string | null): AcpAssistantMessageStart {
     const active = this.#activeAssistantMessage;
 
     if (active?.nativeMessageId === nativeMessageId) {
@@ -788,33 +787,6 @@ export class AcpAssistantTranscriptState {
     const message: AcpAssistantMessageState = {
       id: createDriverId(),
       nativeMessageId,
-      text: "",
-    };
-
-    this.#activeAssistantMessage = message;
-    this.#clearThoughtFallback();
-    events.push({
-      kind: "message.started",
-      payload: {
-        messageId: message.id,
-        role: "agent",
-      },
-      runId: this.#requireRunId(),
-    });
-    return { events, message };
-  }
-
-  #startAnonymousMessage(): AcpAssistantMessageStart {
-    const active = this.#activeAssistantMessage;
-
-    if (active?.nativeMessageId === null) {
-      return { events: [], message: active };
-    }
-
-    const events = this.#finishMessage();
-    const message: AcpAssistantMessageState = {
-      id: createDriverId(),
-      nativeMessageId: null,
       text: "",
     };
 

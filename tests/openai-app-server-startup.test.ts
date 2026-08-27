@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { AgentDriverPermissionPort } from "../src/host-ports";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
@@ -451,11 +451,7 @@ process.stdin.on("data", (chunk) => {
   let toolCompletionHolds = 0;
   const turnTimingEntered = Promise.withResolvers<void>();
   const turnTimingGate = Promise.withResolvers<void>();
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-startup-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
   const context = createAgentDriverContext({
     eventSink: {
       commandUpdate: async () => {},
@@ -675,12 +671,11 @@ describe("OpenAI app-server startup", () => {
       if (!stopped) {
         await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
       }
-      await harness.logger.destroy();
     }
   });
 
   test("injects platform transcript without publishing an unmaterialized thread", async () => {
-    const { backend, context, events, logger, requestLog } = await createHarness(
+    const { backend, context, events, requestLog } = await createHarness(
       "no rollout found for thread id stale-thread",
     );
 
@@ -707,11 +702,10 @@ describe("OpenAI app-server startup", () => {
       threadId: "fresh-thread",
     });
     await backend.stop(context, "test complete", new AbortController().signal);
-    await logger.destroy();
   });
 
   test("stop cleans background terminals even when the thread has no active turn", async () => {
-    const { backend, context, logger, requestLog } = await createCancellationHarness({});
+    const { backend, context, requestLog } = await createCancellationHarness({});
 
     try {
       await backend.start(context, new AbortController().signal);
@@ -724,7 +718,6 @@ describe("OpenAI app-server startup", () => {
       expect(methods).toContain("thread/backgroundTerminals/clean");
     } finally {
       await backend.stop(context, "test complete", new AbortController().signal).catch(() => {});
-      await logger.destroy();
     }
   });
 
@@ -762,7 +755,6 @@ describe("OpenAI app-server startup", () => {
         await harness.backend
           .stop(harness.context, "test complete", new AbortController().signal)
           .catch(() => {});
-        await harness.logger.destroy();
       }
     },
   );
@@ -827,12 +819,11 @@ describe("OpenAI app-server startup", () => {
       ).resolves.toBeUndefined();
     } finally {
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      await harness.logger.destroy();
     }
   });
 
   test("does not replace the thread for other resume failures", async () => {
-    const { backend, context, events, logger } = await createHarness("Unauthorized");
+    const { backend, context, events } = await createHarness("Unauthorized");
 
     try {
       await expect(backend.start(context, new AbortController().signal)).rejects.toThrow(
@@ -841,7 +832,6 @@ describe("OpenAI app-server startup", () => {
       expect(events).toEqual([]);
     } finally {
       await backend.stop(context, "test complete", new AbortController().signal);
-      await logger.destroy();
     }
   });
 
@@ -858,7 +848,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -876,7 +865,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -910,7 +898,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -959,7 +946,6 @@ describe("OpenAI app-server startup", () => {
             new AbortController().signal,
           );
         }
-        await harness.logger.destroy();
       }
     },
   );
@@ -1058,7 +1044,6 @@ describe("OpenAI app-server startup", () => {
       } finally {
         await harness.releaseTurnStartResponse();
         await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-        await harness.logger.destroy();
       }
     },
   );
@@ -1115,7 +1100,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -1208,7 +1192,6 @@ describe("OpenAI app-server startup", () => {
         await harness.backend
           .stop(harness.context, "test complete", new AbortController().signal)
           .catch(() => {});
-        await harness.logger.destroy();
       }
     },
     10_000,
@@ -1250,7 +1233,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -1413,7 +1395,6 @@ describe("OpenAI app-server startup", () => {
     } finally {
       await harness.releaseTurnStartResponse();
       await kernel.stop("test complete").catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -1443,7 +1424,6 @@ describe("OpenAI app-server startup", () => {
     } finally {
       harness.releaseRunCancellation();
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      await harness.logger.destroy();
     }
   });
 
@@ -1483,7 +1463,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1525,7 +1504,6 @@ describe("OpenAI app-server startup", () => {
         await harness.backend
           .stop(harness.context, "test complete", new AbortController().signal)
           .catch(() => {});
-        await harness.logger.destroy();
       }
     },
     10_000,
@@ -1579,7 +1557,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1629,7 +1606,6 @@ describe("OpenAI app-server startup", () => {
       ).toEqual(["run.cancel.requested", "run.cancelled"]);
     } finally {
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      await harness.logger.destroy();
     }
   });
 
@@ -1684,7 +1660,6 @@ describe("OpenAI app-server startup", () => {
     } finally {
       harness.releaseCancellationRequest();
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      await harness.logger.destroy();
     }
   });
 
@@ -1759,7 +1734,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   });
 
@@ -1824,7 +1798,6 @@ describe("OpenAI app-server startup", () => {
         } catch {}
       }
       stopSpy.mockRestore();
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -1937,7 +1910,6 @@ describe("OpenAI app-server startup", () => {
         await kernel.stop("test complete").catch(() => {});
         stopSpy?.mockRestore();
         terminalSpy?.mockRestore();
-        await harness.logger.destroy();
       }
     },
     10_000,
@@ -1969,7 +1941,6 @@ describe("OpenAI app-server startup", () => {
           .stop(harness.context, "test complete", new AbortController().signal)
           .catch(() => {});
       }
-      await harness.logger.destroy();
     }
   });
 
@@ -2054,7 +2025,6 @@ describe("OpenAI app-server startup", () => {
         } catch {}
       }
       stopSpy.mockRestore();
-      await harness.logger.destroy();
     }
   }, 10_000);
 
@@ -2106,7 +2076,6 @@ describe("OpenAI app-server startup", () => {
     } finally {
       permissionGate.resolve();
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      await harness.logger.destroy();
     }
   });
 
@@ -2160,7 +2129,6 @@ describe("OpenAI app-server startup", () => {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
-      await harness.logger.destroy();
     }
   }, 10_000);
 });

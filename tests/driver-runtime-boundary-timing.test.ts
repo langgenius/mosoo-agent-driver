@@ -95,7 +95,6 @@ describe("driver runtime boundary", () => {
       });
     } finally {
       globalThis.setTimeout = nativeSetTimeout;
-      await logger.destroy();
     }
   });
 
@@ -133,7 +132,6 @@ describe("driver runtime boundary", () => {
       label: "externally stopped command loop",
       timeoutMs: 100,
     });
-    await logger.destroy();
 
     expect(outcome.status).toBe("completed");
     expect(socket.updates).toContainEqual({
@@ -201,7 +199,6 @@ describe("driver runtime boundary", () => {
         pending.reject(new Error("late transport failure"));
       }
       await Bun.sleep(0);
-      await logger.destroy();
 
       expect(socket.failedRuns).toEqual([]);
     },
@@ -262,7 +259,6 @@ describe("driver runtime boundary", () => {
         late.reject(new Error("late accepted ACK failure"));
       }
       await Bun.sleep(0);
-      await logger.destroy();
     },
   );
 
@@ -290,7 +286,6 @@ describe("driver runtime boundary", () => {
     });
 
     await dispatcher.run(socket, logger);
-    await logger.destroy();
 
     expect(runtimeState.status()).toBe("ready");
     expect(commandReads.count).toBeGreaterThanOrEqual(1);
@@ -364,7 +359,6 @@ describe("driver runtime boundary", () => {
     });
 
     await dispatcher.run(socket, logger);
-    await logger.destroy();
 
     expect(socket.updates).toMatchObject([
       {
@@ -476,7 +470,6 @@ describe("driver runtime boundary", () => {
       socket,
       (update) => update.commandId === "mcp-stuck" && update.status === "cancelled",
     );
-    await logger.destroy();
 
     expect(runtimeState.status()).toBe("stopped");
     expect(shutdownCalls).toEqual(["test.stop"]);
@@ -520,7 +513,6 @@ describe("driver runtime boundary", () => {
     updateResult.reject(new Error("shutdown abort"));
 
     await expect(run).resolves.toBeUndefined();
-    await logger.destroy();
     expect(socket.failedRuns).toEqual([]);
     expect(socket.pushedEvents).toEqual([]);
     expect(shutdownCalls).toEqual([]);
@@ -564,7 +556,6 @@ describe("driver runtime boundary", () => {
       socket,
       (update) => update.commandId === "mcp-32" && update.status === "failed",
     );
-    await logger.destroy();
 
     expect(executeCalls).toBe(32);
     expect(runtimeState.status()).toBe("stopped");
@@ -600,7 +591,6 @@ describe("driver runtime boundary", () => {
       socket,
       (update) => update.commandId === "input-1" && update.status === "failed",
     );
-    await logger.destroy();
 
     expect(runtimeState.status()).toBe("failed");
     expect(socket.failedRuns).toHaveLength(1);

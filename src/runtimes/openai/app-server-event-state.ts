@@ -1,13 +1,14 @@
-import { createHash } from "node:crypto";
-
 import type { DriverEventInput } from "../../protocol/events";
-import { createDriverId, type MessageId } from "../../protocol/id";
+import type { MessageId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { ProtocolError } from "../../contract";
+import { RuntimePublicIdState } from "../runtime-public-id-state";
 import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 import { toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
 import { readRecord } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
+
+export { RuntimePublicIdState as OpenAiPublicIdState } from "../runtime-public-id-state";
 
 export type OpenAiEventPush = (
   context: AgentDriverContext,
@@ -30,7 +31,6 @@ const usageKeys = [
   "reasoningOutputTokens",
   "totalTokens",
 ] as const;
-const MAX_OPENAI_PUBLIC_NATIVE_ID_BYTES = 256;
 export const MAX_OPENAI_DURABLE_EVENT_BYTES = 1_020 * 1_024;
 
 export function assertOpenAiDurableEventFits(event: DriverEventInput, subject: string): void {
@@ -40,36 +40,6 @@ export function assertOpenAiDurableEventFits(event: DriverEventInput, subject: s
     throw new RangeError(
       `OpenAI ${subject} exceeds durable event capacity (${String(bytes)} UTF-8 bytes).`,
     );
-  }
-}
-
-function openAiNativeIdKey(nativeId: string): string {
-  return Buffer.byteLength(nativeId, "utf8") <= MAX_OPENAI_PUBLIC_NATIVE_ID_BYTES
-    ? nativeId
-    : createHash("sha256").update(nativeId).digest("hex");
-}
-
-export class OpenAiPublicIdState {
-  readonly #publicIds = new Map<string, string>();
-
-  publicId(nativeId: string, namespace = "id"): string {
-    if (Buffer.byteLength(nativeId, "utf8") <= MAX_OPENAI_PUBLIC_NATIVE_ID_BYTES) {
-      return nativeId;
-    }
-
-    const key = `${namespace}:${openAiNativeIdKey(nativeId)}`;
-    const existing = this.#publicIds.get(key);
-    if (existing !== undefined) {
-      return existing;
-    }
-
-    const publicId = createDriverId();
-    this.#publicIds.set(key, publicId);
-    return publicId;
-  }
-
-  reset(): void {
-    this.#publicIds.clear();
   }
 }
 
@@ -535,7 +505,7 @@ export class OpenAiMessageState {
 
 export class OpenAiItemState {
   readonly #completed = new Set<string>();
-  readonly #ids = new OpenAiPublicIdState();
+  readonly #ids = new RuntimePublicIdState();
 
   isCompleted(itemId: string): boolean {
     return this.#completed.has(itemId);

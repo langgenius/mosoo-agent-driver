@@ -326,9 +326,11 @@ describe("driver runtime boundary", () => {
     await dispatcher.run(socket, logger);
     await waitForUpdate(
       socket,
-      (update) => update.commandId === "input-1" && update.status === "completed",
+      (update) =>
+        update.commandId === "input-1" &&
+        update.status === "completed" &&
+        runtimeState.status() === "ready",
     );
-    await logger.destroy();
 
     expect(runtimeState.status()).toBe("ready");
     expect(commandReads.count).toBe(1);
@@ -415,7 +417,6 @@ describe("driver runtime boundary", () => {
         (update) => update.commandId === command.commandId && update.status === "completed",
       );
       await runTask;
-      await logger.destroy();
 
       expect(calls).toBe(1);
       expect(socket.updates.filter((update) => update.status === "accepted")).toHaveLength(2);
@@ -490,7 +491,6 @@ describe("driver runtime boundary", () => {
 
     await first.dispatcher.run(firstSocket, first.logger);
     await effectPersisted.promise;
-    await first.logger.destroy();
 
     const secondSocket = new FakeDriverRuntimeIo([structuredClone(command)]);
     let secondClaims = 0;
@@ -521,7 +521,6 @@ describe("driver runtime boundary", () => {
       };
     };
     await second.dispatcher.run(secondSocket, second.logger);
-    await second.logger.destroy();
 
     expect(providerCalls).toBe(1);
     expect(secondPreparations).toBe(1);
@@ -578,7 +577,10 @@ describe("driver runtime boundary", () => {
     });
 
     await runtime.dispatcher.run(socket, runtime.logger);
-    await runtime.logger.destroy();
+    await waitForUpdate(
+      socket,
+      (update) => update.commandId === command.commandId && update.status === "failed",
+    );
 
     expect(preparations).toBe(1);
     expect(claims).toBe(1);
@@ -640,7 +642,6 @@ describe("driver runtime boundary", () => {
 
     await runtime.dispatcher.run(socket, runtime.logger);
     await disposed.promise;
-    await runtime.logger.destroy();
 
     expect(executions).toBe(0);
     expect(disposals).toBe(1);
@@ -742,7 +743,6 @@ describe("driver runtime boundary", () => {
         socket,
         (update) => update.commandId === command.commandId && update.status === "completed",
       );
-      await runtime.logger.destroy();
 
       expect(providerCalls).toBe(settlement === "executed" ? 1 : 0);
       expect(socket.unknownCount).toBe(0);
@@ -815,7 +815,6 @@ describe("driver runtime boundary", () => {
         socket,
         (update) => update.commandId === command.commandId && update.status === "failed",
       );
-      await runtime.logger.destroy();
       const failure = socket.updates.find(
         (update) => update.commandId === command.commandId && update.status === "failed",
       );
@@ -881,7 +880,6 @@ describe("driver runtime boundary", () => {
       expect(socket.claimCount).toBe(0);
       expect(socket.unknownCount).toBe(0);
     } finally {
-      await runtime.logger.destroy();
       await server.stop(true);
     }
   });
@@ -962,7 +960,6 @@ describe("driver runtime boundary", () => {
     shutdown.abort(new Error("test cancellation"));
     releaseBoundary.resolve();
     await runTask;
-    await runtime.logger.destroy();
 
     expect(preparations).toBe(stage === "before prepare" ? 0 : 1);
     expect(executions).toBe(0);
@@ -1016,7 +1013,6 @@ describe("driver runtime boundary", () => {
       socket,
       (update) => update.commandId === command.commandId && update.status === "failed",
     );
-    await runtime.logger.destroy();
 
     expect(socket.unknownCount).toBe(1);
     expect(socket.fenceSignalAborted).toBe(false);
@@ -1094,7 +1090,6 @@ describe("driver runtime boundary", () => {
     socket.stop();
     shutdown.abort(new Error("test shutdown"));
     await runTask;
-    await runtime.logger.destroy();
 
     expect(socket.fenceSignalAborted).toBe(false);
     expect(socket.fencedCommandId).toBe(mcpCommand.commandId);
@@ -1190,7 +1185,6 @@ describe("driver runtime boundary", () => {
     shutdown.abort(new Error("test shutdown"));
     releaseProvider.resolve();
     await runTask;
-    await runtime.logger.destroy();
 
     expect(socket.completionAttempts).toBe(2);
     expect(socket.completionSignals).toEqual([false, false]);
@@ -1238,7 +1232,6 @@ describe("driver runtime boundary", () => {
       await expect(dispatcher.run(socket, logger)).rejects.toThrow(
         "replayed with changed identity or content",
       );
-      await logger.destroy();
 
       expect(backend.cancelledReasons).toEqual(["first reason"]);
       expect(socket.updates).toEqual([
@@ -1302,7 +1295,13 @@ describe("driver runtime boundary", () => {
     );
     firstInputCanFinish.resolve();
     await runTask;
-    await logger.destroy();
+    await waitForUpdate(
+      socket,
+      (update) =>
+        update.commandId === "input-2" &&
+        update.status === "completed" &&
+        runtimeState.status() === "ready",
+    );
 
     expect(handledInputCount).toBe(2);
     expect(runtimeState.status()).toBe("ready");

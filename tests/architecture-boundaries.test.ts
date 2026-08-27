@@ -459,41 +459,6 @@ function compositionViolations(graph: SourceGraph): string[] {
     .toSorted();
 }
 
-function fileCycles(graph: SourceGraph): string[] {
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const stack: string[] = [];
-  const cycles = new Set<string>();
-
-  function visit(file: string): void {
-    if (visited.has(file)) {
-      return;
-    }
-
-    visiting.add(file);
-    stack.push(file);
-
-    for (const dependency of graph.dependencies.get(file) ?? []) {
-      if (visiting.has(dependency)) {
-        const start = stack.indexOf(dependency);
-        cycles.add([...stack.slice(start), dependency].map(sourcePath).join(" -> "));
-      } else {
-        visit(dependency);
-      }
-    }
-
-    stack.pop();
-    visiting.delete(file);
-    visited.add(file);
-  }
-
-  for (const file of graph.files) {
-    visit(file);
-  }
-
-  return [...cycles].toSorted();
-}
-
 function sourceDirectory(path: string): string {
   const parts = relative(sourceRoot, path).split(sep);
   return parts.length === 1 ? "(entrypoints)" : parts[0]!;
@@ -610,8 +575,10 @@ describe("source architecture", () => {
     ]);
   });
 
-  test("has no file-level import cycles", () => {
-    expect(fileCycles(graph)).toEqual([]);
+  test("has no file-level dependency cycles", () => {
+    expect(
+      graph.files.filter((file) => reachableDependencies(graph, file).has(file)).map(sourcePath),
+    ).toEqual([]);
   });
 
   test("has no bidirectional top-level source directory dependencies", () => {
