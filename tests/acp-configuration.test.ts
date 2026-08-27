@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { ClientSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createBufferedSinkLogger } from "../src/observability";
 import {
@@ -293,12 +296,25 @@ describe("ACP runtime configuration", () => {
   });
 
   test("requires host integration snapshot before starting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-configuration-"));
+    const payload = {
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        session: {
+          ...bootPayload.execution.session,
+          cwd: root,
+          homePath: join(root, "home"),
+          sharedRootPath: root,
+        },
+      },
+    };
     const logger = createBufferedSinkLogger({
       level: "debug",
       service: "acp-configuration-test",
       sink: async () => {},
     });
-    const backend = new AcpDriverBackend(bootPayload);
+    const backend = new AcpDriverBackend(payload);
     const context = createAgentDriverContext({
       eventSink: {
         commandUpdate: async () => {},
@@ -306,7 +322,7 @@ describe("ACP runtime configuration", () => {
         pushEvents: async () => ({ accepted: [] }),
       },
       logger,
-      payload: bootPayload,
+      payload,
       permission: {
         request: async () => "reject_once",
       },
@@ -318,6 +334,7 @@ describe("ACP runtime configuration", () => {
       );
     } finally {
       await logger.destroy();
+      await rm(root, { force: true, recursive: true });
     }
   });
 });

@@ -692,8 +692,15 @@ describe("Claude Agent SDK durable event boundaries", () => {
       } as unknown as SDKMessage,
       runId,
     );
-    await expect(translator.endActiveThought(context)).rejects.toThrow("thought delivery failed");
-    await expect(translator.endActiveThought(context)).resolves.toBeUndefined();
+    const messageStop = {
+      event: { type: "message_stop" },
+      type: "stream_event",
+      uuid: "thought-wire",
+    } as unknown as SDKMessage;
+    await expect(translator.handleSdkMessage(context, messageStop, runId)).rejects.toThrow(
+      "thought delivery failed",
+    );
+    await expect(translator.handleSdkMessage(context, messageStop, runId)).resolves.toBe(false);
     expect(reasons.filter((reason) => reason === "driver.claude.thought.completed")).toHaveLength(
       2,
     );

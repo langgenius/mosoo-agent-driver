@@ -21,6 +21,6 @@ export function createDriverStartInputFromBootPayload(
     execution: createDriverExecutionInputFromBootExecution(payload.execution),
     runtime: payload.runtime,
     runtimeTransport: payload.runtimeTransport,
-    sandboxId: payload.sandboxId,
+    sandboxId: payload.execution.session.context.sandboxId,
   };
 }

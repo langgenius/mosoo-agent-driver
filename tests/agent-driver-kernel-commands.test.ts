@@ -57,67 +57,17 @@ describe("AgentDriverKernelCore", () => {
     expect(events.map((event) => event.kind)).toEqual(["run.started", "run.failed"]);
   });
 
-  test("automatically retries final cleanup after shutdown times out during startup", async () => {
+  test("fails closed for late startup permissions before shutdown closes events", async () => {
     const backend = createBackend();
     const startEntered = Promise.withResolvers<void>();
-    const releaseStart = Promise.withResolvers<void>();
-    const finalCleanup = Promise.withResolvers<void>();
-    let resourceActive = false;
-    let stopCount = 0;
-    let startSignal: AbortSignal | undefined;
-    backend.start = async (_context, signal) => {
-      startSignal = signal;
-      startEntered.resolve();
-      await releaseStart.promise;
-      signal.throwIfAborted();
-      resourceActive = true;
-    };
-    backend.stop = async () => {
-      stopCount += 1;
-      resourceActive = false;
-
-      if (stopCount === 2) {
-        finalCleanup.resolve();
-      }
-    };
-    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
-
-    try {
-      const start = kernel.start(bootPayload);
-      await startEntered.promise;
-      await expect(kernel.stop("startup stop")).rejects.toThrow("timed out");
-      expect(startSignal?.aborted).toBe(true);
-      expect(startSignal?.reason).toMatchObject({ message: "startup stop" });
-      releaseStart.resolve();
-      await start;
-
-      const cleaned = await Promise.race([
-        finalCleanup.promise.then(() => true),
-        Bun.sleep(50).then(() => false),
-      ]);
-      expect(cleaned).toBe(true);
-      expect(stopCount).toBe(2);
-      expect(resourceActive).toBe(false);
-    } finally {
-      releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
-    }
-  });
-
-  test("fails closed for late startup permissions before deferred shutdown closes events", async () => {
-    const backend = createBackend();
-    const startEntered = Promise.withResolvers<void>();
+    const startAborted = Promise.withResolvers<void>();
     const releaseStart = Promise.withResolvers<void>();
     const latePermissionEntered = Promise.withResolvers<void>();
     let latePermission: Promise<unknown> | null = null;
+    let startSignal: AbortSignal | undefined;
     backend.start = async (context, signal) => {
+      startSignal = signal;
+      signal.addEventListener("abort", () => startAborted.resolve(), { once: true });
       startEntered.resolve();
       await releaseStart.promise;
       latePermission = context.ports.permission.request({
@@ -140,26 +90,25 @@ describe("AgentDriverKernelCore", () => {
         permissionPolicy: "supervised" as const,
       },
     };
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
+    let start: Promise<void> | null = null;
+    let stop: Promise<void> | null = null;
 
     try {
-      const start = kernel.start(payload);
+      start = kernel.start(payload);
       await startEntered.promise;
-      await expect(kernel.stop("startup stop")).rejects.toThrow("timed out");
+      stop = kernel.stop("startup stop");
+      await startAborted.promise;
+      expect(startSignal?.aborted).toBe(true);
+      expect(startSignal?.reason).toMatchObject({ message: "startup stop" });
       releaseStart.resolve();
       await latePermissionEntered.promise;
-      await start;
+      await expect(start).resolves.toBeUndefined();
+      await expect(stop).resolves.toBeUndefined();
       await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
       await expect(latePermission).resolves.toBe("reject_once");
     } finally {
       releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
+      await Promise.allSettled([start, stop].filter((task) => task !== null));
     }
   });
 
@@ -305,6 +254,126 @@ describe("AgentDriverKernelCore", () => {
 
     expect(stopCount).toBe(1);
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  test("finalizes events only after a late backend stop and the run task settle", async () => {
+    type ManualTimer = { active: boolean; run: () => void };
+
+    const backend = createBackend();
+    const inputEntered = Promise.withResolvers<void>();
+    const releaseInput = Promise.withResolvers<void>();
+    const stopEntered = Promise.withResolvers<void>();
+    const stopAborted = Promise.withResolvers<void>();
+    const releaseStop = Promise.withResolvers<void>();
+    const failure = new Error("backend lifecycle failed");
+    let context!: AgentDriverContext;
+    backend.start = async (startedContext) => {
+      context = startedContext;
+    };
+    backend.handleInput = async () => {
+      inputEntered.resolve();
+      await releaseInput.promise;
+    };
+    backend.stop = async (_context, _reason, signal) => {
+      stopEntered.resolve();
+      signal.addEventListener("abort", () => stopAborted.resolve(), { once: true });
+      await releaseStop.promise;
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const events = kernel.events()[Symbol.asyncIterator]();
+
+    await kernel.start(bootPayload);
+    const input = kernel.dispatch({
+      commandId: "late-stop-active-input",
+      input: { text: "wait" },
+      kind: "input.start",
+      requestId: "late-stop-active-request",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+    void input.catch(() => {});
+    await inputEntered.promise;
+
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const nativeNow = Date.now;
+    const nativeSetTimeout = globalThis.setTimeout;
+    let shutdownTimer: ManualTimer | null = null;
+    Date.now = () => 0;
+    globalThis.setTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay = 0,
+      ...args: unknown[]
+    ) => {
+      if (delay !== 5_000 || shutdownTimer !== null) {
+        return nativeSetTimeout(callback, delay, ...args);
+      }
+
+      const timer: ManualTimer = {
+        active: true,
+        run: () => {
+          if (timer.active) {
+            callback(...args);
+          }
+        },
+      };
+      shutdownTimer = timer;
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle: ReturnType<typeof setTimeout>) => {
+      if (handle === (shutdownTimer as unknown as ReturnType<typeof setTimeout>)) {
+        if (shutdownTimer !== null) {
+          shutdownTimer.active = false;
+        }
+      } else {
+        nativeClearTimeout(handle);
+      }
+    }) as typeof clearTimeout;
+
+    try {
+      context.lifecycle.fail(failure);
+      await stopEntered.promise;
+      const timer = shutdownTimer as ManualTimer | null;
+      expect(timer).not.toBeNull();
+      timer?.run();
+      await stopAborted.promise;
+
+      const nextEvent = events.next();
+      const observed = nextEvent.then((value) => ({ kind: "event" as const, value }));
+      releaseStop.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(
+        Promise.race([observed, Promise.resolve({ kind: "pending" as const })]),
+      ).resolves.toEqual({ kind: "pending" });
+
+      releaseInput.resolve();
+      await expect(input).rejects.toBe(failure);
+      await expect(observed).resolves.toEqual({
+        kind: "event",
+        value: {
+          done: false,
+          value: {
+            kind: "run.failed",
+            payload: {
+              error: {
+                code: "driver.runtime_failed",
+                details: {},
+                message: failure.message,
+                retryable: false,
+              },
+              recoverable: false,
+            },
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        },
+      });
+      await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
+      await expect(kernel.stop("join backend failure")).rejects.toBe(failure);
+    } finally {
+      releaseInput.resolve();
+      releaseStop.resolve();
+      Date.now = nativeNow;
+      globalThis.clearTimeout = nativeClearTimeout;
+      globalThis.setTimeout = nativeSetTimeout;
+    }
   });
 
   test("publishes an active backend failure only after input and cleanup settle", async () => {
@@ -774,12 +843,14 @@ describe("AgentDriverKernelCore", () => {
       }
     };
     const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const nativeNow = Date.now;
     const nativeSetTimeout = globalThis.setTimeout;
     const acceleratedSetTimeout = (
       callback: (...args: unknown[]) => void,
       delay?: number,
       ...args: unknown[]
     ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
+    Date.now = () => 0;
     globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
     try {
@@ -799,6 +870,7 @@ describe("AgentDriverKernelCore", () => {
       expect(stopSignals[1]).not.toBe(stopSignals[0]);
       expect(stopSignals[1]?.aborted).toBe(false);
     } finally {
+      Date.now = nativeNow;
       globalThis.setTimeout = nativeSetTimeout;
     }
   });
@@ -807,34 +879,40 @@ describe("AgentDriverKernelCore", () => {
     const backend = createBackend();
     let mcpOutput: string | null = null;
     let materializedSkillName: string | null = null;
-    backend.start = async (context: AgentDriverContext) => {
-      const [skill] = await context.ports.skill.materialize(context.payload.execution);
+    backend.start = async (context: AgentDriverContext, signal: AbortSignal) => {
+      const [skill] = await context.ports.skill.materialize(context.payload.execution, signal);
       materializedSkillName = skill?.skillName ?? null;
     };
     backend.handleInput = async (context: AgentDriverContext) => {
-      const result = await context.ports.mcp.execute(
-        {
-          argumentsJson: '{"ok":true}',
-          commandId: "mcp-port-1",
-          kind: "mcp.execute",
-          requestId: "request-1",
-          serverId: "server-1",
-          toolCallId: "tool-1",
-          toolName: "complete",
-        },
-        new AbortController().signal,
-      );
+      const command = {
+        argumentsJson: '{"ok":true}',
+        commandId: "mcp-port-1",
+        kind: "mcp.execute" as const,
+        requestId: "request-1",
+        serverId: "server-1",
+        toolCallId: "tool-1",
+        toolName: "complete",
+      };
+      const signal = new AbortController().signal;
+      await using prepared = await context.ports.mcp.prepare(command, signal);
+      const result = await prepared.execute({
+        effectId: "effect-1",
+        idempotencyKey: "effect-1",
+      });
       mcpOutput = result.outputText;
     };
     const kernel = new AgentDriverKernelCore({
       backendFactory: () => backend,
       hostPorts: {
         mcp: {
-          execute: async (command) => ({
-            outputText: `port:${command.toolName}`,
-            requestId: command.requestId,
-            serverId: command.serverId,
-            toolName: command.toolName,
+          prepare: async (command) => ({
+            execute: async () => ({
+              outputText: `port:${command.toolName}`,
+              requestId: command.requestId,
+              serverId: command.serverId,
+              toolName: command.toolName,
+            }),
+            async [Symbol.asyncDispose]() {},
           }),
         },
         skill: {

@@ -317,6 +317,52 @@ describe("Claude Agent SDK driver backend", () => {
     expect(optionSessionIds).toEqual([null, null, "native-session-1"]);
   });
 
+  test("retains late prewarm cleanup ownership until stop retries it", async () => {
+    process.env[PREWARM_ENV] = "1";
+    const startup = Promise.withResolvers<WarmQuery>();
+    const startupCalled = Promise.withResolvers<void>();
+    const processExit = Promise.withResolvers<void>();
+    const warmClosed = Promise.withResolvers<void>();
+    let optionCalls = 0;
+    let cleanupRetries = 0;
+    const harness = createHarness({
+      createQueryOptions: async (input) => {
+        optionCalls += 1;
+        if (optionCalls === 1) {
+          input.processTasks?.add(processExit.promise);
+          registerClaudeTaskRetry(processExit.promise, async () => {
+            cleanupRetries += 1;
+          });
+        }
+        return { abortController: input.abortController };
+      },
+      query: () => fakeQuery([resultMessage()]),
+      startup: async () => {
+        startupCalled.resolve();
+        return startup.promise;
+      },
+    });
+
+    await harness.backend.start(harness.context, new AbortController().signal);
+    await startupCalled.promise;
+    await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
+
+    startup.resolve({
+      close: () => warmClosed.resolve(),
+      query: () => fakeQuery([resultMessage("stale-session")]),
+      async [Symbol.asyncDispose]() {},
+    });
+    await warmClosed.promise;
+    processExit.reject(new Error("late prewarm cleanup failed"));
+    await nextEventLoopTurn();
+
+    await expect(
+      harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
+    ).resolves.toBeUndefined();
+    expect(cleanupRetries).toBe(1);
+    await harness.logger.destroy();
+  });
+
   test("stop joins a prewarm that ignores cancellation until startup settles", async () => {
     process.env[PREWARM_ENV] = "1";
     const startup = Promise.withResolvers<WarmQuery>();
@@ -535,6 +581,47 @@ describe("Claude Agent SDK driver backend", () => {
     await expect(
       harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
     ).rejects.toBe(cleanupError);
+    await harness.logger.destroy();
+  });
+
+  test("does not lose a permanent prewarm cleanup failure while retrying its sibling", async () => {
+    process.env[PREWARM_ENV] = "1";
+    const permanentExit = Promise.withResolvers<void>();
+    const retryableExit = Promise.withResolvers<void>();
+    const startupCalled = Promise.withResolvers<void>();
+    const permanentError = new Error("permanent prewarm cleanup failure");
+    let cleanupRetries = 0;
+    const harness = createHarness({
+      createQueryOptions: async (input) => {
+        input.processTasks?.add(permanentExit.promise);
+        input.processTasks?.add(retryableExit.promise);
+        registerClaudeTaskRetry(retryableExit.promise, async () => {
+          cleanupRetries += 1;
+        });
+        return { abortController: input.abortController };
+      },
+      query: () => fakeQuery([resultMessage()]),
+      startup: async () => {
+        startupCalled.resolve();
+        throw new Error("prewarm startup failed");
+      },
+    });
+
+    await harness.backend.start(harness.context, new AbortController().signal);
+    await startupCalled.promise;
+    await nextEventLoopTurn();
+    permanentExit.reject(permanentError);
+    retryableExit.reject(new Error("retryable prewarm cleanup failure"));
+    await nextEventLoopTurn();
+
+    await expect(
+      harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
+    ).rejects.toBe(permanentError);
+    expect(cleanupRetries).toBe(1);
+    await expect(
+      harness.backend.stop(harness.context, "test.stop.retry", new AbortController().signal),
+    ).rejects.toBe(permanentError);
+    expect(cleanupRetries).toBe(1);
     await harness.logger.destroy();
   });
 

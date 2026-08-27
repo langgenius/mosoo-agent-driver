@@ -48,7 +48,10 @@ export async function startAcpAgentProcess(
   env: Record<string, string>,
   signal: AbortSignal,
   supervisionOptions: AcpAgentProcessSupervisionOptions = {},
-): Promise<AcpAgentProcess> {
+): Promise<{
+  readonly process: AcpAgentProcess;
+  readonly ready: Promise<void>;
+}> {
   const command = supervisionOptions.command ?? readFallbackCommand();
   const args = supervisionOptions.args ?? readFallbackArgs();
 
@@ -123,14 +126,28 @@ export async function startAcpAgentProcess(
     });
   });
 
+  const ready = waitForAcpAgentProcessReady(
+    context,
+    agentProcess,
+    supervision,
+    signal,
+    supervisionOptions.spawnWatchdog,
+  );
+  void ready.catch(() => {});
+
+  return { process: agentProcess, ready };
+}
+
+async function waitForAcpAgentProcessReady(
+  context: AgentDriverContext,
+  agentProcess: AcpAgentProcess,
+  supervision: AcpAgentProcessSupervision,
+  signal: AbortSignal,
+  spawnWatchdog: typeof spawnLinuxProcessTreeWatchdog = spawnLinuxProcessTreeWatchdog,
+): Promise<void> {
   try {
     supervision.watchdog =
-      agentProcess.pid === undefined
-        ? null
-        : (supervisionOptions.spawnWatchdog ?? spawnLinuxProcessTreeWatchdog)(
-            agentProcess.pid,
-            processTree.marker,
-          );
+      agentProcess.pid === undefined ? null : spawnWatchdog(agentProcess.pid, supervision.marker);
     if (supervision.watchdog !== null) {
       void supervision.watchdog.cleanup.then(
         () => {
@@ -165,21 +182,8 @@ export async function startAcpAgentProcess(
     signal.throwIfAborted();
   } catch (error) {
     signalAcpAgentProcess(agentProcess, "SIGKILL");
-    try {
-      await stopAcpAgentProcess(
-        context,
-        agentProcess,
-        "startup.failed",
-        Date.now() + ACP_AGENT_EXIT_TIMEOUT_MS + ACP_AGENT_FORCE_KILL_TIMEOUT_MS,
-        signal,
-      );
-    } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], "ACP agent process startup cleanup failed.");
-    }
     throw error;
   }
-
-  return agentProcess;
 }
 
 export async function stopAcpAgentProcess(

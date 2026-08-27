@@ -1,6 +1,5 @@
 import type {
   ClientRequest as GeneratedClientRequest,
-  InitializeParams as GeneratedInitializeParams,
   RequestId as GeneratedRequestId,
   ServerNotification as GeneratedServerNotification,
   ServerRequest as GeneratedServerRequest,
@@ -8,13 +7,11 @@ import type {
 import type {
   AskForApproval,
   CurrentTimeReadResponse as GeneratedCurrentTimeReadResponse,
-  SandboxPolicy as GeneratedSandboxPolicy,
   ThreadInjectItemsParams as GeneratedThreadInjectItemsParams,
   ThreadResumeParams as GeneratedThreadResumeParams,
   ThreadStartParams as GeneratedThreadStartParams,
   TurnStartParams as GeneratedTurnStartParams,
   TurnStatus as GeneratedTurnStatus,
-  UserInput as GeneratedUserInput,
 } from "./generated/v2";
 import type { JsonObject } from "./app-server-json";
 
@@ -25,10 +22,6 @@ type WireServerNotification = Exclude<
 
 export type RequestId = GeneratedRequestId;
 export type ApprovalPolicy = AskForApproval;
-export type SandboxPolicy = GeneratedSandboxPolicy;
-export type UserInput = GeneratedUserInput;
-
-export type InitializeParams = GeneratedInitializeParams;
 export type ThreadStartParams = GeneratedThreadStartParams;
 export type ThreadResumeParams = GeneratedThreadResumeParams;
 export type ThreadInjectItemsParams = GeneratedThreadInjectItemsParams;

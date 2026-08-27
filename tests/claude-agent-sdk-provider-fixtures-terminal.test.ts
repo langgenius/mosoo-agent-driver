@@ -6,7 +6,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
-import type { RunId } from "../src/protocol/id";
+import type { MessageId, RunId } from "../src/protocol/id";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
@@ -70,17 +70,17 @@ function readClaudeProviderFixtureCase(path: string): ClaudeProviderFixtureCase 
   };
 }
 
-function collectDriverIds(value: unknown, ids: Set<string>): void {
+function collectDriverIds(value: unknown, aliases: Map<string, string>): void {
   if (typeof value === "string") {
-    if (isDriverId(value)) {
-      ids.add(value);
+    if (isDriverId(value) && !aliases.has(value)) {
+      aliases.set(value, aliases.size === 0 ? "<driver-id>" : `<driver-id-${aliases.size + 1}>`);
     }
     return;
   }
 
   if (Array.isArray(value)) {
     for (const entry of value) {
-      collectDriverIds(entry, ids);
+      collectDriverIds(entry, aliases);
     }
     return;
   }
@@ -90,7 +90,7 @@ function collectDriverIds(value: unknown, ids: Set<string>): void {
   }
 
   for (const entry of Object.values(value)) {
-    collectDriverIds(entry, ids);
+    collectDriverIds(entry, aliases);
   }
 }
 
@@ -100,17 +100,17 @@ function isIsoTimestamp(value: string): boolean {
 
 function normalizeClaudeValue(
   value: unknown,
-  driverIds: ReadonlySet<string>,
+  driverIdAliases: ReadonlyMap<string, string>,
   fieldName?: string,
 ): unknown {
   if (typeof value === "string") {
-    for (const driverId of driverIds) {
+    for (const [driverId, alias] of driverIdAliases) {
       if (value === driverId) {
-        return "<driver-id>";
+        return alias;
       }
 
       if (value.startsWith(`${driverId}:`)) {
-        return value.replace(driverId, "<driver-id>");
+        return `${alias}${value.slice(driverId.length)}`;
       }
     }
 
@@ -122,7 +122,7 @@ function normalizeClaudeValue(
   }
 
   if (Array.isArray(value)) {
-    return value.map((entry) => normalizeClaudeValue(entry, driverIds));
+    return value.map((entry) => normalizeClaudeValue(entry, driverIdAliases));
   }
 
   if (!isRecord(value)) {
@@ -130,20 +130,20 @@ function normalizeClaudeValue(
   }
 
   const entries = Object.entries(value).flatMap(([key, entry]): [string, unknown][] =>
-    entry === undefined ? [] : [[key, normalizeClaudeValue(entry, driverIds, key)]],
+    entry === undefined ? [] : [[key, normalizeClaudeValue(entry, driverIdAliases, key)]],
   );
 
   return Object.fromEntries(entries);
 }
 
 function normalizeClaudeEvents(events: readonly DriverEventInput[]): unknown[] {
-  const driverIds = new Set<string>();
+  const driverIdAliases = new Map<string, string>();
 
   for (const event of events) {
-    collectDriverIds(event, driverIds);
+    collectDriverIds(event, driverIdAliases);
   }
 
-  return events.map((event) => normalizeClaudeValue(event, driverIds));
+  return events.map((event) => normalizeClaudeValue(event, driverIdAliases));
 }
 
 function createHarness() {
@@ -189,6 +189,41 @@ function createHarness() {
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
+  test("preserves Driver ID equivalence classes while normalizing fixtures", () => {
+    const firstMessageId = "01ARZ3NDEKTSV4RRFFQ69G5FAV" as MessageId;
+    const secondMessageId = "01ARZ3NDEKTSV4RRFFQ69G5FAW" as MessageId;
+
+    expect(
+      normalizeClaudeEvents([
+        {
+          kind: "message.started",
+          payload: { messageId: firstMessageId, role: "agent" },
+        },
+        {
+          kind: "thought.started",
+          payload: { channel: "summary", thoughtId: `${firstMessageId}:thought` },
+        },
+        {
+          kind: "message.started",
+          payload: { messageId: secondMessageId, role: "agent" },
+        },
+      ]),
+    ).toEqual([
+      {
+        kind: "message.started",
+        payload: { messageId: "<driver-id>", role: "agent" },
+      },
+      {
+        kind: "thought.started",
+        payload: { channel: "summary", thoughtId: "<driver-id>:thought" },
+      },
+      {
+        kind: "message.started",
+        payload: { messageId: "<driver-id-2>", role: "agent" },
+      },
+    ]);
+  });
+
   test("keeps chunked stream deltas and the complete assistant snapshot on one message", async () => {
     // Real SDK wire shape: every envelope (each stream chunk and the complete
     // assistant replay) carries a distinct uuid; only the API message id inside

@@ -180,15 +180,15 @@
     },
     {
       "kind": "message.started",
-      "payload": { "messageId": "<driver-id>", "role": "agent" },
-      "sourceEventId": "openai.message.started:<driver-id>"
+      "payload": { "messageId": "<driver-id-2>", "role": "agent" },
+      "sourceEventId": "openai.message.started:<driver-id-2>"
     },
     {
       "kind": "item.started",
       "payload": {
         "itemId": "agent-call-1",
         "itemType": "tool_call",
-        "parentMessageId": "<driver-id>",
+        "parentMessageId": "<driver-id-2>",
         "title": "Spawn agent"
       },
       "sourceEventId": "openai.item.started:turn-root:agent-call-1"
@@ -197,7 +197,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "kind": "tool",
-        "parentMessageId": "<driver-id>",
+        "parentMessageId": "<driver-id-2>",
         "status": "running",
         "title": "Spawn agent",
         "toolCallId": "agent-call-1"
@@ -239,14 +239,14 @@
       "kind": "message.added",
       "payload": {
         "content": "PARENT_OK: CHILD_A + CHILD_B",
-        "messageId": "<driver-id>",
+        "messageId": "<driver-id-2>",
         "role": "agent"
       },
       "sourceEventId": "openai.item.completed:turn-root:message-parent:0"
     },
     {
       "kind": "message.completed",
-      "payload": { "messageId": "<driver-id>", "role": "agent" },
+      "payload": { "messageId": "<driver-id-2>", "role": "agent" },
       "sourceEventId": "openai.item.completed:turn-root:message-parent:1"
     },
     {
@@ -262,7 +262,7 @@
         "turnId": "turn-root"
       },
       "payload": {
-        "finalMessageId": "<driver-id>",
+        "finalMessageId": "<driver-id-2>",
         "stopReason": "end_turn"
       },
       "runId": "<driver-id>",

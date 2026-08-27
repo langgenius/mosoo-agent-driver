@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { JsonObject, JsonValue } from "../../protocol/json";
@@ -117,33 +118,41 @@ function stringifyToml(object: Record<string, JsonValue>): string {
   return `${lines.join("\n")}\n`;
 }
 
-async function writeFileIfChanged(
-  path: string,
-  contents: string,
-  options?: { mode?: number },
-): Promise<boolean> {
+async function writeFileIfChanged(path: string, contents: string): Promise<boolean> {
   const existing = await readFile(path, "utf8").catch(() => null);
 
   if (existing === contents) {
-    if (options?.mode !== undefined) {
-      const fileStat = await stat(path);
-      const currentMode = fileStat.mode & 0o777;
-
-      if (currentMode !== options.mode) {
-        await chmod(path, options.mode);
-      }
-    }
-
     return false;
   }
 
-  await writeFile(path, contents, { encoding: "utf8" });
-
-  if (options?.mode !== undefined) {
-    await chmod(path, options.mode);
-  }
-
+  await writeFileAtomically(path, contents);
   return true;
+}
+
+async function writeFileAtomically(path: string, contents: string, mode = 0o666): Promise<void> {
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  let temporaryCreated = false;
+
+  try {
+    const temporary = await open(temporaryPath, "wx", mode);
+    temporaryCreated = true;
+    try {
+      await temporary.writeFile(contents, "utf8");
+      await temporary.sync();
+    } finally {
+      await temporary.close();
+    }
+    await rename(temporaryPath, path);
+    temporaryCreated = false;
+  } finally {
+    if (temporaryCreated) {
+      await unlink(temporaryPath).catch((error: unknown) => {
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+          throw error;
+        }
+      });
+    }
+  }
 }
 
 export async function materializeOpenAiApiKeyAuthState(
@@ -161,7 +170,7 @@ export async function materializeOpenAiApiKeyAuthState(
   }
 
   await mkdir(input.runtimeHome, { recursive: true });
-  const written = await writeFileIfChanged(
+  await writeFileAtomically(
     authJsonPath,
     `${JSON.stringify(
       {
@@ -173,13 +182,13 @@ export async function materializeOpenAiApiKeyAuthState(
       null,
       2,
     )}\n`,
-    { mode: 0o600 },
+    0o600,
   );
 
   return {
     authJsonPath,
     hasApiKey: true,
-    written,
+    written: true,
   };
 }
 

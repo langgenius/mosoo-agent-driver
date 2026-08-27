@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import type { CredentialId, McpServerId } from "../src/protocol/boot";
 import type { DriverStartInput } from "../src/protocol/start";
 import type { McpExecuteCommand } from "../src/runtime-command";
-import { executeRemoteHttpMcpCommand } from "../src/runtimes/mcp/remote-http-mcp-executor";
+import { prepareRemoteHttpMcpCommand } from "../src/runtimes/mcp/remote-http-mcp-executor";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
 const MCP_SERVER_ID = "01J00000000000000000000020" as McpServerId;
@@ -47,10 +47,16 @@ function command(requestId: string): McpExecuteCommand {
 }
 
 async function execute(proxyUrl: string, requestId: string, signal = new AbortController().signal) {
-  return executeRemoteHttpMcpCommand(payload(proxyUrl), command(requestId), signal, {
+  await using prepared = await prepareRemoteHttpMcpCommand(
+    payload(proxyUrl),
+    command(requestId),
+    signal,
+  );
+  const result = await prepared.execute({
     effectId: `effect-${requestId}`,
     idempotencyKey: `key-${requestId}`,
   });
+  return result;
 }
 
 test("classifies typed MCP HTTP failures by status", async () => {

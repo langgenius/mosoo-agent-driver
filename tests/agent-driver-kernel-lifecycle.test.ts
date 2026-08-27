@@ -48,17 +48,19 @@ describe("AgentDriverKernelCore", () => {
         },
         hostPorts: {
           mcp: {
-            execute: async (command) => {
-              calls += 1;
-              const result = {
-                debug: { nested: "original" },
-                outputText: `ran ${command.toolName}`,
-                requestId: command.requestId,
-                serverId: command.serverId,
-                toolName: command.toolName,
-              };
-              return result;
-            },
+            prepare: async (command) => ({
+              async execute() {
+                calls += 1;
+                return {
+                  debug: { nested: "original" },
+                  outputText: `ran ${command.toolName}`,
+                  requestId: command.requestId,
+                  serverId: command.serverId,
+                  toolName: command.toolName,
+                };
+              },
+              async [Symbol.asyncDispose]() {},
+            }),
           },
         },
       });
@@ -310,7 +312,7 @@ describe("AgentDriverKernelCore", () => {
       });
       await nextInputEntered.promise;
       releaseResolution.resolve();
-      await permission;
+      await expect(permission).resolves.toBe("reject_once");
       expect(resolutionRunId).toBe(DRIVER_TEST_IDS.runId);
       releaseNextInput.resolve();
       await expect(nextInput).resolves.toEqual({ requestId: "next-request" });
@@ -483,7 +485,7 @@ describe("AgentDriverKernelCore", () => {
     },
   );
 
-  test("serializes concurrent stop calls with an in-flight start", async () => {
+  test("joins concurrent stop calls with an in-flight start", async () => {
     const backend = createBackend();
     const startEntered = Promise.withResolvers<void>();
     const releaseStart = Promise.withResolvers<void>();

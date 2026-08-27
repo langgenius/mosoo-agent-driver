@@ -109,7 +109,7 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
       snapshot: async () => null,
     },
     mcp: {
-      execute: async () => {
+      prepare: async () => {
         throw new Error("Driver MCP host port is not configured.");
       },
     },

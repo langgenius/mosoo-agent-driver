@@ -10,15 +10,18 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
-import { createDriverId } from "../src/protocol/id";
-import type { EventId, RunId, SessionId } from "../src/protocol/id";
-import { toRuntimeEventInput } from "../src/runtime-events";
+import type { RunId } from "../src/protocol/id";
 import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
 import { limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
 import { toPermissionRequest } from "../src/runtimes/acp/acp-permission-events";
 import { toPromptStartEvents } from "../src/runtimes/acp/acp-session-events";
+import {
+  MAX_RUN_TERMINAL_BATCH_BYTES,
+  MAX_RUN_TERMINAL_BATCH_EVENTS,
+  preflightDriverEventPush,
+} from "../src/runtimes/driver-event-admission";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
-import { CMA_MAX_EVENT_BYTES, encodeCmaSseRecord } from "../src/stores/cma-store";
+import { CMA_MAX_EVENT_BYTES } from "../src/stores/cma-store";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import {
   DRIVER_TEST_IDS,
@@ -212,6 +215,13 @@ describe("ACP runtime event translation", () => {
       text: parseText("x".repeat(500_000)),
     });
     const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
+    let recordCount = 0;
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "message.added",
+      "run.dispatched",
+      "run.started",
+    ]);
 
     for (const event of events) {
       for (const { event: envelope } of toDriverEventEnvelopes(
@@ -219,11 +229,12 @@ describe("ACP runtime event translation", () => {
         event,
         DRIVER_TEST_IDS.runId,
       )) {
-        await expect(
-          store.appendDriverEvent(DRIVER_TEST_IDS.sessionId, envelope),
-        ).resolves.toBeArray();
+        const records = await store.appendDriverEvent(DRIVER_TEST_IDS.sessionId, envelope);
+        expect(records).toBeArray();
+        recordCount += records.length;
       }
     }
+    expect(recordCount).toBeGreaterThan(0);
   });
 
   test("normalizes official ACP empty chunks and tool titles before canonical ingress", () => {
@@ -380,67 +391,135 @@ describe("ACP runtime event translation", () => {
     ).toMatchObject({ content: finalText });
   });
 
-  test("materializes oversized final text as bounded lossless CMA events", async () => {
+  test("evicts bounded settled assistant IDs without suppressing the oldest message", () => {
     const state = new AcpAssistantTranscriptState();
-    const runId = createDriverId() as RunId;
-    const sessionId = createDriverId() as SessionId;
-    const text = `开始😀${'"\n\\'.repeat(400_000)}结束`;
+    state.begin({ messageId: "message-1", runId: RUN_ID });
 
-    state.begin({ messageId: createDriverId(), runId });
-    const streamed = state.translateUpdate({
+    const first = state.translateUpdate({
       update: {
-        content: { text, type: "text" },
-        messageId: "native-final",
+        content: { text: "chunk-0", type: "text" },
+        messageId: "native-0",
         sessionUpdate: "agent_message_chunk",
       },
     });
-    const terminal = state.completePrompt("end_turn", null);
-    const snapshots = terminal.filter(
-      (event) => event.kind === "message.added" || event.kind === "message.delta",
+    const firstRuntimeMessageId = eventPayloadString(
+      requireEvent(first, "message.started"),
+      "messageId",
     );
-    const store = createCmaMemoryStore({ sessions: [{ id: sessionId }] });
-    const records = [];
 
-    expect(Buffer.byteLength(JSON.stringify(streamed.at(-1)), "utf8")).toBeGreaterThan(
-      CMA_MAX_EVENT_BYTES,
-    );
-    expect(snapshots.length).toBeGreaterThan(1);
-    expect(snapshots.every((event) => event.delivery === "lossless")).toBe(true);
-
-    for (const event of terminal) {
-      const [envelope] = toRuntimeEventInput(
-        {
-          createId: () => createDriverId() as EventId,
-          occurredAt: "2026-08-13T00:00:00.000Z",
-          runId,
-          sessionId,
+    for (let index = 1; index < 1_026; index += 1) {
+      state.translateUpdate({
+        update: {
+          content: { text: `chunk-${index}`, type: "text" },
+          messageId: `native-${index}`,
+          sessionUpdate: "agent_message_chunk",
         },
-        event,
-      );
-      records.push(...(await store.appendDriverEvent(sessionId, envelope!)));
+      });
     }
 
-    expect(
-      records.every((record) => encodeCmaSseRecord(record).byteLength < CMA_MAX_EVENT_BYTES),
-    ).toBe(true);
-    expect(
-      records
-        .flatMap(({ event }) => {
-          if (
-            !("sourceEventKind" in event) ||
-            !["message.added", "message.delta"].includes(event.sourceEventKind) ||
-            typeof event.message !== "object" ||
-            event.message === null
-          ) {
-            return [];
-          }
+    const replayAfterEviction = state.translateUpdate({
+      update: {
+        content: { text: "oldest accepted again", type: "text" },
+        messageId: "native-0",
+        sessionUpdate: "agent_message_chunk",
+      },
+    });
 
-          const message = event.message as Record<string, unknown>;
-          return [String(message["content"] ?? message["contentDelta"] ?? "")];
-        })
-        .join(""),
-    ).toBe(text);
-    expect(requireEvent(terminal, "run.completed").payload).not.toHaveProperty("finalMessageText");
+    expect(eventKinds(replayAfterEviction)).toEqual([
+      "message.added",
+      "message.completed",
+      "message.started",
+      "message.delta",
+    ]);
+    expect(
+      eventPayloadString(requireEvent(replayAfterEviction, "message.started"), "messageId"),
+    ).not.toBe(firstRuntimeMessageId);
+    expect(
+      eventPayloadString(requireEvent(replayAfterEviction, "message.delta"), "contentDelta"),
+    ).toBe("oldest accepted again");
+  });
+
+  test("keeps the maximum admitted assistant text inside the shared terminal budget", () => {
+    const state = new AcpAssistantTranscriptState();
+    const content = "x".repeat(8 * 1_024);
+
+    state.begin({ messageId: "message-1", runId: RUN_ID });
+    for (let index = 0; index < 47; index += 1) {
+      state.translateUpdate({
+        update: {
+          content: { text: content, type: "text" },
+          messageId: "native-final",
+          sessionUpdate: "agent_message_chunk",
+        },
+      });
+    }
+    const terminal = state.completePrompt("end_turn", null);
+
+    expect(() => preflightDriverEventPush(terminal, RUN_ID)).not.toThrow();
+    expect(Buffer.byteLength(JSON.stringify(terminal), "utf8")).toBeLessThan(
+      MAX_RUN_TERMINAL_BATCH_BYTES,
+    );
+  });
+
+  test("keeps the maximum retained item closures inside the shared terminal budget", () => {
+    const state = new AcpAssistantTranscriptState();
+    state.begin({ messageId: "message-1", runId: RUN_ID });
+
+    for (let index = 0; index < 509; index += 1) {
+      state.translateUpdate({
+        sessionId: "native-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          status: "running",
+          title: "tool",
+          toolCallId: `tool-${index}-${"x".repeat(642)}`,
+        },
+      });
+    }
+    state.translateUpdate({
+      update: {
+        content: { text: "final", type: "text" },
+        messageId: "native-final",
+        sessionUpdate: "agent_thought_chunk",
+      },
+    });
+    const terminal = state.completePrompt("end_turn", { totalTokens: 1 });
+
+    expect(terminal).toHaveLength(MAX_RUN_TERMINAL_BATCH_EVENTS);
+    expect(() => preflightDriverEventPush(terminal, RUN_ID)).not.toThrow();
+  });
+
+  test("keeps prompt usage extensions out of the lossless terminal budget", () => {
+    const state = new AcpAssistantTranscriptState();
+    const fallbackToolId = "request-".repeat(40_000);
+    state.begin({ messageId: "message-1", runId: RUN_ID });
+    state.translatePermission({
+      params: {
+        options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+        toolCall: { status: "in_progress" },
+      },
+      requestId: fallbackToolId,
+    });
+
+    const terminal = state.completePrompt("end_turn", {
+      _meta: { padding: "x".repeat(410_000) },
+      inputTokens: 1,
+      outputTokens: 1,
+      totalTokens: 2,
+    });
+    const usage = eventPayload(requireEvent(terminal, "usage.updated"));
+
+    expect(usage).toEqual({
+      inputTokens: 1,
+      outputTokens: 1,
+      source: "prompt_response",
+      totalTokens: 2,
+      usageContract: "anthropic_bucketed",
+    });
+    expect(() => preflightDriverEventPush(terminal, RUN_ID)).not.toThrow();
+    expect(Buffer.byteLength(JSON.stringify(terminal), "utf8")).toBeLessThan(
+      MAX_RUN_TERMINAL_BATCH_BYTES,
+    );
   });
 
   test("uses a later identified final after anonymous progress, but fails closed for an anonymous final", () => {
@@ -662,13 +741,13 @@ describe("ACP runtime event translation", () => {
     expect(() =>
       state.translateUpdate({
         update: {
-          rawOutput: "x".repeat(600_000),
+          rawOutput: "x".repeat(400_000),
           sessionUpdate: "tool_call_update",
-          status: "completed",
+          status: "in_progress",
           toolCallId: "tool-1",
         },
       }),
-    ).toThrow("ACP tool update exceeds 524288 UTF-8 bytes");
+    ).toThrow("ACP turn state exceeds 393216 retained UTF-8 bytes");
 
     const events = state.translateUpdate({
       update: {
@@ -695,14 +774,14 @@ describe("ACP runtime event translation", () => {
         params: {
           options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
           toolCall: {
-            rawInput: "x".repeat(600_000),
+            rawInput: "x".repeat(400_000),
             status: "in_progress",
             toolCallId: "tool-1",
           },
         },
         requestId: "request-1",
       }),
-    ).toThrow("ACP tool update exceeds 524288 UTF-8 bytes");
+    ).toThrow("ACP turn state exceeds 393216 retained UTF-8 bytes");
 
     expect(
       state
@@ -710,6 +789,33 @@ describe("ACP runtime event translation", () => {
           params: {
             options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
             toolCall: { status: "in_progress", toolCallId: "tool-1" },
+          },
+          requestId: "request-1",
+        })
+        .events.map((event) => event.kind),
+    ).toEqual(["message.started", "item.started", "tool.call.updated"]);
+  });
+
+  test("accounts for a permission request ID retained as the fallback tool ID", () => {
+    const state = new AcpAssistantTranscriptState();
+    state.begin({ messageId: "message-1", runId: RUN_ID });
+
+    expect(() =>
+      state.translatePermission({
+        params: {
+          options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+          toolCall: { status: "in_progress", title: "Run command" },
+        },
+        requestId: "r".repeat(400_000),
+      }),
+    ).toThrow("ACP turn state exceeds 393216 retained UTF-8 bytes");
+
+    expect(
+      state
+        .translatePermission({
+          params: {
+            options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+            toolCall: { status: "in_progress", title: "Run command" },
           },
           requestId: "request-1",
         })
@@ -849,6 +955,37 @@ describe("ACP runtime event translation", () => {
       ).toEqual([]);
     },
   );
+
+  test("evicts completed replay history only after projecting its late update", () => {
+    const state = new AcpAssistantTranscriptState();
+    state.begin({ messageId: "message-1", runId: RUN_ID });
+
+    for (const toolCallId of ["tool-0", "tool-1"]) {
+      state.translateUpdate({
+        update: {
+          rawInput: "x".repeat(200_000),
+          sessionUpdate: "tool_call",
+          status: "completed",
+          toolCallId,
+        },
+      });
+    }
+
+    const events = state.translateUpdate({
+      update: {
+        rawOutput: "y".repeat(200_000),
+        sessionUpdate: "tool_call_update",
+        status: "running",
+        toolCallId: "tool-0",
+      },
+    });
+
+    expect(eventKinds(events)).toEqual(["tool.call.updated"]);
+    expect(eventPayload(events[0]!)).toMatchObject({
+      status: "completed",
+      toolCallId: "tool-0",
+    });
+  });
 
   test.each([
     ["completed", "running", "without content"],

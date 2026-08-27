@@ -40,6 +40,7 @@ interface DriverCommandDispatcherOptions {
 const COMMAND_POLL_INTERVAL_MS = 250;
 export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
 const ACTIVE_INPUT_SETTLE_GRACE_MS = ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS;
+const EXTERNAL_TOOL_EFFECT_COMPLETE_ATTEMPTS = 2;
 const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
@@ -567,8 +568,8 @@ export class DriverCommandDispatcher {
     command: Extract<RuntimeCommand, { kind: "mcp.execute" }>,
     controller: AbortController,
   ): Promise<void> {
-    let effectClaimed = false;
-    let effectCompleted = false;
+    let effectMayBeClaimed = false;
+    let durableResult: McpExecuteCommandResult | null = null;
     const effectLedger = runtimeContext.ports.eventSink;
 
     if (
@@ -592,42 +593,55 @@ export class DriverCommandDispatcher {
           },
         },
       ]);
-      const effect = await effectLedger.claimExternalToolEffect(
+      controller.signal.throwIfAborted();
+      await using prepared = await runtimeContext.ports.mcp.prepare(command, controller.signal);
+      controller.signal.throwIfAborted();
+      const pendingClaim = effectLedger.claimExternalToolEffect(
         { commandId: command.commandId },
         controller.signal,
       );
-      if (effect.kind === "unknown") {
-        throw new ExternalToolEffectResolutionRequiredError(command, effect.effectId);
+      effectMayBeClaimed = true;
+      const claim = await pendingClaim;
+      if (claim.kind === "unknown") {
+        effectMayBeClaimed = false;
+        throw new ExternalToolEffectResolutionRequiredError(command, claim.effectId);
       }
 
       let result: McpExecuteCommandResult;
-
-      if (effect.kind === "completed") {
-        result = effect.result;
+      if (claim.kind === "completed") {
+        effectMayBeClaimed = false;
+        result = claim.result;
+        durableResult = result;
       } else {
-        effectClaimed = true;
         runtimeContext.logger.info("driver.runtime.mcp.execute.started", {
-          effectAttempt: effect.attempt,
+          effectAttempt: claim.attempt,
           serverId: command.serverId,
           toolName: command.toolName,
         });
-        const execution = await runtimeContext.ports.mcp.execute(
-          command,
-          controller.signal,
-          effect,
-        );
+        const execution = await prepared.execute(claim);
         const { providerReceiptJson, ...executionResult } = execution;
         result = executionResult;
-        controller.signal.throwIfAborted();
-        await effectLedger.completeExternalToolEffect(
-          {
-            commandId: command.commandId,
-            ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
-            result,
-          },
-          controller.signal,
-        );
-        effectCompleted = true;
+        let completionFailure: { error: unknown } | null = null;
+        for (let attempt = 0; attempt < EXTERNAL_TOOL_EFFECT_COMPLETE_ATTEMPTS; attempt += 1) {
+          try {
+            await effectLedger.completeExternalToolEffect(
+              {
+                commandId: command.commandId,
+                ...(providerReceiptJson === undefined ? {} : { providerReceiptJson }),
+                result,
+              },
+              AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS),
+            );
+            durableResult = result;
+            completionFailure = null;
+            break;
+          } catch (error) {
+            completionFailure = { error };
+          }
+        }
+        if (completionFailure !== null) {
+          throw completionFailure.error;
+        }
       }
 
       await pushLosslessEvents(socket, [
@@ -653,8 +667,18 @@ export class DriverCommandDispatcher {
         toolName: command.toolName,
       });
     } catch (error) {
-      if (effectClaimed && !effectCompleted) {
+      if (effectMayBeClaimed && durableResult === null) {
         await this.#markExternalToolEffectUnknown(effectLedger, command.commandId);
+      }
+
+      if (durableResult !== null) {
+        if (!this.#commandDelivery.hasTerminal(command.commandId)) {
+          await this.#commandDelivery.finish(runtimeContext, command, {
+            result: durableResult,
+            status: "completed",
+          });
+        }
+        throw error;
       }
 
       if (this.#commandDelivery.hasTerminal(command.commandId)) {
@@ -700,10 +724,7 @@ export class DriverCommandDispatcher {
       throw new Error("Driver external tool effect ledger is not configured.");
     }
 
-    const signal = AbortSignal.any([
-      this.#shutdownSignal,
-      AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS),
-    ]);
+    const signal = AbortSignal.timeout(EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS);
     await markUnknown.call(effectLedger, { commandId }, signal);
   }
 
@@ -772,10 +793,28 @@ export class DriverCommandDispatcher {
     cancellation: AbortController,
     runId: RunId,
   ): Promise<void> {
+    let terminalSelectedAtCancellation: "cancelled" | "completed" | "failed" | null = null;
+    const captureTerminalSelection = () => {
+      terminalSelectedAtCancellation =
+        socket.selectedRunEventTerminal?.(runId) ?? socket.runEventTerminal?.(runId) ?? null;
+    };
+    cancellation.signal.addEventListener("abort", captureTerminalSelection, { once: true });
+    if (cancellation.signal.aborted) {
+      captureTerminalSelection();
+    }
+
     try {
       cancellation.signal.throwIfAborted();
       await this.#backend.handleInput(runtimeContext, command.input, runId, cancellation.signal);
-      cancellation.signal.throwIfAborted();
+      if (cancellation.signal.aborted) {
+        const deliveredTerminal = socket.runEventTerminal?.(runId) ?? null;
+        if (
+          terminalSelectedAtCancellation === null ||
+          deliveredTerminal !== terminalSelectedAtCancellation
+        ) {
+          cancellation.signal.throwIfAborted();
+        }
+      }
       await this.#commandDelivery.finish(runtimeContext, command, {
         result: {
           requestId: command.requestId,
@@ -837,6 +876,8 @@ export class DriverCommandDispatcher {
       this.#rememberRunFailure(commandFailure);
       await this.#shutdown(socket, commandFailure.code);
       this.#shutdownCompleted = true;
+    } finally {
+      cancellation.signal.removeEventListener("abort", captureTerminalSelection);
     }
   }
 

@@ -1,9 +1,13 @@
 import type { StopReason } from "@agentclientprotocol/sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
+import { createDriverId } from "../../protocol/id";
 import type { RunId } from "../../protocol/id";
+import {
+  MAX_RUN_TERMINAL_BATCH_BYTES,
+  MAX_RUN_TERMINAL_BATCH_EVENTS,
+} from "../driver-event-admission";
 import { chunkJsonText } from "../provider-json";
-import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 import { toPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
 import {
@@ -28,10 +32,26 @@ import {
 import type { JsonObject } from "./acp-types";
 
 const MAX_ACP_MESSAGE_EVENT_TEXT_BYTES = MAX_ACP_LOSSLESS_EVENT_BYTES - 1_024;
+// An open item can require two terminal closures. Reserve four shared-batch
+// slots for message/thought/final envelopes. A retained byte (notably a tool
+// ID) can occur in both closures, so reserve one quarter of the byte budget for
+// envelopes and admit half of the remaining three quarters. Measuring current
+// retained state makes replay/no-op traffic free while keeping every possible
+// ACP settlement below the shared 1024-event / 1 MiB hard limit.
+const MAX_ACP_RETAINED_TURN_BYTES = (MAX_RUN_TERMINAL_BATCH_BYTES * 3) / 8;
+const MAX_ACP_RETAINED_TURN_ITEMS = Math.floor((MAX_RUN_TERMINAL_BATCH_EVENTS - 4) / 2);
+// Settled native IDs are only a replay-suppression cache. Bound and evict them
+// independently; they cannot produce terminal closures.
+const MAX_ACP_SETTLED_MESSAGE_HISTORY_BYTES = MAX_ACP_LOSSLESS_EVENT_BYTES;
+const MAX_ACP_SETTLED_MESSAGE_HISTORY_ITEMS = 1_024;
 
 export interface AcpAssistantTranscriptStateInput {
   readonly messageId: string;
   readonly runId: RunId;
+}
+
+export class AcpTurnStateLimitError extends RangeError {
+  override readonly name = "AcpTurnStateLimitError";
 }
 
 interface AcpAssistantMessageState {
@@ -47,13 +67,13 @@ interface AcpAssistantMessageStart {
 
 export class AcpAssistantTranscriptState {
   #activeAssistantMessage: AcpAssistantMessageState | null = null;
-  readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
-  #lastCompletedAssistantMessage: Pick<AcpAssistantMessageState, "id" | "text"> | null = null;
+  #lastCompletedAssistantMessage: { readonly hasVisibleText: boolean; readonly id: string } | null =
+    null;
   #promptMessageId: string | null = null;
   #runId: RunId | null = null;
   #sequence = 0;
   readonly #settledAssistantNativeMessageIds = new Set<string>();
-  #unidentifiedAssistantMessageSequence = 0;
+  #settledAssistantNativeMessageIdBytes = 0;
   #thoughtCompleted = false;
   #thoughtFallbackText = "";
   #thoughtFallbackNativeMessageId: string | null = null;
@@ -67,13 +87,12 @@ export class AcpAssistantTranscriptState {
 
   begin(input: AcpAssistantTranscriptStateInput): void {
     this.#activeAssistantMessage = null;
-    this.#assistantMessageIds.reset();
     this.#lastCompletedAssistantMessage = null;
     this.#promptMessageId = input.messageId;
     this.#runId = input.runId;
     this.#sequence = 0;
     this.#settledAssistantNativeMessageIds.clear();
-    this.#unidentifiedAssistantMessageSequence = 0;
+    this.#settledAssistantNativeMessageIdBytes = 0;
     this.#thoughtCompleted = false;
     this.#thoughtFallbackText = "";
     this.#thoughtFallbackNativeMessageId = null;
@@ -84,13 +103,12 @@ export class AcpAssistantTranscriptState {
 
   clear(): void {
     this.#activeAssistantMessage = null;
-    this.#assistantMessageIds.reset();
     this.#lastCompletedAssistantMessage = null;
     this.#promptMessageId = null;
     this.#runId = null;
     this.#sequence = 0;
     this.#settledAssistantNativeMessageIds.clear();
-    this.#unidentifiedAssistantMessageSequence = 0;
+    this.#settledAssistantNativeMessageIdBytes = 0;
     this.#thoughtCompleted = false;
     this.#thoughtFallbackText = "";
     this.#thoughtFallbackNativeMessageId = null;
@@ -108,11 +126,11 @@ export class AcpAssistantTranscriptState {
         : { ...this.#lastCompletedAssistantMessage };
     const sequence = this.#sequence;
     const settledAssistantNativeMessageIds = new Set(this.#settledAssistantNativeMessageIds);
+    const settledAssistantNativeMessageIdBytes = this.#settledAssistantNativeMessageIdBytes;
     const thoughtCompleted = this.#thoughtCompleted;
     const thoughtFallbackNativeMessageId = this.#thoughtFallbackNativeMessageId;
     const thoughtFallbackText = this.#thoughtFallbackText;
     const thoughtStarted = this.#thoughtStarted;
-    const unidentifiedAssistantMessageSequence = this.#unidentifiedAssistantMessageSequence;
     const restoreTools = this.#tools.checkpoint();
 
     return () => {
@@ -123,11 +141,11 @@ export class AcpAssistantTranscriptState {
       settledAssistantNativeMessageIds.forEach((id) =>
         this.#settledAssistantNativeMessageIds.add(id),
       );
+      this.#settledAssistantNativeMessageIdBytes = settledAssistantNativeMessageIdBytes;
       this.#thoughtCompleted = thoughtCompleted;
       this.#thoughtFallbackNativeMessageId = thoughtFallbackNativeMessageId;
       this.#thoughtFallbackText = thoughtFallbackText;
       this.#thoughtStarted = thoughtStarted;
-      this.#unidentifiedAssistantMessageSequence = unidentifiedAssistantMessageSequence;
       restoreTools();
     };
   }
@@ -188,7 +206,7 @@ export class AcpAssistantTranscriptState {
     const finalMessage = this.#lastCompletedAssistantMessage;
     const emptyTurn =
       stopReason === "end_turn" &&
-      (finalMessage === null || finalMessage.text.trim().length === 0) &&
+      (finalMessage === null || !finalMessage.hasVisibleText) &&
       !this.#tools.hasActivity();
 
     if (stopReason === "cancelled") {
@@ -277,7 +295,6 @@ export class AcpAssistantTranscriptState {
 
     events.push(
       ...this.#tools.completeOpen({
-        error: message,
         runId,
         status: "failed",
       }),
@@ -303,98 +320,114 @@ export class AcpAssistantTranscriptState {
     const record = isRecord(params) ? params : {};
     const update = readRecord(record, "update");
     const sessionUpdate = readString(update, "sessionUpdate");
+    const retainsTurnState =
+      this.#runId !== null &&
+      (sessionUpdate === "agent_message_chunk" ||
+        sessionUpdate === "agent_thought_chunk" ||
+        sessionUpdate === "tool_call" ||
+        sessionUpdate === "tool_call_update");
+    const restore = retainsTurnState ? this.checkpoint() : null;
 
-    let events: DriverEventInput[];
+    try {
+      let events: DriverEventInput[];
 
-    switch (sessionUpdate) {
-      case "agent_message_chunk": {
-        events = this.#messageChunk(update);
-        break;
-      }
-      case "agent_thought_chunk": {
-        events = this.#thoughtChunk(update);
-        break;
-      }
-      case "available_commands_update": {
-        events = toCommandEvents(update);
-        break;
-      }
-      case "config_option_update": {
-        events = toConfigEvents(update);
-        break;
-      }
-      case "current_mode_update": {
-        events = toModeEvents(update);
-        break;
-      }
-      case "plan": {
-        events = toPlanEvents(update);
-        break;
-      }
-      case "session_info_update": {
-        events = toInfoEvents(update);
-        break;
-      }
-      case "tool_call":
-      case "tool_call_update": {
-        events = this.#tool(update, sessionUpdate);
-        break;
-      }
-      case "usage_update": {
-        events = toUsageEvents(update);
-        break;
-      }
-      case "user_message_chunk":
-      case undefined:
-      case null: {
-        events = [];
-        break;
-      }
-      default: {
-        events = [
-          {
-            delivery: "best_effort",
-            kind: "diagnostic.reported",
-            payload: {
-              message: `Unsupported ACP session update: ${sessionUpdate}.`,
-              raw: update,
-              severity: "info",
+      switch (sessionUpdate) {
+        case "agent_message_chunk": {
+          events = this.#messageChunk(update);
+          break;
+        }
+        case "agent_thought_chunk": {
+          events = this.#thoughtChunk(update);
+          break;
+        }
+        case "available_commands_update": {
+          events = toCommandEvents(update);
+          break;
+        }
+        case "config_option_update": {
+          events = toConfigEvents(update);
+          break;
+        }
+        case "current_mode_update": {
+          events = toModeEvents(update);
+          break;
+        }
+        case "plan": {
+          events = toPlanEvents(update);
+          break;
+        }
+        case "session_info_update": {
+          events = toInfoEvents(update);
+          break;
+        }
+        case "tool_call":
+        case "tool_call_update": {
+          events = this.#tool(update, sessionUpdate);
+          break;
+        }
+        case "usage_update": {
+          events = toUsageEvents(update);
+          break;
+        }
+        case "user_message_chunk":
+        case undefined:
+        case null: {
+          events = [];
+          break;
+        }
+        default: {
+          events = [
+            {
+              delivery: "best_effort",
+              kind: "diagnostic.reported",
+              payload: {
+                message: `Unsupported ACP session update: ${sessionUpdate}.`,
+                raw: update,
+                severity: "info",
+              },
+              visibility: "owner_debug",
             },
-            visibility: "owner_debug",
-          },
-        ];
-        break;
+          ];
+          break;
+        }
       }
-    }
 
-    return assertBoundedLosslessEvents(events);
+      if (retainsTurnState) {
+        this.#assertRetainedTurnState();
+      }
+      return assertBoundedLosslessEvents(events);
+    } catch (error) {
+      restore?.();
+      throw error;
+    }
   }
 
   translatePermission(input: { params: unknown; requestId: string }): AcpPermissionTranslation {
     const runId = this.activeRunId();
-    const translation = toPermissionRequest({
-      params: input.params,
-      requestId: input.requestId,
-      runId,
-    });
+    const restore = runId === null ? null : this.checkpoint();
 
-    if (runId === null || translation.toolCall === null) {
-      return {
-        ...translation,
-        events: assertBoundedLosslessEvents(translation.events),
-      };
-    }
+    try {
+      const translation = toPermissionRequest({
+        params: input.params,
+        requestId: input.requestId,
+        runId,
+      });
 
-    this.#tools.patch({
-      status: toRuntimeToolStatus(readString(translation.toolCall, "status")),
-      toolCallId: translation.targetItemId,
-      update: translation.toolCall,
-    });
+      if (runId === null || translation.toolCall === null) {
+        return {
+          ...translation,
+          events: assertBoundedLosslessEvents(translation.events),
+        };
+      }
 
-    return {
-      ...translation,
-      events: assertBoundedLosslessEvents([
-        ...this.#ensureToolParentMessage(translation.targetItemId),
+      const parentStart = this.#ensureToolParentMessage(translation.targetItemId);
+      this.#tools.patch({
+        status: toRuntimeToolStatus(readString(translation.toolCall, "status")),
+        toolCallId: translation.targetItemId,
+        update: translation.toolCall,
+      });
+      const events = [
+        ...parentStart,
         ...this.#tools.ensureStarted({
           parentMessageId: this.#toolParentMessageId(),
           runId,
@@ -402,8 +435,17 @@ export class AcpAssistantTranscriptState {
           toolCallId: translation.targetItemId,
         }),
         ...translation.events,
-      ]),
-    };
+      ];
+      this.#assertRetainedTurnState();
+
+      return {
+        ...translation,
+        events: assertBoundedLosslessEvents(events),
+      };
+    } catch (error) {
+      restore?.();
+      throw error;
+    }
   }
 
   #nextEventId(kind: string): string {
@@ -601,10 +643,10 @@ export class AcpAssistantTranscriptState {
     this.#activeAssistantMessage = null;
 
     if (message.nativeMessageId !== null) {
-      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+      this.#rememberSettledAssistantMessage(message.nativeMessageId);
       this.#lastCompletedAssistantMessage = {
+        hasVisibleText: message.text.trim().length > 0,
         id: message.id,
-        text: message.text,
       };
     } else {
       // ACP v1 does not give anonymous chunks a stable message boundary. If
@@ -665,7 +707,7 @@ export class AcpAssistantTranscriptState {
     this.#lastCompletedAssistantMessage = null;
 
     if (message.nativeMessageId !== null) {
-      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+      this.#rememberSettledAssistantMessage(message.nativeMessageId);
     }
 
     if (stopReason === "cancelled") {
@@ -711,7 +753,7 @@ export class AcpAssistantTranscriptState {
     this.#lastCompletedAssistantMessage = null;
 
     if (message.nativeMessageId !== null) {
-      this.#settledAssistantNativeMessageIds.add(message.nativeMessageId);
+      this.#rememberSettledAssistantMessage(message.nativeMessageId);
     }
 
     return [
@@ -744,7 +786,7 @@ export class AcpAssistantTranscriptState {
 
     const events = this.#finishMessage();
     const message: AcpAssistantMessageState = {
-      id: this.#assistantMessageIds.getOrCreate(`native:${nativeMessageId}`),
+      id: createDriverId(),
       nativeMessageId,
       text: "",
     };
@@ -770,11 +812,8 @@ export class AcpAssistantTranscriptState {
     }
 
     const events = this.#finishMessage();
-    this.#unidentifiedAssistantMessageSequence += 1;
     const message: AcpAssistantMessageState = {
-      id: this.#assistantMessageIds.getOrCreate(
-        `fallback:unidentified:${this.#unidentifiedAssistantMessageSequence}`,
-      ),
+      id: createDriverId(),
       nativeMessageId: null,
       text: "",
     };
@@ -828,6 +867,66 @@ export class AcpAssistantTranscriptState {
 
   #toolParentMessageId(): string | undefined {
     return this.#activeAssistantMessage?.id ?? this.#promptMessageId ?? undefined;
+  }
+
+  #assertRetainedTurnState(): void {
+    this.#tools.compactHistory();
+    const assistantItems =
+      (this.#activeAssistantMessage === null ? 0 : 1) +
+      (this.#thoughtFallbackNativeMessageId === null ? 0 : 1);
+    const itemCount = assistantItems + this.#tools.openItemCount();
+
+    if (itemCount > MAX_ACP_RETAINED_TURN_ITEMS) {
+      throw new AcpTurnStateLimitError(
+        `ACP turn state exceeds ${MAX_ACP_RETAINED_TURN_ITEMS} retained open items.`,
+      );
+    }
+
+    const retainedState = {
+      activeAssistantMessage: this.#activeAssistantMessage,
+      thoughtFallback:
+        this.#thoughtFallbackNativeMessageId === null
+          ? null
+          : {
+              nativeMessageId: this.#thoughtFallbackNativeMessageId,
+              text: this.#thoughtFallbackText,
+            },
+      tools: this.#tools.retainedOpenState(),
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(retainedState), "utf8");
+
+    if (bytes > MAX_ACP_RETAINED_TURN_BYTES) {
+      throw new AcpTurnStateLimitError(
+        `ACP turn state exceeds ${MAX_ACP_RETAINED_TURN_BYTES} retained UTF-8 bytes.`,
+      );
+    }
+  }
+
+  #rememberSettledAssistantMessage(nativeMessageId: string): void {
+    if (this.#settledAssistantNativeMessageIds.has(nativeMessageId)) {
+      return;
+    }
+
+    this.#settledAssistantNativeMessageIds.add(nativeMessageId);
+    this.#settledAssistantNativeMessageIdBytes += Buffer.byteLength(
+      JSON.stringify(nativeMessageId),
+      "utf8",
+    );
+
+    while (
+      this.#settledAssistantNativeMessageIds.size > MAX_ACP_SETTLED_MESSAGE_HISTORY_ITEMS ||
+      this.#settledAssistantNativeMessageIdBytes > MAX_ACP_SETTLED_MESSAGE_HISTORY_BYTES
+    ) {
+      const oldest = this.#settledAssistantNativeMessageIds.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#settledAssistantNativeMessageIds.delete(oldest);
+      this.#settledAssistantNativeMessageIdBytes -= Buffer.byteLength(
+        JSON.stringify(oldest),
+        "utf8",
+      );
+    }
   }
 
   // Tool calls must be parented to an assistant message: the session event

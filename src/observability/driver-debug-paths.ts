@@ -101,7 +101,6 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
   const { context } = session;
 
   return {
-    driverControlPort: payload.driverControlPort,
     driverInstanceId: payload.driverInstanceId,
     execution: {
       additionalDirectories: summarizePathCollection(session.additionalDirectories, {
@@ -126,9 +125,8 @@ export function summarizeDriverBootPayload(payload: DriverBootPayload): Record<s
       skillCatalogCount: payload.execution.skillCatalog.length,
       skillCount: payload.execution.skills.length,
     },
-    heartbeatIntervalMs: payload.heartbeatIntervalMs,
     protocolVersion: payload.protocolVersion,
     runtime: payload.runtime,
-    sandboxId: payload.sandboxId,
+    sandboxId: context.sandboxId,
   };
 }

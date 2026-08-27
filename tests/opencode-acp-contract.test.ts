@@ -22,7 +22,7 @@ import {
 import { limitAcpInput } from "../src/runtimes/acp/acp-input-limit";
 import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
 import { createBufferedSinkLogger } from "../src/observability";
-import { exposeNativeSkillAliases } from "../src/runtimes/skill-materialization";
+import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
 import type { DriverStartInput } from "../src/protocol/start";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
@@ -234,15 +234,20 @@ Check the diff.`,
   });
 
   try {
-    await exposeNativeSkillAliases(execution, logger, [
-      {
-        mountPath,
-        skillId: "skill-1",
-        skillMarkdownPath,
-        skillName: "review",
-        snapshotId: "snapshot-1",
-      },
-    ]);
+    await exposeNativeSkillAliases(
+      execution,
+      logger,
+      [
+        {
+          mountPath,
+          skillId: "skill-1",
+          skillMarkdownPath,
+          skillName: "review",
+          snapshotId: "snapshot-1",
+        },
+      ],
+      new AbortController().signal,
+    );
 
     const expectedSkillPath = join(await realpath(root), ".agents", "skills", "review", "SKILL.md");
     expect(discoverOpenCodeSkills(root, homePath)).toContainEqual(
@@ -252,7 +257,7 @@ Check the diff.`,
       }),
     );
 
-    await exposeNativeSkillAliases(execution, logger, []);
+    await exposeNativeSkillAliases(execution, logger, [], new AbortController().signal);
 
     expect(discoverOpenCodeSkills(root, homePath).some((skill) => skill.name === "review")).toBe(
       false,

@@ -1,4 +1,4 @@
-import { jsonValueSchema, timestampSchema } from "../../contract/common";
+import { timestampSchema } from "../../contract/common";
 import type { DriverId } from "../id";
 import { parseDriverId } from "../id";
 import type {
@@ -90,15 +90,9 @@ export function hasRunStartedAt(record: RuntimeEventRecord): boolean {
 }
 
 export function omitPayloadIdentity(payload: RuntimeEventRecord): RuntimeEventRecord {
-  const result: RuntimeEventRecord = {};
-
-  for (const [key, value] of Object.entries(payload)) {
-    if (!payloadIdentityFields.has(key)) {
-      result[key] = value;
-    }
-  }
-
-  return result;
+  return Object.fromEntries(
+    Object.entries(payload).filter(([key]) => !payloadIdentityFields.has(key)),
+  );
 }
 
 export function requirePayloadRecord(
@@ -183,20 +177,6 @@ export function requireOptionalBoolean(
 
   if (typeof value[field] !== "boolean") {
     throw new Error(`${label} ${field} must be a boolean.`);
-  }
-}
-
-export function requireOptionalJsonValue(
-  value: RuntimeEventRecord,
-  field: string,
-  label: RuntimeEventKind | string,
-): void {
-  if (!(field in value) || value[field] === undefined) {
-    return;
-  }
-
-  if (!jsonValueSchema.safeParse(value[field]).success) {
-    throw new Error(`${label} ${field} must be JSON-serializable.`);
   }
 }
 
@@ -345,18 +325,13 @@ export function readPrimitiveRecord(
     return {};
   }
 
-  const result: Record<string, string | number | boolean | null> = {};
-
-  for (const [key, entry] of Object.entries(value)) {
-    if (
-      entry === null ||
-      typeof entry === "string" ||
-      typeof entry === "number" ||
-      typeof entry === "boolean"
-    ) {
-      result[key] = entry;
-    }
-  }
-
-  return result;
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      ([, entry]) =>
+        entry === null ||
+        typeof entry === "string" ||
+        typeof entry === "number" ||
+        typeof entry === "boolean",
+    ),
+  ) as Record<string, string | number | boolean | null>;
 }

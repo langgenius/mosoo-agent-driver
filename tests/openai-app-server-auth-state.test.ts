@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,8 +44,12 @@ afterEach(async () => {
 });
 
 describe("OpenAI app-server auth state", () => {
-  test("skips unchanged API key auth writes", async () => {
+  test("atomically replaces API key auth symlinks with a private file", async () => {
     const runtimeHome = await createRuntimeHome();
+    const authJsonPath = join(runtimeHome, "auth.json");
+    const symlinkTarget = join(runtimeHome, "auth-target.json");
+    await writeFile(symlinkTarget, "untouched\n");
+    await symlink(symlinkTarget, authJsonPath);
     const input = {
       env: {
         OPENAI_API_KEY: "openai-key",
@@ -57,10 +61,28 @@ describe("OpenAI app-server auth state", () => {
       hasApiKey: true,
       written: true,
     });
-    await expect(materializeOpenAiApiKeyAuthState(input)).resolves.toMatchObject({
-      hasApiKey: true,
-      written: false,
+    const authStat = await lstat(authJsonPath);
+    expect(authStat.isSymbolicLink()).toBe(false);
+    expect(authStat.mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(authJsonPath, "utf8"))).toMatchObject({
+      OPENAI_API_KEY: "openai-key",
+      auth_mode: "apikey",
     });
+    expect(await readFile(symlinkTarget, "utf8")).toBe("untouched\n");
+    expect((await readdir(runtimeHome)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  test("removes the private temporary file when auth replacement fails", async () => {
+    const runtimeHome = await createRuntimeHome();
+    await mkdir(join(runtimeHome, "auth.json"));
+
+    await expect(
+      materializeOpenAiApiKeyAuthState({
+        env: { OPENAI_API_KEY: "openai-key" },
+        runtimeHome,
+      }),
+    ).rejects.toThrow();
+    expect(await readdir(runtimeHome)).toEqual(["auth.json"]);
   });
 
   test("writes model provider config for OpenAI-compatible credentials", async () => {

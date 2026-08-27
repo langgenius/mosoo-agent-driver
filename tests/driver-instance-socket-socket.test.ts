@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
+import type { DriverEventInput } from "../src/protocol/events";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
@@ -332,6 +333,27 @@ describe("DriverInstanceSocket lifecycle", () => {
     expect(closeNotifications).toEqual([[1000, "test shutdown"]]);
   });
 
+  test("bounds close reasons at a complete UTF-8 character", async () => {
+    globalThis.WebSocket = OpenWebSocket as unknown as typeof WebSocket;
+    const socket = new DriverInstanceSocket(driverBootPayload, {
+      onClose: () => {},
+    });
+    await socket.connect();
+    const reason = `${"x".repeat(121)}🙂diagnostic detail`;
+    const heartbeat = socket.heartbeat({
+      at: new Date(0).toISOString(),
+      reason: "interval",
+    });
+    await Promise.resolve();
+
+    socket.close(1000, reason);
+
+    await expect(heartbeat).rejects.toThrow(reason);
+    const closeReason = PendingWebSocket.instances[0]?.closeReason;
+    expect(closeReason).toBe("x".repeat(121));
+    expect(Buffer.byteLength(closeReason ?? "", "utf8")).toBeLessThanOrEqual(123);
+  });
+
   test("requires a fresh hello after reconnecting", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
     const socket = new DriverInstanceSocket(driverBootPayload, {
@@ -404,6 +426,35 @@ describe("DriverInstanceSocket lifecycle", () => {
     await expect(first).rejects.toThrow("test shutdown");
     expect(PendingWebSocket.instances[0]?.readyState).toBe(1);
     socket.close();
+  });
+
+  test("keeps durable effect settlement independent from aborted ordinary RPCs", async () => {
+    const socket = await connectRpcSocket();
+    socket.abortPendingRequests("test shutdown");
+    const signal = new AbortController().signal;
+
+    await expect(
+      socket.completeExternalToolEffect(
+        {
+          commandId: "effect-command",
+          result: {
+            outputText: "done",
+            requestId: "effect-request",
+            serverId: "effect-server",
+            toolName: "lookup",
+          },
+        },
+        signal,
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      socket.markExternalToolEffectUnknown({ commandId: "unknown-command" }, signal),
+    ).resolves.toBeUndefined();
+
+    expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([
+      "/driver/completeExternalToolEffect",
+      "/driver/markExternalToolEffectUnknown",
+    ]);
   });
 
   test("uses the terminal-attempt signal to abort only that command update", async () => {
@@ -653,6 +704,292 @@ describe("DriverInstanceSocket lifecycle", () => {
 
     expect(wire.eventBatchSizes).toEqual([3, 2]);
     expect(result.accepted).toHaveLength(3);
+  });
+
+  test("linearizes each run at one fully acknowledged final terminal", async () => {
+    RpcWebSocket.eventBatchMaxSize = 2;
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const delta: DriverEventInput = {
+      kind: "message.delta",
+      payload: { contentDelta: "x", messageId: "message-1", role: "agent" },
+    };
+    const completed: DriverEventInput = {
+      kind: "run.completed",
+      payload: { stopReason: "end_turn" },
+    };
+
+    await expect(socket.pushEvents({ events: [completed, delta] })).rejects.toThrow(
+      "must be the final event",
+    );
+    await expect(
+      socket.pushEvents({
+        events: [
+          completed,
+          {
+            kind: "run.failed",
+            payload: { error: { code: "failed", message: "failed", retryable: false } },
+          },
+        ],
+      }),
+    ).rejects.toThrow("multiple run terminals");
+    await expect(
+      socket.pushEvents({ events: [{ ...completed, delivery: "best_effort" }] }),
+    ).rejects.toThrow("must use lossless delivery");
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+
+    RpcWebSocket.acceptedEventCounts = [1, 0];
+    await expect(socket.pushEvents({ events: [delta, completed] })).rejects.toThrow("no progress");
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+    expect(socket.selectedRunEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+
+    await expect(socket.pushEvents({ events: [completed] })).resolves.toMatchObject({
+      accepted: [{ type: "run.completed" }],
+    });
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+    await expect(socket.pushEvents({ events: [delta] })).rejects.toThrow(
+      "cannot target a terminated run",
+    );
+    await expect(socket.pushEvents({ events: [{ ...delta, runId: null }] })).resolves.toMatchObject(
+      { accepted: [{ type: "message.delta" }] },
+    );
+    await expect(
+      socket.pushEvents({ events: [{ ...delta, runId: DRIVER_TEST_IDS.secondRunId }] }),
+    ).rejects.toThrow("must target the active run");
+  });
+
+  test("does not replace an active run or discard its terminal state", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    await socket.pushEvents({
+      events: [{ kind: "run.completed", payload: { stopReason: "end_turn" } }],
+    });
+
+    expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow("another run is active");
+    expect(socket.currentRunId()).toBe(DRIVER_TEST_IDS.runId);
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+
+    socket.endRun(DRIVER_TEST_IDS.runId);
+    socket.beginRun(DRIVER_TEST_IDS.secondRunId);
+    expect(socket.currentRunId()).toBe(DRIVER_TEST_IDS.secondRunId);
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+  });
+
+  test("reserves a terminal before its RPC and serializes the matching control terminal", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.stalledPath = "/driver/pushEvents";
+    const completed: DriverEventInput = {
+      kind: "run.completed",
+      payload: { stopReason: "end_turn" },
+    };
+    const failed: DriverEventInput = {
+      kind: "run.failed",
+      payload: { error: { code: "failed", message: "failed", retryable: false } },
+    };
+    const failure = {
+      code: "failed",
+      details: {},
+      message: "failed",
+      retryable: false,
+    };
+
+    const eventTerminal = socket.pushEvents({ events: [completed] });
+    await RpcWebSocket.stalled.promise;
+    expect(socket.selectedRunEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+    await expect(socket.pushEvents({ events: [failed] })).rejects.toThrow(
+      "cannot target a terminated run",
+    );
+    const matchingControl = socket.completeRun();
+    const eventTerminalOutcome = eventTerminal.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    const matchingControlOutcome = matchingControl.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await expect(socket.failRun(failure)).resolves.toBeUndefined();
+    await Bun.sleep(0);
+
+    const firstWire = PendingWebSocket.instances[0] as RpcWebSocket;
+    expect(firstWire.paths.filter((path) => path !== "/driver/hello")).toEqual([
+      "/driver/pushEvents",
+    ]);
+    firstWire.close(1006, "terminal response lost");
+    const eventTerminalError = await eventTerminalOutcome;
+    const matchingControlError = await matchingControlOutcome;
+    expect(eventTerminalError).toBeInstanceOf(Error);
+    expect(matchingControlError).toBeInstanceOf(Error);
+    expect(matchingControlError as Error).toHaveProperty(
+      "message",
+      expect.stringContaining("connection changed"),
+    );
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+
+    await socket.connect();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    await expect(socket.pushEvents({ events: [failed] })).rejects.toThrow(
+      "cannot target a terminated run",
+    );
+    expect((PendingWebSocket.instances[1] as RpcWebSocket).paths).toEqual(["/driver/hello"]);
+  });
+
+  test.each([
+    ["completeRun", "/driver/completeRun"],
+    ["failRun", "/driver/failRun"],
+  ] as const)("does not begin another run after an in-flight %s", async (selected, path) => {
+    const socket = await connectRpcSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const failure = {
+      code: "test.failure",
+      details: {},
+      message: "failed",
+      retryable: false,
+    };
+    RpcWebSocket.lostResponsePath = path;
+    const terminal = selected === "completeRun" ? socket.completeRun() : socket.failRun(failure);
+    await RpcWebSocket.stalled.promise;
+
+    socket.endRun(DRIVER_TEST_IDS.runId);
+    expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+      "control terminal has been selected",
+    );
+    expect(socket.currentRunId()).toBeNull();
+    expect(selected === "completeRun" ? socket.completeRun() : socket.failRun(failure)).toBe(
+      terminal,
+    );
+    await expect(
+      selected === "completeRun" ? socket.failRun(failure) : socket.completeRun(),
+    ).resolves.toBeUndefined();
+
+    (PendingWebSocket.instances[0] as RpcWebSocket).close(1006, "terminal response lost");
+    await expect(terminal).rejects.toThrow("terminal response lost");
+    expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+      "control terminal has been selected",
+    );
+  });
+
+  test("does not redirect a queued run event after the active run ends", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.stalledPath = "/driver/pushEvents";
+    const controller = new AbortController();
+    const blocker = socket.pushEvents({
+      events: [
+        {
+          kind: "diagnostic.reported",
+          payload: { code: "queue.blocker", message: "block", severity: "info" },
+          runId: null,
+        },
+      ],
+      signal: controller.signal,
+    });
+    await RpcWebSocket.stalled.promise;
+    const queuedTerminal = socket.pushEvents({
+      events: [{ kind: "run.completed", payload: { stopReason: "end_turn" } }],
+    });
+    const queuedOutcome = queuedTerminal.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    socket.endRun(DRIVER_TEST_IDS.runId);
+    socket.beginRun(DRIVER_TEST_IDS.secondRunId);
+    controller.abort(new Error("release old run"));
+    await expect(blocker).rejects.toThrow();
+    const queuedError = await queuedOutcome;
+    expect(queuedError).toBeInstanceOf(Error);
+    expect(queuedError as Error).toHaveProperty(
+      "message",
+      expect.stringContaining("active run changed"),
+    );
+    expect(socket.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+    expect(
+      (PendingWebSocket.instances[0] as RpcWebSocket).paths.filter(
+        (path) => path === "/driver/pushEvents",
+      ),
+    ).toHaveLength(1);
+
+    RpcWebSocket.stalledPath = null;
+    await expect(
+      socket.pushEvents({
+        events: [
+          {
+            kind: "message.delta",
+            payload: { contentDelta: "new", messageId: "message-2", role: "agent" },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ accepted: [{ type: "message.delta" }] });
+  });
+
+  test("does not send a queued control terminal after its run ends", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.stalledPath = "/driver/pushEvents";
+    const controller = new AbortController();
+    const blocker = socket.pushEvents({
+      events: [
+        {
+          kind: "diagnostic.reported",
+          payload: { code: "queue.blocker", message: "block", severity: "info" },
+          runId: null,
+        },
+      ],
+      signal: controller.signal,
+    });
+    await RpcWebSocket.stalled.promise;
+    const oldTerminal = socket.completeRun();
+
+    socket.endRun(DRIVER_TEST_IDS.runId);
+    expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+      "control terminal has been selected",
+    );
+    controller.abort(new Error("release old run"));
+
+    await expect(blocker).rejects.toThrow();
+    await expect(oldTerminal).rejects.toThrow("active run changed");
+    const paths = (PendingWebSocket.instances[0] as RpcWebSocket).paths;
+    expect(paths.filter((path) => path === "/driver/pushEvents")).toHaveLength(1);
+    expect(paths).not.toContain("/driver/completeRun");
+    expect(socket.currentRunId()).toBeNull();
   });
 
   test("does not retry an unaccepted best-effort suffix", async () => {

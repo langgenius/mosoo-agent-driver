@@ -5,12 +5,14 @@ import type { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-
 import type { DriverBootPayload } from "../src/protocol/boot";
 import type { DriverLogBatchInput } from "../src/protocol/orpc";
 
-const FLUSH_INTERVAL_MS = 200;
-
 function createBootPayload(): DriverBootPayload {
   return {
     driverInstanceId: "01J00000000000000000000DRV",
-    sandboxId: "01J00000000000000000000SBX",
+    execution: {
+      session: {
+        context: { sandboxId: "01J00000000000000000000SBX" },
+      },
+    },
   } as DriverBootPayload;
 }
 
@@ -42,10 +44,6 @@ function createFakeSocket(): FakeSocket {
   return state;
 }
 
-async function waitForFlushWindow(): Promise<void> {
-  await Bun.sleep(FLUSH_INTERVAL_MS + 100);
-}
-
 describe("createDriverLogger", () => {
   test("holds log batches until the uplink gate opens", async () => {
     const fake = createFakeSocket();
@@ -54,11 +52,16 @@ describe("createDriverLogger", () => {
     logger.info("driver.runtime.boot.loaded");
     logger.info("driver.runtime.hello.sending");
 
-    await waitForFlushWindow();
+    let flushed = false;
+    const flush = logger.flush().then(() => {
+      flushed = true;
+    });
+    await Promise.resolve();
+    expect(flushed).toBe(false);
     expect(fake.batches).toHaveLength(0);
 
     uplink.open();
-    await logger.flush();
+    await flush;
 
     const sent = fake.batches.flatMap((batch) => batch.logs);
     expect(sent.map((entry) => entry.message)).toEqual([

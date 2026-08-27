@@ -1,6 +1,6 @@
 export {
   normalizePromptUsage,
-  shouldIgnoreReplay,
+  isTurnScopedSessionUpdate,
   toAuthEvent,
   toInitializeEvents,
   toPromptStartEvents,

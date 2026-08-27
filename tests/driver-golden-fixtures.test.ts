@@ -94,6 +94,18 @@ describe("Driver golden fixtures", () => {
     );
   });
 
+  test.each([Number.NaN, Number.POSITIVE_INFINITY, undefined])(
+    "rejects non-JSON usage payload value %p at the shared event boundary",
+    (tokens) => {
+      expect(
+        ingestRuntimeEventInput(createRuntimeEventContext(), {
+          kind: "usage.updated",
+          payload: { tokens },
+        }),
+      ).toMatchObject({ status: "rejected" });
+    },
+  );
+
   test("enforces the shared agent task payload contract", () => {
     expect(
       ingestRuntimeEventInput(createRuntimeEventContext(), {

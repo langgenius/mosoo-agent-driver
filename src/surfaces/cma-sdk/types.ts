@@ -22,6 +22,17 @@ export interface CmaSdkClientOptions {
   readonly betaHeader?: CmaSdkBetaHeader | false;
   readonly fetch?: CmaSdkFetch;
   readonly headers?: HeadersInit;
+  readonly maxResponseBytes?: number;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+}
+
+export interface CmaSdkRequestOptions {
+  readonly signal?: AbortSignal;
+}
+
+export interface CmaSdkStreamOptions extends CmaSdkRequestOptions {
+  readonly afterCursor?: string;
 }
 
 export interface CmaSessionEventDispatchRecord {
@@ -32,24 +43,34 @@ export interface CmaSessionEventDispatchRecord {
 }
 
 export interface CmaSdkClient {
-  archiveEnvironment(id: string): Promise<CmaEnvironmentRecord>;
-  createAgent(input: CmaCreateAgentInput): Promise<CmaAgentRecord>;
-  createEnvironment(input: CmaCreateEnvironmentInput): Promise<CmaEnvironmentRecord>;
-  createSession(input: CmaCreateSessionInput): Promise<CmaSessionRecord>;
-  deleteEnvironment(id: string): Promise<void>;
-  getAgent(id: string): Promise<CmaAgentRecord>;
-  getEnvironment(id: string): Promise<CmaEnvironmentRecord>;
-  getSession(id: string): Promise<CmaSessionRecord>;
-  listAgents(): Promise<readonly CmaAgentRecord[]>;
-  listEnvironments(): Promise<readonly CmaEnvironmentRecord[]>;
-  listSessionEvents(sessionId: string): Promise<readonly CmaSessionEventRecord[]>;
+  archiveEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<CmaEnvironmentRecord>;
+  createAgent(input: CmaCreateAgentInput, options?: CmaSdkRequestOptions): Promise<CmaAgentRecord>;
+  createEnvironment(
+    input: CmaCreateEnvironmentInput,
+    options?: CmaSdkRequestOptions,
+  ): Promise<CmaEnvironmentRecord>;
+  createSession(
+    input: CmaCreateSessionInput,
+    options?: CmaSdkRequestOptions,
+  ): Promise<CmaSessionRecord>;
+  deleteEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<void>;
+  getAgent(id: string, options?: CmaSdkRequestOptions): Promise<CmaAgentRecord>;
+  getEnvironment(id: string, options?: CmaSdkRequestOptions): Promise<CmaEnvironmentRecord>;
+  getSession(id: string, options?: CmaSdkRequestOptions): Promise<CmaSessionRecord>;
+  listAgents(options?: CmaSdkRequestOptions): Promise<readonly CmaAgentRecord[]>;
+  listEnvironments(options?: CmaSdkRequestOptions): Promise<readonly CmaEnvironmentRecord[]>;
+  listSessionEvents(
+    sessionId: string,
+    options?: CmaSdkRequestOptions,
+  ): Promise<readonly CmaSessionEventRecord[]>;
   sendSessionEvent(
     sessionId: string,
     event: CmaInboundEvent,
+    options?: CmaSdkRequestOptions,
   ): Promise<CmaSessionEventDispatchRecord>;
   streamSessionEvents(
     sessionId: string,
-    afterCursor?: string,
+    options?: CmaSdkStreamOptions,
   ): AsyncIterable<CmaSessionEventRecord>;
 }
 

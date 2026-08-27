@@ -116,12 +116,13 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       throw new Error("Claude Agent SDK backend cannot restart after stopping.");
     }
 
-    const materializedSkills = await raceWithAbort(
-      context.ports.skill.materialize(this.#payload.execution),
+    const materializedSkills = await context.ports.skill.materialize(
+      this.#payload.execution,
       signal,
     );
-    const bootstrapArtifacts = await raceWithAbort(
-      writeSkillBootstrapArtifacts(this.#payload.execution),
+    const bootstrapArtifacts = await writeSkillBootstrapArtifacts(
+      this.#payload.execution,
+      materializedSkills,
       signal,
     );
     const { homePath } = this.#payload.execution.session;

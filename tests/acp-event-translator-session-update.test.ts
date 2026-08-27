@@ -464,6 +464,8 @@ describe("ACP runtime event translation", () => {
     expect(eventPayload(requireEvent(events, "run.failed"))).toMatchObject({
       error: { message: "transport closed" },
     });
+    expect(eventPayload(events[5]!)).not.toHaveProperty("error");
+    expect(eventPayload(events[6]!)).not.toHaveProperty("error");
   });
 
   test("emits native resume state from ACP session setup", () => {
@@ -768,14 +770,6 @@ describe("ACP runtime event translation", () => {
         cachedWriteTokens: 7,
         inputTokens: 10,
         outputTokens: 2,
-        raw: {
-          cachedReadTokens: 90,
-          cachedWriteTokens: 7,
-          inputTokens: 10,
-          outputTokens: 2,
-          thoughtTokens: 3,
-          totalTokens: 112,
-        },
         source: "prompt_response",
         thoughtTokens: 3,
         totalTokens: 112,

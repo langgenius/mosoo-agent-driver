@@ -1,3 +1,5 @@
+import { delimiter, isAbsolute } from "node:path";
+
 import type { DriverInstanceId } from "../id";
 import type { JsonObject } from "../json";
 import { readJsonObject } from "../json";
@@ -212,25 +214,31 @@ export interface DriverBootPayload {
 
 function readVariables(value: unknown): Record<string, string> {
   const record = readRecord(value, "execution.environment.variables");
-  const variables: Record<string, string> = {};
+  const entries = Object.entries(record);
 
-  for (const [key, entry] of Object.entries(record)) {
-    if (typeof entry !== "string") {
-      throw new TypeError(`execution.environment.variables.${key} must be a string.`);
+  for (const [key, entry] of entries) {
+    if (
+      key.length === 0 ||
+      key.includes("=") ||
+      key.includes("\0") ||
+      typeof entry !== "string" ||
+      entry.includes("\0")
+    ) {
+      throw new TypeError(
+        `execution.environment.variables.${key} must be a valid environment entry.`,
+      );
     }
-
-    variables[key] = entry;
   }
 
-  return variables;
+  return Object.fromEntries(entries) as Record<string, string>;
 }
 
 function readAbsolutePathArray(record: Record<string, unknown>, field: string): string[] {
   const label = "execution.environment.paths";
   return readStringArray(record, field, label).map((path, index) => {
-    if (!path.startsWith("/") || path.includes("\0")) {
+    if (!isAbsolute(path) || path.includes("\0") || path.includes(delimiter)) {
       throw new TypeError(
-        `${label}.${field}[${index}] must be an absolute path without null bytes.`,
+        `${label}.${field}[${index}] must be an absolute path without null bytes or path delimiters.`,
       );
     }
 
@@ -534,18 +542,25 @@ export function parseDriverBootPayload(value: unknown): DriverBootPayload {
     throw new TypeError("Driver boot payload.controlUrl must be an absolute URL.");
   }
 
+  const execution = readExecution(record["execution"]);
+  const sandboxId = parseId(record["sandboxId"], "Driver sandbox ID") as SandboxId;
+
+  if (sandboxId !== execution.session.context.sandboxId) {
+    throw new TypeError("Driver boot payload sandbox IDs must match.");
+  }
+
   return {
     bootToken: readNonEmptyString(record, "bootToken", "Driver boot payload"),
     controlUrl,
     driverControlPort,
     driverGeneration,
     driverInstanceId: parseId(record["driverInstanceId"], "Driver instance ID") as DriverInstanceId,
-    execution: readExecution(record["execution"]),
+    execution,
     heartbeatIntervalMs,
     protocolVersion,
     runtime,
     runtimeTransport,
-    sandboxId: parseId(record["sandboxId"], "Driver sandbox ID") as SandboxId,
+    sandboxId,
     traceparent: readNonEmptyString(record, "traceparent", "Driver boot payload"),
   };
 }

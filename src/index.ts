@@ -47,6 +47,8 @@ export type {
   CmaSdkClient,
   CmaSdkClientOptions,
   CmaSdkFetch,
+  CmaSdkRequestOptions,
+  CmaSdkStreamOptions,
   CmaSessionEventDispatchRecord,
 } from "./surfaces/cma-sdk";
 export { createCmaMemoryStore } from "./stores/memory";
@@ -79,7 +81,6 @@ export type {
   CmaStoreResourceKind,
 } from "./stores/cma-store";
 export type {
-  AgentDriverHostPortName,
   AgentDriverHostPorts,
   AgentDriverCommandSource,
   AgentDriverEventSink,
@@ -99,7 +100,6 @@ export type {
   AgentDriverContextPortOverrides,
 } from "./core/agent-driver-backend";
 export { createAgentDriverContext } from "./core/agent-driver-backend";
-export { OPENAI_DEFAULT_MODEL_ID } from "./models";
 export {
   isSupportedDriverRuntime,
   isSupportedDriverRuntimeTransport,
@@ -163,9 +163,5 @@ export type {
 export {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   createAgentDriverProviderCapabilities,
-  createAgentDriverProviderRegistry,
 } from "./runtimes/provider-registry";
-export type {
-  AgentDriverProviderDescriptor,
-  AgentDriverProviderRegistry,
-} from "./runtimes/provider-registry";
+export type { AgentDriverProviderDescriptor } from "./runtimes/provider-registry";

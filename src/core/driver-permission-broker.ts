@@ -146,11 +146,12 @@ export class DriverPermissionBroker {
       timeoutMs: this.#eventDeliveryTimeoutMs * 2,
     });
     this.#cancellationTask = task;
-    void idle.promise.then(() => {
+    const clear = () => {
       if (this.#cancellationTask === task) {
         this.#cancellationTask = null;
       }
-    });
+    };
+    void task.then(clear, clear);
     return task;
   }
 
@@ -170,6 +171,7 @@ export class DriverPermissionBroker {
     socket: DriverRuntimeEventPort,
     input: DriverPermissionRequest,
     signal?: AbortSignal,
+    ownsRun?: () => boolean,
   ): Promise<PermissionDecision> {
     if (!this.#interactiveRequests) {
       this.#logger()?.debug("driver.runtime.permission.request.rejected", {
@@ -194,6 +196,7 @@ export class DriverPermissionBroker {
     }
 
     const runId = socket.currentRunId();
+    const isCurrentRun = ownsRun ?? (() => socket.currentRunId() === runId);
     const events: DriverEventInput[] = [
       {
         kind: "permission.requested",
@@ -320,11 +323,18 @@ export class DriverPermissionBroker {
         if (requestedDelivery.status === "timed_out") {
           lateDelivery = requestedTask;
         }
+        if (!isCurrentRun()) {
+          return "reject_once";
+        }
         throw new PermissionEventDeliveryError(
           input.requestId,
           "requested",
           requestedDelivery.error,
         );
+      }
+
+      if (!isCurrentRun()) {
+        return "reject_once";
       }
 
       this.#logger()?.debug("driver.runtime.permission.request.sent", {
@@ -357,6 +367,10 @@ export class DriverPermissionBroker {
         });
       }
 
+      if (!isCurrentRun()) {
+        return "reject_once";
+      }
+
       const resolutionTask = pushLosslessEvents(
         socket,
         [
@@ -387,6 +401,9 @@ export class DriverPermissionBroker {
         if (resolutionDelivery.status === "timed_out") {
           lateDelivery = resolutionTask;
         }
+        if (!isCurrentRun()) {
+          return "reject_once";
+        }
         throw new PermissionEventDeliveryError(
           input.requestId,
           "resolved",
@@ -400,7 +417,7 @@ export class DriverPermissionBroker {
         requestId: input.requestId,
       });
 
-      return decision;
+      return isCurrentRun() ? decision : "reject_once";
     } finally {
       unregister();
       signal?.removeEventListener("abort", cancel);

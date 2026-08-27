@@ -1,15 +1,12 @@
-export const DRIVER_RUNTIME_STATUSES = [
-  "created",
-  "starting",
-  "ready",
-  "running",
-  "needs_approval",
-  "stopping",
-  "stopped",
-  "failed",
-] as const;
-
-export type DriverRuntimeStatus = (typeof DRIVER_RUNTIME_STATUSES)[number];
+export type DriverRuntimeStatus =
+  | "created"
+  | "starting"
+  | "ready"
+  | "running"
+  | "needs_approval"
+  | "stopping"
+  | "stopped"
+  | "failed";
 
 export const DRIVER_RUNTIME_TRANSITIONS: Readonly<
   Record<DriverRuntimeStatus, readonly DriverRuntimeStatus[]>
@@ -58,6 +55,10 @@ export class DriverRuntimeStateMachine {
     if (this.#status === "running" || this.#status === "needs_approval") {
       this.enter("ready");
     }
+  }
+
+  ownsRun(generation: number): boolean {
+    return this.#activeRunGeneration === generation;
   }
 
   beginApproval(): number | null {

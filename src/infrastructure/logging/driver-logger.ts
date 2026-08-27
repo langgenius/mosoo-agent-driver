@@ -109,6 +109,7 @@ export function createDriverLogger(
   payload: DriverBootPayload,
   socket: DriverInstanceSocket,
 ): DriverLoggerHandle {
+  const sandboxId = payload.execution.session.context.sandboxId;
   let nextSeq = 0;
   let openUplink: () => void = () => undefined;
   // The API rejects pushLogs until the hello handshake commits. Hold every
@@ -121,7 +122,7 @@ export function createDriverLogger(
 
   const logger = createBufferedSinkLogger({
     context: {
-      sandboxId: payload.sandboxId,
+      sandboxId,
     },
     flushIntervalMs: 200,
     level: "trace",
@@ -159,7 +160,7 @@ export async function runWithDriverLogContext<T>(
   return runWithLogContextAsync(
     createTraceLogContext({
       context: {
-        sandboxId: payload.sandboxId,
+        sandboxId: payload.execution.session.context.sandboxId,
       },
       service: "driver",
       traceparent: payload.traceparent,

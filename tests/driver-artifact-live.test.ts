@@ -833,6 +833,7 @@ function createBootPayload(input: {
   readonly sessionId: string;
 }): DriverArtifactBootPayload {
   const runtimeCase = input.runtimeCase;
+  const sandboxId = createTestId();
 
   return {
     bootToken: `artifact-test-${input.driverInstanceId}`,
@@ -876,7 +877,7 @@ function createBootPayload(input: {
             executionOwnerUserId: createTestId(),
             type: "agent",
           },
-          sandboxId: createTestId(),
+          sandboxId,
           sandboxKind: "cattle",
           sandboxSessionId: createTestId(),
           sandboxSubjectId: input.sessionId,
@@ -895,7 +896,7 @@ function createBootPayload(input: {
     protocolVersion: 2,
     runtime: runtimeCase.runtime,
     runtimeTransport: runtimeCase.transport,
-    sandboxId: createTestId(),
+    sandboxId,
     traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
   };
 }

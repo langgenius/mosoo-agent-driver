@@ -172,26 +172,35 @@ export class AcpTerminalManager {
     const args = readArray(record, "args").filter(
       (entry): entry is string => typeof entry === "string",
     );
-    const cwd = await this.#pathScope.resolveExisting(
-      readNonEmptyString(record, "cwd") ?? this.#pathScope.cwd(),
-      "ACP terminal cwd",
-    );
+    const requestedCwd = readNonEmptyString(record, "cwd") ?? this.#pathScope.cwd();
     const requestedOutputByteLimit = readNumber(record, "outputByteLimit");
     const outputByteLimit = normalizeByteLimit(requestedOutputByteLimit);
     const env = this.#readTerminalEnv(record);
     const terminalId = createDriverId();
-    const processTree = createProcessTreeEnvironment({
-      ...this.#env,
-      ...env,
-    });
-    const child = spawn(command, args, {
-      cwd,
-      detached: true,
-      env: processTree.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const cwd = await this.#pathScope.openDirectory(requestedCwd, "ACP terminal cwd");
+    let processTree: ReturnType<typeof createProcessTreeEnvironment>;
+    let child: ChildProcessWithoutNullStreams;
+    let cwdPath: string;
+
+    try {
+      signal?.throwIfAborted();
+      processTree = createProcessTreeEnvironment({
+        ...this.#env,
+        ...env,
+      });
+      child = spawn(command, args, {
+        cwd: cwd.procPath,
+        detached: true,
+        env: processTree.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (error) {
+      await cwd.file.close().catch(() => {});
+      throw error;
+    }
     const target = bindSpawnedProcess(child, process.platform, processTree);
     const spawned = once(child, "spawn");
+    void spawned.catch(() => {});
     const { promise: closed, resolve: resolveClosed } = Promise.withResolvers<void>();
     const {
       promise: exited,
@@ -287,6 +296,8 @@ export class AcpTerminalManager {
         );
       }
       await raceWithAbort(spawned, signal);
+      cwdPath = await this.#pathScope.identify(cwd);
+      await cwd.file.close();
       if (process.platform === "linux" && terminal.watchdog === null) {
         throw new Error(`ACP terminal ${terminalId} supervision could not start.`);
       }
@@ -309,7 +320,7 @@ export class AcpTerminalManager {
           kind: "terminal.created",
           payload: {
             command,
-            cwd,
+            cwd: cwdPath,
             outputByteLimit,
             terminalId,
           },
@@ -357,6 +368,8 @@ export class AcpTerminalManager {
       releaseLinuxProcessMarker(terminal.marker);
       this.#removeTerminal(terminal);
       throw error;
+    } finally {
+      await cwd.file.close().catch(() => {});
     }
 
     return { terminalId };
@@ -431,7 +444,11 @@ export class AcpTerminalManager {
 
   async stopAll(context: AgentDriverContext): Promise<void> {
     this.#stopping = true;
-    await this.#stop(context);
+    try {
+      await this.#stop(context);
+    } finally {
+      await this.#pathScope.close();
+    }
   }
 
   async stopTurn(context: AgentDriverContext, turn: number): Promise<void> {

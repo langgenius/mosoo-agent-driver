@@ -29,7 +29,7 @@ import type { RunId } from "../protocol/id";
 import { createDriverStartInputFromBootPayload } from "../protocol/start";
 import type { DriverStartInput } from "../protocol/start";
 import type { RunError } from "../runtime-command";
-import { executeRemoteHttpMcpCommand } from "../runtimes/mcp/remote-http-mcp-executor";
+import { prepareRemoteHttpMcpCommand } from "../runtimes/mcp/remote-http-mcp-executor";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   createAgentDriverProviderCapabilities,
@@ -171,7 +171,6 @@ export class DriverProcess {
           backend,
           createContext: () => this.createAgentDriverContext(socket, logger),
           labels: {
-            deferredStop: "Driver deferred backend shutdown",
             finalStop: "Driver final backend shutdown",
             start: "Driver backend startup",
             stop: "Driver backend shutdown",
@@ -522,7 +521,9 @@ export class DriverProcess {
             }
 
             try {
-              return await this.#permissionBroker.request(socket, input, signal);
+              return await this.#permissionBroker.request(socket, input, signal, () =>
+                this.#runtimeState.ownsRun(generation),
+              );
             } finally {
               this.#runtimeState.endApproval(generation);
             }
@@ -531,19 +532,15 @@ export class DriverProcess {
       },
       ports: {
         mcp: {
-          execute: async (command, signal, effect) => {
-            if (effect === undefined) {
-              throw new Error("Driver external tool effect ledger is not configured.");
-            }
-
-            return executeRemoteHttpMcpCommand(this.#startInput, command, signal, effect);
-          },
+          prepare: (command, signal) =>
+            prepareRemoteHttpMcpCommand(this.#startInput, command, signal),
         },
         hostIntegration: {
           snapshot: async () => this.#hostSnapshot,
         },
         skill: {
-          materialize: async (execution) => materializeResolvedSkills(execution, logger),
+          materialize: async (execution, signal) =>
+            materializeResolvedSkills(execution, logger, signal),
         },
       },
     });

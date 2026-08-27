@@ -21,11 +21,14 @@ import type {
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import type { AcpAssistantTranscriptState } from "./acp-assistant-transcript-state";
+import {
+  AcpTurnStateLimitError,
+  type AcpAssistantTranscriptState,
+} from "./acp-assistant-transcript-state";
 import { AcpFileSystem } from "./acp-file-system";
 import { AcpPathScope } from "./acp-path-scope";
 import type { AcpPermissionOption, AcpPermissionTranslation } from "./acp-permission-events";
-import { shouldIgnoreReplay } from "./acp-session-events";
+import { isTurnScopedSessionUpdate } from "./acp-session-events";
 import { AcpSessionUpdateInbox, type AcpSessionUpdateScope } from "./acp-session-update-inbox";
 import { AcpTerminalManager } from "./acp-terminal-manager";
 import { isRecord, raceWithAbort, readNonEmptyString } from "./acp-types";
@@ -45,12 +48,14 @@ export class AcpClientRequestHandler {
   readonly #fileSystem: AcpFileSystem;
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
+  readonly #onUpdateFailure: (error: Error) => void;
+  readonly #pathScope: AcpPathScope;
   readonly #pendingPermissions = new Set<Promise<unknown>>();
   readonly #push: AcpClientRequestHandlerOptions["push"];
   #permissionIngressClosed = false;
   #stopping = false;
   #transcriptTail: Promise<void> = Promise.resolve();
-  #turnUpdateIngressClosed = false;
+  #turnTranscriptIngressClosed = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
   readonly #turnEvents: AcpAssistantTranscriptState;
@@ -58,22 +63,23 @@ export class AcpClientRequestHandler {
   constructor(options: AcpClientRequestHandlerOptions) {
     this.#isCancelling = options.isCancelling;
     this.#nativeSessionId = options.nativeSessionId;
+    this.#onUpdateFailure = options.onUpdateFailure;
     this.#push = options.push;
     this.#turnEvents = options.turnEvents;
-    const pathScope = new AcpPathScope({
+    this.#pathScope = new AcpPathScope({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
     });
     this.#fileSystem = new AcpFileSystem({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
-      pathScope,
+      pathScope: this.#pathScope,
     });
     this.#terminalManager = new AcpTerminalManager({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
       env: options.env,
-      pathScope,
+      pathScope: this.#pathScope,
       push: options.push,
     });
     this.#updateInbox = new AcpSessionUpdateInbox({
@@ -82,8 +88,16 @@ export class AcpClientRequestHandler {
     });
   }
 
+  initializePathScope(): Promise<void> {
+    return this.#pathScope.initialize();
+  }
+
+  closePathScope(): Promise<void> {
+    return this.#pathScope.close();
+  }
+
   enqueueUpdate(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
-    if (this.#turnUpdateIngressClosed) {
+    if (this.#turnTranscriptIngressClosed && isTurnScopedSessionUpdate(notification)) {
       return Promise.resolve();
     }
 
@@ -229,8 +243,8 @@ export class AcpClientRequestHandler {
     this.#permissionIngressClosed = true;
   }
 
-  closeTurnUpdateIngress(): void {
-    this.#turnUpdateIngressClosed = true;
+  closeTurnTranscriptIngress(): void {
+    this.#turnTranscriptIngressClosed = true;
   }
 
   async drainUpdates(): Promise<void> {
@@ -256,8 +270,8 @@ export class AcpClientRequestHandler {
     this.#permissionIngressClosed = false;
   }
 
-  openTurnUpdateIngress(): void {
-    this.#turnUpdateIngressClosed = false;
+  openTurnTranscriptIngress(): void {
+    this.#turnTranscriptIngressClosed = false;
   }
 
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
@@ -299,7 +313,12 @@ export class AcpClientRequestHandler {
         return translated;
       }),
       signal,
-    );
+    ).catch((error: unknown) => {
+      if (error instanceof AcpTurnStateLimitError) {
+        this.#onUpdateFailure(error);
+      }
+      throw error;
+    });
 
     let chosen: AcpPermissionOption | null = null;
 
@@ -328,13 +347,9 @@ export class AcpClientRequestHandler {
   ): Promise<void> {
     this.#assertSession("session/update", params);
 
-    if (scope.suppressed && shouldIgnoreReplay(params)) {
-      return;
-    }
-
     if (
-      (scope.replaying || this.#turnEvents.activeRunId() === null) &&
-      shouldIgnoreReplay(params)
+      (scope.suppressed || scope.replaying || this.#turnEvents.activeRunId() === null) &&
+      isTurnScopedSessionUpdate(params)
     ) {
       return;
     }

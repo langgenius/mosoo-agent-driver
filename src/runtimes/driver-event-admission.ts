@@ -4,7 +4,8 @@ import type { RunId } from "../protocol/id";
 
 const MAX_PENDING_DRIVER_EVENTS = 1_024;
 const MAX_PENDING_DRIVER_EVENT_BYTES = 32 * 1_024 * 1_024;
-const MAX_RUN_TERMINAL_BATCH_BYTES = 1_024 * 1_024;
+export const MAX_RUN_TERMINAL_BATCH_EVENTS = MAX_PENDING_DRIVER_EVENTS;
+export const MAX_RUN_TERMINAL_BATCH_BYTES = 1_024 * 1_024;
 
 export interface QueuedDriverEvent {
   readonly bytes: number;
@@ -49,14 +50,12 @@ export function preflightDriverEventPush(
   events: readonly DriverEventInput[],
   activeRunId: RunId | null,
 ): void {
-  for (const event of events) {
-    admitDriverEventPush(
-      [event],
-      activeRunId,
-      Symbol("driver-event-preflight"),
-      EMPTY_DRIVER_EVENT_ADMISSION_STATE,
-    );
-  }
+  admitDriverEventPush(
+    events,
+    activeRunId,
+    Symbol("driver-event-preflight"),
+    EMPTY_DRIVER_EVENT_ADMISSION_STATE,
+  );
 }
 
 export function driverEventBatchBytes(bytes: number, count: number): number {
@@ -145,6 +144,12 @@ export function admitDriverEventPush(
 
   const losslessCount = terminalBatch ? 0 : losslessEvents.length;
 
+  if (terminalBatch && losslessEvents.length > MAX_RUN_TERMINAL_BATCH_EVENTS) {
+    throw new Error(
+      `Driver event run terminal batch exceeds ${MAX_RUN_TERMINAL_BATCH_EVENTS} events.`,
+    );
+  }
+
   if (
     state.pendingLosslessCount + state.queuedLosslessCount + losslessCount >
     MAX_PENDING_DRIVER_EVENTS
@@ -174,7 +179,6 @@ export function admitDriverEventPush(
   }
 
   const frozenEvents = admittedEvents.map((event) => scopeDriverEvent(event, activeRunId));
-  const terminalKey = terminalBatch ? JSON.stringify(frozenEvents) : null;
   const stampedEvents = withSourceEventIds(frozenEvents);
 
   if (new Set(stampedEvents.map((event) => event.sourceEventId)).size !== stampedEvents.length) {
@@ -263,6 +267,7 @@ export function admitDriverEventPush(
     eventCount = serializedLosslessCount;
   }
 
+  const terminalKey = terminalBatch ? JSON.stringify(frozenEvents) : null;
   const queuedEvents: QueuedDriverEvent[] = [];
 
   for (const [index, event] of stampedEvents.entries()) {

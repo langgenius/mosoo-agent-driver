@@ -16,7 +16,6 @@ import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatch
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
-import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
@@ -48,12 +47,20 @@ interface CancellationHarnessOptions {
   readonly failInitialThreadStart?: boolean;
   readonly holdCancellationRequest?: boolean;
   readonly holdRunCancellation?: boolean;
+  readonly holdMessageStart?: boolean;
   readonly holdTurnStartAfterItems?: boolean;
   readonly holdToolCompletion?: boolean;
   readonly restartResumeError?: string;
   readonly threadId?: string;
   readonly turnId?: string;
   readonly turnStartErrorMessage?: string;
+  readonly toolStartFollowup?:
+    | "error_response"
+    | "error_then_malformed"
+    | "error_then_success"
+    | "malformed"
+    | "terminal_response"
+    | "terminal_then_malformed";
   readonly useCma?: boolean;
 }
 
@@ -124,8 +131,7 @@ const sendInterrupted = (turnId) => process.stdout.write(JSON.stringify({
     },
   },
 }) + "\\n");
-const sendToolLifecycle = (turnId, finishTurn, completeItem = true) => {
-  const item = {
+const toolItem = {
     aggregatedOutput: "done",
     command: "printf done",
     commandActions: [],
@@ -139,16 +145,19 @@ const sendToolLifecycle = (turnId, finishTurn, completeItem = true) => {
     source: "agent",
     status: "completed",
     type: "commandExecution",
-  };
-  process.stdout.write(JSON.stringify({
+};
+const toolStartMessage = (turnId) => JSON.stringify({
     method: "item/started",
     params: {
-      item: { ...item, aggregatedOutput: null, durationMs: null, exitCode: null, status: "inProgress" },
+      item: { ...toolItem, aggregatedOutput: null, durationMs: null, exitCode: null, status: "inProgress" },
       startedAtMs: 1,
       threadId: "fresh-thread",
       turnId,
     },
-  }) + "\\n");
+  }) + "\\n";
+const sendToolLifecycle = (turnId, finishTurn, completeItem = true) => {
+  const item = toolItem;
+  process.stdout.write(toolStartMessage(turnId));
   if (completeItem) {
     process.stdout.write(JSON.stringify({
       method: "item/completed",
@@ -248,7 +257,14 @@ process.stdin.on("data", (chunk) => {
     const turnId = configuredTurnId ?? (launchNumber === 1
       ? "turn-" + turnNumber
       : "turn-" + launchNumber + "-" + turnNumber);
-    const turnStartErrorMessage = ${JSON.stringify(cancellationOptions.turnStartErrorMessage ?? null)};
+    const configuredToolStartFollowup = ${JSON.stringify(cancellationOptions.toolStartFollowup ?? null)};
+    const toolStartFollowup =
+      request.method === "turn/start" && turnNumber === 1 ? configuredToolStartFollowup : null;
+    const configuredTurnStartErrorMessage = ${JSON.stringify(cancellationOptions.turnStartErrorMessage ?? null)};
+    const turnStartErrorMessage =
+      configuredToolStartFollowup === "error_then_success" && turnNumber > 1
+        ? null
+        : configuredTurnStartErrorMessage;
     const configuredResumeError = ${JSON.stringify(resumeErrorMessage)};
     const restartResumeError = ${JSON.stringify(cancellationOptions.restartResumeError ?? null)};
     const resumeError =
@@ -259,8 +275,11 @@ process.stdin.on("data", (chunk) => {
           ? "no rollout found for thread id " + request.params.threadId
           : configuredResumeError;
     const terminalTurn =
-      (launchNumber > 1 || turnNumber > 1) &&
-      !${JSON.stringify(cancellationOptions.emitToolCompletionOnTurnStart ?? false)};
+      ["terminal_response", "terminal_then_malformed"].includes(
+        toolStartFollowup,
+      ) ||
+      ((launchNumber > 1 || turnNumber > 1) &&
+        !${JSON.stringify(cancellationOptions.emitToolCompletionOnTurnStart ?? false)});
     const holdTurnStart =
       (${JSON.stringify(holdFirstTurnStartResponse)} ||
         ${JSON.stringify(cancellationOptions.holdTurnStartAfterItems ?? false)}) &&
@@ -317,7 +336,26 @@ process.stdin.on("data", (chunk) => {
         sendDuplicateRequest(turnId);
         return;
       }
-      if (response !== null) process.stdout.write(JSON.stringify(response) + "\\n");
+      if (request.method === "turn/start" && response !== null && toolStartFollowup === "malformed") {
+        process.stdout.write(JSON.stringify(response) + "\\n" + toolStartMessage(turnId) + "not-json\\n");
+      } else if (
+        request.method === "turn/start" &&
+        response !== null &&
+        (toolStartFollowup === "error_then_malformed" ||
+          toolStartFollowup === "terminal_then_malformed")
+      ) {
+        process.stdout.write(toolStartMessage(turnId) + JSON.stringify(response) + "\\nnot-json\\n");
+      } else if (
+        request.method === "turn/start" &&
+        response !== null &&
+        (toolStartFollowup === "error_response" ||
+          toolStartFollowup === "error_then_success" ||
+          toolStartFollowup === "terminal_response")
+      ) {
+        process.stdout.write(toolStartMessage(turnId) + JSON.stringify(response) + "\\n");
+      } else if (response !== null) {
+        process.stdout.write(JSON.stringify(response) + "\\n");
+      }
       if (request.method === "turn/start" && duplicateRequestPhase === "active_turn") {
         setTimeout(() => sendDuplicateRequest(turnId), 5);
       }
@@ -404,6 +442,8 @@ process.stdin.on("data", (chunk) => {
   let cancellationRequestFailures = 0;
   const cancellationRequestEntered = Promise.withResolvers<void>();
   const cancellationRequestGate = Promise.withResolvers<void>();
+  const messageStartEntered = Promise.withResolvers<void>();
+  const messageStartGate = Promise.withResolvers<void>();
   const runCancellationEntered = Promise.withResolvers<void>();
   const runCancellationGate = Promise.withResolvers<void>();
   const toolCompletionEntered = Promise.withResolvers<void>();
@@ -421,6 +461,13 @@ process.stdin.on("data", (chunk) => {
       commandUpdate: async () => {},
       currentRunId: () => activeRunId,
       pushEvents: async (input) => {
+        if (
+          cancellationOptions.holdMessageStart === true &&
+          input.events.some((event) => event.kind === "message.started")
+        ) {
+          messageStartEntered.resolve();
+          await messageStartGate.promise;
+        }
         if (
           holdTurnTiming &&
           input.events.some((event) => event.sourceEventId === "openai.provider.turn_start:turn-1")
@@ -520,9 +567,11 @@ process.stdin.on("data", (chunk) => {
     context,
     events,
     logger,
+    messageStartEntered: messageStartEntered.promise,
     payload,
     processLog,
     releaseCancellationRequest: () => cancellationRequestGate.resolve(),
+    releaseMessageStart: () => messageStartGate.resolve(),
     releaseRunCancellation: () => runCancellationGate.resolve(),
     releaseToolCompletion: () => toolCompletionGate.resolve(),
     releaseTurnTiming: () => turnTimingGate.resolve(),
@@ -974,7 +1023,6 @@ describe("OpenAI app-server startup", () => {
           error: { message: reason },
           status: "failed",
         });
-        await Bun.sleep(25);
 
         expect(
           harness.events
@@ -1064,6 +1112,141 @@ describe("OpenAI app-server startup", () => {
       ]);
     } finally {
       await harness.releaseTurnStartResponse();
+      await harness.backend
+        .stop(harness.context, "test complete", new AbortController().signal)
+        .catch(() => {});
+      await harness.logger.destroy();
+    }
+  });
+
+  test.each([
+    ["terminal response", "terminal_response", "completed", "run.completed"],
+    [
+      "terminal response followed by a malformed frame",
+      "terminal_then_malformed",
+      "completed",
+      "run.completed",
+    ],
+    ["error response", "error_response", "failed", "run.failed"],
+    [
+      "error response followed by a malformed frame",
+      "error_then_malformed",
+      "failed",
+      "run.failed",
+    ],
+    ["malformed frame", "malformed", "failed", "run.failed"],
+  ] as const)(
+    "closes a durably started tool before a same-burst %s",
+    async (_label, toolStartFollowup, closureStatus, terminalKind) => {
+      const harness = await createCancellationHarness({
+        holdMessageStart: true,
+        ...(toolStartFollowup === "error_response" || toolStartFollowup === "error_then_malformed"
+          ? { turnStartErrorMessage: "turn start rejected" }
+          : {}),
+        toolStartFollowup,
+      });
+
+      try {
+        await harness.backend.start(harness.context, new AbortController().signal);
+        const input = harness.backend.handleInput(
+          harness.context,
+          { text: "hello" },
+          DRIVER_TEST_IDS.runId,
+        );
+        void input.catch(() => {});
+        await harness.messageStartEntered;
+        expect(
+          harness.events.some((event) =>
+            ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
+          ),
+        ).toBe(false);
+
+        harness.releaseMessageStart();
+        if (
+          toolStartFollowup !== "terminal_response" &&
+          toolStartFollowup !== "terminal_then_malformed"
+        ) {
+          await expect(input).rejects.toThrow(
+            toolStartFollowup === "malformed" ? "stdout is not valid JSON" : "turn start rejected",
+          );
+        } else {
+          await expect(input).resolves.toBeUndefined();
+        }
+
+        expect(
+          harness.events
+            .filter((event) =>
+              [
+                "item.completed",
+                "item.started",
+                "message.completed",
+                "message.failed",
+                "message.started",
+                "run.completed",
+                "run.failed",
+                "tool.call.updated",
+              ].includes(event.kind),
+            )
+            .map((event) => [event.kind, eventPayloadStatus(event)]),
+        ).toEqual([
+          ["message.started", undefined],
+          ["item.started", undefined],
+          ["tool.call.updated", "running"],
+          [
+            toolStartFollowup === "terminal_response" ||
+            toolStartFollowup === "terminal_then_malformed"
+              ? "message.completed"
+              : "message.failed",
+            undefined,
+          ],
+          ["tool.call.updated", closureStatus],
+          ["item.completed", closureStatus],
+          [terminalKind, undefined],
+        ]);
+      } finally {
+        harness.releaseMessageStart();
+        await harness.backend
+          .stop(harness.context, "test complete", new AbortController().signal)
+          .catch(() => {});
+        await harness.logger.destroy();
+      }
+    },
+    10_000,
+  );
+
+  test("does not carry failed turn-start item state into the next turn", async () => {
+    const harness = await createCancellationHarness({
+      toolStartFollowup: "error_then_success",
+      turnStartErrorMessage: "turn start rejected",
+    });
+
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow("turn start rejected");
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "second" },
+          DRIVER_TEST_IDS.secondRunId,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(
+        harness.events.filter((event) => event.kind === "item.completed").map(eventPayloadStatus),
+      ).toEqual(["failed"]);
+      expect(
+        harness.events
+          .filter((event) => event.kind === "tool.call.updated")
+          .map(eventPayloadStatus),
+      ).toEqual(["running", "failed"]);
+      expect(
+        harness.events
+          .filter((event) => ["run.completed", "run.failed"].includes(event.kind))
+          .map((event) => event.kind),
+      ).toEqual(["run.failed", "run.completed"]);
+    } finally {
       await harness.backend
         .stop(harness.context, "test complete", new AbortController().signal)
         .catch(() => {});
@@ -1308,21 +1491,7 @@ describe("OpenAI app-server startup", () => {
     "bounds a duplicate-request protocol failure during %s before terminal CMA delivery",
     async (duplicateRequestPhase) => {
       const harness = await createCancellationHarness({ duplicateRequestPhase });
-      const lifecycleFailure = Promise.withResolvers<Error>();
-      const lifecycleFail = spyOn(harness.context.lifecycle, "fail").mockImplementation((error) =>
-        lifecycleFailure.resolve(error),
-      );
-      const protocolFailureGate = Promise.withResolvers<void>();
-      const nativeFailActiveTurns = OpenAiAppServerEventBridge.prototype.failActiveTurns;
-      const failActiveTurns =
-        duplicateRequestPhase === "turn_start"
-          ? spyOn(OpenAiAppServerEventBridge.prototype, "failActiveTurns").mockImplementation(
-              async function (this: OpenAiAppServerEventBridge, context, error) {
-                await protocolFailureGate.promise;
-                return nativeFailActiveTurns.call(this, context, error);
-              },
-            )
-          : null;
+      const lifecycleFail = spyOn(harness.context.lifecycle, "fail").mockImplementation(() => {});
 
       try {
         await harness.backend.start(harness.context, new AbortController().signal);
@@ -1335,7 +1504,6 @@ describe("OpenAI app-server startup", () => {
         await expect(input).rejects.toThrow(
           "OpenAI provider error message was omitted because it contained 1100046 UTF-8 bytes.",
         );
-        protocolFailureGate.resolve();
         const terminal = harness.events.find((event) => event.kind === "run.failed");
         expect(terminal).toMatchObject({
           payload: {
@@ -1351,25 +1519,8 @@ describe("OpenAI app-server startup", () => {
         });
         expect(Buffer.byteLength(JSON.stringify(terminal), "utf8")).toBeLessThan(1_048_576);
         expect(harness.cmaEventTypes).toContain("session.error");
-        if (duplicateRequestPhase === "turn_start") {
-          await expect(
-            settlePromiseWithTimeout(lifecycleFailure.promise, {
-              label: "bounded turn-start protocol lifecycle failure",
-              timeoutMs: 1_000,
-            }),
-          ).resolves.toMatchObject({
-            status: "completed",
-            value: {
-              message:
-                "OpenAI provider error message was omitted because it contained 1100046 UTF-8 bytes.",
-            },
-          });
-        } else {
-          expect(lifecycleFail).not.toHaveBeenCalled();
-        }
+        expect(lifecycleFail).not.toHaveBeenCalled();
       } finally {
-        protocolFailureGate.resolve();
-        failActiveTurns?.mockRestore();
         lifecycleFail.mockRestore();
         await harness.backend
           .stop(harness.context, "test complete", new AbortController().signal)
@@ -1944,7 +2095,6 @@ describe("OpenAI app-server startup", () => {
       permissionGate.resolve();
       await cancellation;
       await expect(input).rejects.toThrow("test.cancel");
-      await Bun.sleep(25);
 
       const messages = (await readFile(harness.requestLog, "utf8"))
         .trim()

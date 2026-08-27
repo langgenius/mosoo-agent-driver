@@ -126,7 +126,6 @@ export async function handlePostSessionEvent(
     try {
       signal.throwIfAborted();
       commandResult = (await dispatchDriverCommand({ command, event, session, signal })) ?? null;
-      signal.throwIfAborted();
     } catch {
       if (!keeper.signal.aborted) {
         await store
@@ -164,7 +163,7 @@ export async function handlePostSessionEvent(
   }
 }
 
-export function createCmaSseResponse(events: AsyncIterable<CmaSessionEventRecord>): Response {
+function createCmaSseResponse(events: AsyncIterable<CmaSessionEventRecord>): Response {
   let cleanupPromise: Promise<void> | undefined;
   let iterator: AsyncIterator<CmaSessionEventRecord> | undefined;
   const cleanup = () =>

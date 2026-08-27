@@ -10,6 +10,7 @@ import {
   OpenAiPublicIdState,
   OpenAiSessionUsageState,
   OpenAiToolState,
+  type OpenAiTerminalOutcome,
 } from "./app-server-event-state";
 import { chunkOpenAiText, OpenAiAppServerItemEventBridge } from "./app-server-item-events";
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
@@ -309,8 +310,8 @@ export class OpenAiAppServerEventBridge {
     this.#itemEvents.reset();
   }
 
-  turnStartCancellationEvents(): DriverEventInput[] {
-    return this.#itemEvents.terminalEvents({ kind: "cancelled" });
+  turnStartTerminalEvents(outcome: OpenAiTerminalOutcome): DriverEventInput[] {
+    return this.#itemEvents.terminalEvents(outcome);
   }
 
   async trackTurn(turnId: string, runId: RunId): Promise<void> {

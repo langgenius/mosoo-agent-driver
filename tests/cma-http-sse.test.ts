@@ -129,7 +129,7 @@ describe("CMA HTTP surface", () => {
     await events.return?.();
   });
 
-  test("reclaims an accepted command after its worker lease expires", async () => {
+  test("does not redispatch an accepted command after its worker lease expires", async () => {
     let now = new Date();
     let dispatches = 0;
     const store = createCmaMemoryStore({
@@ -154,11 +154,11 @@ describe("CMA HTTP surface", () => {
     );
 
     expect(response.status).toBe(202);
-    expect(dispatches).toBe(1);
+    expect(dispatches).toBe(0);
     expect(await readJson(response)).toMatchObject({
       data: {
         event: {
-          commandStatus: "completed",
+          commandStatus: "accepted",
           id: abandoned.event.id,
         },
       },
@@ -208,6 +208,38 @@ describe("CMA HTTP surface", () => {
       }),
     );
     expect(retry.status).toBe(502);
+    expect(dispatches).toBe(1);
+  });
+
+  test("commits a fulfilled dispatch even when the request aborts before settlement", async () => {
+    const controller = new AbortController();
+    let dispatches = 0;
+    const handler = createCmaHttpHandler({
+      dispatchDriverCommand: async () => {
+        dispatches += 1;
+        controller.abort(new Error("client disconnected"));
+      },
+      store: createCmaMemoryStore({ sessions: [{ id: "session-1" }] }),
+    });
+    const event = { commandId: "command-1", type: "user.interrupt" };
+    const request = new Request("https://driver.test/v1/sessions/session-1/events", {
+      body: JSON.stringify(event),
+      headers: {
+        [CMA_DEFAULT_BETA_HEADER_NAME]: CMA_DEFAULT_BETA_HEADER_VALUE,
+        "content-type": "application/json",
+      },
+      method: "POST",
+      signal: controller.signal,
+    });
+
+    const response = await handler(request);
+    expect(response.status).toBe(202);
+    expect(await readJson(response)).toMatchObject({
+      data: { event: { commandStatus: "completed" } },
+    });
+
+    const retry = await handler(jsonRequest("/v1/sessions/session-1/events", "POST", event));
+    expect(retry.status).toBe(202);
     expect(dispatches).toBe(1);
   });
 

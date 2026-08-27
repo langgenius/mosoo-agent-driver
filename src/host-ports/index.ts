@@ -14,15 +14,6 @@ import type {
   RuntimeCommandResult,
 } from "../runtime-command";
 
-export type AgentDriverHostPortName =
-  | "command_source"
-  | "event_sink"
-  | "permission"
-  | "mcp"
-  | "skill"
-  | "file"
-  | "host_integration";
-
 export interface AgentDriverCommandSource {
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
 }
@@ -81,12 +72,12 @@ export interface DriverPermissionRequest {
   toolKind: string | null;
 }
 
+export interface AgentDriverMcpExecution extends AsyncDisposable {
+  execute(effect: McpExternalToolEffectExecution): Promise<McpExternalToolExecutionResult>;
+}
+
 export interface AgentDriverMcpPort {
-  execute(
-    command: McpExecuteCommand,
-    signal: AbortSignal,
-    effect?: McpExternalToolEffectExecution,
-  ): Promise<McpExternalToolExecutionResult>;
+  prepare(command: McpExecuteCommand, signal: AbortSignal): Promise<AgentDriverMcpExecution>;
 }
 
 export interface AgentDriverMaterializedSkill {
@@ -98,7 +89,10 @@ export interface AgentDriverMaterializedSkill {
 }
 
 export interface AgentDriverSkillPort {
-  materialize(execution: DriverExecutionInput): Promise<readonly AgentDriverMaterializedSkill[]>;
+  materialize(
+    execution: DriverExecutionInput,
+    signal: AbortSignal,
+  ): Promise<readonly AgentDriverMaterializedSkill[]>;
 }
 
 export interface AgentDriverFilePort {

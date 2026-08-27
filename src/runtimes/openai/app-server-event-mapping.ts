@@ -33,7 +33,7 @@ function readNonNegativeNumber(value: JsonObject | null, key: string): number | 
   return typeof entry === "number" && Number.isSafeInteger(entry) && entry >= 0 ? entry : null;
 }
 
-export function toOpenAiErrorMessage(
+function toOpenAiErrorMessage(
   message: string,
   additionalDetails: string | null | undefined,
 ): string {

@@ -389,11 +389,10 @@ describe("DriverEventPublisher", () => {
     const first = publisher.push(context, "first", [createDelta("a")]);
 
     await firstSendEntered.promise;
-    const blocked = await Promise.race([first.then(() => false), Bun.sleep(10).then(() => true)]);
+    await first;
     releaseFirstSend.resolve();
     await publisher.push(context, "flush", [createEvent("message.completed")]);
 
-    expect(blocked).toBe(false);
     await context.logger.destroy();
   });
 
@@ -685,6 +684,88 @@ describe("DriverEventPublisher", () => {
       ),
     ).toHaveLength(1);
     expect(new Set(attempts.slice(1, 4).map(([event]) => event?.sourceEventId)).size).toBe(1);
+    await context.logger.destroy();
+  });
+
+  test("keeps a failed terminal settlement reserved until the same run retries it", async () => {
+    const attempts: DriverEventInput[][] = [];
+    let activeRunId: RunId | null = DRIVER_TEST_IDS.runId;
+    let available = false;
+    let seq = 0;
+    const context = createContext({
+      currentRunId: () => activeRunId,
+      pushEvents: async (events) => {
+        attempts.push(events);
+
+        if (!available) {
+          throw new Error("terminal transport unavailable");
+        }
+
+        return acceptEvents(events, () => (seq += 1));
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const closure = createEvent("message.completed");
+    const terminal = createRunTerminal("run.completed");
+
+    await expect(publisher.pushTerminal(context, "terminal", [closure], terminal)).rejects.toThrow(
+      "terminal transport unavailable",
+    );
+    activeRunId = DRIVER_TEST_IDS.secondRunId;
+    await expect(
+      publisher.pushSession(context, "session", [
+        {
+          kind: "agent.task.updated",
+          payload: { active: false, status: "completed", taskId: "agent-1" },
+        },
+      ]),
+    ).rejects.toThrow("terminal settlement slot is full");
+    expect(() =>
+      publisher.pushTerminal(context, "next-run", [], {
+        ...terminal,
+        runId: DRIVER_TEST_IDS.secondRunId,
+      }),
+    ).toThrow("terminal settlement slot is full");
+
+    activeRunId = DRIVER_TEST_IDS.runId;
+    available = true;
+    await publisher.pushTerminal(context, "terminal.retry", [closure], terminal);
+
+    expect(kinds(attempts)).toEqual([
+      ["message.completed"],
+      ["message.completed"],
+      ["message.completed"],
+      ["run.completed"],
+    ]);
+    expect(attempts.flat().some((event) => event.kind === "agent.task.updated")).toBe(false);
+    await context.logger.destroy();
+  });
+
+  test("does not let a session push cross a terminal installed at its await boundary", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const session = publisher.pushSession(context, "session", [
+      {
+        kind: "agent.task.updated",
+        payload: { active: false, status: "completed", taskId: "agent-1" },
+      },
+    ]);
+    const terminal = publisher.pushTerminal(
+      context,
+      "terminal",
+      [],
+      createRunTerminal("run.completed"),
+    );
+
+    await expect(session).rejects.toThrow("terminal settlement slot is full");
+    await terminal;
+    expect(kinds(attempts)).toEqual([["run.completed"]]);
     await context.logger.destroy();
   });
 
@@ -1086,7 +1167,7 @@ describe("DriverEventPublisher", () => {
     await context.logger.destroy();
   });
 
-  test("rejects an oversized closure without delivering the run terminal", async () => {
+  test("rejects aggregate terminal bytes before delivering any event", async () => {
     let sends = 0;
     const context = createContext({
       pushEvents: async () => {
@@ -1095,23 +1176,49 @@ describe("DriverEventPublisher", () => {
       },
     });
     const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-    const oversized = {
+    const closures = ["one", "two"].map((messageId): DriverEventInput => ({
       kind: "message.completed",
       payload: {
-        messageId: "message-1",
-        metadata: { detail: "x".repeat(32 * 1_024 * 1_024) },
+        messageId,
+        metadata: { detail: "x".repeat(600 * 1_024) },
         stopReason: "end_turn",
       },
-    } satisfies DriverEventInput;
+    }));
+
+    expect(() =>
+      publisher.pushTerminal(context, "terminal", closures, createRunTerminal("run.completed")),
+    ).toThrow("run terminal batch exceeds 1048576 UTF-8 bytes");
+    expect(sends).toBe(0);
+    await context.logger.destroy();
+  });
+
+  test("rejects aggregate terminal count before reading payloads", async () => {
+    let payloadReads = 0;
+    let sends = 0;
+    const closure = {
+      kind: "message.completed",
+      get payload() {
+        payloadReads += 1;
+        return { messageId: "message-1", stopReason: "end_turn" };
+      },
+    } as DriverEventInput;
+    const context = createContext({
+      pushEvents: async () => {
+        sends += 1;
+        return { accepted: [] };
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
 
     expect(() =>
       publisher.pushTerminal(
         context,
         "terminal",
-        [createEvent("message.completed"), oversized],
+        Array.from({ length: 1_024 }, () => closure),
         createRunTerminal("run.completed"),
       ),
-    ).toThrow("Driver event queue exceeds 33554432 UTF-8 bytes");
+    ).toThrow("exceeds 1024 events");
+    expect(payloadReads).toBe(0);
     expect(sends).toBe(0);
     await context.logger.destroy();
   });
@@ -1410,7 +1517,7 @@ describe("DriverEventPublisher", () => {
         ...createRunTerminal("run.completed"),
         runId: DRIVER_TEST_IDS.secondRunId,
       }),
-    ).toThrow("settlement slot is full");
+    ).toThrow("must target the active run");
     release.resolve();
     await first;
 

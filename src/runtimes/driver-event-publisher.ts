@@ -142,6 +142,12 @@ export class DriverEventPublisher {
     }
 
     await this.#terminalSettlement?.task;
+
+    const settlement = this.#terminalSettlement;
+    if (settlement !== null && settlement.nextIndex < settlement.events.length) {
+      throw new Error("Driver event run terminal settlement slot is full.");
+    }
+
     const sessionEvents = events.map((event): DriverEventInput => ({ ...event, runId: null }));
     try {
       return this.#submit(context, reason, sessionEvents, undefined, true).catch(
@@ -192,7 +198,7 @@ export class DriverEventPublisher {
     if (
       settlement !== null &&
       settlement !== terminalSettlement &&
-      (settlement.nextIndex >= settlement.events.length || settlement.task === null) &&
+      settlement.nextIndex >= settlement.events.length &&
       currentRunId !== settlement.activeRunId
     ) {
       this.#terminalSettlement = null;
@@ -297,22 +303,26 @@ export class DriverEventPublisher {
     }
 
     const activeRunId = context.ports.eventSink.currentRunId();
-    const targetRunId = (terminal.runId as RunId | undefined) ?? activeRunId;
 
     if (activeRunId === null) {
       throw new Error("Driver terminal push requires an active run.");
     }
 
-    const scopedEvents = [...closures, terminal].map((event) =>
-      scopeDriverEvent(event, targetRunId),
-    );
+    if (terminal.runId !== undefined && terminal.runId !== activeRunId) {
+      throw new Error("Driver terminal push must target the active run.");
+    }
+
+    const targetRunId = activeRunId;
+    const settlementEvents = [...closures, terminal];
 
     if (
-      scopedEvents.some((event) => ((event.runId as RunId | undefined) ?? null) !== targetRunId)
+      settlementEvents.some((event) => event.runId !== undefined && event.runId !== targetRunId)
     ) {
       throw new Error("Driver terminal push requires every event to target the same run.");
     }
 
+    preflightDriverEventPush(settlementEvents, targetRunId);
+    const scopedEvents = settlementEvents.map((event) => scopeDriverEvent(event, targetRunId));
     const key = terminalSettlementKey(scopedEvents);
     const current = this.#terminalSettlement;
 
@@ -326,17 +336,13 @@ export class DriverEventPublisher {
         return this.#startTerminalSettlement(context, reason, current);
       }
 
-      const idle = current.nextIndex >= current.events.length || current.task === null;
+      const settled = current.nextIndex >= current.events.length;
       const activeRunChanged = activeRunId !== current.activeRunId;
-      if (!idle || !activeRunChanged) {
+      if (!settled || !activeRunChanged) {
         throw new Error("Driver event run terminal settlement slot is full.");
       }
 
       this.#terminalSettlement = null;
-    }
-
-    if (targetRunId !== activeRunId) {
-      throw new Error("Driver terminal push must target the active run.");
     }
 
     const retryCandidates = [
@@ -391,8 +397,6 @@ export class DriverEventPublisher {
         throw new Error("Driver terminal source event ID conflicts with a pending event.");
       }
     }
-
-    preflightDriverEventPush(events, targetRunId);
 
     if (this.#terminalSettlement !== null) {
       if (this.#terminalSettlement.key !== key) {

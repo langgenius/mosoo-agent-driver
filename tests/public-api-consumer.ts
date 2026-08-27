@@ -19,7 +19,3 @@ export interface PublicApiConsumer {
   readonly snapshot: SessionSnapshot;
   readonly startInput: DriverStartInput;
 }
-
-export function consumePublicApi(api: PublicApiConsumer): PublicApiConsumer {
-  return api;
-}

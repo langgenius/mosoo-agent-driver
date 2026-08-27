@@ -130,7 +130,7 @@ export function toAuthEvent(input: {
   ])[0]!;
 }
 
-export function shouldIgnoreReplay(params: unknown): boolean {
+export function isTurnScopedSessionUpdate(params: unknown): boolean {
   const record = isRecord(params) ? params : {};
   const update = readRecord(record, "update");
 
@@ -171,12 +171,14 @@ export function normalizePromptUsage(raw: unknown): JsonObject | null {
     return null;
   }
 
+  // Prompt usage is emitted in the same lossless batch as every open-item
+  // closure. Keep only the bounded canonical counters; ACP extension metadata
+  // is arbitrary JSON and cannot safely participate in that atomic batch.
   return {
     ...(cachedReadTokens === null ? {} : { cachedReadTokens }),
     ...(cachedWriteTokens === null ? {} : { cachedWriteTokens }),
     ...(inputTokens === null ? {} : { inputTokens }),
     ...(outputTokens === null ? {} : { outputTokens }),
-    raw,
     source: "prompt_response",
     ...(thoughtTokens === null ? {} : { thoughtTokens }),
     ...(totalTokens === null ? {} : { totalTokens }),

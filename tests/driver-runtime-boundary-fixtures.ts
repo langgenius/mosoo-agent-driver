@@ -7,7 +7,12 @@ import type { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state
 import type { AgentDriverMcpPort } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import type { RuntimeCommand } from "../src/runtime-command";
+import type {
+  McpExecuteCommand,
+  McpExternalToolEffectExecution,
+  McpExternalToolExecutionResult,
+  RuntimeCommand,
+} from "../src/runtime-command";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 export { DRIVER_TEST_IDS };
@@ -153,7 +158,12 @@ export function createBackend(): RecordingBackend {
 export function createDispatcher(input: {
   backend: AgentDriverBackend;
   isShuttingDown?: () => boolean;
-  mcpExecute?: AgentDriverMcpPort["execute"];
+  mcpExecute?: (
+    command: McpExecuteCommand,
+    signal: AbortSignal,
+    effect: McpExternalToolEffectExecution,
+  ) => Promise<McpExternalToolExecutionResult>;
+  mcpPrepare?: AgentDriverMcpPort["prepare"];
   permissionRequests?: DriverPermissionBroker;
   rememberRunFailure?: (error: Parameters<DriverRuntimeIo["failRun"]>[0]) => void;
   runtimeState: DriverRuntimeStateMachine;
@@ -200,13 +210,20 @@ export function createDispatcher(input: {
             },
           },
           mcp: {
-            execute:
-              input.mcpExecute ??
-              (async (command) => ({
-                outputText: `ran ${command.toolName}`,
-                requestId: command.requestId,
-                serverId: command.serverId,
-                toolName: command.toolName,
+            prepare:
+              input.mcpPrepare ??
+              (async (command, signal) => ({
+                execute: (effect) =>
+                  (
+                    input.mcpExecute ??
+                    (async () => ({
+                      outputText: `ran ${command.toolName}`,
+                      requestId: command.requestId,
+                      serverId: command.serverId,
+                      toolName: command.toolName,
+                    }))
+                  )(command, signal, effect),
+                async [Symbol.asyncDispose]() {},
               })),
           },
         },

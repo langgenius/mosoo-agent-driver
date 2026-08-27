@@ -265,6 +265,132 @@ describe("AgentDriverKernelCore", () => {
     },
   );
 
+  test("commits only an admitted terminal for the active run", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const events = kernel.events()[Symbol.asyncIterator]();
+    const delta: DriverEventInput = {
+      delivery: "lossless",
+      kind: "message.delta",
+      payload: {
+        contentDelta: "x",
+        messageId: "message-1",
+        role: "agent",
+      },
+    };
+    kernel.beginRun(DRIVER_TEST_IDS.runId);
+
+    for (const runId of [null, DRIVER_TEST_IDS.secondRunId]) {
+      await expect(
+        kernel.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { stopReason: "end_turn" },
+              runId,
+            },
+          ],
+        }),
+      ).rejects.toThrow("must target the active run");
+    }
+    await kernel.pushEvents({ events: Array.from({ length: 1_024 }, () => delta) });
+    await expect(
+      kernel.pushEvents({
+        events: [
+          {
+            kind: "run.completed",
+            payload: { stopReason: "end_turn" },
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        ],
+      }),
+    ).rejects.toThrow("exceeds 1024 items");
+    expect(kernel.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+
+    await kernel.failRun({
+      code: "terminal_admission_failed",
+      details: {},
+      message: "Terminal admission failed.",
+      retryable: false,
+    });
+    await kernel.stop("test.complete");
+
+    const received: DriverEventInput[] = [];
+    for await (const event of { [Symbol.asyncIterator]: () => events }) {
+      received.push(event);
+    }
+
+    expect(received).toHaveLength(1_025);
+    expect(received.at(-1)).toMatchObject({
+      kind: "run.failed",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+  });
+
+  test("linearizes each run at its single final terminal", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const delta: DriverEventInput = {
+      delivery: "lossless",
+      kind: "message.delta",
+      payload: {
+        contentDelta: "x",
+        messageId: "message-1",
+        role: "agent",
+      },
+    };
+    const completed: DriverEventInput = {
+      kind: "run.completed",
+      payload: { stopReason: "end_turn" },
+      runId: DRIVER_TEST_IDS.runId,
+    };
+    kernel.beginRun(DRIVER_TEST_IDS.runId);
+
+    await expect(kernel.pushEvents({ events: [completed, delta] })).rejects.toThrow(
+      "must be the final event",
+    );
+    await expect(
+      kernel.pushEvents({
+        events: [
+          completed,
+          {
+            kind: "run.failed",
+            payload: { error: { code: "failed", message: "failed", retryable: false } },
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        ],
+      }),
+    ).rejects.toThrow("multiple run terminals");
+    await expect(
+      kernel.pushEvents({ events: [{ ...delta, runId: DRIVER_TEST_IDS.secondRunId }] }),
+    ).rejects.toThrow("must target the active run");
+    await expect(
+      kernel.pushEvents({ events: [{ ...completed, delivery: "best_effort" }] }),
+    ).rejects.toThrow("must be lossless");
+    expect(kernel.runEventTerminal(DRIVER_TEST_IDS.runId)).toBeNull();
+
+    await expect(kernel.pushEvents({ events: [delta, completed] })).resolves.toMatchObject({
+      accepted: [{ type: "message.delta" }, { type: "run.completed" }],
+    });
+    expect(kernel.runEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+
+    await expect(kernel.pushEvents({ events: [delta] })).rejects.toThrow(
+      "cannot target a terminated run",
+    );
+    await expect(kernel.pushEvents({ events: [{ ...delta, runId: null }] })).resolves.toMatchObject(
+      { accepted: [{ type: "message.delta" }] },
+    );
+
+    expect(() => kernel.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+      `Driver run ${DRIVER_TEST_IDS.runId} is already active.`,
+    );
+    expect(kernel.currentRunId()).toBe(DRIVER_TEST_IDS.runId);
+    expect(kernel.runEventTerminal(DRIVER_TEST_IDS.runId)).toBe("completed");
+
+    kernel.endRun(DRIVER_TEST_IDS.runId);
+    kernel.beginRun(DRIVER_TEST_IDS.secondRunId);
+    expect(kernel.currentRunId()).toBe(DRIVER_TEST_IDS.secondRunId);
+    expect(kernel.runEventTerminal(DRIVER_TEST_IDS.secondRunId)).toBeNull();
+  });
+
   test("treats stop before start as a terminal lifecycle", async () => {
     const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
     const events = kernel.events()[Symbol.asyncIterator]();

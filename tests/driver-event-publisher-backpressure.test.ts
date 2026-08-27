@@ -144,9 +144,7 @@ describe("DriverEventPublisher", () => {
 
       releaseFirstSend.resolve();
       await expect(first).rejects.toThrow("socket unavailable");
-      expect(
-        await Promise.race([recovered.promise.then(() => true), Bun.sleep(50).then(() => false)]),
-      ).toBe(true);
+      await recovered.promise;
       expect(attempts).toHaveLength(2);
       expect(attempts[1]?.map((event) => event.sourceEventId)).toEqual(
         attempts[0]?.map((event) => event.sourceEventId),

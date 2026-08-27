@@ -123,6 +123,29 @@ describe("DriverPermissionBroker", () => {
     await expect(first).resolves.toBe("allow_once");
   });
 
+  test("rejects a request whose delivery outlives its run generation", async () => {
+    const deliveryEntered = Promise.withResolvers<void>();
+    const releaseDelivery = Promise.withResolvers<void>();
+    const broker = new DriverPermissionBroker(() => null);
+    let ownsRun = true;
+    const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
+      pushEvents: async ({ events }) => {
+        deliveryEntered.resolve();
+        await releaseDelivery.promise;
+        return acceptEvents(events);
+      },
+    };
+
+    const request = broker.request(socket, permissionInput, undefined, () => ownsRun);
+    await deliveryEntered.promise;
+    ownsRun = false;
+    releaseDelivery.resolve();
+
+    await expect(request).resolves.toBe("reject_once");
+    expect(broker.hasPending()).toBe(false);
+  });
+
   test("bounds the number of pending requests", async () => {
     const broker = new DriverPermissionBroker(() => null, {
       maxPendingRequestBytes: 1_024,
@@ -802,6 +825,51 @@ describe("DriverPermissionBroker", () => {
       "permission.resolved",
       "diagnostic.reported",
     ]);
+  });
+
+  test("gives a cancellation retry a fresh wait budget", async () => {
+    const requestedPublishing = Promise.withResolvers<void>();
+    const releaseRequested = Promise.withResolvers<void>();
+    const socket: DriverRuntimeEventPort = {
+      currentRunId: () => runId,
+      pushEvents: async ({ events }) => {
+        if (events.some((event) => event.kind === "permission.requested")) {
+          requestedPublishing.resolve();
+          await releaseRequested.promise;
+        }
+        return acceptEvents(events);
+      },
+    };
+    const broker = new DriverPermissionBroker(() => null, {
+      eventDeliveryTimeoutMs: 10,
+    });
+    const request = broker.request(socket, permissionInput);
+    const requestOutcome = request.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    await requestedPublishing.promise;
+    const first = broker.rejectAllAndWait();
+    await expect(first).rejects.toThrow("Driver permission cancellation timed out");
+
+    const retry = broker.rejectAllAndWait();
+    expect(retry).not.toBe(first);
+    let retrySettled = false;
+    void retry.then(
+      () => {
+        retrySettled = true;
+      },
+      () => {
+        retrySettled = true;
+      },
+    );
+    await Promise.resolve();
+    expect(retrySettled).toBe(false);
+
+    releaseRequested.resolve();
+    expect(await requestOutcome).toBeInstanceOf(PermissionEventDeliveryError);
+    await expect(retry).resolves.toBeUndefined();
   });
 
   test("bounds ordinary cancellation delivery below the active-turn grace", async () => {

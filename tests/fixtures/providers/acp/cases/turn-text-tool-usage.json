@@ -152,13 +152,6 @@
         "cachedWriteTokens": 1,
         "inputTokens": 4,
         "outputTokens": 2,
-        "raw": {
-          "cachedReadTokens": 5,
-          "cachedWriteTokens": 1,
-          "inputTokens": 4,
-          "outputTokens": 2,
-          "totalTokens": 12
-        },
         "source": "prompt_response",
         "totalTokens": 12,
         "usageContract": "anthropic_bucketed"

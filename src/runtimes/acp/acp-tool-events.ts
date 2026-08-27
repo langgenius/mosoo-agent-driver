@@ -15,6 +15,19 @@ import type { JsonObject } from "./acp-types";
 
 export type RuntimeToolStatus = "cancelled" | "completed" | "failed" | "running";
 
+// Completed calls are retained only to suppress bounded late replays. They do
+// not participate in terminal settlement admission: only open calls can emit
+// terminal closures. The cache has its own independent memory bound.
+const MAX_ACP_COMPLETED_TOOL_HISTORY_BYTES = MAX_ACP_LOSSLESS_EVENT_BYTES;
+const MAX_ACP_COMPLETED_TOOL_HISTORY_ITEMS = 1_024;
+
+interface AcpToolState {
+  readonly completed: boolean;
+  readonly hasNonzeroExit: boolean;
+  readonly snapshot: JsonObject;
+  readonly started: boolean;
+}
+
 function readToolDisplayString(value: unknown): string | undefined {
   const display = stringifyForDisplay(value);
 
@@ -41,37 +54,51 @@ function hasNonzeroExecuteExit(kind: unknown, update: JsonObject | null): boolea
 }
 
 export class AcpToolEventState {
-  #completed = new Set<string>();
-  #nonzeroExecuteExits = new Set<string>();
-  #snapshots = new Map<string, JsonObject>();
-  #started = new Set<string>();
+  #hadActivity = false;
+  #tools = new Map<string, AcpToolState>();
 
   hasActivity(): boolean {
-    return this.#started.size > 0;
+    return this.#hadActivity;
   }
 
   hasStarted(toolCallId: string): boolean {
-    return this.#started.has(toolCallId);
+    return this.#tools.get(toolCallId)?.started ?? false;
+  }
+
+  openItemCount(): number {
+    let count = 0;
+
+    for (const tool of this.#tools.values()) {
+      if (tool.started && !tool.completed) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  retainedOpenState(): readonly JsonObject[] {
+    return [...this.#tools.values()].flatMap((tool) =>
+      tool.started && !tool.completed ? [tool.snapshot] : [],
+    );
+  }
+
+  compactHistory(): void {
+    this.#trimCompletedHistory();
   }
 
   clear(): void {
-    this.#completed.clear();
-    this.#nonzeroExecuteExits.clear();
-    this.#snapshots.clear();
-    this.#started.clear();
+    this.#hadActivity = false;
+    this.#tools.clear();
   }
 
   checkpoint(): () => void {
-    const completed = new Set(this.#completed);
-    const nonzeroExecuteExits = new Set(this.#nonzeroExecuteExits);
-    const snapshots = new Map(this.#snapshots);
-    const started = new Set(this.#started);
+    const hadActivity = this.#hadActivity;
+    const tools = new Map([...this.#tools].map(([toolCallId, tool]) => [toolCallId, { ...tool }]));
 
     return () => {
-      this.#completed = completed;
-      this.#nonzeroExecuteExits = nonzeroExecuteExits;
-      this.#snapshots = snapshots;
-      this.#started = started;
+      this.#hadActivity = hadActivity;
+      this.#tools = tools;
     };
   }
 
@@ -81,13 +108,14 @@ export class AcpToolEventState {
     toolCallId: string;
     update: JsonObject | null;
   }): { changed: boolean; payload: JsonObject; status: RuntimeToolStatus } {
-    const previous = this.#snapshots.get(input.toolCallId);
-    const previousStatus = previous?.["status"];
-    const kind = readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool";
+    const previous = this.#tools.get(input.toolCallId);
+    const previousSnapshot = previous?.snapshot;
+    const previousStatus = previousSnapshot?.["status"];
+    const kind = readNonEmptyString(input.update, "kind") ?? previousSnapshot?.["kind"] ?? "tool";
     const nextStatus = input.status ?? "running";
 
     const hasNonzeroExit =
-      this.#nonzeroExecuteExits.has(input.toolCallId) || hasNonzeroExecuteExit(kind, input.update);
+      (previous?.hasNonzeroExit ?? false) || hasNonzeroExecuteExit(kind, input.update);
 
     const status =
       previousStatus === "cancelled" ||
@@ -100,12 +128,12 @@ export class AcpToolEventState {
     // The projection layer links tool calls to their assistant message via
     // parentMessageId; keep the first observed parent for the call's lifetime.
     const parentMessageId =
-      (typeof previous?.["parentMessageId"] === "string"
-        ? previous["parentMessageId"]
+      (typeof previousSnapshot?.["parentMessageId"] === "string"
+        ? previousSnapshot["parentMessageId"]
         : undefined) ?? input.parentMessageId;
-    const title = readNonEmptyString(input.update, "title") ?? previous?.["title"];
+    const title = readNonEmptyString(input.update, "title") ?? previousSnapshot?.["title"];
     const payload = {
-      ...previous,
+      ...previousSnapshot,
       ...toToolCallPayload(input.toolCallId, status, input.update),
       kind,
       ...(parentMessageId === undefined ? {} : { parentMessageId }),
@@ -113,18 +141,15 @@ export class AcpToolEventState {
       ...(typeof title === "string" ? { title } : {}),
       toolCallId: input.toolCallId,
     };
-    const changed = previous === undefined || !isDeepStrictEqual(previous, payload);
+    const changed = previousSnapshot === undefined || !isDeepStrictEqual(previousSnapshot, payload);
 
-    if (Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_ACP_LOSSLESS_EVENT_BYTES) {
-      throw new RangeError(`ACP tool update exceeds ${MAX_ACP_LOSSLESS_EVENT_BYTES} UTF-8 bytes.`);
-    }
-
-    if (hasNonzeroExit) {
-      this.#nonzeroExecuteExits.add(input.toolCallId);
-    }
-
-    if (changed) {
-      this.#snapshots.set(input.toolCallId, structuredClone(payload));
+    if (changed || hasNonzeroExit !== previous?.hasNonzeroExit) {
+      this.#tools.set(input.toolCallId, {
+        completed: previous?.completed ?? false,
+        hasNonzeroExit,
+        snapshot: changed ? structuredClone(payload) : previous!.snapshot,
+        started: previous?.started ?? false,
+      });
     }
 
     return { changed, payload, status };
@@ -136,11 +161,18 @@ export class AcpToolEventState {
     toolCallId: string;
     update: JsonObject | null;
   }): DriverEventInput | null {
-    if (this.#completed.has(input.toolCallId)) {
+    const tool = this.#tools.get(input.toolCallId);
+
+    if (tool === undefined) {
+      throw new Error("ACP tool completion requires a projected tool call.");
+    }
+    if (tool.completed) {
+      this.#trimCompletedHistory();
       return null;
     }
 
-    this.#completed.add(input.toolCallId);
+    this.#tools.set(input.toolCallId, { ...tool, completed: true });
+    this.#trimCompletedHistory();
     return {
       kind: "item.completed",
       payload: {
@@ -160,12 +192,12 @@ export class AcpToolEventState {
   }): DriverEventInput[] {
     const events: DriverEventInput[] = [];
 
-    for (const itemId of this.#started) {
-      if (this.#completed.has(itemId)) {
+    for (const [itemId, tool] of this.#tools) {
+      if (!tool.started || tool.completed) {
         continue;
       }
 
-      this.#completed.add(itemId);
+      this.#tools.set(itemId, { ...tool, completed: true });
       events.push({
         kind: "tool.call.updated",
         payload: {
@@ -187,6 +219,8 @@ export class AcpToolEventState {
       });
     }
 
+    this.#trimCompletedHistory();
+
     return events;
   }
 
@@ -196,11 +230,17 @@ export class AcpToolEventState {
     title: string;
     toolCallId: string;
   }): DriverEventInput[] {
-    if (this.#started.has(input.toolCallId)) {
+    const tool = this.#tools.get(input.toolCallId);
+
+    if (tool?.started) {
       return [];
     }
+    if (tool === undefined) {
+      throw new Error("ACP tool start requires a projected tool call.");
+    }
 
-    this.#started.add(input.toolCallId);
+    this.#hadActivity = true;
+    this.#tools.set(input.toolCallId, { ...tool, started: true });
     return [
       {
         kind: "item.started",
@@ -213,6 +253,29 @@ export class AcpToolEventState {
         runId: input.runId,
       },
     ];
+  }
+
+  #trimCompletedHistory(): void {
+    const completed = [...this.#tools].filter(([, tool]) => tool.completed);
+    let retainedItems = completed.length;
+    let bytes = completed.reduce(
+      (total, [toolCallId, tool]) =>
+        total + Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8"),
+      0,
+    );
+
+    for (const [toolCallId, tool] of completed) {
+      if (
+        retainedItems <= MAX_ACP_COMPLETED_TOOL_HISTORY_ITEMS &&
+        bytes <= MAX_ACP_COMPLETED_TOOL_HISTORY_BYTES
+      ) {
+        break;
+      }
+
+      this.#tools.delete(toolCallId);
+      retainedItems -= 1;
+      bytes -= Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8");
+    }
   }
 }
 

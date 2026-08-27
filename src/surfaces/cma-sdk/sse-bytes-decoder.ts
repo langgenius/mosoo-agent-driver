@@ -71,13 +71,22 @@ function sseFrameLimitError(): CmaSdkError {
 
 export async function* decodeCmaSseBytes(
   body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
 ): AsyncIterable<CmaSessionEventRecord> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const frame = new Uint8Array(CMA_MAX_EVENT_BYTES + 1);
+  let cancellation: Promise<void> | undefined;
   let completed = false;
   let frameLength = 0;
   let scanFrom = 0;
+  const cancel = () =>
+    (cancellation ??= reader.cancel(signal?.reason).then(
+      () => undefined,
+      () => undefined,
+    ));
+  const onAbort = () => void cancel();
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   const consume = (separator: {
     readonly index: number;
@@ -129,8 +138,11 @@ export async function* decodeCmaSseBytes(
   };
 
   try {
+    signal?.throwIfAborted();
+
     while (true) {
       const chunk = await reader.read();
+      signal?.throwIfAborted();
 
       if (chunk.done) {
         completed = true;
@@ -162,8 +174,12 @@ export async function* decodeCmaSseBytes(
       }
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
+
     if (!completed) {
-      await reader.cancel();
+      await cancel();
     }
+
+    reader.releaseLock();
   }
 }

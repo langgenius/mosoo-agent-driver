@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId } from "../src/protocol/id";
 import { spawnLinuxProcessTreeWatchdog } from "../src/runtimes/child-process";
+import { AcpPathScope } from "../src/runtimes/acp/acp-path-scope";
 import { AcpTerminalManager } from "../src/runtimes/acp/acp-terminal-manager";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -19,6 +20,8 @@ function createHarness(
   maxTerminals?: number,
   recordAfterPush = false,
   spawnWatchdog?: typeof spawnLinuxProcessTreeWatchdog,
+  pathScope?: AcpPathScope,
+  cwd = process.cwd(),
 ) {
   const events: DriverEventInput[] = [];
   const logger = createBufferedSinkLogger({
@@ -37,9 +40,10 @@ function createHarness(
   });
   const manager = new AcpTerminalManager({
     allowedRoots: [],
-    cwd: process.cwd(),
+    cwd,
     env: {},
     maxTerminals,
+    pathScope,
     push: async (_context, _reason, next) => {
       if (recordAfterPush) {
         await onPush?.(_reason, next);
@@ -94,6 +98,47 @@ async function waitForProcessExit(pid: number): Promise<void> {
 }
 
 describe("ACP terminal manager", () => {
+  test("binds terminal cwd to the opened directory when its ancestor is exchanged", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mosoo-acp-terminal-cwd-race-"));
+    const outside = await mkdtemp(join(tmpdir(), "mosoo-acp-terminal-cwd-race-outside-"));
+    const workspace = join(root, "workspace");
+    const retained = join(root, "retained");
+
+    class ExchangingPathScope extends AcpPathScope {
+      override async openDirectory(path: string, label: string) {
+        const capability = await super.openDirectory(path, label);
+        await rename(workspace, retained);
+        await symlink(outside, workspace);
+        return capability;
+      }
+    }
+
+    await mkdir(workspace);
+    const pathScope = new ExchangingPathScope({ allowedRoots: [], cwd: root });
+    const harness = createHarness(undefined, undefined, false, undefined, pathScope, root);
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'require("node:fs").writeFileSync("marker.txt", process.cwd())'],
+        command: process.execPath,
+        cwd: workspace,
+      });
+      await harness.manager.waitForExit(terminal);
+      await harness.manager.release(harness.context, terminal);
+
+      expect(await readFile(join(retained, "marker.txt"), "utf8")).toBe(retained);
+      expect(existsSync(join(outside, "marker.txt"))).toBe(false);
+      expect(harness.events.find((event) => event.kind === "terminal.created")).toMatchObject({
+        payload: { cwd: retained },
+      });
+    } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await harness.logger.destroy();
+      await rm(root, { force: true, recursive: true });
+      await rm(outside, { force: true, recursive: true });
+    }
+  });
+
   test("retains a valid UTF-8 suffix and exposes exit only after output closes", async () => {
     const harness = createHarness();
 
@@ -115,6 +160,7 @@ describe("ACP terminal manager", () => {
       });
       await harness.manager.release(harness.context, { terminalId });
     } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
       await harness.logger.destroy();
     }
   });
@@ -587,6 +633,52 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     }
   });
 
+  test("rejects a synchronous spawn failure without retaining terminal capacity", async () => {
+    const harness = createHarness(undefined, 1);
+
+    try {
+      await expect(
+        harness.manager.create(harness.context, {
+          command: "invalid\0command",
+        }),
+      ).rejects.toThrow("null bytes");
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(terminal);
+      await harness.manager.release(harness.context, terminal);
+    } finally {
+      await harness.manager.stopAll(harness.context);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("rejects repeated invalid cwd requests before reserving process ownership", async () => {
+    const harness = createHarness(undefined, 1);
+
+    try {
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        await expect(
+          harness.manager.create(harness.context, {
+            command: process.execPath,
+            cwd: "/",
+          }),
+        ).rejects.toThrow("outside the allowed roots");
+      }
+
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(terminal);
+      await harness.manager.release(harness.context, terminal);
+    } finally {
+      await harness.manager.stopAll(harness.context);
+      await harness.logger.destroy();
+    }
+  });
+
   test("rejects terminal creation after shutdown starts", async () => {
     const harness = createHarness();
 
@@ -818,6 +910,7 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
         await expect(operation()).rejects.toThrow("does not exist");
       }
     } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
       await harness.logger.destroy();
     }
   });

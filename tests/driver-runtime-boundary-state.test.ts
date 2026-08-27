@@ -3,17 +3,56 @@ import { describe, expect, test } from "bun:test";
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { createTimingEvent } from "../src/core/driver-runtime-timing";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
+import type { CredentialId, McpServerId } from "../src/protocol/boot";
 import { parseDriverEventEnvelope } from "../src/protocol/events";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
-import type { RuntimeCommand } from "../src/runtime-command";
+import type { DriverStartInput } from "../src/protocol/start";
+import type { McpExecuteCommand, RuntimeCommand } from "../src/runtime-command";
+import { prepareRemoteHttpMcpCommand } from "../src/runtimes/mcp/remote-http-mcp-executor";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import {
   FakeDriverRuntimeIo,
+  bootPayload,
   createBackend,
   createDispatcher,
   waitForUpdate,
 } from "./driver-runtime-boundary-fixtures";
+
+const MCP_PREFLIGHT_SERVER_ID = "01J00000000000000000000020" as McpServerId;
+const MCP_PREFLIGHT_CREDENTIAL_ID = "01J00000000000000000000021" as CredentialId;
+
+function withMcpServers(
+  mcpServers: DriverStartInput["execution"]["session"]["mcpServers"],
+): DriverStartInput {
+  return {
+    ...bootPayload,
+    execution: {
+      ...bootPayload.execution,
+      session: {
+        ...bootPayload.execution.session,
+        mcpServers,
+      },
+    },
+  };
+}
+
+class EffectLedgerRecordingSocket extends FakeDriverRuntimeIo {
+  claimCount = 0;
+  unknownCount = 0;
+
+  override async claimExternalToolEffect(
+    input: Parameters<FakeDriverRuntimeIo["claimExternalToolEffect"]>[0],
+    signal: AbortSignal,
+  ): ReturnType<FakeDriverRuntimeIo["claimExternalToolEffect"]> {
+    this.claimCount += 1;
+    return super.claimExternalToolEffect(input, signal);
+  }
+
+  override async markExternalToolEffectUnknown(): Promise<void> {
+    this.unknownCount += 1;
+  }
+}
 
 describe("driver runtime boundary", () => {
   test("rejects an invalid runtime transition", () => {
@@ -454,27 +493,39 @@ describe("driver runtime boundary", () => {
     await first.logger.destroy();
 
     const secondSocket = new FakeDriverRuntimeIo([structuredClone(command)]);
+    let secondClaims = 0;
+    let secondPreparations = 0;
     const second = createDispatcher({
       backend: createBackend(),
       isShuttingDown: () => secondSocket.isDrained(),
-      mcpExecute: async () => {
-        providerCalls += 1;
-        throw new Error("provider must not run during terminal redelivery");
+      mcpPrepare: async () => {
+        secondPreparations += 1;
+        return {
+          async execute() {
+            throw new Error("completed effect must not execute");
+          },
+          async [Symbol.asyncDispose]() {},
+        };
       },
       runtimeState: new DriverRuntimeStateMachine("ready"),
     });
 
     // The default fixture ledger has no cross-process state, so carry the
     // persisted effect receipt through the fresh Dispatcher explicitly.
-    secondSocket.claimExternalToolEffect = async () => ({
-      effectId: "effect-1",
-      kind: "completed" as const,
-      result: effectResult!,
-    });
+    secondSocket.claimExternalToolEffect = async () => {
+      secondClaims += 1;
+      return {
+        effectId: "effect-1",
+        kind: "completed" as const,
+        result: effectResult!,
+      };
+    };
     await second.dispatcher.run(secondSocket, second.logger);
     await second.logger.destroy();
 
     expect(providerCalls).toBe(1);
+    expect(secondPreparations).toBe(1);
+    expect(secondClaims).toBe(1);
     expect(secondSocket.updates).toEqual([
       { commandId: command.commandId, status: "accepted" },
       { commandId: command.commandId, result: effectResult, status: "completed" },
@@ -500,17 +551,28 @@ describe("driver runtime boundary", () => {
       toolName: "createIssue",
     };
     const socket = new FakeDriverRuntimeIo([command]);
-    socket.claimExternalToolEffect = async () => ({
-      effectId: "01J0000000000000000000000Z",
-      kind: "unknown" as const,
-    });
-    let providerCalls = 0;
+    let claims = 0;
+    let executions = 0;
+    let preparations = 0;
+    socket.claimExternalToolEffect = async () => {
+      claims += 1;
+      return {
+        effectId: "01J0000000000000000000000Z",
+        kind: "unknown" as const,
+      };
+    };
     const runtime = createDispatcher({
       backend: createBackend(),
       isShuttingDown: () => socket.isDrained(),
-      mcpExecute: async () => {
-        providerCalls += 1;
-        throw new Error("provider must not run for an unknown effect");
+      mcpPrepare: async () => {
+        preparations += 1;
+        return {
+          async execute() {
+            executions += 1;
+            throw new Error("unknown effect must not execute");
+          },
+          async [Symbol.asyncDispose]() {},
+        };
       },
       runtimeState: new DriverRuntimeStateMachine("ready"),
     });
@@ -518,7 +580,9 @@ describe("driver runtime boundary", () => {
     await runtime.dispatcher.run(socket, runtime.logger);
     await runtime.logger.destroy();
 
-    expect(providerCalls).toBe(0);
+    expect(preparations).toBe(1);
+    expect(claims).toBe(1);
+    expect(executions).toBe(0);
     expect(socket.updates).toMatchObject([
       { commandId: command.commandId, status: "accepted" },
       {
@@ -533,7 +597,432 @@ describe("driver runtime boundary", () => {
     ]);
   });
 
-  test("fences an in-flight MCP effect with a live signal when a turn is cancelled", async () => {
+  test("disposes MCP preparation when the claim CAS observes a completed effect", async () => {
+    const command: McpExecuteCommand = {
+      argumentsJson: "{}",
+      commandId: "claim-race-completed",
+      kind: "mcp.execute",
+      requestId: "claim-race-request",
+      serverId: MCP_PREFLIGHT_SERVER_ID,
+      toolCallId: "claim-race-tool",
+      toolName: "lookup",
+    };
+    const result = {
+      outputText: "already completed",
+      requestId: command.requestId,
+      serverId: command.serverId,
+      toolName: command.toolName,
+    };
+    const socket = new FakeDriverRuntimeIo([command]);
+    socket.claimExternalToolEffect = async () => ({
+      effectId: "claim-race-effect",
+      kind: "completed" as const,
+      result,
+    });
+    let disposals = 0;
+    let executions = 0;
+    const disposed = Promise.withResolvers<void>();
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      mcpPrepare: async () => ({
+        async execute() {
+          executions += 1;
+          throw new Error("completed claim must not execute");
+        },
+        async [Symbol.asyncDispose]() {
+          disposals += 1;
+          disposed.resolve();
+        },
+      }),
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    await runtime.dispatcher.run(socket, runtime.logger);
+    await disposed.promise;
+    await runtime.logger.destroy();
+
+    expect(executions).toBe(0);
+    expect(disposals).toBe(1);
+    expect(socket.updates).toContainEqual({
+      commandId: command.commandId,
+      result,
+      status: "completed",
+    });
+  });
+
+  test.each(["executed", "completed claim"] as const)(
+    "keeps a durable %s MCP result completed when its event publication fails",
+    async (settlement) => {
+      const command: McpExecuteCommand = {
+        argumentsJson: "{}",
+        commandId: `durable-event-failure-${settlement.replaceAll(" ", "-")}`,
+        kind: "mcp.execute",
+        requestId: "durable-event-failure-request",
+        serverId: MCP_PREFLIGHT_SERVER_ID,
+        toolCallId: "durable-event-failure-tool",
+        toolName: "lookup",
+      };
+      const result = {
+        outputText: "durable result",
+        requestId: command.requestId,
+        serverId: command.serverId,
+        toolName: command.toolName,
+      };
+      const durable = Promise.withResolvers<void>();
+      const completedEventEntered = Promise.withResolvers<void>();
+      const releaseCompletedEvent = Promise.withResolvers<void>();
+
+      class FailingCompletedEventSocket extends FakeDriverRuntimeIo {
+        unknownCount = 0;
+
+        override async claimExternalToolEffect(): ReturnType<
+          FakeDriverRuntimeIo["claimExternalToolEffect"]
+        > {
+          if (settlement === "completed claim") {
+            durable.resolve();
+            return { effectId: "durable-effect", kind: "completed", result };
+          }
+          return {
+            attempt: 1,
+            effectId: "durable-effect",
+            idempotencyKey: "durable-effect",
+            kind: "execute",
+          };
+        }
+
+        override async completeExternalToolEffect(): Promise<void> {
+          durable.resolve();
+        }
+
+        override async markExternalToolEffectUnknown(): Promise<void> {
+          this.unknownCount += 1;
+        }
+
+        override async pushEvents(
+          input: Parameters<FakeDriverRuntimeIo["pushEvents"]>[0],
+        ): ReturnType<FakeDriverRuntimeIo["pushEvents"]> {
+          if (
+            input.events.some(
+              (event) =>
+                event.kind === "tool.call.updated" &&
+                typeof event.payload === "object" &&
+                event.payload !== null &&
+                "status" in event.payload &&
+                event.payload.status === "completed",
+            )
+          ) {
+            completedEventEntered.resolve();
+            await releaseCompletedEvent.promise;
+            throw new Error("completed tool event delivery failed");
+          }
+          return super.pushEvents(input);
+        }
+      }
+
+      const socket = new FailingCompletedEventSocket([command]);
+      let providerCalls = 0;
+      const runtime = createDispatcher({
+        backend: createBackend(),
+        isShuttingDown: () => socket.isDrained(),
+        mcpExecute: async () => {
+          providerCalls += 1;
+          return result;
+        },
+        runtimeState: new DriverRuntimeStateMachine("ready"),
+      });
+      const runTask = runtime.dispatcher.run(socket, runtime.logger);
+
+      await durable.promise;
+      await completedEventEntered.promise;
+      expect(socket.updates.filter(({ status }) => status !== "accepted")).toEqual([]);
+      releaseCompletedEvent.resolve();
+      await runTask;
+      await waitForUpdate(
+        socket,
+        (update) => update.commandId === command.commandId && update.status === "completed",
+      );
+      await runtime.logger.destroy();
+
+      expect(providerCalls).toBe(settlement === "executed" ? 1 : 0);
+      expect(socket.unknownCount).toBe(0);
+      expect(socket.updates.filter(({ status }) => status !== "accepted")).toEqual([
+        { commandId: command.commandId, result, status: "completed" },
+      ]);
+    },
+  );
+
+  test.each([
+    [
+      "invalid arguments",
+      withMcpServers([
+        {
+          authType: "bearer",
+          authorizationState: "active",
+          credentialId: MCP_PREFLIGHT_CREDENTIAL_ID,
+          credentialScope: "session",
+          credentialStatus: "active",
+          name: "Test MCP",
+          proxyGrantId: "test-grant",
+          proxyUrl: "https://mcp.invalid.test",
+          serverId: MCP_PREFLIGHT_SERVER_ID,
+        },
+      ]),
+      "{",
+      MCP_PREFLIGHT_SERVER_ID,
+      "Invalid MCP tool arguments",
+    ],
+    ["missing server", withMcpServers([]), "{}", MCP_PREFLIGHT_SERVER_ID, "not configured"],
+    [
+      "disabled server",
+      withMcpServers([
+        {
+          authType: "bearer",
+          authorizationState: "disabled",
+          credentialScope: "session",
+          credentialStatus: "disabled",
+          name: "Test MCP",
+          serverId: MCP_PREFLIGHT_SERVER_ID,
+        },
+      ]),
+      "{}",
+      MCP_PREFLIGHT_SERVER_ID,
+      "disabled for this session",
+    ],
+  ] as const)(
+    "rejects %s before claiming an external effect",
+    async (_name, payload, argumentsJson, serverId, message) => {
+      const command: McpExecuteCommand = {
+        argumentsJson,
+        commandId: `preflight-${_name.replaceAll(" ", "-")}`,
+        kind: "mcp.execute",
+        requestId: "preflight-request",
+        serverId,
+        toolCallId: "preflight-tool",
+        toolName: "lookup",
+      };
+
+      const socket = new EffectLedgerRecordingSocket([command]);
+      const runtime = createDispatcher({
+        backend: createBackend(),
+        isShuttingDown: () => socket.isDrained(),
+        mcpPrepare: (input, signal) => prepareRemoteHttpMcpCommand(payload, input, signal),
+        runtimeState: new DriverRuntimeStateMachine("ready"),
+      });
+
+      await runtime.dispatcher.run(socket, runtime.logger);
+      await waitForUpdate(
+        socket,
+        (update) => update.commandId === command.commandId && update.status === "failed",
+      );
+      await runtime.logger.destroy();
+      const failure = socket.updates.find(
+        (update) => update.commandId === command.commandId && update.status === "failed",
+      );
+
+      expect(failure?.error?.message).toContain(message);
+      expect(socket.claimCount).toBe(0);
+      expect(socket.unknownCount).toBe(0);
+    },
+  );
+
+  test("does not claim an external effect when MCP connection setup fails", async () => {
+    let requestCount = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        requestCount += 1;
+        return new Response("unavailable", { status: 503 });
+      },
+    });
+    const payload = withMcpServers([
+      {
+        authType: "bearer",
+        authorizationState: "active",
+        credentialId: MCP_PREFLIGHT_CREDENTIAL_ID,
+        credentialScope: "session",
+        credentialStatus: "active",
+        name: "Test MCP",
+        proxyGrantId: "test-grant",
+        proxyUrl: `http://${server.hostname}:${server.port}`,
+        serverId: MCP_PREFLIGHT_SERVER_ID,
+      },
+    ]);
+    const command: McpExecuteCommand = {
+      argumentsJson: "{}",
+      commandId: "preflight-connect-failure",
+      kind: "mcp.execute",
+      requestId: "preflight-connect-request",
+      serverId: MCP_PREFLIGHT_SERVER_ID,
+      toolCallId: "preflight-connect-tool",
+      toolName: "lookup",
+    };
+    const socket = new EffectLedgerRecordingSocket([command]);
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      mcpPrepare: (input, signal) => prepareRemoteHttpMcpCommand(payload, input, signal),
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    try {
+      await runtime.dispatcher.run(socket, runtime.logger);
+      await waitForUpdate(
+        socket,
+        (update) => update.commandId === command.commandId && update.status === "failed",
+      );
+      const failure = socket.updates.find(
+        (update) => update.commandId === command.commandId && update.status === "failed",
+      );
+
+      expect(requestCount).toBeGreaterThan(0);
+      expect(failure?.error?.message).toContain("HTTP 503");
+      expect(socket.claimCount).toBe(0);
+      expect(socket.unknownCount).toBe(0);
+    } finally {
+      await runtime.logger.destroy();
+      await server.stop(true);
+    }
+  });
+
+  test.each([
+    ["before prepare", 0, 0],
+    ["during prepare", 0, 0],
+    ["during claim", 1, 1],
+  ] as const)("linearizes MCP cancellation %s", async (stage, expectedClaims, expectedUnknowns) => {
+    const command: McpExecuteCommand = {
+      argumentsJson: "{}",
+      commandId: `cancel-${stage.replace(" ", "-")}`,
+      kind: "mcp.execute",
+      requestId: "cancel-preparation-request",
+      serverId: MCP_PREFLIGHT_SERVER_ID,
+      toolCallId: "cancel-preparation-tool",
+      toolName: "lookup",
+    };
+    const boundaryEntered = Promise.withResolvers<void>();
+    const releaseBoundary = Promise.withResolvers<void>();
+
+    class CancellationSocket extends EffectLedgerRecordingSocket {
+      #blocked = false;
+
+      override async claimExternalToolEffect(
+        input: Parameters<FakeDriverRuntimeIo["claimExternalToolEffect"]>[0],
+        signal: AbortSignal,
+      ): ReturnType<FakeDriverRuntimeIo["claimExternalToolEffect"]> {
+        if (stage !== "during claim") {
+          return super.claimExternalToolEffect(input, signal);
+        }
+        this.claimCount += 1;
+        boundaryEntered.resolve();
+        return new Promise((_, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+
+      override async pushEvents(
+        input: Parameters<FakeDriverRuntimeIo["pushEvents"]>[0],
+      ): ReturnType<FakeDriverRuntimeIo["pushEvents"]> {
+        if (stage === "before prepare" && !this.#blocked) {
+          this.#blocked = true;
+          boundaryEntered.resolve();
+          await releaseBoundary.promise;
+        }
+        return super.pushEvents(input);
+      }
+    }
+
+    const socket = new CancellationSocket([command]);
+    const shutdown = new AbortController();
+    let executions = 0;
+    let preparations = 0;
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => shutdown.signal.aborted,
+      mcpPrepare: async () => {
+        preparations += 1;
+        if (stage === "during prepare") {
+          boundaryEntered.resolve();
+          await releaseBoundary.promise;
+        }
+        return {
+          async execute() {
+            executions += 1;
+            throw new Error("cancelled preparation must not execute");
+          },
+          async [Symbol.asyncDispose]() {},
+        };
+      },
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+      shutdownSignal: shutdown.signal,
+    });
+    const runTask = runtime.dispatcher.run(socket, runtime.logger);
+
+    await boundaryEntered.promise;
+    shutdown.abort(new Error("test cancellation"));
+    releaseBoundary.resolve();
+    await runTask;
+    await runtime.logger.destroy();
+
+    expect(preparations).toBe(stage === "before prepare" ? 0 : 1);
+    expect(executions).toBe(0);
+    expect(socket.claimCount).toBe(expectedClaims);
+    expect(socket.unknownCount).toBe(expectedUnknowns);
+    expect(socket.updates).toContainEqual({
+      commandId: command.commandId,
+      status: "cancelled",
+    });
+  });
+
+  test("fences an MCP claim when its acknowledgement is lost", async () => {
+    const command: McpExecuteCommand = {
+      argumentsJson: "{}",
+      commandId: "lost-claim-ack",
+      kind: "mcp.execute",
+      requestId: "lost-claim-request",
+      serverId: MCP_PREFLIGHT_SERVER_ID,
+      toolCallId: "lost-claim-tool",
+      toolName: "lookup",
+    };
+
+    class LostClaimSocket extends FakeDriverRuntimeIo {
+      fenceSignalAborted: boolean | null = null;
+      unknownCount = 0;
+
+      override async claimExternalToolEffect(): ReturnType<
+        FakeDriverRuntimeIo["claimExternalToolEffect"]
+      > {
+        throw new Error("claim acknowledgement lost");
+      }
+
+      override async markExternalToolEffectUnknown(
+        _input: Parameters<FakeDriverRuntimeIo["markExternalToolEffectUnknown"]>[0],
+        signal: AbortSignal,
+      ): Promise<void> {
+        this.unknownCount += 1;
+        this.fenceSignalAborted = signal.aborted;
+      }
+    }
+
+    const socket = new LostClaimSocket([command]);
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    await runtime.dispatcher.run(socket, runtime.logger);
+    await waitForUpdate(
+      socket,
+      (update) => update.commandId === command.commandId && update.status === "failed",
+    );
+    await runtime.logger.destroy();
+
+    expect(socket.unknownCount).toBe(1);
+    expect(socket.fenceSignalAborted).toBe(false);
+  });
+
+  test("fences an in-flight MCP effect after the shutdown signal aborts", async () => {
     const mcpCommand: RuntimeCommand = {
       argumentsJson: '{"title":"cancel safely"}',
       commandId: "cancelled-effect-command",
@@ -543,15 +1032,10 @@ describe("driver runtime boundary", () => {
       toolCallId: "tool-cancelled-effect",
       toolName: "createIssue",
     };
-    const cancelCommand: RuntimeCommand = {
-      commandId: "cancelled-effect-turn",
-      kind: "turn.cancel",
-      reason: "viewer.cancelled",
-    };
     const mcpStarted = Promise.withResolvers<void>();
 
     class CancellationSocket extends FakeDriverRuntimeIo {
-      readonly #nextCommand = Promise.withResolvers<RuntimeCommand>();
+      readonly #nextCommand = Promise.withResolvers<RuntimeCommand | null>();
       #readFirstCommand = true;
       #drained = false;
       fenceSignalAborted: boolean | null = null;
@@ -582,13 +1066,15 @@ describe("driver runtime boundary", () => {
         return this.#nextCommand.promise;
       }
 
-      sendCancellation(): void {
+      stop(): void {
         this.#drained = true;
-        this.#nextCommand.resolve(cancelCommand);
+        this.#nextCommand.resolve(null);
       }
     }
 
     const socket = new CancellationSocket();
+    const shutdown = new AbortController();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
     const runtime = createDispatcher({
       backend: createBackend(),
       isShuttingDown: () => socket.isDrained(),
@@ -598,12 +1084,15 @@ describe("driver runtime boundary", () => {
           signal.addEventListener("abort", () => reject(signal.reason), { once: true });
         });
       },
-      runtimeState: new DriverRuntimeStateMachine("ready"),
+      runtimeState,
+      shutdownSignal: shutdown.signal,
     });
     const runTask = runtime.dispatcher.run(socket, runtime.logger);
 
     await mcpStarted.promise;
-    socket.sendCancellation();
+    runtimeState.enter("stopping");
+    socket.stop();
+    shutdown.abort(new Error("test shutdown"));
     await runTask;
     await runtime.logger.destroy();
 
@@ -611,9 +1100,113 @@ describe("driver runtime boundary", () => {
     expect(socket.fencedCommandId).toBe(mcpCommand.commandId);
     expect(socket.updates).toMatchObject([
       { commandId: mcpCommand.commandId, status: "accepted" },
-      { commandId: cancelCommand.commandId, status: "accepted" },
       { commandId: mcpCommand.commandId, status: "cancelled" },
-      { commandId: cancelCommand.commandId, status: "completed" },
+    ]);
+  });
+
+  test("persists a known MCP result after shutdown with a fresh retry budget", async () => {
+    const command: McpExecuteCommand = {
+      argumentsJson: "{}",
+      commandId: "known-result-during-shutdown",
+      kind: "mcp.execute",
+      requestId: "known-result-request",
+      serverId: MCP_PREFLIGHT_SERVER_ID,
+      toolCallId: "known-result-tool",
+      toolName: "lookup",
+    };
+    const providerStarted = Promise.withResolvers<void>();
+    const releaseProvider = Promise.withResolvers<void>();
+
+    class CompletionSocket extends FakeDriverRuntimeIo {
+      readonly #nextCommand = Promise.withResolvers<RuntimeCommand | null>();
+      #readFirstCommand = true;
+      #drained = false;
+      completionAttempts = 0;
+      readonly completionSignals: boolean[] = [];
+      unknownCount = 0;
+
+      constructor() {
+        super([]);
+      }
+
+      override isDrained(): boolean {
+        return this.#drained;
+      }
+
+      override nextCommand(_signal: AbortSignal): Promise<RuntimeCommand | null> {
+        if (this.#readFirstCommand) {
+          this.#readFirstCommand = false;
+          return Promise.resolve(command);
+        }
+
+        return this.#nextCommand.promise;
+      }
+
+      override async completeExternalToolEffect(
+        _input: Parameters<FakeDriverRuntimeIo["completeExternalToolEffect"]>[0],
+        signal: AbortSignal,
+      ): Promise<void> {
+        this.completionAttempts += 1;
+        this.completionSignals.push(signal.aborted);
+        if (this.completionAttempts === 1) {
+          throw new Error("completion acknowledgement lost");
+        }
+      }
+
+      override async markExternalToolEffectUnknown(): Promise<void> {
+        this.unknownCount += 1;
+      }
+
+      stop(): void {
+        this.#drained = true;
+        this.#nextCommand.resolve(null);
+      }
+    }
+
+    const socket = new CompletionSocket();
+    const shutdown = new AbortController();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      mcpExecute: async (input) => {
+        providerStarted.resolve();
+        await releaseProvider.promise;
+        return {
+          outputText: "known result",
+          requestId: input.requestId,
+          serverId: input.serverId,
+          toolName: input.toolName,
+        };
+      },
+      runtimeState,
+      shutdownSignal: shutdown.signal,
+    });
+    const runTask = runtime.dispatcher.run(socket, runtime.logger);
+
+    await providerStarted.promise;
+    runtimeState.enter("stopping");
+    socket.stop();
+    shutdown.abort(new Error("test shutdown"));
+    releaseProvider.resolve();
+    await runTask;
+    await runtime.logger.destroy();
+
+    expect(socket.completionAttempts).toBe(2);
+    expect(socket.completionSignals).toEqual([false, false]);
+    expect(socket.unknownCount).toBe(0);
+    expect(socket.updates).toMatchObject([
+      { commandId: command.commandId, status: "accepted" },
+      {
+        commandId: command.commandId,
+        result: {
+          outputText: "known result",
+          requestId: command.requestId,
+          serverId: command.serverId,
+          toolName: command.toolName,
+        },
+        status: "completed",
+      },
     ]);
   });
 

@@ -26,10 +26,10 @@ import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
   computeRuntimeBootstrapDigest,
+  exposeNativeSkillAliases,
   writeNativeRuntimeSystemPrompt,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
-import { exposeNativeSkillAliases } from "../skill-materialization";
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
@@ -70,6 +70,8 @@ export class AcpDriverBackend implements AgentDriverBackend {
   #agentCapabilities: AgentCapabilities | null = null;
   #agentLaunch: { readonly args: readonly string[]; readonly command: string } | null = null;
   #agentProcess: AcpAgentProcess | null = null;
+  #agentProcessStop: { readonly process: AcpAgentProcess; readonly task: Promise<void> } | null =
+    null;
   readonly #childProcessEnv: Record<string, string>;
   readonly #clientRequests: AcpClientRequestHandler;
   #connection: ClientConnection | null = null;
@@ -81,7 +83,9 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
   #started = false;
+  #stopFailure: { readonly error: unknown } | null = null;
   #stopRequested = false;
+  #stopSucceeded = false;
   #stopTask: Promise<void> | null = null;
   readonly #turnController: AcpTurnController;
 
@@ -93,7 +97,8 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#runtimeBootstrapText = buildRuntimeBootstrapText(payload.execution);
     this.#turnController = new AcpTurnController(
       (context, reason, events) => this.#push(context, reason, events),
-      (context) => this.#recycleCancelledTurn(context),
+      (context, providerPromptAdmitted) =>
+        this.#settleCancelledTurn(context, providerPromptAdmitted),
       (context, reason, closures, terminal) =>
         this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
     );
@@ -115,39 +120,43 @@ export class AcpDriverBackend implements AgentDriverBackend {
       throw new Error("ACP driver backend cannot restart after stopping.");
     }
 
-    const hostSnapshot = await raceWithAbort(context.ports.hostIntegration.snapshot(), signal);
-
-    if (hostSnapshot === null) {
-      throw new Error("ACP fallback requires a host integration snapshot.");
-    }
-
-    this.#hostSnapshot = hostSnapshot;
-    const materializedSkills = await raceWithAbort(
-      context.ports.skill.materialize(this.#payload.execution),
-      signal,
-    );
-    const nativeSkillAliases = await raceWithAbort(
-      exposeNativeSkillAliases(this.#payload.execution, context.logger, materializedSkills),
-      signal,
-    );
-    const bootstrapArtifacts = await raceWithAbort(
-      writeSkillBootstrapArtifacts(this.#payload.execution),
-      signal,
-    );
-    const launch = (this.#agentLaunch ??= {
-      args: readFallbackArgs(),
-      command: readFallbackCommand(),
-    });
-    this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
-      ? await raceWithAbort(writeNativeRuntimeSystemPrompt(this.#payload.execution), signal)
-      : null;
-
-    if (this.#stopRequested || signal.aborted) {
-      signal.throwIfAborted();
-      throw new Error("ACP driver backend stopped during startup.");
-    }
-
     try {
+      await raceWithAbort(this.#clientRequests.initializePathScope(), signal);
+      const hostSnapshot = await raceWithAbort(context.ports.hostIntegration.snapshot(), signal);
+
+      if (hostSnapshot === null) {
+        throw new Error("ACP fallback requires a host integration snapshot.");
+      }
+
+      this.#hostSnapshot = hostSnapshot;
+      const materializedSkills = await context.ports.skill.materialize(
+        this.#payload.execution,
+        signal,
+      );
+      const nativeSkillAliases = await exposeNativeSkillAliases(
+        this.#payload.execution,
+        context.logger,
+        materializedSkills,
+        signal,
+      );
+      const bootstrapArtifacts = await writeSkillBootstrapArtifacts(
+        this.#payload.execution,
+        materializedSkills,
+        signal,
+      );
+      const launch = (this.#agentLaunch ??= {
+        args: readFallbackArgs(),
+        command: readFallbackCommand(),
+      });
+      this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
+        ? await writeNativeRuntimeSystemPrompt(this.#payload.execution, materializedSkills, signal)
+        : null;
+
+      if (this.#stopRequested || signal.aborted) {
+        signal.throwIfAborted();
+        throw new Error("ACP driver backend stopped during startup.");
+      }
+
       signal.throwIfAborted();
       if (this.#stopRequested) {
         throw new Error("ACP driver backend stopped during startup.");
@@ -190,7 +199,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
         this.#connection?.close(
           signal.reason instanceof Error ? signal.reason : new Error("ACP startup aborted."),
         );
-        signal.throwIfAborted();
       }
 
       await this.stop(context, "startup.failed", signal).catch((cleanupError: unknown) => {
@@ -198,6 +206,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
           message: toErrorMessage(cleanupError, "startup cleanup failed"),
         });
       });
+      signal.throwIfAborted();
       throw error;
     }
   }
@@ -216,17 +225,19 @@ export class AcpDriverBackend implements AgentDriverBackend {
       this.#nativeInstructionPath === null
         ? this.#childProcessEnv
         : appendOpenCodeInstruction(this.#childProcessEnv, this.#nativeInstructionPath);
-    const agentProcess = await startAcpAgentProcess(
+    const startedProcess = await startAcpAgentProcess(
       context,
       this.#payload,
       processEnv,
       signal,
       launch,
     );
+    const agentProcess = startedProcess.process;
     this.#agentProcess = agentProcess;
     let connection: ClientConnection | null = null;
 
     try {
+      await startedProcess.ready;
       signal.throwIfAborted();
       if (this.#stopRequested) {
         throw new Error("ACP driver backend stopped while connecting.");
@@ -297,16 +308,21 @@ export class AcpDriverBackend implements AgentDriverBackend {
         const error =
           reason instanceof Error ? reason : new Error("ACP transport closed unexpectedly.");
         context.logger.error("driver.acp.transport.failed", error, {});
-        const cleanup = stopAcpAgentProcess(context, agentProcess, "connection.failed");
-        if (this.#turnController.failActive(error, cleanup)) {
+        this.#connection = null;
+        const cleanup = this.#stopOwnedAgent(context, agentProcess, "connection.failed");
+        const turnSettled = this.#turnController.routeFatal(error, cleanup);
+        if (turnSettled === null) {
           return;
         }
-        void cleanup.then(
-          () => context.lifecycle.fail(error),
-          (cleanupError: unknown) =>
-            context.lifecycle.fail(
-              new AggregateError([error, cleanupError], "ACP provider failure cleanup failed."),
-            ),
+        void Promise.allSettled([cleanup, turnSettled]).then(([cleanupResult]) =>
+          context.lifecycle.fail(
+            cleanupResult?.status === "rejected"
+              ? new AggregateError(
+                  [error, cleanupResult.reason],
+                  "ACP provider failure cleanup failed.",
+                )
+              : error,
+          ),
         );
       });
 
@@ -393,12 +409,9 @@ export class AcpDriverBackend implements AgentDriverBackend {
         this.#connection = null;
       }
       connection?.close(error instanceof Error ? error : new Error("ACP connection failed."));
-      if (this.#agentProcess === agentProcess) {
-        this.#agentProcess = null;
-      }
 
       try {
-        await stopAcpAgentProcess(
+        await this.#stopOwnedAgent(
           context,
           agentProcess,
           "connection.failed",
@@ -444,9 +457,21 @@ export class AcpDriverBackend implements AgentDriverBackend {
     if (this.#stopTask !== null) {
       return this.#stopTask;
     }
+    if (this.#stopSucceeded) {
+      return Promise.resolve();
+    }
 
-    const task = Promise.resolve()
+    const operation = Promise.resolve()
       .then(() => this.#performStop(context, reason, signal))
+      .finally(() => this.#clientRequests.closePathScope());
+    const task = operation
+      .then(() => {
+        this.#stopSucceeded = true;
+      })
+      .catch((error: unknown) => {
+        this.#stopFailure ??= { error };
+        throw error;
+      })
       .finally(() => {
         if (this.#stopTask === task) {
           this.#stopTask = null;
@@ -456,9 +481,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return task;
   }
 
-  async #recycleCancelledTurn(context: AgentDriverContext): Promise<void> {
+  async #settleCancelledTurn(
+    context: AgentDriverContext,
+    providerPromptAdmitted: boolean,
+  ): Promise<void> {
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
+      return;
+    }
+    if (!providerPromptAdmitted) {
       return;
     }
 
@@ -471,12 +502,11 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     const deadline = Date.now() + ACP_RECYCLE_BUDGET_MS;
     this.#connection = null;
-    this.#agentProcess = null;
     transport.close(new Error("ACP cancelled turn recycling provider process."));
-    await stopAcpAgentProcess(context, agentProcess, "turn.cancelled.recycle", deadline);
+    await this.#stopOwnedAgent(context, agentProcess, "turn.cancelled.recycle", deadline);
 
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
 
@@ -491,12 +521,12 @@ export class AcpDriverBackend implements AgentDriverBackend {
       if (!this.#stopRequested) {
         throw error;
       }
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
 
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
 
@@ -582,11 +612,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     try {
       if (agentProcess !== null) {
-        await stopAcpAgentProcess(context, agentProcess, reason, deadline, signal);
-      }
-
-      if (this.#agentProcess === agentProcess) {
-        this.#agentProcess = null;
+        await this.#stopOwnedAgent(context, agentProcess, reason, deadline, signal);
       }
     } catch (error) {
       processFailure = { error };
@@ -708,6 +734,51 @@ export class AcpDriverBackend implements AgentDriverBackend {
     }
 
     return this.#hostSnapshot;
+  }
+
+  async #joinStop(): Promise<void> {
+    if (this.#stopFailure !== null) {
+      throw this.#stopFailure.error;
+    }
+    if (this.#stopTask !== null) {
+      await this.#stopTask;
+      return;
+    }
+    if (this.#stopSucceeded) {
+      return;
+    }
+    throw new Error("ACP driver stop was requested without an owned cleanup barrier.");
+  }
+
+  async #stopOwnedAgent(
+    context: AgentDriverContext,
+    agentProcess: AcpAgentProcess,
+    reason: string,
+    deadline?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const existing = this.#agentProcessStop;
+    if (existing?.process === agentProcess) {
+      await existing.task;
+      return;
+    }
+
+    const cleanup =
+      deadline === undefined
+        ? stopAcpAgentProcess(context, agentProcess, reason)
+        : stopAcpAgentProcess(context, agentProcess, reason, deadline, signal);
+    this.#agentProcessStop = { process: agentProcess, task: cleanup };
+
+    try {
+      await cleanup;
+      if (this.#agentProcess === agentProcess) {
+        this.#agentProcess = null;
+      }
+    } finally {
+      if (this.#agentProcessStop?.task === cleanup) {
+        this.#agentProcessStop = null;
+      }
+    }
   }
 
   #remainingStopMs(deadline: number): number {

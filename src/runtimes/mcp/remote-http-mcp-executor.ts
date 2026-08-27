@@ -12,12 +12,9 @@ import {
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
 import { AGENT_DRIVER_VERSION } from "../../core/version";
+import type { AgentDriverMcpExecution } from "../../host-ports";
 import type { DriverStartInput } from "../../protocol/start";
-import type {
-  McpExecuteCommand,
-  McpExternalToolEffectExecution,
-  McpExternalToolExecutionResult,
-} from "../../runtime-command";
+import type { McpExecuteCommand, McpExternalToolExecutionResult } from "../../runtime-command";
 import { settlePromiseWithTimeout } from "../../utils/async";
 
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
@@ -221,15 +218,35 @@ function mapMcpExecutionError(
   return new Error(`Failed to execute MCP tool ${command.toolName} on ${server.name}.`);
 }
 
-export async function executeRemoteHttpMcpCommand(
+async function closeMcpConnection(
+  client: Client,
+  transport: StreamableHTTPClientTransport,
+): Promise<void> {
+  await settlePromiseWithTimeout(
+    Promise.resolve().then(() => transport.terminateSession()),
+    {
+      label: "MCP session termination",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    },
+  );
+  await settlePromiseWithTimeout(
+    Promise.resolve().then(() => client.close()),
+    {
+      label: "MCP client close",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    },
+  );
+}
+
+export async function prepareRemoteHttpMcpCommand(
   payload: DriverStartInput,
   command: McpExecuteCommand,
   signal: AbortSignal,
-  effect: McpExternalToolEffectExecution,
-): Promise<McpExternalToolExecutionResult> {
+): Promise<AgentDriverMcpExecution> {
   signal.throwIfAborted();
   const server = resolveActiveMcpServer(payload, command);
   const argumentsObject = parseToolArguments(command);
+  const proxyUrl = new URL(server.proxyUrl);
   const authProvider: AuthProvider = {
     token: async () => server.proxyGrantId,
   };
@@ -242,45 +259,61 @@ export async function executeRemoteHttpMcpCommand(
       versionNegotiation: { mode: "auto" },
     },
   );
-  const transport = new StreamableHTTPClientTransport(new URL(server.proxyUrl), {
+  const transport = new StreamableHTTPClientTransport(proxyUrl, {
     authProvider,
     requestInit: {
       headers: { [MOSOO_TOOL_CALL_ID_HEADER]: command.toolCallId },
     },
   });
-  const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
+  const connectSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
 
   try {
     await client.connect(transport, {
-      signal: requestSignal,
+      signal: connectSignal,
       timeout: MCP_REQUEST_TIMEOUT_MS,
     });
-    const result = await client.callTool(
-      {
-        _meta: {
-          "io.mosoo/idempotency-key": effect.idempotencyKey,
-        },
-        arguments: argumentsObject,
-        name: command.toolName,
-      },
-      {
-        signal: requestSignal,
-        timeout: MCP_REQUEST_TIMEOUT_MS,
-      },
-    );
-
-    return normalizeCallToolResult(result, command);
   } catch (error) {
+    await closeMcpConnection(client, transport);
     throw mapMcpExecutionError(command, server, error);
-  } finally {
-    await settlePromiseWithTimeout(transport.terminateSession(), {
-      label: "MCP session termination",
-      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
-    });
-
-    await settlePromiseWithTimeout(client.close(), {
-      label: "MCP client close",
-      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
-    });
   }
+
+  let disposed = false;
+  let executed = false;
+
+  return {
+    async execute(effect): Promise<McpExternalToolExecutionResult> {
+      if (disposed || executed) {
+        throw new Error(`Prepared MCP command ${command.commandId} can only be executed once.`);
+      }
+      executed = true;
+      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
+
+      try {
+        const result = await client.callTool(
+          {
+            _meta: {
+              "io.mosoo/idempotency-key": effect.idempotencyKey,
+            },
+            arguments: argumentsObject,
+            name: command.toolName,
+          },
+          {
+            signal: requestSignal,
+            timeout: MCP_REQUEST_TIMEOUT_MS,
+          },
+        );
+
+        return normalizeCallToolResult(result, command);
+      } catch (error) {
+        throw mapMcpExecutionError(command, server, error);
+      }
+    },
+    async [Symbol.asyncDispose](): Promise<void> {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      await closeMcpConnection(client, transport);
+    },
+  };
 }

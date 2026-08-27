@@ -44,6 +44,10 @@ export interface AgentDriverKernelOptions {
 }
 
 type KernelCommandResult = RuntimeCommandResult | void;
+type RunEventTerminal = {
+  readonly runId: RunId;
+  readonly status: "cancelled" | "completed" | "failed";
+};
 
 const KERNEL_SHUTDOWN_TIMEOUT_MS = 5_000;
 const KERNEL_START_TIMEOUT_MS = 60_000;
@@ -102,13 +106,11 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   readonly #shutdownController = new AbortController();
   #activeRunId: RunId | null = null;
   #backendLifecycle: AgentBackendLifecycle | null = null;
+  #eventFinalizationTask: Promise<void> | null = null;
   #pushedEventSeq = 0;
   #runTask: Promise<void> | null = null;
   #runTaskSettled = false;
-  #runEventTerminal: {
-    readonly runId: RunId;
-    readonly status: "cancelled" | "completed" | "failed";
-  } | null = null;
+  #runEventTerminal: RunEventTerminal | null = null;
   #shutdownComplete = false;
   #shutdownRunFailure: { error: RunError; runId: RunId | null } | null = null;
   #runTerminal: "cancelled" | "completed" | "failed" | null = null;
@@ -125,6 +127,9 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   }
 
   beginRun(runId: RunId): void {
+    if (this.#activeRunId !== null) {
+      throw new Error(`Driver run ${this.#activeRunId} is already active.`);
+    }
     this.#activeRunId = runId;
     this.#runEventTerminal = null;
     this.#runTerminal = null;
@@ -267,7 +272,22 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   }
   async pushEvents(input: { events: DriverEventInput[] }): Promise<DriverEventBatchOutput> {
     const events = structuredClone(input.events);
-    for (const event of events) {
+    let terminal: RunEventTerminal | null = null;
+    let terminalIndex = -1;
+
+    for (const [index, event] of events.entries()) {
+      const runId = event.runId === undefined ? this.#activeRunId : event.runId;
+
+      if (runId !== null) {
+        if (runId !== this.#activeRunId) {
+          throw new Error("Driver event must target the active run.");
+        }
+
+        if (this.#runTerminal !== null) {
+          throw new Error("Driver event cannot target a terminated run.");
+        }
+      }
+
       const status =
         event.kind === "run.cancelled"
           ? "cancelled"
@@ -276,13 +296,38 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
             : event.kind === "run.failed"
               ? "failed"
               : null;
-      const runId = event.runId ?? this.#activeRunId;
-      if (status !== null && runId !== null) {
-        this.#runEventTerminal = { runId, status };
-        this.#runTerminal = status;
+
+      if (status === null) {
+        continue;
       }
+
+      if (runId === null) {
+        throw new Error("Driver run terminal must target the active run.");
+      }
+
+      if (event.delivery === "best_effort") {
+        throw new Error("Driver run terminal must be lossless.");
+      }
+
+      if (terminal !== null) {
+        throw new Error("Driver event batch cannot contain multiple run terminals.");
+      }
+
+      terminal = { runId, status };
+      terminalIndex = index;
     }
+
+    if (terminalIndex >= 0 && terminalIndex !== events.length - 1) {
+      throw new Error("Driver run terminal must be the final event in its batch.");
+    }
+
     this.#events.pushMany(events);
+
+    if (terminal !== null) {
+      this.#runEventTerminal = terminal;
+      this.#runTerminal = terminal.status;
+    }
+
     const accepted = events.map((event) => {
       this.#pushedEventSeq += 1;
 
@@ -297,6 +342,10 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
 
   runEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
     return this.#runEventTerminal?.runId === runId ? this.#runEventTerminal.status : null;
+  }
+
+  selectedRunEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
+    return this.runEventTerminal(runId);
   }
 
   async start(input: AgentDriverKernelStartInput): Promise<void> {
@@ -325,13 +374,14 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
         backend,
         createContext: () => this.#createContext(input),
         labels: {
-          deferredStop: "Driver kernel deferred backend shutdown",
           finalStop: "Driver kernel final backend shutdown",
           start: "Driver kernel backend startup",
           stop: "Driver kernel backend shutdown",
         },
         onDeferredStopComplete: () => {
-          void this.#closeEventsAfterPermissions();
+          void this.#completeShutdown().catch((error: unknown) => {
+            this.#logger.error("driver.kernel.deferred_finalization.failed", error, {});
+          });
         },
         onDeferredStopError: (error) => {
           this.#logger.error("driver.kernel.deferred_shutdown.failed", error, {});
@@ -391,9 +441,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
           this.#rejectPendingCommands(
             this.#terminalCause?.error ?? new Error("Driver kernel stopped."),
           );
-          if (this.#shutdownComplete) {
-            await this.#finalizeEvents();
-          }
+          await this.#finalizeShutdown();
         });
     } catch (error) {
       this.#rememberTerminalCause(error);
@@ -491,7 +539,9 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
             }
 
             try {
-              return await this.#permissionBroker.request(this, input, signal);
+              return await this.#permissionBroker.request(this, input, signal, () =>
+                this.#runtimeState.ownsRun(generation),
+              );
             } finally {
               this.#runtimeState.endApproval(generation);
             }
@@ -595,6 +645,26 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     await this.#closeEventsAfterPermissions();
   }
 
+  async #completeShutdown(): Promise<void> {
+    if (this.#runtimeState.status() === "stopping") {
+      this.#runtimeState.enter("stopped");
+    }
+    this.#backendLifecycle = null;
+    this.#shutdownComplete = true;
+    await this.#finalizeShutdown();
+  }
+
+  async #finalizeShutdown(): Promise<void> {
+    if (!this.#shutdownComplete || (this.#runTask !== null && !this.#runTaskSettled)) {
+      return;
+    }
+
+    await (this.#eventFinalizationTask ??= this.#finalizeEvents().catch((error: unknown) => {
+      this.#eventFinalizationTask = null;
+      throw error;
+    }));
+  }
+
   #shutdown(reason: string): Promise<void> {
     return (this.#shutdownTask ??= this.#runShutdown(reason).catch((error: unknown) => {
       this.#shutdownTask = null;
@@ -604,6 +674,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
 
   async #runShutdown(reason: string): Promise<void> {
     if (this.#runtimeState.status() === "stopped") {
+      await this.#finalizeShutdown();
       return;
     }
 
@@ -633,14 +704,7 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
         throw failure.reason;
       }
 
-      if (this.#runtimeState.status() === "stopping") {
-        this.#runtimeState.enter("stopped");
-      }
-      this.#backendLifecycle = null;
-      this.#shutdownComplete = true;
-      if (this.#runTask === null || this.#runTaskSettled) {
-        await this.#finalizeEvents();
-      }
+      await this.#completeShutdown();
     } catch (error) {
       if (this.#runtimeState.status() === "stopping") {
         this.#runtimeState.enter("failed");

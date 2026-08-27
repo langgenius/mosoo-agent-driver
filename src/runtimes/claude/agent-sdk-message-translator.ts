@@ -82,36 +82,18 @@ export class ClaudeAgentSdkMessageTranslator {
     this.#permissionDenialAdvisories.clear();
   }
 
-  async endActiveThought(context: AgentDriverContext): Promise<void> {
+  async #cancelOpenTurn(context: AgentDriverContext): Promise<void> {
     for (const [messageId, thoughtId] of this.#state.activeThoughts()) {
-      await this.#events.endThought(context, thoughtId);
+      await this.#events.cancelThought(context, thoughtId);
       this.#state.deleteThoughtId(messageId);
-    }
-  }
-
-  async finishTurn(
-    context: AgentDriverContext,
-    toolStatus: "cancelled" | "completed" | "failed",
-  ): Promise<void> {
-    if (toolStatus === "cancelled") {
-      for (const [messageId, thoughtId] of this.#state.activeThoughts()) {
-        await this.#events.cancelThought(context, thoughtId);
-        this.#state.deleteThoughtId(messageId);
-      }
-    } else {
-      await this.endActiveThought(context);
     }
 
     for (const [messageId, runId] of this.#state.assistantMessages()) {
-      if (toolStatus === "cancelled") {
-        await this.#events.cancelMessage(context, messageId);
-        this.#state.completeAssistantMessage(runId, messageId, false);
-      } else {
-        await this.#endAssistantMessage(context, runId, messageId);
-      }
+      await this.#events.cancelMessage(context, messageId);
+      this.#state.completeAssistantMessage(runId, messageId, false);
     }
 
-    await this.#events.finishTools(context, toolStatus);
+    await this.#events.finishTools(context, "cancelled");
     const taskClosure = this.#tasks.prepareClosure();
     for (const [index, event] of taskClosure.events.entries()) {
       taskClosure.beforePublish(index);
@@ -768,7 +750,7 @@ export class ClaudeAgentSdkMessageTranslator {
     context: AgentDriverContext,
     message: Extract<SDKMessage, { type: "conversation_reset" }>,
   ): Promise<void> {
-    await this.finishTurn(context, "cancelled");
+    await this.#cancelOpenTurn(context);
     await this.#options.replaceNativeSessionId(
       context,
       message.session_id,

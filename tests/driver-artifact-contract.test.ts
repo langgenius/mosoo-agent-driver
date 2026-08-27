@@ -221,10 +221,8 @@ describe("driver artifact contract", () => {
     );
   });
 
-  test("runs every live suite through the packed driver controller", () => {
+  test("routes every live suite through the packed driver artifact", () => {
     const packageJson = readDriverPackageJson();
-    const controller = readText("./driver-artifact-test-controller.ts");
-    const liveTest = readText("./driver-artifact-live.test.ts");
     const artifactScript = packageJson.scripts?.["test:live:artifact"] ?? "";
 
     expect(artifactScript).toContain("AGENT_DRIVER_LIVE=1");
@@ -237,48 +235,6 @@ describe("driver artifact contract", () => {
       expect(script).toContain(`AGENT_DRIVER_LIVE_SUITE=${suite}`);
       expect(script).toContain("tests/driver-artifact-live.test.ts");
     }
-    expect(controller).toContain("export class DriverArtifactTestController");
-    expect(controller).toContain("parseDriverEventBatchInput");
-    expect(controller).toContain("crashDriver(): void");
-    expect(controller).toMatch(
-      /crashDriver\(\): void \{\s+this\.#signalDriver\("SIGKILL", false\);\s+\}/,
-    );
-    expect(controller).toContain("disconnectDriver(): void");
-    expect(controller).toContain("failHeartbeats(): void");
-    expect(controller).toContain("signalDriver(signal: NodeJS.Signals): void");
-    const scenarioNames = (start: string, end: string) =>
-      Array.from(
-        liveTest.slice(liveTest.indexOf(start), liveTest.indexOf(end)).matchAll(/\["([^"]+)"/g),
-        (match) => match[1],
-      );
-    expect(liveTest).toContain("const compatibilityScenarios");
-    expect(liveTest).toContain("const lifecycleScenarios");
-    expect(liveTest).toContain("const controlScenarios");
-    expect(scenarioNames("const compatibilityScenarios", "const lifecycleScenarios")).toEqual([
-      "sequential turns",
-    ]);
-    expect(scenarioNames("const lifecycleScenarios", "const controlScenarios")).toEqual([
-      "workspace Unicode CRUD",
-      "nonzero command recovery",
-      "native MCP configuration and tool call",
-      "native process resume",
-      "provider crash and native resume",
-      "stale native resume",
-      "run.started ACK-boundary, active, replayed, and idle cancellation",
-      "supervised permission cancellation, rejection, and approval",
-      "active stop and restart",
-    ]);
-    expect(scenarioNames("const controlScenarios", 'describe("packed driver live matrix"')).toEqual(
-      [
-        "process crash and native resume",
-        "SIGTERM and restart",
-        "active control disconnect",
-        "active heartbeat failure",
-      ],
-    );
-    expect(liveTest).toContain("for (const runtimeCase of runtimeCases)");
-    expect(liveTest).toContain("for (const runtimeCase of lifecycleCases)");
-    expect(liveTest).not.toMatch(/from ["']\.\.\/src\/(?:core|runtimes)/);
   });
 
   test("pins runtime executables and keeps release publication monotonic", () => {

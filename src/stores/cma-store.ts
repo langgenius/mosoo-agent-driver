@@ -187,6 +187,10 @@ export interface CmaStore {
     driverEvent: RuntimeEventEnvelope,
   ): Promise<readonly CmaSessionEventRecord[]>;
   archiveEnvironment(id: string): Promise<CmaEnvironmentRecord>;
+  /**
+   * Claims a command only on first admission. An accepted command is never
+   * reissued because an expired worker cannot prove that its effect did not happen.
+   */
   claimInboundEvent(input: CmaClaimInboundEventInput): Promise<CmaClaimInboundEventResult>;
   createAgent(input: CmaCreateAgentInput): Promise<CmaAgentRecord>;
   createEnvironment(input: CmaCreateEnvironmentInput): Promise<CmaEnvironmentRecord>;

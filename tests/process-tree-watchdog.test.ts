@@ -137,18 +137,36 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
   test.skipIf(process.getuid?.() === 0)(
     "keeps a newer unreadable process indeterminate",
     async () => {
-      const marker = createProcessTreeEnvironment(process.env).marker;
+      const processTree = createProcessTreeEnvironment(process.env);
+      const root = spawn("sleep", ["30"], { env: processTree.env });
+      expect(root.pid).toBeDefined();
+      processIds.add(root.pid!);
+      bindSpawnedProcess(root, process.platform, processTree);
+      root.kill("SIGKILL");
+      await expectExited(root.pid!);
       const unreadable = await spawnNonDumpableProcess();
       expect(() => readFileSync(`/proc/${unreadable.pid}/environ`)).toThrow();
 
-      await expect(waitForLinuxProcessMarkerExit(marker, 100)).rejects.toThrow(
+      await expect(waitForLinuxProcessMarkerExit(processTree.marker, 100)).rejects.toThrow(
         "Supervised process tree did not exit",
       );
       process.kill(unreadable.pid!, "SIGKILL");
       await expectExited(unreadable.pid!);
-      await expect(waitForLinuxProcessMarkerExit(marker)).resolves.toBeUndefined();
+      await expect(waitForLinuxProcessMarkerExit(processTree.marker)).resolves.toBeUndefined();
+      releaseLinuxProcessMarker(processTree.marker);
     },
   );
+
+  test("does not reserve process state until a root is bound", async () => {
+    const processTrees = Array.from({ length: 64 }, () =>
+      createProcessTreeEnvironment(process.env),
+    );
+
+    for (const processTree of processTrees) {
+      expect(spawnLinuxProcessTreeWatchdog(process.pid, processTree.marker)).toBeNull();
+      await expect(waitForLinuxProcessMarkerExit(processTree.marker, 1)).resolves.toBeUndefined();
+    }
+  });
 
   test("keeps a confirmed process after it clears the marker environment", async () => {
     const processTree = createProcessTreeEnvironment(process.env);
@@ -159,6 +177,7 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
     });
     expect(child.pid).toBeDefined();
     processIds.add(child.pid!);
+    bindSpawnedProcess(child, process.platform, processTree);
     const stoppedDeadline = Date.now() + 3_000;
     let stopped = false;
     while (Date.now() < stoppedDeadline) {
@@ -183,6 +202,7 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
     expect(signalLinuxProcessMarker(processTree.marker, "SIGKILL")).toBe(true);
     await waitForLinuxProcessMarkerExit(processTree.marker);
     await expectExited(child.pid!);
+    releaseLinuxProcessMarker(processTree.marker);
   });
 
   test("rejects raw signals after the bound root identity changes", async () => {
@@ -209,18 +229,17 @@ describe.skipIf(process.platform !== "linux")("Linux process-tree watchdog", () 
     await expectExited(child.pid!);
   });
 
-  test("does not trust a watchdog root without the marker", async () => {
+  test("does not supervise a root before marker ownership is bound", async () => {
     const marker = createProcessTreeEnvironment(process.env).marker;
     const child = spawn("sleep", ["30"]);
     expect(child.pid).toBeDefined();
     processIds.add(child.pid!);
     const watchdog = spawnLinuxProcessTreeWatchdog(child.pid!, marker);
 
-    expect(watchdog).not.toBeNull();
+    expect(watchdog).toBeNull();
     expect(signalLinuxProcessMarker(marker, 0)).toBe(false);
     expect(isRunning(child.pid!)).toBe(true);
     child.kill("SIGKILL");
-    await watchdog!.cleanup;
     await expectExited(child.pid!);
   });
 

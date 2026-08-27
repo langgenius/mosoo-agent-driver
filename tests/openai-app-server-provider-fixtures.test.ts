@@ -121,10 +121,43 @@ function isIsoTimestamp(value: string): boolean {
   return value.endsWith("Z") && !Number.isNaN(Date.parse(value));
 }
 
-function normalizeBridgeValue(value: unknown, fieldName?: string): unknown {
+function collectDriverIds(value: unknown, aliases: Map<string, string>, fieldName?: string): void {
   if (typeof value === "string") {
-    if (isDriverId(value)) {
-      return "<driver-id>";
+    const candidates = fieldName === "sourceEventId" ? value.split(":") : [value];
+    for (const candidate of candidates) {
+      if (isDriverId(candidate) && !aliases.has(candidate)) {
+        aliases.set(
+          candidate,
+          aliases.size === 0 ? "<driver-id>" : `<driver-id-${aliases.size + 1}>`,
+        );
+      }
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectDriverIds(entry, aliases);
+    }
+    return;
+  }
+
+  if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      collectDriverIds(entry, aliases, key);
+    }
+  }
+}
+
+function normalizeBridgeValue(
+  value: unknown,
+  aliases: ReadonlyMap<string, string>,
+  fieldName?: string,
+): unknown {
+  if (typeof value === "string") {
+    const alias = aliases.get(value);
+    if (alias !== undefined) {
+      return alias;
     }
 
     if (fieldName !== undefined && fieldName.endsWith("At") && isIsoTimestamp(value)) {
@@ -134,7 +167,7 @@ function normalizeBridgeValue(value: unknown, fieldName?: string): unknown {
     if (fieldName === "sourceEventId") {
       return value
         .split(":")
-        .map((part) => (isDriverId(part) ? "<driver-id>" : part))
+        .map((part) => aliases.get(part) ?? part)
         .join(":");
     }
 
@@ -142,7 +175,7 @@ function normalizeBridgeValue(value: unknown, fieldName?: string): unknown {
   }
 
   if (Array.isArray(value)) {
-    return value.map((entry) => normalizeBridgeValue(entry));
+    return value.map((entry) => normalizeBridgeValue(entry, aliases));
   }
 
   if (!isRecord(value)) {
@@ -150,24 +183,35 @@ function normalizeBridgeValue(value: unknown, fieldName?: string): unknown {
   }
 
   return Object.fromEntries(
-    Object.entries(value).map(([key, entry]) => [key, normalizeBridgeValue(entry, key)]),
+    Object.entries(value).map(([key, entry]) => [key, normalizeBridgeValue(entry, aliases, key)]),
   );
 }
 
-function normalizeBridgeEvent(event: DriverEventInput): Record<string, unknown> {
+function normalizeBridgeEvent(
+  event: DriverEventInput,
+  aliases: ReadonlyMap<string, string>,
+): Record<string, unknown> {
   const eventRecord = event as unknown as Record<string, unknown>;
   const normalized: Record<string, unknown> = {
     kind: event.kind,
-    payload: normalizeBridgeValue(event.payload),
+    payload: normalizeBridgeValue(event.payload, aliases),
   };
 
   for (const field of ["delivery", "native", "runId", "sourceEventId", "visibility"] as const) {
     if (eventRecord[field] !== undefined) {
-      normalized[field] = normalizeBridgeValue(eventRecord[field], field);
+      normalized[field] = normalizeBridgeValue(eventRecord[field], aliases, field);
     }
   }
 
   return normalized;
+}
+
+function normalizeBridgeEvents(events: readonly DriverEventInput[]): Record<string, unknown>[] {
+  const aliases = new Map<string, string>();
+  for (const event of events) {
+    collectDriverIds(event, aliases);
+  }
+  return events.map((event) => normalizeBridgeEvent(event, aliases));
 }
 
 function createHarness(input: { sharedRootPath?: string } = {}) {
@@ -417,6 +461,27 @@ function createTurnFixture() {
 }
 
 describe("OpenAI app-server provider fixtures", () => {
+  test("normalizes generated IDs without collapsing their equivalence classes", () => {
+    const [normalized] = normalizeBridgeEvents([
+      {
+        kind: "diagnostic.reported",
+        payload: {
+          first: DRIVER_TEST_IDS.runId,
+          repeated: DRIVER_TEST_IDS.runId,
+          second: DRIVER_TEST_IDS.secondRunId,
+        },
+        sourceEventId: `test:${DRIVER_TEST_IDS.thirdRunId}`,
+      } as unknown as DriverEventInput,
+    ]);
+
+    expect(normalized?.["payload"]).toEqual({
+      first: "<driver-id>",
+      repeated: "<driver-id>",
+      second: "<driver-id-2>",
+    });
+    expect(normalized?.["sourceEventId"]).toBe("test:<driver-id-3>");
+  });
+
   test("matches the installed reasoning, MCP progress, and interactive request surface", () => {
     expect(
       parseNotificationParams("item/reasoning/summaryPartAdded", {
@@ -1475,6 +1540,6 @@ describe("OpenAI app-server provider fixtures", () => {
     await assertTrackTurnFixture(bridge, fixture.trackTurnAfterNotifications);
     await logger.destroy();
 
-    expect(events().map(normalizeBridgeEvent)).toEqual(fixture.expectedEvents);
+    expect(normalizeBridgeEvents(events())).toEqual(fixture.expectedEvents);
   });
 });

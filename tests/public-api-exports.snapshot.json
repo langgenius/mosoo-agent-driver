@@ -10,7 +10,6 @@
       "AgentDriverEventSink",
       "AgentDriverFilePort",
       "AgentDriverHostIntegrationPort",
-      "AgentDriverHostPortName",
       "AgentDriverHostPorts",
       "AgentDriverKernel",
       "AgentDriverKernelCore",
@@ -20,7 +19,6 @@
       "AgentDriverMcpPort",
       "AgentDriverPermissionPort",
       "AgentDriverProviderDescriptor",
-      "AgentDriverProviderRegistry",
       "AgentDriverRuntimeEvent",
       "AgentDriverSkillPort",
       "CmaAgentRecord",
@@ -55,6 +53,8 @@
       "CmaSdkClientOptions",
       "CmaSdkError",
       "CmaSdkFetch",
+      "CmaSdkRequestOptions",
+      "CmaSdkStreamOptions",
       "CmaSessionEventDispatchRecord",
       "CmaSessionEventRecord",
       "CmaSessionRecord",
@@ -121,13 +121,11 @@
       "CmaUnsupportedFieldError",
       "DRIVER_ID_INPUT_PATTERN",
       "DRIVER_ID_PATTERN",
-      "OPENAI_DEFAULT_MODEL_ID",
       "SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS",
       "SUPPORTED_DRIVER_RUNTIMES",
       "SUPPORTED_DRIVER_RUNTIME_TRANSPORTS",
       "createAgentDriverContext",
       "createAgentDriverProviderCapabilities",
-      "createAgentDriverProviderRegistry",
       "createCmaHttpHandler",
       "createCmaMemoryStore",
       "createCmaSdkClient",
@@ -222,6 +220,8 @@
       "CmaSdkClientOptions",
       "CmaSdkError",
       "CmaSdkFetch",
+      "CmaSdkRequestOptions",
+      "CmaSdkStreamOptions",
       "CmaSessionEventDispatchRecord"
     ],
     "values": ["CmaSdkError", "createCmaSdkClient"]
@@ -518,7 +518,7 @@
     ]
   },
   "./paths": {
-    "types": ["SandboxFileBrowserPathPurpose"],
+    "types": [],
     "values": [
       "SANDBOX_CACHE_PATH",
       "SANDBOX_MEMORY_PATH",

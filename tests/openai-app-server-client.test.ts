@@ -242,6 +242,53 @@ setInterval(() => {}, 1000);
     }
   });
 
+  test("handles an admitted notification before a later malformed frame", async () => {
+    const notificationEntered = Promise.withResolvers<void>();
+    const notificationGate = Promise.withResolvers<void>();
+    let notificationCompleted = false;
+    const harness = await createClientHarness(
+      () => `
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (request.method === "initialized") {
+      process.stdout.write(
+        JSON.stringify({ method: "skills/changed", params: {} }) + "\\nnot-json\\n",
+      );
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      async () => {
+        notificationEntered.resolve();
+        await notificationGate.promise;
+        notificationCompleted = true;
+      },
+    );
+
+    try {
+      await harness.client.start();
+      await notificationEntered.promise;
+      expect(harness.protocolErrors).toEqual([]);
+
+      notificationGate.resolve();
+      expect((await harness.protocolError).message).toContain("stdout is not valid JSON");
+      expect(notificationCompleted).toBe(true);
+    } finally {
+      notificationGate.resolve();
+      await harness.client.stop();
+      await harness.logger.destroy();
+    }
+  });
+
   test.each([
     [
       "both result and error",
@@ -488,17 +535,23 @@ setInterval(() => {}, 1000);
     }
   });
 
-  test("rejects a child process spawn failure without an unhandled error", async () => {
-    const harness = await createClientHarness(() => "");
-    process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"] = join(harness.directory, "missing");
+  test.each(["asynchronous", "synchronous"] as const)(
+    "rejects a child process %s spawn failure without retaining ownership",
+    async (failure) => {
+      const harness = await createClientHarness(() => "");
+      process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"] =
+        failure === "asynchronous" ? join(harness.directory, "missing") : "invalid\0executable";
 
-    try {
-      await expect(harness.client.start()).rejects.toThrow();
-    } finally {
-      await harness.client.stop();
-      await harness.logger.destroy();
-    }
-  });
+      try {
+        await expect(harness.client.start()).rejects.toThrow();
+        await expect(harness.client.stop()).resolves.toBeUndefined();
+        await expect(harness.client.stop()).resolves.toBeUndefined();
+      } finally {
+        await harness.client.stop();
+        await harness.logger.destroy();
+      }
+    },
+  );
 
   test.each(["unavailable", "error"] as const)(
     "fails closed when the process-tree watchdog is %s",
@@ -975,10 +1028,10 @@ setInterval(() => {}, 1000);
     try {
       await harness.client.start();
       await permissionStarted.promise;
-      harness.client.abortServerRequests(new Error("turn cancelled"));
+      const abort = harness.client.abortServerRequests(new Error("turn cancelled"));
       await permissionAborted.promise;
       permissionGate.resolve();
-      await Bun.sleep(25);
+      await abort;
 
       expect(await Bun.file(join(harness.directory, "late-response.json")).exists()).toBe(false);
     } finally {
@@ -1078,7 +1131,6 @@ process.stdin.on("data", (chunk) => {
         while (!(await Bun.file(join(harness.directory, "leader-exited")).exists())) {
           await Bun.sleep(5);
         }
-        await Bun.sleep(25);
 
         const stop = harness.client.stop();
         void stop.catch(() => {});
@@ -1180,7 +1232,7 @@ setInterval(() => {}, 1000);
         });
 
         await expect(request).rejects.toThrow(`app-server exited with ${expectedExit}`);
-        await harness.client.drainServerMessages();
+        await expect(harness.client.drainServerMessages()).rejects.toThrow(expectedExit);
         expect(harness.protocolErrors).toHaveLength(1);
         expect(harness.protocolErrors[0]?.message).toContain(expectedExit);
       } finally {
@@ -1606,32 +1658,36 @@ setInterval(() => {}, 1000);
     }
   });
 
-  test("applies backpressure to a bounded multi-agent notification burst", async () => {
+  test.each([
+    ["backpressures below", 900, false],
+    ["rejects above", 1_025, true],
+  ] as const)("%s the 1024-message queue limit", async (_label, messageCount, rejected) => {
     const firstNotification = Promise.withResolvers<void>();
     const notificationGate = Promise.withResolvers<void>();
     let handled = 0;
     const harness = await createClientHarness(
-      () => `
+      (directory) => `
+import { writeFileSync } from "node:fs";
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
-  const newline = buffer.indexOf("\\n");
-  if (newline < 0) return;
-  const request = JSON.parse(buffer.slice(0, newline));
-  buffer = buffer.slice(newline + 1);
-  if (request.id === undefined) return;
-  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
-  for (let index = 0; index < 2048; index += 1) {
-    process.stdout.write(JSON.stringify({
-      method: "item/agentMessage/delta",
-      params: {
-        delta: "x",
-        itemId: "message-" + index,
-        threadId: "thread-child-" + (index % 2),
-        turnId: "turn-child-" + (index % 2)
-      }
-    }) + "\\n");
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    } else if (request.method === "initialized") {
+      const notification = JSON.stringify({
+        method: "warning",
+        params: { message: "x".repeat(${rejected ? "1" : "4096"}), threadId: null },
+      });
+      process.stdout.write(
+        Array.from({ length: ${String(messageCount)} }, () => notification).join("\\n") + "\\n",
+        () => writeFileSync(${JSON.stringify(join(directory, "burst-flushed"))}, "flushed"),
+      );
+    }
   }
 });
 setInterval(() => {}, 1000);
@@ -1648,13 +1704,27 @@ setInterval(() => {}, 1000);
     try {
       await harness.client.start();
       await firstNotification.promise;
-      await Bun.sleep(25);
+      expect(handled).toBe(1);
       expect(harness.protocolErrors).toEqual([]);
+      if (!rejected) {
+        expect(await Bun.file(join(harness.directory, "burst-flushed")).exists()).toBe(false);
+      }
 
       notificationGate.resolve();
-      await harness.client.drainServerMessages();
-      expect(handled).toBe(2048);
-      expect(harness.protocolErrors).toEqual([]);
+      const drain = harness.client.drainServerMessages();
+      if (rejected) {
+        await expect(drain).rejects.toThrow("message queue limit exceeded");
+      } else {
+        await drain;
+        expect(await Bun.file(join(harness.directory, "burst-flushed")).exists()).toBe(true);
+      }
+      expect(handled).toBe(Math.min(messageCount, 1_024));
+      if (rejected) {
+        expect((await harness.protocolError).message).toContain("message queue limit exceeded");
+        expect(harness.protocolErrors).toHaveLength(1);
+      } else {
+        expect(harness.protocolErrors).toEqual([]);
+      }
     } finally {
       notificationGate.resolve();
       await harness.client.stop();

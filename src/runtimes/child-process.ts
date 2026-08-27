@@ -425,9 +425,6 @@ export function createProcessTreeEnvironment(
 ): ProcessTreeEnvironment {
   const supervisor = ensureLinuxProcessTreeSupervisor();
   const marker = randomUUID();
-  if (supervisor !== null) {
-    linuxMarkedProcessState(marker).cutoff = Number(supervisor.startTime);
-  }
   return {
     env: {
       ...env,
@@ -488,15 +485,16 @@ export function bindSpawnedProcess(
 ): BoundSpawnedProcess {
   const pid = child.pid;
   const stat = platform === "linux" && pid !== undefined ? readLinuxProcessStat(pid) : null;
-  if (pid !== undefined && stat !== null && processTree !== undefined) {
-    const state = linuxMarkedProcessStates.get(processTree.marker);
-    const stdin = linuxProcessTreeSupervisor?.process.stdin;
-    if (state !== undefined) {
-      state.cutoff = Number(stat.startTime);
+  if (platform === "linux" && processTree !== undefined && linuxProcessTreeSupervisor !== null) {
+    const state = linuxMarkedProcessState(processTree.marker);
+    state.cutoff = Number(stat?.startTime ?? linuxProcessTreeSupervisor.startTime);
+    const stdin = linuxProcessTreeSupervisor.process.stdin;
+    if (pid !== undefined && stat !== null) {
       state.processes.set(pid, stat.startTime);
     }
     if (
-      state === undefined ||
+      pid === undefined ||
+      stat === null ||
       stdin === null ||
       stdin === undefined ||
       stdin.destroyed ||

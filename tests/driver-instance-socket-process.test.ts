@@ -538,6 +538,81 @@ describe("DriverProcess lifecycle", () => {
     expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
   }, 15_000);
 
+  test.each(["before", "after"] as const)(
+    "linearizes a completed run terminal selected %s input cancellation",
+    async (selectionOrder) => {
+      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+      RpcWebSocket.commands = [
+        {
+          commandId: `terminal-${selectionOrder}-input`,
+          input: { text: "complete once" },
+          kind: "input.start",
+          requestId: `terminal-${selectionOrder}-request`,
+          runId: DRIVER_TEST_IDS.runId,
+        },
+        {
+          commandId: `terminal-${selectionOrder}-cancel`,
+          kind: "turn.cancel",
+          reason: "test cancellation",
+        },
+        {
+          commandId: `terminal-${selectionOrder}-stop`,
+          kind: "session.stop",
+          reason: "test complete",
+        },
+      ];
+      const inputEntered = Promise.withResolvers<void>();
+      const cancellationEntered = Promise.withResolvers<void>();
+      const allowTerminalSelection = Promise.withResolvers<void>();
+      const backend = createBackend();
+      backend.handleInput = async (context, _input, runId) => {
+        inputEntered.resolve();
+        if (selectionOrder === "after") {
+          await allowTerminalSelection.promise;
+        }
+        await context.ports.eventSink.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { stopReason: "end_turn" },
+              runId,
+            },
+          ],
+        });
+      };
+      backend.cancelActiveTurn = async () => {
+        cancellationEntered.resolve();
+        allowTerminalSelection.resolve();
+      };
+      if (selectionOrder === "before") {
+        RpcWebSocket.delayedEventKind = "run.completed";
+      }
+
+      const run = new DriverProcess(driverBootPayload, () => backend).run();
+      await inputEntered.promise;
+      if (selectionOrder === "before") {
+        await RpcWebSocket.stalled.promise;
+      }
+      await cancellationEntered.promise;
+      RpcWebSocket.delayedResponse.resolve();
+      await expect(run).resolves.toBeUndefined();
+
+      const inputTerminals = (PendingWebSocket.instances[0] as RpcWebSocket).requests
+        .filter(({ path }) => path === "/driver/commandUpdate")
+        .map(({ input }) => input as { commandId: string; status: string })
+        .filter(
+          ({ commandId, status }) =>
+            commandId === `terminal-${selectionOrder}-input` && status !== "accepted",
+        );
+      expect(inputTerminals).toEqual([
+        expect.objectContaining({
+          commandId: `terminal-${selectionOrder}-input`,
+          status: selectionOrder === "before" ? "completed" : "cancelled",
+        }),
+      ]);
+    },
+  );
+
   test.each([
     ["hello", "/driver/hello", false, 0],
     ["backend start", "/driverInstance/nextCommand", true, 2],
@@ -632,71 +707,6 @@ describe("DriverProcess lifecycle", () => {
     expect(stopCount).toBe(2);
     expect(resourceActive).toBe(false);
     expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-  });
-
-  test("automatically retries final cleanup after shutdown times out during backend start", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const existingSignalListeners = new Set(process.listeners("SIGTERM"));
-    const startEntered = Promise.withResolvers<void>();
-    const releaseStart = Promise.withResolvers<void>();
-    const finalCleanup = Promise.withResolvers<void>();
-    const backend = createBackend();
-    let resourceActive = false;
-    let stopCount = 0;
-    let startSignal: AbortSignal | undefined;
-    backend.start = async (_context, signal) => {
-      startSignal = signal;
-      startEntered.resolve();
-      await releaseStart.promise;
-      signal.throwIfAborted();
-      resourceActive = true;
-    };
-    backend.stop = async () => {
-      stopCount += 1;
-      resourceActive = false;
-
-      if (stopCount === 3) {
-        finalCleanup.resolve();
-      }
-    };
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
-
-    try {
-      const run = new DriverProcess(driverBootPayload, () => backend).run();
-      const outcome = run.then(
-        () => null,
-        (error: unknown) => error,
-      );
-
-      await startEntered.promise;
-      const shutdown = process
-        .listeners("SIGTERM")
-        .find((listener) => !existingSignalListeners.has(listener));
-      expect(shutdown).toBeDefined();
-      shutdown?.("SIGTERM");
-      await outcome;
-      expect(startSignal?.aborted).toBe(true);
-      expect(startSignal?.reason).toMatchObject({ message: "signal.sigterm" });
-      releaseStart.resolve();
-
-      const cleaned = await Promise.race([
-        finalCleanup.promise.then(() => true),
-        Bun.sleep(50).then(() => false),
-      ]);
-      expect(cleaned).toBe(true);
-      expect(stopCount).toBe(3);
-      expect(resourceActive).toBe(false);
-      expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-    } finally {
-      releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
-    }
   });
 
   test("propagates a heartbeat failure instead of treating it as a normal shutdown", async () => {
@@ -1001,12 +1011,14 @@ describe("DriverProcess lifecycle", () => {
         });
       }
     };
+    const nativeNow = Date.now;
     const nativeSetTimeout = globalThis.setTimeout;
     const acceleratedSetTimeout = (
       callback: (...args: unknown[]) => void,
       delay?: number,
       ...args: unknown[]
     ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
+    Date.now = () => 0;
     globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
     try {
@@ -1026,6 +1038,7 @@ describe("DriverProcess lifecycle", () => {
       expect(stopSignals[1]?.aborted).toBe(false);
       expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
     } finally {
+      Date.now = nativeNow;
       globalThis.setTimeout = nativeSetTimeout;
     }
   });

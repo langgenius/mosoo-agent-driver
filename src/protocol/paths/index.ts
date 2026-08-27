@@ -7,8 +7,6 @@ export const SANDBOX_SESSION_ROOT = `${SANDBOX_WORKSPACE_ROOT}/se`;
 
 const SESSION_RESOURCE_MOUNT_DIR = "session-files";
 
-export type SandboxFileBrowserPathPurpose = "content" | "tree";
-
 export function getSessionWorkspacePath(sessionId: string): string {
   return `${SANDBOX_SESSION_ROOT}/${sessionId}`;
 }
@@ -135,10 +133,7 @@ function isAllowedSandboxFileBrowserPath(path: string): boolean {
   );
 }
 
-export function normalizeSandboxFileBrowserPath(
-  rawPath: string,
-  _purpose: SandboxFileBrowserPathPurpose,
-): string {
+export function normalizeSandboxFileBrowserPath(rawPath: string): string {
   const path = readSandboxFileBrowserPathOriginal(rawPath);
 
   if (isSandboxCachePath(path)) {

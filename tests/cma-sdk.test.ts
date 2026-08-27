@@ -11,6 +11,7 @@ import {
 } from "../src/surfaces/cma-http";
 import type { CmaSdkError } from "../src/surfaces/cma-sdk";
 import { createCmaSdkClient } from "../src/surfaces/cma-sdk";
+import { promiseWithTimeout } from "../src/utils/async";
 
 describe("CMA SDK client", () => {
   test("sends the default beta header and decodes JSON data responses", async () => {
@@ -56,6 +57,78 @@ describe("CMA SDK client", () => {
       code: "CMA_ENVIRONMENT_NOT_FOUND",
       status: 404,
     } satisfies Partial<CmaSdkError>);
+  });
+
+  test.each(["client", "request"] as const)(
+    "propagates %s cancellation through fetch",
+    async (scope) => {
+      const controller = new AbortController();
+      const entered = Promise.withResolvers<void>();
+      const reason = new Error(`${scope} cancelled`);
+      let fetchSignal: AbortSignal | undefined;
+      const client = createCmaSdkClient({
+        baseUrl: "https://driver.test",
+        fetch: async (_input, init) => {
+          fetchSignal = init?.signal ?? undefined;
+          entered.resolve();
+          return new Promise<Response>(() => {});
+        },
+        ...(scope === "client" ? { signal: controller.signal } : {}),
+      });
+      const pending = client.listAgents(
+        scope === "request" ? { signal: controller.signal } : undefined,
+      );
+      await entered.promise;
+
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      expect(fetchSignal?.aborted).toBe(true);
+    },
+  );
+
+  test("times out an unresponsive fetch", async () => {
+    let fetchSignal: AbortSignal | undefined;
+    const client = createCmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async (_input, init) => {
+        fetchSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      },
+      timeoutMs: 0,
+    });
+
+    await expect(
+      promiseWithTimeout(client.listAgents(), {
+        label: "CMA SDK timeout",
+        timeoutMs: 100,
+      }),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(fetchSignal?.aborted).toBe(true);
+  });
+
+  test("bounds and cancels JSON response bodies", async () => {
+    let canceled = false;
+    const client = createCmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              canceled = true;
+            },
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"data":["too large"]}'));
+            },
+          }),
+        ),
+      maxResponseBytes: 8,
+    });
+
+    await expect(client.listAgents()).rejects.toMatchObject({
+      code: "CMA_SDK_RESPONSE_TOO_LARGE",
+    });
+    expect(canceled).toBe(true);
   });
 
   test("streams server-sent session event replay through fetch", async () => {
@@ -155,7 +228,10 @@ describe("CMA SDK client", () => {
     );
     const resumed = [];
 
-    for await (const event of client.streamSessionEvents(sessionId, first?.cursor)) {
+    for await (const event of client.streamSessionEvents(
+      sessionId,
+      first ? { afterCursor: first.cursor } : {},
+    )) {
       resumed.push(event);
       break;
     }
@@ -352,5 +428,48 @@ describe("CMA SDK client", () => {
 
     await expect(stream.next()).rejects.toMatchObject({ code: "CMA_SDK_FRAME_TOO_LARGE" });
     expect(canceled).toBe(true);
+  });
+
+  test("return interrupts a pending SSE read and waits for cleanup", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const readEntered = Promise.withResolvers<void>();
+    let fetchSignal: AbortSignal | undefined;
+    const client = createCmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async (_input, init) => {
+        fetchSignal = init?.signal ?? undefined;
+        return new Response(
+          new ReadableStream(
+            {
+              cancel() {
+                cleanup.resolve();
+              },
+              pull() {
+                readEntered.resolve();
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+        );
+      },
+    });
+    const iterator = client.streamSessionEvents("session-1")[Symbol.asyncIterator]();
+    const pending = iterator.next();
+    await readEntered.promise;
+
+    const returned = iterator.return?.();
+
+    if (!returned) {
+      throw new Error("Expected the CMA stream iterator to support return().");
+    }
+
+    await expect(
+      promiseWithTimeout(pending, { label: "pending CMA stream read", timeoutMs: 100 }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    await expect(
+      promiseWithTimeout(returned, { label: "CMA stream return", timeoutMs: 100 }),
+    ).resolves.toMatchObject({ done: true });
+    await promiseWithTimeout(cleanup.promise, { label: "CMA stream cleanup", timeoutMs: 100 });
+    expect(fetchSignal?.aborted).toBe(true);
   });
 });
