@@ -25,7 +25,7 @@ export type AcpAgentProcess = ChildProcessByStdio<Writable, Readable, Readable>;
 
 const ACP_AGENT_EXIT_TIMEOUT_MS = 1_500;
 const ACP_AGENT_FORCE_KILL_TIMEOUT_MS = 500;
-const agentProcessCloseTasks = new WeakMap<AcpAgentProcess, Promise<void>>();
+const agentProcessExitTasks = new WeakMap<AcpAgentProcess, Promise<void>>();
 const agentProcessSupervision = new WeakMap<AcpAgentProcess, AcpAgentProcessSupervision>();
 
 interface AcpAgentProcessSupervision {
@@ -91,16 +91,17 @@ export async function startAcpAgentProcess(
   agentProcessSupervision.set(agentProcess, supervision);
   const onAbort = () => signalAcpAgentProcess(agentProcess, "SIGKILL");
   signal.addEventListener("abort", onAbort, { once: true });
-  agentProcessCloseTasks.set(
-    agentProcess,
-    new Promise<void>((resolve) =>
-      agentProcess.once("close", () => {
-        signalLinuxProcessMarker(supervision.marker, "SIGKILL");
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }),
-    ),
-  );
+  const exited = Promise.withResolvers<void>();
+  const onExit = () => {
+    agentProcess.off("exit", onExit);
+    agentProcess.off("close", onExit);
+    signalLinuxProcessMarker(supervision.marker, "SIGKILL");
+    signal.removeEventListener("abort", onAbort);
+    exited.resolve();
+  };
+  agentProcess.once("exit", onExit);
+  agentProcess.once("close", onExit);
+  agentProcessExitTasks.set(agentProcess, exited.promise);
 
   agentProcess.stderr.setEncoding("utf8");
   agentProcess.stderr.on("data", (chunk: string) => {
@@ -237,7 +238,7 @@ function releaseAcpAgentProcessSupervision(agentProcess: AcpAgentProcess): void 
     return;
   }
   releaseLinuxProcessMarker(supervision.marker);
-  agentProcessCloseTasks.delete(agentProcess);
+  agentProcessExitTasks.delete(agentProcess);
   agentProcessSupervision.delete(agentProcess);
 }
 
@@ -321,13 +322,16 @@ async function waitForChildProcessExit(
   process: AcpAgentProcess,
   timeoutMs: number,
 ): Promise<boolean> {
-  const closed = agentProcessCloseTasks.get(process);
+  if (process.exitCode !== null || process.signalCode !== null) {
+    return true;
+  }
+  const exited = agentProcessExitTasks.get(process);
 
-  if (closed === undefined) {
-    return process.exitCode !== null || process.signalCode !== null;
+  if (exited === undefined) {
+    return false;
   }
 
-  const result = await settlePromiseWithTimeout(closed, {
+  const result = await settlePromiseWithTimeout(exited, {
     label: "ACP agent process exit",
     timeoutMs,
   });
@@ -337,7 +341,7 @@ async function waitForChildProcessExit(
   }
 
   if (result.status === "timed_out") {
-    return false;
+    return process.exitCode !== null || process.signalCode !== null;
   }
 
   throw result.error;
