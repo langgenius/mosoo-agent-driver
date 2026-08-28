@@ -94,7 +94,7 @@ describe("ACP agent process lifecycle", () => {
     }
   });
 
-  test("waits for close when a descendant keeps the exited leader's stdio open", async () => {
+  test("stops promptly when a descendant keeps the exited leader's stdio open", async () => {
     const harness = createHarness();
     const root = await mkdtemp(join(tmpdir(), "driver-acp-process-"));
     const boot = {
@@ -142,13 +142,23 @@ describe("ACP agent process lifecycle", () => {
       }
 
       expect(closed).toBe(false);
-      await stopAcpAgentProcess(
-        harness.context,
-        child,
-        "test.stop",
-        Date.now() + 2_000,
-        new AbortController().signal,
-      );
+      // Process exit is the stop signal; stdio held open by a descendant must
+      // not block or fail the stop. The group SIGKILL still reaps the
+      // descendant, so close arrives shortly after.
+      await expect(
+        stopAcpAgentProcess(
+          harness.context,
+          child,
+          "test.stop",
+          Date.now() + 2_000,
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+
+      if (!closed) {
+        await once(child, "close");
+      }
+
       expect(closed).toBe(true);
     } finally {
       if (child !== undefined && !closed) {
