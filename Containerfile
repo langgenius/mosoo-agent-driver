@@ -4,7 +4,7 @@ FROM docker.io/oven/bun:${BUN_VERSION}@sha256:5ff609364c049b54eb0ff560ec96319729
 FROM docker.io/cloudflare/sandbox:0.12.8@sha256:822501de5f0c52a012c125c4e5e4c0080421a8e93ca4ce0ba3d247148021989f
 
 # Keep this pin in sync with downstream mosoo apps/api/package.json -> @cloudflare/sandbox.
-ARG CLAUDE_AGENT_SDK_VERSION=0.3.247
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.251
 ARG BUN_VERSION
 ARG OPENAI_RUNTIME_VERSION=0.150.1
 ARG OPENCODE_VERSION=1.18.23
