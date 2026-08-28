@@ -189,7 +189,7 @@ function readOptionalString(record: Record<string, unknown>, field: string): str
 }
 
 function normalizeControlReason(reason: string): string {
-  const bytes = Buffer.byteLength(reason, "utf8");
+  const bytes = new TextEncoder().encode(reason).byteLength;
   return bytes <= MAX_RUNTIME_CONTROL_REASON_BYTES
     ? reason
     : `Runtime command reason exceeded ${String(MAX_RUNTIME_CONTROL_REASON_BYTES)} UTF-8 bytes (received ${String(bytes)}).`;

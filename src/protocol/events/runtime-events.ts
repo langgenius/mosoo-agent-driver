@@ -52,6 +52,7 @@ export * from "./runtime-event-types";
 
 const runtimeEventKindSet = new Set<string>(RUNTIME_EVENT_KINDS);
 const MAX_AGENT_TASKS_REPLACED_PAYLOAD_BYTES = 1_020 * 1_024;
+const utf8Encoder = new TextEncoder();
 const agentTasksReplacedPayloadSchema = z
   .object({
     tasks: z
@@ -61,7 +62,7 @@ const agentTasksReplacedPayloadSchema = z
             taskId: z
               .string()
               .min(1)
-              .refine((value) => Buffer.byteLength(value, "utf8") <= 256),
+              .refine((value) => utf8Encoder.encode(value).byteLength <= 256),
             taskType: z.string().min(1).max(4_096).optional(),
             title: z.string().min(1).max(4_096).optional(),
           })
@@ -85,7 +86,8 @@ const agentTasksReplacedPayloadSchema = z
   .strict()
   .superRefine((payload, context) => {
     if (
-      Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_AGENT_TASKS_REPLACED_PAYLOAD_BYTES
+      utf8Encoder.encode(JSON.stringify(payload)).byteLength >
+      MAX_AGENT_TASKS_REPLACED_PAYLOAD_BYTES
     ) {
       context.addIssue({
         code: "custom",

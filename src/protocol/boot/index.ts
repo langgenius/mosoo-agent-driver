@@ -1,4 +1,3 @@
-import { delimiter, isAbsolute } from "node:path";
 import { z } from "zod";
 
 import type { DriverInstanceId } from "../id";
@@ -85,7 +84,7 @@ function omitUndefinedProperties<Value extends Record<string, unknown>>(value: V
 }
 
 const absolutePathSchema = nonEmptyStringSchema.refine(
-  (path) => isAbsolute(path) && !path.includes("\0") && !path.includes(delimiter),
+  (path) => path.startsWith("/") && !path.includes("\0") && !path.includes(":"),
   "must be an absolute path without null bytes or path delimiters",
 );
 
