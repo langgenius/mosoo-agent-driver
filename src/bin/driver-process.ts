@@ -22,8 +22,6 @@ import type { Logger } from "../observability";
 import { summarizeDriverBootPayload } from "../observability/driver-debug";
 import { DRIVER_PROTOCOL_VERSION } from "../protocol/boot";
 import type { DriverBootPayload } from "../protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../protocol/host-integration";
-import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
 import { parseRunId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
 import { createDriverStartInputFromBootPayload } from "../protocol/start";
@@ -52,7 +50,6 @@ export class DriverProcess {
   private readonly payload: DriverBootPayload;
   readonly #permissionBroker: DriverPermissionBroker;
   readonly #shutdownController = new AbortController();
-  readonly #hostSnapshot: DriverHostIntegrationSnapshot;
   readonly #runtimeState = new DriverRuntimeStateMachine("created");
   readonly #startInput: DriverStartInput;
   #shutdownReason: string | null = null;
@@ -67,7 +64,6 @@ export class DriverProcess {
   ) {
     this.#backendFactory = backendFactory;
     this.payload = payload;
-    this.#hostSnapshot = createDriverHostIntegrationSnapshotFromBootExecution(payload.execution);
     this.#startInput = createDriverStartInputFromBootPayload(payload);
     this.#permissionBroker = new DriverPermissionBroker(() => this.#logger);
     this.#heartbeatLoop = new DriverHeartbeatLoop({
@@ -530,9 +526,6 @@ export class DriverProcess {
         mcp: {
           prepare: (command, signal) =>
             prepareRemoteHttpMcpCommand(this.#startInput, command, signal),
-        },
-        hostIntegration: {
-          snapshot: async () => this.#hostSnapshot,
         },
         skill: {
           materialize: async (execution, signal) =>

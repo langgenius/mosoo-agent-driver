@@ -3,6 +3,7 @@
 These eight runtime schemas are selected from `@openai/codex@0.150.1` output and must not be edited by hand.
 
 ```sh
+set -eu
 vp exec codex --version
 schema_tmp=$(mktemp -d)
 trap 'rm -rf "$schema_tmp"' EXIT

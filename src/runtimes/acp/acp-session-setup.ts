@@ -7,7 +7,6 @@ import type {
   ResumeSessionRequest,
 } from "@agentclientprotocol/sdk";
 
-import type { DriverExecutionSessionContext } from "../../protocol/boot";
 import type { DriverStartInput } from "../../protocol/start";
 import {
   buildMcpServers,
@@ -34,7 +33,6 @@ interface AcpSessionSetupInput {
   readonly connection: ClientContext;
   readonly currentSessionId: string | null;
   readonly payload: DriverStartInput;
-  readonly sessionContext: DriverExecutionSessionContext;
   replaySession<T>(operation: () => Promise<T>): Promise<T>;
 }
 
@@ -87,7 +85,7 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
 
   const baseParams = {
     _meta: toRequestMeta({
-      sessionContext: input.sessionContext,
+      sessionContext: input.payload.execution.session.context,
     }),
     ...(additionalDirectories.length === 0 ? {} : { additionalDirectories }),
     cwd: input.payload.execution.session.cwd,

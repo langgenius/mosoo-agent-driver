@@ -9,6 +9,9 @@ import {
   parseDriverCommandUpdateInput,
   parseDriverCompletionInput,
   parseDriverEventBatchInput,
+  parseDriverExternalToolEffectClaimInput,
+  parseDriverExternalToolEffectCompleteInput,
+  parseDriverExternalToolEffectUnknownInput,
   parseDriverFailureInput,
   parseDriverHeartbeatInput,
   parseDriverHelloInput,
@@ -1003,10 +1006,8 @@ export class DriverArtifactTestController {
         return { ok: true };
       }
       case "/driver/claimExternalToolEffect": {
-        const commandId = readString(input, "commandId", "external tool effect claim");
-        this.#assertDriverInstanceId(
-          readString(input, "driverInstanceId", "external tool effect claim"),
-        );
+        const { commandId, driverInstanceId } = parseDriverExternalToolEffectClaimInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
         const effectId = `artifact-test-effect-${commandId}`;
         const effect = this.#externalToolEffects.get(commandId);
 
@@ -1021,31 +1022,13 @@ export class DriverArtifactTestController {
         return { attempt: 1, effectId, idempotencyKey: effectId, kind: "execute" };
       }
       case "/driver/completeExternalToolEffect": {
-        const commandId = readString(input, "commandId", "external tool effect completion");
-        const driverInstanceId = readString(
-          input,
-          "driverInstanceId",
-          "external tool effect completion",
-        );
+        const { commandId, driverInstanceId, result } =
+          parseDriverExternalToolEffectCompleteInput(input);
         this.#assertDriverInstanceId(driverInstanceId);
-        const parsed = parseDriverCommandUpdateInput({
-          commandId,
-          driverInstanceId,
-          result: input["result"],
-          status: "completed",
-        });
-
-        if (
-          parsed.result === undefined ||
-          parsed.result === null ||
-          !("outputText" in parsed.result)
-        ) {
-          throw new Error("External tool effect completion requires an MCP result.");
-        }
 
         const current = this.#externalToolEffects.get(commandId);
         if (current?.status === "completed") {
-          if (JSON.stringify(current.result) !== JSON.stringify(parsed.result)) {
+          if (JSON.stringify(current.result) !== JSON.stringify(result)) {
             throw new Error(`External tool effect ${commandId} completed with a different result.`);
           }
           return { ok: true };
@@ -1055,16 +1038,14 @@ export class DriverArtifactTestController {
         }
 
         this.#externalToolEffects.set(commandId, {
-          result: structuredClone(parsed.result),
+          result: structuredClone(result),
           status: "completed",
         });
         return { ok: true };
       }
       case "/driver/markExternalToolEffectUnknown": {
-        const commandId = readString(input, "commandId", "external tool effect uncertainty");
-        this.#assertDriverInstanceId(
-          readString(input, "driverInstanceId", "external tool effect uncertainty"),
-        );
+        const { commandId, driverInstanceId } = parseDriverExternalToolEffectUnknownInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
         const current = this.#externalToolEffects.get(commandId);
 
         if (current?.status === "completed") {

@@ -176,6 +176,7 @@ test("OpenCode rejects unadvertised additional directories before session creati
         session: {
           ...driverStartInput.execution.session,
           additionalDirectories: [additionalDirectory],
+          context: sessionContext,
           cwd,
           homePath,
           sharedRootPath: cwd,
@@ -190,7 +191,6 @@ test("OpenCode rejects unadvertised additional directories before session creati
         connection: connection.agent,
         currentSessionId: null,
         payload,
-        sessionContext,
         replaySession: async (operation) => operation(),
       }),
     ).rejects.toThrow("does not advertise additionalDirectories support");

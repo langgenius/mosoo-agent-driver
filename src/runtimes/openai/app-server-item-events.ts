@@ -17,6 +17,11 @@ import type {
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
 import {
+  OpenAiAgentTaskState,
+  openAiAgentTasksClosedEvent,
+  type OpenAiSubAgentActivity,
+} from "./app-server-agent-task-events";
+import {
   toOpenAiCollaborationOutput,
   toOpenAiFileChangeEvents,
   toOpenAiMessagePhase,
@@ -100,6 +105,26 @@ interface OpenAiItemCompletionCommit {
   readonly events: DriverEventInput[];
 }
 
+function readOpenAiSubAgentActivity(item: JsonObject): OpenAiSubAgentActivity | null {
+  if (readString(item, "type") !== "subAgentActivity") {
+    return null;
+  }
+
+  const kind = readString(item, "kind");
+  const agentId = readNonEmptyString(item, "agentThreadId");
+  const agentPath = readNonEmptyString(item, "agentPath");
+
+  if (
+    agentId === null ||
+    agentPath === null ||
+    (kind !== "started" && kind !== "interacted" && kind !== "interrupted" && kind !== "completed")
+  ) {
+    throw new Error("OpenAI sub-agent activity is malformed.");
+  }
+
+  return { agentId, agentPath, kind };
+}
+
 function withOpenAiEventIds(
   events: readonly DriverEventInput[],
   sourcePrefix: string,
@@ -143,20 +168,7 @@ function toOpenAiItemLifecycleEvents(
         return [];
       }
 
-      const activityKind = readString(item, "kind");
-      const agentId = readNonEmptyString(item, "agentThreadId");
-      const agentPath = readNonEmptyString(item, "agentPath");
-
-      if (
-        agentId === null ||
-        agentPath === null ||
-        (activityKind !== "started" &&
-          activityKind !== "interacted" &&
-          activityKind !== "interrupted" &&
-          activityKind !== "completed")
-      ) {
-        throw new Error("OpenAI sub-agent activity is malformed.");
-      }
+      const { agentId, agentPath, kind: activityKind } = readOpenAiSubAgentActivity(item)!;
 
       return [
         {
@@ -323,6 +335,7 @@ function toOpenAiToolStatus(
 }
 
 export class OpenAiAppServerItemEventBridge {
+  readonly #agentTasks = new OpenAiAgentTaskState();
   readonly #citationDiagnosticsEmitted = new Set<string>();
   readonly #citationFilters = new Map<string, OpenAiPrivateCitationStreamFilter>();
   readonly #items: OpenAiItemState;
@@ -349,6 +362,7 @@ export class OpenAiAppServerItemEventBridge {
   }
 
   reset(): void {
+    this.#agentTasks.reset();
     this.#citationDiagnosticsEmitted.clear();
     this.#citationFilters.clear();
     this.#items.reset();
@@ -357,8 +371,12 @@ export class OpenAiAppServerItemEventBridge {
     this.#tools.reset();
   }
 
-  terminalEvents(outcome: OpenAiTerminalOutcome): DriverEventInput[] {
-    return [...this.#messages.terminalEvents(outcome), ...this.#tools.terminalEvents(outcome)];
+  terminalEvents(outcome: OpenAiTerminalOutcome): [DriverEventInput, ...DriverEventInput[]] {
+    return [
+      openAiAgentTasksClosedEvent(),
+      ...this.#messages.terminalEvents(outcome),
+      ...this.#tools.terminalEvents(outcome),
+    ];
   }
 
   async onMessageDelta(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -454,6 +472,8 @@ export class OpenAiAppServerItemEventBridge {
 
     // Validate and prepare the full completion before committing replay state.
     const toolStatus = toOpenAiToolStatus(item, "completed");
+    const activity = readOpenAiSubAgentActivity(item);
+    const agentTaskUpdate = activity === null ? null : this.#agentTasks.prepare(activity);
     const publicItemId = this.#items.publicId(itemId);
     const publicTurnId = this.#items.publicId(turnId, "turn");
     const lifecycleEvents = toOpenAiItemLifecycleEvents(item, publicItemId, "completed");
@@ -467,6 +487,7 @@ export class OpenAiAppServerItemEventBridge {
 
     events.push(...toOpenAiFileChangeEvents(item));
     events.push(...lifecycleEvents);
+    events.push(...(agentTaskUpdate?.events ?? []));
 
     if (events.length > 0) {
       const durableEvents = withOpenAiEventIds(
@@ -482,6 +503,7 @@ export class OpenAiAppServerItemEventBridge {
     for (const completion of completions) {
       completion.commit();
     }
+    agentTaskUpdate?.commit();
     this.#items.markCompleted(itemId);
   }
 

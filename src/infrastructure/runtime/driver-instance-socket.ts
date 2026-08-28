@@ -7,6 +7,7 @@ import { assertDriverEventReceiptPrefix } from "../../core/driver-runtime-io";
 import type { DriverBootPayload } from "../../protocol/boot";
 import type { DriverEventEnvelope, DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
+import { driverRuntimeRpcSchemas } from "../../protocol/orpc";
 import type {
   DriverFailureInput,
   DriverEventBatchOutput,
@@ -27,7 +28,6 @@ import type {
   RuntimeCommand,
   RuntimeCommandResult,
 } from "../../runtime-command";
-import { parseRuntimeCommand } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
 import { dialDriverControlSocket } from "./driver-control-dial";
 import type { DriverWireSocket } from "./driver-control-dial";
@@ -136,11 +136,11 @@ export class DriverInstanceSocket {
     this.#eventBatchMaxSize = null;
     this.#rpcAbortController = new AbortController();
     this.#socket = socket;
-    this.#client = createORPCClient(
+    this.#client = createORPCClient<DriverRuntimeClient>(
       new RPCLink({
         websocket: socket,
       }),
-    ) as unknown as DriverRuntimeClient;
+    );
 
     socket.addEventListener("close", (event) => {
       if (generation !== this.#connectionGeneration || this.#socket !== socket) {
@@ -223,15 +223,17 @@ export class DriverInstanceSocket {
     },
     signal: AbortSignal,
   ): Promise<void> {
-    await this.#requireClient().driver.commandUpdate(
-      {
-        commandId: input.commandId,
-        driverInstanceId: this.payload.driverInstanceId,
-        ...(input.error === undefined ? {} : { error: input.error }),
-        status: input.status,
-        ...(input.result === undefined ? {} : { result: input.result }),
-      },
-      this.#rpcOptions(signal),
+    driverRuntimeRpcSchemas.driver.commandUpdate.output.parse(
+      await this.#requireClient().driver.commandUpdate(
+        {
+          commandId: input.commandId,
+          driverInstanceId: this.payload.driverInstanceId,
+          ...(input.error === undefined ? {} : { error: input.error }),
+          status: input.status,
+          ...(input.result === undefined ? {} : { result: input.result }),
+        },
+        this.#rpcOptions(signal),
+      ),
     );
   }
 
@@ -240,12 +242,14 @@ export class DriverInstanceSocket {
     signal: AbortSignal,
   ): Promise<McpExternalToolEffectClaim> {
     const result: DriverExternalToolEffectClaimOutput =
-      await this.#requireClient().driver.claimExternalToolEffect(
-        {
-          commandId: input.commandId,
-          driverInstanceId: this.payload.driverInstanceId,
-        },
-        this.#rpcOptions(signal),
+      driverRuntimeRpcSchemas.driver.claimExternalToolEffect.output.parse(
+        await this.#requireClient().driver.claimExternalToolEffect(
+          {
+            commandId: input.commandId,
+            driverInstanceId: this.payload.driverInstanceId,
+          },
+          this.#rpcOptions(signal),
+        ),
       );
 
     return result;
@@ -259,16 +263,18 @@ export class DriverInstanceSocket {
     },
     signal: AbortSignal,
   ): Promise<void> {
-    await this.#requireClient().driver.completeExternalToolEffect(
-      {
-        commandId: input.commandId,
-        driverInstanceId: this.payload.driverInstanceId,
-        ...(input.providerReceiptJson === undefined
-          ? {}
-          : { providerReceiptJson: input.providerReceiptJson }),
-        result: input.result,
-      },
-      this.#effectSettlementRpcOptions(signal),
+    driverRuntimeRpcSchemas.driver.completeExternalToolEffect.output.parse(
+      await this.#requireClient().driver.completeExternalToolEffect(
+        {
+          commandId: input.commandId,
+          driverInstanceId: this.payload.driverInstanceId,
+          ...(input.providerReceiptJson === undefined
+            ? {}
+            : { providerReceiptJson: input.providerReceiptJson }),
+          result: input.result,
+        },
+        this.#effectSettlementRpcOptions(signal),
+      ),
     );
   }
 
@@ -281,13 +287,15 @@ export class DriverInstanceSocket {
   }
 
   async heartbeat(input: Omit<DriverHeartbeatInput, "pid">): Promise<DriverHeartbeatOutput> {
-    return this.#requireClient().driver.heartbeat(
-      {
-        at: input.at,
-        pid: process.pid,
-        reason: input.reason,
-      },
-      this.#rpcOptions(),
+    return driverRuntimeRpcSchemas.driver.heartbeat.output.parse(
+      await this.#requireClient().driver.heartbeat(
+        {
+          at: input.at,
+          pid: process.pid,
+          reason: input.reason,
+        },
+        this.#rpcOptions(),
+      ),
     );
   }
 
@@ -298,31 +306,22 @@ export class DriverInstanceSocket {
   ): Promise<DriverHelloOutput> {
     const generation = this.#connectionGeneration;
     const client = this.#requireClient();
-    const result = await client.driver.hello(
-      {
-        capabilities: input.capabilities,
-        driverVersion: input.driverVersion,
-        pid: process.pid,
-        protocolVersion: input.protocolVersion,
-        runtime: this.payload.runtime,
-        startedAt: input.startedAt,
-      },
-      this.#rpcOptions(),
+    const result = driverRuntimeRpcSchemas.driver.hello.output.parse(
+      await client.driver.hello(
+        {
+          capabilities: input.capabilities,
+          driverVersion: input.driverVersion,
+          pid: process.pid,
+          protocolVersion: input.protocolVersion,
+          runtime: this.payload.runtime,
+          startedAt: input.startedAt,
+        },
+        this.#rpcOptions(),
+      ),
     );
 
     if (generation !== this.#connectionGeneration || client !== this.#client) {
       throw new Error("Driver socket connection changed during hello.");
-    }
-
-    if (!Number.isSafeInteger(result.heartbeatIntervalMs) || result.heartbeatIntervalMs < 250) {
-      throw new Error("Driver heartbeat interval must be an integer of at least 250ms.");
-    }
-
-    if (
-      !Number.isSafeInteger(result.runConfig.eventBatchMaxSize) ||
-      result.runConfig.eventBatchMaxSize < 1
-    ) {
-      throw new Error("Driver event batch max size must be a positive integer.");
     }
 
     this.#eventBatchMaxSize = result.runConfig.eventBatchMaxSize;
@@ -479,12 +478,14 @@ export class DriverInstanceSocket {
       let remaining = events.slice(index, index + maxBatchSize);
 
       while (remaining.length > 0) {
-        const result = await client.driver.pushEvents(
-          {
-            driverInstanceId: this.payload.driverInstanceId,
-            events: remaining,
-          },
-          rpcOptions,
+        const result = driverRuntimeRpcSchemas.driver.pushEvents.output.parse(
+          await client.driver.pushEvents(
+            {
+              driverInstanceId: this.payload.driverInstanceId,
+              events: remaining,
+            },
+            rpcOptions,
+          ),
         );
         this.#assertConnection(client, generation, "event delivery");
         this.#assertRunGeneration(prepared);
@@ -516,23 +517,27 @@ export class DriverInstanceSocket {
   }
 
   async pushLogs(input: Omit<DriverLogBatchInput, "driverInstanceId">): Promise<void> {
-    await this.#requireClient().driver.pushLogs(
-      {
-        driverInstanceId: this.payload.driverInstanceId,
-        logs: input.logs,
-      },
-      this.#rpcOptions(),
+    driverRuntimeRpcSchemas.driver.pushLogs.output.parse(
+      await this.#requireClient().driver.pushLogs(
+        {
+          driverInstanceId: this.payload.driverInstanceId,
+          logs: input.logs,
+        },
+        this.#rpcOptions(),
+      ),
     );
   }
 
   async ready(input: Omit<DriverReadyInput, "driverInstanceId" | "pid">): Promise<void> {
-    await this.#requireClient().driver.ready(
-      {
-        at: input.at,
-        driverInstanceId: this.payload.driverInstanceId,
-        pid: process.pid,
-      },
-      this.#rpcOptions(),
+    driverRuntimeRpcSchemas.driver.ready.output.parse(
+      await this.#requireClient().driver.ready(
+        {
+          at: input.at,
+          driverInstanceId: this.payload.driverInstanceId,
+          pid: process.pid,
+        },
+        this.#rpcOptions(),
+      ),
     );
   }
 
@@ -542,11 +547,13 @@ export class DriverInstanceSocket {
     let result: Awaited<ReturnType<DriverRuntimeClient["driverInstance"]["nextCommand"]>>;
 
     try {
-      result = await this.#requireClient().driverInstance.nextCommand(
-        {
-          driverInstanceId: this.payload.driverInstanceId,
-        },
-        this.#rpcOptions(signal, timeoutSignal),
+      result = driverRuntimeRpcSchemas.driverInstance.nextCommand.output.parse(
+        await this.#requireClient().driverInstance.nextCommand(
+          {
+            driverInstanceId: this.payload.driverInstanceId,
+          },
+          this.#rpcOptions(signal, timeoutSignal),
+        ),
       );
     } catch (error) {
       if (
@@ -561,19 +568,21 @@ export class DriverInstanceSocket {
       throw error;
     }
 
-    return result.command === null ? null : parseRuntimeCommand(result.command);
+    return result.command;
   }
 
   async markExternalToolEffectUnknown(
     input: { commandId: string },
     signal: AbortSignal,
   ): Promise<void> {
-    await this.#requireClient().driver.markExternalToolEffectUnknown(
-      {
-        commandId: input.commandId,
-        driverInstanceId: this.payload.driverInstanceId,
-      },
-      this.#effectSettlementRpcOptions(signal),
+    driverRuntimeRpcSchemas.driver.markExternalToolEffectUnknown.output.parse(
+      await this.#requireClient().driver.markExternalToolEffectUnknown(
+        {
+          commandId: input.commandId,
+          driverInstanceId: this.payload.driverInstanceId,
+        },
+        this.#effectSettlementRpcOptions(signal),
+      ),
     );
   }
 
@@ -625,17 +634,21 @@ export class DriverInstanceSocket {
       const options = this.#rpcOptions(signal);
 
       if (terminal.status === "completed") {
-        await client.driver.completeRun(
-          { driverInstanceId: this.payload.driverInstanceId },
-          options,
+        driverRuntimeRpcSchemas.driver.completeRun.output.parse(
+          await client.driver.completeRun(
+            { driverInstanceId: this.payload.driverInstanceId },
+            options,
+          ),
         );
       } else {
-        await client.driver.failRun(
-          {
-            driverInstanceId: this.payload.driverInstanceId,
-            error: structuredClone(terminal.error),
-          },
-          options,
+        driverRuntimeRpcSchemas.driver.failRun.output.parse(
+          await client.driver.failRun(
+            {
+              driverInstanceId: this.payload.driverInstanceId,
+              error: structuredClone(terminal.error),
+            },
+            options,
+          ),
         );
       }
 

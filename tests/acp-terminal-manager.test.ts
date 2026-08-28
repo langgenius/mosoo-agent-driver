@@ -54,6 +54,26 @@ function createHarness(
   return { context, events, manager };
 }
 
+async function waitForTerminalOutput(
+  manager: AcpTerminalManager,
+  terminal: unknown,
+  expected: "non-empty" | "ready" = "ready",
+): Promise<void> {
+  const deadline = Date.now() + 3_000;
+
+  for (;;) {
+    const output = manager.output(terminal).output;
+
+    if (expected === "non-empty" ? output.length > 0 : output === expected) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for terminal output ${expected}.`);
+    }
+    await Bun.sleep(10);
+  }
+}
+
 function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -167,9 +187,7 @@ describe("ACP terminal manager", () => {
         args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
         command: process.execPath,
       });
-      while (harness.manager.output(terminal).output !== "ready") {
-        await Bun.sleep(10);
-      }
+      await waitForTerminalOutput(harness.manager, terminal);
       const killed = harness.manager.kill(harness.context, terminal);
       let settled = false;
       void killed.then(() => {
@@ -203,9 +221,7 @@ describe("ACP terminal manager", () => {
         args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
         command: process.execPath,
       });
-      while (harness.manager.output(terminal).output !== "ready") {
-        await Bun.sleep(10);
-      }
+      await waitForTerminalOutput(harness.manager, terminal);
       const released = harness.manager.release(harness.context, terminal);
       const pending = await settlePromiseWithTimeout(released, {
         label: "terminal release cleanup barrier",
@@ -243,9 +259,7 @@ describe("ACP terminal manager", () => {
         args: ["-e", "process.stdout.write(String(process.pid));setInterval(() => {}, 1000)"],
         command: process.execPath,
       });
-      while (harness.manager.output(terminal).output === "") {
-        await Bun.sleep(10);
-      }
+      await waitForTerminalOutput(harness.manager, terminal, "non-empty");
       const exited = harness.manager.waitForExit(terminal);
       void exited.catch(() => {});
       process.kill(Number.parseInt(harness.manager.output(terminal).output, 10), "SIGTERM");
@@ -292,9 +306,7 @@ describe("ACP terminal manager", () => {
           ],
           command: process.execPath,
         });
-        while (harness.manager.output(terminal).output !== "ready") {
-          await Bun.sleep(10);
-        }
+        await waitForTerminalOutput(harness.manager, terminal);
         pid = await waitForPidFile(pidPath);
 
         if (outcome === "completed") {
@@ -328,9 +340,7 @@ describe("ACP terminal manager", () => {
           args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
           command: process.execPath,
         });
-        while (harness.manager.output(terminal).output !== "ready") {
-          await Bun.sleep(10);
-        }
+        await waitForTerminalOutput(harness.manager, terminal);
 
         cleanup.reject(new Error("test watchdog cleanup failed"));
         await expect(harness.manager.waitForExit(terminal)).rejects.toThrow("watchdog failed");
@@ -566,9 +576,7 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
         args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
         command: process.execPath,
       });
-      while (harness.manager.output(first).output !== "ready") {
-        await Bun.sleep(10);
-      }
+      await waitForTerminalOutput(harness.manager, first);
 
       await harness.manager.stopTurn(harness.context, firstTurn);
       expect(() => harness.manager.output(first)).toThrow("does not exist");

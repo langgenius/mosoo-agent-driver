@@ -9,7 +9,6 @@ import {
 } from "../../core/driver-runtime-state";
 import { summarizeRuntimeCommandInput } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
-import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
 import { createDriverId } from "../../protocol/id";
 import type { MessageId, RunId } from "../../protocol/id";
 import type { RuntimeCommandInput } from "../../runtime-command";
@@ -186,7 +185,6 @@ export class AcpTurnController {
     runId: RunId,
     connection: ClientContext,
     sessionId: string,
-    hostSnapshot: DriverHostIntegrationSnapshot,
     clientRequests: AcpClientRequestHandler,
     signal?: AbortSignal,
   ): Promise<void> {
@@ -285,7 +283,7 @@ export class AcpTurnController {
       active.providerPromptAdmitted = true;
       const promptResult = await connection.request(acpMethods.agent.session.prompt, {
         _meta: {
-          ...toRequestMeta({ sessionContext: hostSnapshot.sessionContext }),
+          ...toRequestMeta({ sessionContext: context.payload.execution.session.context }),
           "mosoo.ai/messageId": messageId,
         },
         prompt: [{ text: input.text, type: "text" }],

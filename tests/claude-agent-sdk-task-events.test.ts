@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import type { SDKBackgroundTasksChangedMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import type { DriverEventInput } from "../src/protocol/events";
-import { ClaudeAgentSdkTaskEvents } from "../src/runtimes/claude/agent-sdk-task-events";
+import {
+  claudeBackgroundTasksClosedEvent,
+  projectClaudeBackgroundTasksSnapshot,
+} from "../src/runtimes/claude/agent-sdk-task-events";
 
 function backgroundTasks(
   tasks: SDKBackgroundTasksChangedMessage["tasks"],
@@ -30,160 +32,125 @@ function task(
   };
 }
 
-function commit(
-  projection: ClaudeAgentSdkTaskEvents,
-  message: SDKBackgroundTasksChangedMessage,
-): readonly DriverEventInput[] {
-  const prepared = projection.prepare(message);
-  prepared.commit();
-  return prepared.events;
+function projection(tasks: SDKBackgroundTasksChangedMessage["tasks"]) {
+  return projectClaudeBackgroundTasksSnapshot(backgroundTasks(tasks));
 }
 
-describe("Claude Agent SDK task events", () => {
-  test("projects replacement snapshots and metadata changes", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
+function snapshot(tasks: SDKBackgroundTasksChangedMessage["tasks"]) {
+  return projection(tasks).snapshot;
+}
 
-    expect(commit(projection, backgroundTasks([task("task-1")]))).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: {
-          active: true,
-          taskId: "task-1",
-          taskType: "local_agent",
-          title: "Inspect the repository",
-        },
+describe("Claude Agent SDK task snapshots", () => {
+  test("projects every SDK snapshot as one complete replacement", () => {
+    const initial = {
+      delivery: "lossless",
+      kind: "agent.tasks.replaced",
+      payload: {
+        tasks: [
+          {
+            taskId: "task-1",
+            taskType: "local_agent",
+            title: "Inspect the repository",
+          },
+        ],
       },
-    ]);
-    expect(commit(projection, backgroundTasks([task("task-1")]))).toEqual([]);
-    expect(commit(projection, backgroundTasks([task("task-1", "Inspect tests")]))).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { taskId: "task-1", title: "Inspect tests" },
-      },
-    ]);
-  });
+      visibility: "participant",
+    } as const;
 
-  test("treats removal and ambient changes as visibility, not guessed completion", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
-    commit(projection, backgroundTasks([task("task-1")]));
-
-    expect(commit(projection, backgroundTasks([task("task-1", undefined, true)]))).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { active: false, taskId: "task-1" },
-      },
-    ]);
-    expect(commit(projection, backgroundTasks([task("task-1")]))[0]).toMatchObject({
-      payload: { active: true, taskId: "task-1" },
+    expect(snapshot([task("task-1")])).toEqual(initial);
+    expect(snapshot([task("task-1")])).toEqual(initial);
+    expect(snapshot([task("task-1", "Inspect tests")])).toEqual({
+      ...initial,
+      payload: { tasks: [{ ...initial.payload.tasks[0], title: "Inspect tests" }] },
     });
-    expect(commit(projection, backgroundTasks([]))).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { active: false, taskId: "task-1" },
-      },
-    ]);
   });
 
-  test("bounds visible tasks, IDs, and text", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
-    const events = commit(
-      projection,
-      backgroundTasks(
-        Array.from({ length: 256 }, (_, index) =>
-          task(index === 0 ? "界".repeat(257) : `task-${index}`, `${"x".repeat(4_095)}😀tail`),
-        ),
-      ),
-    );
+  test("filters ambient tasks and publishes membership removal as an empty snapshot", () => {
+    const event = snapshot([task("task-1"), task("ambient-task", "private ambient task", true)]);
 
-    expect(events).toHaveLength(256);
-    expect(events[0]?.payload).toMatchObject({
-      taskId: expect.stringMatching(/^claude-task:[a-f0-9]{64}$/),
-      title: expect.stringMatching(/^x{4095}$/),
+    expect(event).toMatchObject({
+      kind: "agent.tasks.replaced",
+      payload: { tasks: [{ taskId: "task-1" }] },
     });
-    expect(projection.prepareClosure().events).toHaveLength(256);
+    expect(JSON.stringify(event)).not.toContain("private");
+    expect(snapshot([task("task-1", "private", true)])).toEqual(claudeBackgroundTasksClosedEvent());
   });
 
-  test("filters ambient prefixes and omits empty metadata", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
-    const ambient = Array.from({ length: 1_023 }, (_, index) =>
-      task(`ambient-${index}`, "private", true),
-    );
+  test("bounds task IDs, text, counts, and aggregate event size", () => {
+    const bounded = snapshot([
+      task("界".repeat(257), `${"x".repeat(4_095)}😀tail`),
+      { description: "", task_id: "empty-metadata", task_type: "" },
+    ]);
+    expect(bounded).toMatchObject({
+      payload: {
+        tasks: [
+          {
+            taskId: expect.stringMatching(/^claude-task:[a-f0-9]{64}$/),
+            title: expect.stringMatching(/^x{4095}$/),
+          },
+          { taskId: "empty-metadata" },
+        ],
+      },
+    });
+
+    const maximum = snapshot(Array.from({ length: 256 }, (_, index) => task(`task-${index}`)));
+    expect(maximum).toMatchObject({ kind: "agent.tasks.replaced" });
+    if (maximum === null) {
+      throw new Error("Expected a task replacement snapshot.");
+    }
+    expect((maximum.payload as { tasks: unknown[] }).tasks).toHaveLength(256);
 
     expect(
-      commit(
-        projection,
-        backgroundTasks([...ambient, { description: "", task_id: "visible", task_type: "" }]),
-      ),
-    ).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { active: true, taskId: "visible" },
-      },
-    ]);
-
-    const oversized = projection.prepare(
-      backgroundTasks(Array.from({ length: 257 }, (_, index) => task(`visible-${index}`))),
-    );
-    expect(oversized.events).toMatchObject([
-      {
+      projection(Array.from({ length: 257 }, (_, index) => task(`visible-${index}`))),
+    ).toMatchObject({
+      diagnostic: {
         kind: "diagnostic.reported",
         payload: { code: "claude.visible_background_tasks_too_many" },
         visibility: "owner_debug",
       },
-    ]);
-    oversized.commit();
-    expect(projection.prepareClosure().events).toHaveLength(1);
-
+      snapshot: null,
+    });
     expect(
-      projection.prepare(
-        backgroundTasks(
-          Array.from({ length: 1_025 }, (_, index) => task(`raw-${index}`, "x", true)),
-        ),
-      ).events,
-    ).toMatchObject([
-      {
+      projection(Array.from({ length: 1_025 }, (_, index) => task(`ambient-${index}`, "x", true))),
+    ).toMatchObject({
+      diagnostic: {
         kind: "diagnostic.reported",
         payload: { code: "claude.background_tasks_snapshot_too_large" },
       },
-    ]);
-    expect(projection.prepareClosure().events).toHaveLength(1);
+      snapshot: null,
+    });
+    const oversizedMetadata = projection(
+      Array.from({ length: 100 }, (_, index) => ({
+        description: "界".repeat(4_096),
+        task_id: `large-${index}`,
+        task_type: "界".repeat(4_096),
+      })),
+    );
+    expect(oversizedMetadata).toMatchObject({
+      diagnostic: {
+        kind: "diagnostic.reported",
+        payload: { code: "claude.tasks_snapshot_too_large" },
+      },
+      snapshot: {
+        delivery: "lossless",
+        kind: "agent.tasks.replaced",
+        visibility: "participant",
+      },
+    });
+    if (oversizedMetadata.snapshot === null) {
+      throw new Error("Expected an ID-only membership snapshot.");
+    }
+    expect(
+      (oversizedMetadata.snapshot.payload as { tasks: Array<Record<string, unknown>> }).tasks,
+    ).toEqual(Array.from({ length: 100 }, (_, index) => ({ taskId: `large-${index}` })));
   });
 
-  test("retains only the durably accepted prefix", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
-    const prepared = projection.prepare(backgroundTasks([task("task-1"), task("task-2")]));
-
-    expect(prepared.events).toHaveLength(2);
-    prepared.beforePublish(0);
-    prepared.commitAccepted(0);
-    expect(projection.prepareClosure().events).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { active: false, taskId: "task-1" },
-      },
-    ]);
-  });
-
-  test("commits closure only after durable publication", () => {
-    const projection = new ClaudeAgentSdkTaskEvents();
-    commit(projection, backgroundTasks([task("task-1")]));
-
-    const closure = projection.prepareClosure();
-    expect(closure.events).toEqual([
-      {
-        delivery: "lossless",
-        kind: "agent.task.updated",
-        payload: { active: false, taskId: "task-1" },
-      },
-    ]);
-    expect(projection.prepareClosure().events).toEqual(closure.events);
-    closure.commit();
-    expect(projection.prepareClosure().events).toEqual([]);
+  test("uses an authoritative empty replacement for turn and process closure", () => {
+    expect(claudeBackgroundTasksClosedEvent()).toEqual({
+      delivery: "lossless",
+      kind: "agent.tasks.replaced",
+      payload: { tasks: [] },
+      visibility: "participant",
+    });
   });
 });

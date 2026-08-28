@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "../src/boot";
-import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "../src/cma-http";
-import { CmaSdkClient as CmaSdkClientFromSubpath } from "../src/cma-sdk";
+import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "@mosoo/agent-driver/boot";
+import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "@mosoo/agent-driver/cma-http";
+import { CmaSdkClient as CmaSdkClientFromSubpath } from "@mosoo/agent-driver/cma-sdk";
 import {
   PROTOCOL_VERSION as PROTOCOL_VERSION_FROM_CONTRACT,
   protocolVersionSchema as protocolVersionSchemaFromContract,
   sessionSnapshotSchema as sessionSnapshotSchemaFromContract,
-} from "../src/contract";
-import { parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath } from "../src/events";
+} from "@mosoo/agent-driver/contract";
+import { parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath } from "@mosoo/agent-driver/events";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   AgentDriverKernelCore,
@@ -25,15 +25,16 @@ import {
   pushDriverDiagnosticEvent,
   projectCmaInboundToDriverCommand,
   projectDriverEventToCma,
-} from "../src/index";
+} from "@mosoo/agent-driver";
 import {
   parseDriverHeartbeatInput as parseDriverHeartbeatInputFromOrpcSubpath,
   parseDriverHelloInput as parseDriverHelloInputFromOrpcSubpath,
   parseDriverReadyInput as parseDriverReadyInputFromOrpcSubpath,
-} from "../src/orpc";
-import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "../src/orpc";
-import { SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH } from "../src/paths";
-import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "../src/runtime";
+} from "@mosoo/agent-driver/orpc";
+import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "@mosoo/agent-driver/orpc";
+import { SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH } from "@mosoo/agent-driver/paths";
+import { filterOpenAiPrivateCitations } from "@mosoo/agent-driver/provider-output";
+import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "@mosoo/agent-driver/runtime";
 
 describe("public API", () => {
   test("imports without starting the driver process", () => {
@@ -100,5 +101,9 @@ describe("public API", () => {
     });
     expect(isSupportedDriverRuntimeFromSubpath("openai-runtime")).toBe(true);
     expect(SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH).toBe("/workspace/memory");
+    expect(filterOpenAiPrivateCitations("plain text")).toEqual({
+      privateCitationCount: 0,
+      text: "plain text",
+    });
   });
 });

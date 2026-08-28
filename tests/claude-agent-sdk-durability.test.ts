@@ -67,6 +67,7 @@ function createCmaHarness() {
       const [envelope] = toRuntimeEventInput(
         {
           createId: () => createDriverId() as EventId,
+          driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
           occurredAt: "2026-08-13T00:00:00.000Z",
           runId,
           sessionId,
@@ -456,11 +457,10 @@ describe("Claude Agent SDK durable event boundaries", () => {
     await translator.failTurn(context, runId, "claude.task_delivery_failed", "delivery failed");
 
     expect(
-      events.filter((event) => event.kind === "agent.task.updated").map((event) => payload(event)),
-    ).toMatchObject([
-      { active: true, taskId: "task-1" },
-      { active: false, taskId: "task-1" },
-    ]);
+      events
+        .filter((event) => event.kind === "agent.tasks.replaced")
+        .map((event) => payload(event)),
+    ).toMatchObject([{ tasks: [{ taskId: "task-1" }] }, { tasks: [] }]);
     expect(events.at(-1)?.kind).toBe("run.failed");
   });
 

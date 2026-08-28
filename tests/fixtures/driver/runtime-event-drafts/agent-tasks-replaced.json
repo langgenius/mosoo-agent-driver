@@ -1,0 +1,14 @@
+{
+  "delivery": "lossless",
+  "kind": "agent.tasks.replaced",
+  "payload": {
+    "tasks": [
+      {
+        "taskId": "task-1",
+        "taskType": "local_agent",
+        "title": "Inspect the repository"
+      }
+    ]
+  },
+  "visibility": "participant"
+}

@@ -1,6 +1,5 @@
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
-import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
 import type { RunId } from "../protocol/id";
 import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type {
@@ -103,15 +102,10 @@ export interface AgentDriverFilePort {
   }): Promise<void>;
 }
 
-export interface AgentDriverHostIntegrationPort {
-  snapshot(): Promise<DriverHostIntegrationSnapshot | null>;
-}
-
 export interface AgentDriverHostPorts {
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
-  hostIntegration: AgentDriverHostIntegrationPort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
   skill: AgentDriverSkillPort;

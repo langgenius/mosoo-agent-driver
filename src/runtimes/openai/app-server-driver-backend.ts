@@ -23,6 +23,7 @@ import {
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
 import { OpenAiAppServerClient } from "./app-server-client";
+import { openAiAgentTasksClosedEvent } from "./app-server-agent-task-events";
 import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "./app-server-env";
 import { OpenAiAppServerEventBridge } from "./app-server-event-bridge";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
@@ -241,6 +242,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       [, bootstrapArtifacts] = await Promise.all([clientStartPromise, skillBootstrapPromise]);
     } catch (error) {
       await this.#cleanupFailedClient(context, client, "driver.openai.startup.cleanup.failed");
+      await this.#publishAgentTasksClosed(context, "driver.openai.startup.failed");
       signal.throwIfAborted();
       throw error;
     }
@@ -262,10 +264,14 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       );
     } catch (error) {
       await this.#cleanupFailedClient(context, client, "driver.openai.startup.cleanup.failed");
+      await this.#publishAgentTasksClosed(context, "driver.openai.startup.failed");
       signal.throwIfAborted();
       throw error;
     }
-    signal.throwIfAborted();
+    if (signal.aborted) {
+      await this.#publishAgentTasksClosed(context, "driver.openai.startup.cancelled");
+      signal.throwIfAborted();
+    }
     this.#threadId = threadResult.thread.id;
     void this.#emitStartupTiming(context, startupStartedAt, startupPhases);
 
@@ -329,6 +335,25 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     if (this.#client === client) {
       this.#client = null;
     }
+  }
+
+  async #publishAgentTasksClosed(
+    context: AgentDriverContext,
+    reason: string,
+    runId = context.ports.eventSink.currentRunId(),
+  ): Promise<void> {
+    if (runId === null) {
+      return;
+    }
+
+    await this.#eventPublisher.push(context, reason, [
+      {
+        ...openAiAgentTasksClosedEvent(),
+        runId,
+        sourceEventId: `${reason}:${runId}`,
+      },
+    ]);
+    this.#events.releaseTurnState();
   }
 
   async #startThread(
@@ -634,11 +659,20 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       ...toOpenAiProtocolError({ message: error.message }),
       code: "openai.provider_failed",
     } as const;
+    const [taskClosure, ...itemClosures] = this.#events.turnStartTerminalEvents({
+      error: protocolError,
+      kind: "failed",
+    });
 
     await this.#eventPublisher.pushTerminal(
       context,
       "driver.openai.provider.failed",
       [
+        {
+          ...taskClosure,
+          runId,
+          sourceEventId: `openai.provider.failed.closure:${runId}:0`,
+        },
         {
           kind: "run.started",
           payload: {
@@ -647,14 +681,12 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           runId,
           sourceEventId: `openai.provider.failed.started:${runId}`,
         },
-        ...this.#events
-          .turnStartTerminalEvents({ error: protocolError, kind: "failed" })
-          .map((event, index) => ({
-            ...event,
-            runId,
-            sourceEventId:
-              event.sourceEventId ?? `openai.provider.failed.closure:${runId}:${String(index)}`,
-          })),
+        ...itemClosures.map((event, index) => ({
+          ...event,
+          runId,
+          sourceEventId:
+            event.sourceEventId ?? `openai.provider.failed.closure:${runId}:${String(index + 1)}`,
+        })),
       ],
       {
         kind: "run.failed",
@@ -676,10 +708,18 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     runId: RunId,
     reason: string,
   ): Promise<void> {
+    const [taskClosure, ...itemClosures] = this.#events.turnStartTerminalEvents({
+      kind: "cancelled",
+    });
     await this.#eventPublisher.pushTerminal(
       context,
       "driver.openai.turn_start.cancelled",
       [
+        {
+          ...taskClosure,
+          runId,
+          sourceEventId: `openai.turn_start.cancelled.closure:${runId}:0`,
+        },
         {
           kind: "run.started",
           payload: {
@@ -698,11 +738,12 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           runId,
           sourceEventId: `openai.turn_start.cancelled.requested:${runId}`,
         },
-        ...this.#events.turnStartTerminalEvents({ kind: "cancelled" }).map((event, index) => ({
+        ...itemClosures.map((event, index) => ({
           ...event,
           runId,
           sourceEventId:
-            event.sourceEventId ?? `openai.turn_start.cancelled.closure:${runId}:${String(index)}`,
+            event.sourceEventId ??
+            `openai.turn_start.cancelled.closure:${runId}:${String(index + 1)}`,
         })),
       ],
       {
@@ -801,6 +842,13 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     void serverRequests.catch(() => {});
 
     if (this.#turnStartInFlight) {
+      if (!publishTurnStartCancellation) {
+        await this.#publishAgentTasksClosed(
+          context,
+          "driver.openai.turn_start.stopped",
+          this.#turnStartRunId,
+        );
+      }
       this.#pendingTurnStartCancellationEvent = publishTurnStartCancellation;
       this.#pendingTurnStartCancellationReason = reason;
       this.#pendingTurnStartServerRequests = serverRequests;

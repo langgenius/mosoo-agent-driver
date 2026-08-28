@@ -9,6 +9,7 @@ import {
   type DriverArtifactBootPayload,
 } from "./driver-artifact-test-controller";
 import {
+  driverRuntimeRpcSchemas,
   parseDriverCommandUpdateInput,
   parseDriverFailureInput,
   parseDriverHelloInput,
@@ -255,6 +256,17 @@ describe("driver artifact test controller", () => {
   });
 
   test("validates structured RPC inputs with the production parsers", () => {
+    const hello = parseDriverHelloInput({
+      capabilities: [{ details: undefined, id: "input_start", status: "supported", version: 1 }],
+      driverVersion: "test",
+      ignored: true,
+      pid: 1,
+      protocolVersion: 2,
+      runtime: "acp-fallback",
+      startedAt: "now",
+    });
+    expect(Object.hasOwn(hello, "ignored")).toBeFalse();
+    expect(Object.hasOwn(hello.capabilities[0]!, "details")).toBeFalse();
     expect(() =>
       parseDriverHelloInput({
         capabilities: [],
@@ -287,6 +299,43 @@ describe("driver artifact test controller", () => {
       }).result,
     ).toMatchObject({ isError: true });
     expect(() =>
+      parseDriverCommandUpdateInput({
+        commandId: "command-1",
+        driverInstanceId: "driver-1",
+        result: { outputText: "partial", requestId: "request-1" },
+        status: "completed",
+      }),
+    ).toThrow("serverId");
+    expect(() =>
+      parseDriverCommandUpdateInput({
+        commandId: "command-1",
+        driverInstanceId: "driver-1",
+        result: { isError: true, requestId: "request-1" },
+        status: "completed",
+      }),
+    ).toThrow("outputText");
+    expect(() =>
+      parseDriverCommandUpdateInput({
+        commandId: "command-1",
+        driverInstanceId: "driver-1",
+        result: { outputText: undefined, requestId: "request-1" },
+        status: "completed",
+      }),
+    ).toThrow("outputText");
+    expect(() =>
+      parseDriverHelloInput({
+        capabilities: [
+          { id: "input_start", status: "supported", version: 1 },
+          { id: "input_start", status: "unsupported", version: 1 },
+        ],
+        driverVersion: "test",
+        pid: 1,
+        protocolVersion: 2,
+        runtime: "acp-fallback",
+        startedAt: "now",
+      }),
+    ).toThrow("capabilities must not contain duplicate ids");
+    expect(() =>
       parseDriverFailureInput({
         driverInstanceId: "driver-1",
         error: {
@@ -297,12 +346,44 @@ describe("driver artifact test controller", () => {
         },
       }),
     ).toThrow("driver failure details.nested must be a primitive value");
+    const details = JSON.parse('{"__proto__":"preserved"}') as Record<string, unknown>;
+    const failure = parseDriverFailureInput({
+      driverInstanceId: "driver-1",
+      error: { code: "failed", details, message: "failed", retryable: false },
+    });
+    expect(Object.hasOwn(failure.error.details, "__proto__")).toBeTrue();
     expect(() =>
       parseDriverLogBatchInput({
         driverInstanceId: "driver-1",
         logs: [{ level: "verbose", message: "bad", seq: 0, timestamp: "now" }],
       }),
     ).toThrow("driver log level is unsupported");
+  });
+
+  test("reports nested schema failures without throwing from safeParse", () => {
+    const commandUpdate = driverRuntimeRpcSchemas.driver.commandUpdate.input.safeParse({
+      commandId: "command-1",
+      driverInstanceId: "driver-1",
+      result: { outputText: "partial", requestId: "request-1" },
+      status: "completed",
+    });
+    expect(commandUpdate.success).toBeFalse();
+    expect(commandUpdate.error?.issues).toContainEqual(
+      expect.objectContaining({ path: ["result", "serverId"] }),
+    );
+
+    const events = driverRuntimeRpcSchemas.driver.pushEvents.input.safeParse({
+      driverInstanceId: "driver-1",
+      events: [{}],
+    });
+    expect(events.success).toBeFalse();
+    expect(events.error?.issues[0]?.path).toEqual(["events", 0]);
+
+    const command = driverRuntimeRpcSchemas.driverInstance.nextCommand.output.safeParse({
+      command: { commandId: "command-1", kind: "unknown" },
+    });
+    expect(command.success).toBeFalse();
+    expect(command.error?.issues[0]?.path).toEqual(["command"]);
   });
 
   test("scanner carries only the suffix needed for cross-chunk detection", () => {

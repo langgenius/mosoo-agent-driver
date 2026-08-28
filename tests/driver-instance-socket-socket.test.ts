@@ -55,6 +55,7 @@ class RpcWebSocket extends OpenWebSocket {
   static lostResponsePath: string | null = null;
   static nextCommand: unknown = null;
   static receiptOverride: Partial<{ eventId: string; seq: number; type: string }> | null = null;
+  static responseOverrides = new Map<string, unknown>();
   static sendFailurePath: string | null = null;
   static stalledPath: string | null = null;
   static stalled = Promise.withResolvers<void>();
@@ -148,6 +149,10 @@ class RpcWebSocket extends OpenWebSocket {
       output = { ok: true };
     }
 
+    if (RpcWebSocket.responseOverrides.has(path)) {
+      output = RpcWebSocket.responseOverrides.get(path);
+    }
+
     queueMicrotask(() => {
       this.dispatchEvent(
         new MessageEvent("message", {
@@ -184,6 +189,7 @@ afterEach(() => {
   RpcWebSocket.lostResponsePath = null;
   RpcWebSocket.nextCommand = null;
   RpcWebSocket.receiptOverride = null;
+  RpcWebSocket.responseOverrides.clear();
   RpcWebSocket.sendFailurePath = null;
   RpcWebSocket.stalledPath = null;
   RpcWebSocket.stalled = Promise.withResolvers<void>();
@@ -457,6 +463,48 @@ describe("DriverInstanceSocket lifecycle", () => {
     ]);
   });
 
+  test("validates control-plane responses before returning them", async () => {
+    const socket = await connectRpcSocket();
+    const signal = new AbortController().signal;
+
+    RpcWebSocket.responseOverrides.set("/driver/heartbeat", {
+      heartbeatCount: 1,
+      ok: false,
+    });
+    await expect(
+      socket.heartbeat({ at: new Date(0).toISOString(), reason: "interval" }),
+    ).rejects.toThrow("expected true");
+
+    RpcWebSocket.responseOverrides.set("/driver/ready", { ok: false });
+    await expect(socket.ready({ at: new Date(0).toISOString() })).rejects.toThrow("expected true");
+
+    RpcWebSocket.responseOverrides.set("/driver/claimExternalToolEffect", {
+      attempt: 0,
+      effectId: "effect-1",
+      idempotencyKey: "effect-1",
+      kind: "execute",
+    });
+    await expect(
+      socket.claimExternalToolEffect({ commandId: "command-1" }, signal),
+    ).rejects.toThrow("attempt must be a positive safe integer");
+  });
+
+  test("marks a run terminal delivered only after validating its response", async () => {
+    const socket = await connectRpcSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.responseOverrides.set("/driver/completeRun", { ok: false });
+
+    await expect(socket.completeRun()).rejects.toThrow("expected true");
+    RpcWebSocket.responseOverrides.delete("/driver/completeRun");
+    await expect(socket.completeRun()).resolves.toBeUndefined();
+
+    expect(
+      (PendingWebSocket.instances[0] as RpcWebSocket).paths.filter(
+        (path) => path === "/driver/completeRun",
+      ),
+    ).toHaveLength(2);
+  });
+
   test("uses the terminal-attempt signal to abort only that command update", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
     RpcWebSocket.stalledPath = "/driver/commandUpdate";
@@ -644,6 +692,33 @@ describe("DriverInstanceSocket lifecycle", () => {
     const secondWire = PendingWebSocket.instances[1] as RpcWebSocket;
     expect(firstWire.paths.filter((sent) => sent === path)).toHaveLength(1);
     expect(secondWire.paths.filter((sent) => sent === path)).toHaveLength(1);
+  });
+
+  test("rejects event receipts that are not a submitted-prefix", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    RpcWebSocket.responseOverrides.set("/driver/pushEvents", {
+      accepted: [
+        { seq: 1, type: "message.completed" },
+        { seq: 2, type: "message.completed" },
+      ],
+    });
+
+    await expect(
+      socket.pushEvents({
+        events: [
+          {
+            kind: "message.completed",
+            payload: { messageId: "message-1", stopReason: "end_turn" },
+          },
+        ],
+      }),
+    ).rejects.toThrow("receipt count exceeds");
   });
 
   test("splits event delivery at the negotiated batch limit", async () => {

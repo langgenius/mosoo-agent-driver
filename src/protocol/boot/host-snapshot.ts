@@ -1,4 +1,7 @@
-import type { DriverId, SessionId, RunId } from "../id";
+import { z } from "zod";
+
+import type { DriverId, RunId, SessionId } from "../id";
+import { DRIVER_ID_INPUT_PATTERN, normalizeDriverId } from "../id";
 import type {
   AccountId,
   AgentDeploymentVersionId,
@@ -8,108 +11,76 @@ import type {
   SandboxId,
   SandboxSessionId,
 } from "./host-ids";
-import { parseId, parseNullableId, readNonEmptyString, readNumber, readRecord } from "./readers";
 
-export interface DriverOrigin {
-  readonly callerUserId: AccountId;
-  readonly entrypoint: "api" | "chat";
-  readonly executionOwnerUserId: AccountId;
-  readonly type: "agent";
+const driverIdInputPattern = new RegExp(DRIVER_ID_INPUT_PATTERN, "u");
+const nonEmptyStringSchema = z.string().min(1);
+
+export function ownObjectSchema<const Shape extends z.ZodRawShape>(shape: Shape) {
+  const keys = Object.keys(shape);
+  return z.preprocess(
+    (value) =>
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(
+            keys.flatMap((key) =>
+              Object.hasOwn(value, key) ? [[key, (value as Record<string, unknown>)[key]]] : [],
+            ),
+          )
+        : value,
+    z.object(shape),
+  );
 }
 
-export interface DriverExecutionSessionContext {
-  readonly homePath: string;
-  readonly origin: DriverOrigin;
-  readonly sandboxId: SandboxId;
-  readonly sandboxKind: string;
-  readonly sandboxSessionId: SandboxSessionId;
-  readonly sandboxSubjectId: DriverId;
-  readonly sandboxSubjectKind: string;
-  readonly sessionOrganizationPath: string;
+export function ownArraySchema<Element extends z.ZodType>(element: Element) {
+  return z.preprocess((value) => {
+    if (!Array.isArray(value)) {
+      return value;
+    }
+
+    const copy = Array.from<unknown>({ length: value.length });
+    for (let index = 0; index < value.length; index += 1) {
+      copy[index] = Object.hasOwn(value, index) ? value[index] : undefined;
+    }
+    return copy;
+  }, z.array(element));
 }
 
-export interface DriverConfigRevision {
-  readonly agentId: AgentId;
-  readonly deploymentVersionId: AgentDeploymentVersionId | null;
-  readonly deploymentVersionNumber: number | null;
-  readonly environmentId: EnvironmentId;
-  readonly environmentRevisionId: EnvironmentRevisionId;
-  readonly runId: RunId | null;
-  readonly sessionId: SessionId;
+export function createDriverIdSchema<Id extends DriverId>() {
+  return z
+    .string()
+    .regex(driverIdInputPattern, "must be a valid ULID")
+    .transform((value) => normalizeDriverId(value) as Id);
 }
 
-function readOrigin(value: unknown): DriverOrigin {
-  const record = readRecord(value, "execution.session.context.origin");
-  const entrypoint = readNonEmptyString(record, "entrypoint", "execution.session.context.origin");
-  const type = readNonEmptyString(record, "type", "execution.session.context.origin");
+export const driverOriginSchema = ownObjectSchema({
+  callerUserId: createDriverIdSchema<AccountId>(),
+  entrypoint: z.enum(["api", "chat"]),
+  executionOwnerUserId: createDriverIdSchema<AccountId>(),
+  type: z.literal("agent"),
+});
 
-  if (entrypoint !== "api" && entrypoint !== "chat") {
-    throw new TypeError("execution.session.context.origin.entrypoint must be api or chat.");
-  }
+export type DriverOrigin = z.infer<typeof driverOriginSchema>;
 
-  if (type !== "agent") {
-    throw new TypeError("execution.session.context.origin.type must be agent.");
-  }
+export const driverExecutionSessionContextSchema = ownObjectSchema({
+  homePath: nonEmptyStringSchema,
+  origin: driverOriginSchema,
+  sandboxId: createDriverIdSchema<SandboxId>(),
+  sandboxKind: nonEmptyStringSchema,
+  sandboxSessionId: createDriverIdSchema<SandboxSessionId>(),
+  sandboxSubjectId: createDriverIdSchema<DriverId>(),
+  sandboxSubjectKind: nonEmptyStringSchema,
+  sessionOrganizationPath: nonEmptyStringSchema,
+});
 
-  return {
-    callerUserId: parseId(record["callerUserId"], "Driver origin caller user ID") as AccountId,
-    entrypoint,
-    executionOwnerUserId: parseId(
-      record["executionOwnerUserId"],
-      "Driver origin execution owner user ID",
-    ) as AccountId,
-    type,
-  };
-}
+export type DriverExecutionSessionContext = z.infer<typeof driverExecutionSessionContextSchema>;
 
-export function readConfigRevision(value: unknown): DriverConfigRevision {
-  const record = readRecord(value, "execution.configRevision");
+export const driverConfigRevisionSchema = ownObjectSchema({
+  agentId: createDriverIdSchema<AgentId>(),
+  deploymentVersionId: createDriverIdSchema<AgentDeploymentVersionId>().nullable(),
+  deploymentVersionNumber: z.number().finite().nullable(),
+  environmentId: createDriverIdSchema<EnvironmentId>(),
+  environmentRevisionId: createDriverIdSchema<EnvironmentRevisionId>(),
+  runId: createDriverIdSchema<RunId>().nullable(),
+  sessionId: createDriverIdSchema<SessionId>(),
+});
 
-  return {
-    agentId: parseId(record["agentId"], "Driver config agent ID") as AgentId,
-    deploymentVersionId: parseNullableId(
-      record["deploymentVersionId"],
-      "Driver config deployment version ID",
-    ) as AgentDeploymentVersionId | null,
-    deploymentVersionNumber:
-      record["deploymentVersionNumber"] === null
-        ? null
-        : readNumber(record, "deploymentVersionNumber", "execution.configRevision"),
-    environmentId: parseId(
-      record["environmentId"],
-      "Driver config environment ID",
-    ) as EnvironmentId,
-    environmentRevisionId: parseId(
-      record["environmentRevisionId"],
-      "Driver config environment revision ID",
-    ) as EnvironmentRevisionId,
-    runId: parseNullableId(record["runId"], "Driver config run ID") as RunId | null,
-    sessionId: parseId(record["sessionId"], "Driver config session ID") as SessionId,
-  };
-}
-
-export function readExecutionSessionContext(value: unknown): DriverExecutionSessionContext {
-  const record = readRecord(value, "execution.session.context");
-
-  return {
-    homePath: readNonEmptyString(record, "homePath", "execution.session.context"),
-    origin: readOrigin(record["origin"]),
-    sandboxId: parseId(record["sandboxId"], "Driver execution sandbox ID") as SandboxId,
-    sandboxKind: readNonEmptyString(record, "sandboxKind", "execution.session.context"),
-    sandboxSessionId: parseId(
-      record["sandboxSessionId"],
-      "Driver execution sandbox session ID",
-    ) as SandboxSessionId,
-    sandboxSubjectId: parseId(record["sandboxSubjectId"], "Driver execution sandbox subject ID"),
-    sandboxSubjectKind: readNonEmptyString(
-      record,
-      "sandboxSubjectKind",
-      "execution.session.context",
-    ),
-    sessionOrganizationPath: readNonEmptyString(
-      record,
-      "sessionOrganizationPath",
-      "execution.session.context",
-    ),
-  };
-}
+export type DriverConfigRevision = z.infer<typeof driverConfigRevisionSchema>;

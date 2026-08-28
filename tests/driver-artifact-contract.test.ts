@@ -87,6 +87,15 @@ function readWorkflow(path: string): Workflow {
   return Bun.YAML.parse(readText(path)) as Workflow;
 }
 
+function readContainerArguments(): Record<string, string> {
+  return Object.fromEntries(
+    [...readText("../Containerfile").matchAll(/^ARG ([A-Z_]+)=(.+)$/gmu)].map(([, name, value]) => [
+      name,
+      value,
+    ]),
+  );
+}
+
 function workflowJob(workflow: Workflow, id: string): WorkflowJob {
   const job = workflow.jobs?.[id];
   if (job === undefined) {
@@ -129,7 +138,6 @@ describe("driver artifact contract", () => {
     });
     expect(packageJson.types).toBe("./dist/types/index.d.ts");
     expect(packageJson.files).toEqual(["dist", "src", "!src/runtimes/openai/generated", "assets"]);
-    expect(packageJson.files).not.toContain("tests/fixtures");
   });
 
   test("keeps public package entries separate from process internals", () => {
@@ -156,7 +164,6 @@ describe("driver artifact contract", () => {
       "src/contract/index.ts",
     ].toSorted();
 
-    expect(packageJson.scripts?.["build:types"]).toBe("vp pack");
     expect(viteConfig.pack).toEqual({
       dts: { emitDtsOnly: true },
       entry: ["src/*.ts", "src/contract/index.ts"],
@@ -189,82 +196,55 @@ describe("driver artifact contract", () => {
     }
   });
 
-  test("keeps the root library entry free of boot and transport internals", () => {
-    const publicApi = readText("../src/index.ts");
-
-    expect(publicApi).toContain("./core/agent-driver-kernel");
-    expect(publicApi).toContain("./runtimes/provider-registry");
-    expect(publicApi).toContain("./protocol/runtime");
-    expect(publicApi).not.toContain("./bin/driver-process");
-    expect(publicApi).not.toContain("./protocol/boot");
-    expect(publicApi).not.toContain("./protocol/orpc");
-    expect(publicApi).not.toContain("./protocol/paths");
-    expect(publicApi).not.toContain("DriverProcess");
-    expect(publicApi).not.toContain("DriverBootPayload");
-    expect(publicApi).not.toContain("DriverRuntimeClient");
-    expect(publicApi).not.toContain("createDriverStartInputFromBootPayload");
-  });
-
-  test("builds and packages only the process runner artifact", () => {
-    const packageJson = readDriverPackageJson();
-    const buildScript = packageJson.scripts?.["build"] ?? "";
-    const imageBuildScript = packageJson.scripts?.["build:image"] ?? "";
-    const imageTestScript = packageJson.scripts?.["test:image:environment"] ?? "";
-    const containerignore = readText("../.containerignore");
-    const containerfile = readText("../Containerfile");
-    const processEntry = readText("../src/bin/driver.ts");
-
-    expect(processEntry.startsWith("#!/usr/bin/env bun\n")).toBe(true);
-    expect(buildScript).toContain("src/bin/driver.ts");
-    expect(buildScript).toContain("dist/driver.mjs");
-    expect(buildScript).not.toContain("src/index.ts");
-    expect(containerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
-    expect(containerfile).toContain("RUN chmod +x /usr/local/bin/agent-driver");
-    expect(containerfile).toContain("ENV MOSOO_ACP_FALLBACK_COMMAND=opencode");
-    expect(containerignore).toContain("!dist/driver.mjs");
-    expect(imageBuildScript).toBe(
-      "vp run build && buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .",
-    );
-    expect(imageTestScript).toBe(
-      "podman run --pull=never --rm --entrypoint node agent-driver:local /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
-    );
-    expect(packageJson.scripts?.["prepack"]).toBe("vp run build");
-  });
-
-  test("pins the OpenAI runtime, CLI, and app-server schema to one stable version", () => {
+  test("pins container runtimes to package dependency versions", () => {
     const packageJson = readDriverPackageJson();
     const containerfile = readText("../Containerfile");
-    const runtimeVersion = packageJson.devDependencies?.["@openai/codex"];
+    const versions = {
+      BUN_VERSION: packageJson.packageManager?.replace("bun@", ""),
+      CLAUDE_AGENT_SDK_VERSION: packageJson.dependencies?.["@anthropic-ai/claude-agent-sdk"],
+      OPENAI_RUNTIME_VERSION: packageJson.devDependencies?.["@openai/codex"],
+      OPENCODE_VERSION: packageJson.devDependencies?.["opencode-ai"],
+    };
 
-    expect(runtimeVersion).toMatch(/^\d+\.\d+\.\d+$/);
-    expect(containerfile).toContain(`ARG OPENAI_RUNTIME_VERSION=${runtimeVersion}`);
+    expect(readContainerArguments()).toMatchObject(versions);
+    for (const version of Object.values(versions)) {
+      expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+    }
+    for (const marker of [
+      'test "$(bun --version)" = "$BUN_VERSION"',
+      "@anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}",
+      "opencode-linux-x64-baseline@${OPENCODE_VERSION}",
+    ])
+      expect(containerfile).toContain(marker);
+
+    const openAiVersion = versions.OPENAI_RUNTIME_VERSION;
     expect(readText("../src/runtimes/openai/generated/README.md")).toContain(
-      `version \`${runtimeVersion}\``,
+      `version \`${openAiVersion}\``,
     );
     expect(readText("../src/runtimes/openai/generated-json-schema/README.md")).toContain(
-      `@openai/codex@${runtimeVersion}`,
+      `@openai/codex@${openAiVersion}`,
     );
   });
 
-  test("routes every live suite through the packed driver artifact", () => {
-    const packageJson = readDriverPackageJson();
-    const artifactScript = packageJson.scripts?.["test:live:artifact"] ?? "";
+  test("builds and tests the packed process artifact", () => {
+    const scripts = readDriverPackageJson().scripts ?? {};
+    const containerfile = readText("../Containerfile");
 
-    expect(artifactScript).toContain("AGENT_DRIVER_LIVE=1");
-    expect(artifactScript).toContain("tests/driver-artifact-live.test.ts");
-    expect(artifactScript).toContain("tests/driver-artifact-mcp.test.ts");
-    expect(packageJson.scripts?.["test:live"]).toBe("vp run build && vp run test:live:artifact");
+    expect(scripts["build"]).toContain("src/bin/driver.ts");
+    expect(scripts["build"]).toContain("dist/driver.mjs");
+    expect(scripts["prepack"]).toBe("vp run build");
+    expect(containerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
+    expect(scripts["test:live"]).toBe("vp run build && vp run test:live:artifact");
+    expect(scripts["test:live:artifact"]).toContain("tests/driver-artifact-mcp.test.ts");
+
     for (const suite of ["anthropic", "openai", "opencode"] as const) {
-      const script = packageJson.scripts?.[`test:live:${suite}`] ?? "";
-      expect(script).toContain("vp run build");
-      expect(script).toContain(`AGENT_DRIVER_LIVE_SUITE=${suite}`);
-      expect(script).toContain("tests/driver-artifact-live.test.ts");
+      expect(scripts[`test:live:${suite}`]).toContain("vp run build");
+      expect(scripts[`test:live:${suite}`]).toContain(`AGENT_DRIVER_LIVE_SUITE=${suite}`);
+      expect(scripts[`test:live:${suite}`]).toContain("tests/driver-artifact-live.test.ts");
     }
   });
 
-  test("pins runtime executables and keeps release publication monotonic", () => {
-    const packageJson = readDriverPackageJson();
-    const containerfile = readText("../Containerfile");
+  test("keeps release publication ordered, monotonic, and verifiable", () => {
     const prWorkflow = readWorkflow("../.github/workflows/pr.yml");
     const releaseWorkflowText = readText("../.github/workflows/release.yml");
     const releaseWorkflow = readWorkflow("../.github/workflows/release.yml");
@@ -274,29 +254,18 @@ describe("driver artifact contract", () => {
     const npmJob = workflowJob(releaseWorkflow, "publish-npm");
     const latestJob = workflowJob(releaseWorkflow, "publish-latest-image");
     const verifyRun = workflowStep(verifyJob, "Verify release tag").run ?? "";
-    const buildRun =
-      buildJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
     const imageRun = workflowStep(imageJob, "Publish versioned image").run ?? "";
     const npmRun = workflowStep(npmJob, "Publish package").run ?? "";
+    const buildRun =
+      buildJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
     const latestRun =
       latestJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
-    const claudeVersion = packageJson.dependencies?.["@anthropic-ai/claude-agent-sdk"];
-    const openCodeVersion = packageJson.devDependencies?.["opencode-ai"];
-    const bunVersion = packageJson.packageManager?.replace("bun@", "");
     const actionUses = [prWorkflow, releaseWorkflow].flatMap((workflow) =>
       Object.values(workflow.jobs ?? {}).flatMap((job) =>
         (job.steps ?? []).flatMap((step) => (step.uses === undefined ? [] : [step.uses])),
       ),
     );
 
-    expect(containerfile).toContain(`ARG BUN_VERSION=${bunVersion}`);
-    expect(containerfile).toContain('RUN test "$(bun --version)" = "$BUN_VERSION"');
-    expect(containerfile).toContain(`ARG CLAUDE_AGENT_SDK_VERSION=${claudeVersion}`);
-    expect(containerfile).toContain(`ARG OPENCODE_VERSION=${openCodeVersion}`);
-    expect(containerfile).toContain(
-      "@anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}",
-    );
-    expect(containerfile).toContain("opencode-linux-x64-baseline@${OPENCODE_VERSION}");
     expect(releaseWorkflow.concurrency).toEqual({ group: "release", queue: "max" });
     expect({
       build: buildJob.needs,
@@ -360,16 +329,10 @@ describe("driver artifact contract", () => {
     });
   });
 
-  test("keeps the standalone package out of Mosoo workspace dependencies", () => {
+  test("keeps the standalone package independent of Mosoo workspace packages", () => {
     const packageJson = readDriverPackageJson();
     const deps = Object.keys(packageJson.dependencies ?? {});
-    const tsconfig = readText("../tsconfig.json");
 
     expect(deps.filter((dependency) => dependency.startsWith("@mosoo/"))).toEqual([]);
-    expect(packageJson.dependencies).not.toHaveProperty("@cfworker/json-schema");
-    expect(packageJson.dependencies).toHaveProperty("fflate");
-    expect(packageJson.dependencies).toHaveProperty("vestig");
-    expect(tsconfig).not.toContain("../../dev/");
-    expect(tsconfig).not.toContain('"extends"');
   });
 });

@@ -419,7 +419,9 @@ describe("AgentDriverKernelCore", () => {
     expect(startInput).not.toHaveProperty("traceparent");
     expect(startInput.execution).not.toHaveProperty("configRevision");
     expect(startInput.execution).toHaveProperty("run");
-    expect(startInput.execution.session).not.toHaveProperty("context");
+    expect(startInput.execution.session.context).toEqual(
+      driverBootPayload.execution.session.context,
+    );
     expect(startInput.execution.session).toHaveProperty("sharedRootPath");
   });
 

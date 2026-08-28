@@ -13,7 +13,6 @@ import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
 import { createDisabledLogger } from "../src/observability";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
@@ -23,6 +22,7 @@ import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-
 import { AcpTurnController } from "../src/runtimes/acp/acp-turn-controller";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
+import { waitForAcpTestCondition } from "./acp-test-helpers";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
 const FAKE_AGENT = String.raw`
@@ -566,9 +566,6 @@ async function createHarness(
     payload,
     permission: { request: options.permission ?? (async () => "reject_once") },
     ports: {
-      hostIntegration: {
-        snapshot: async () => createDriverHostIntegrationSnapshotFromBootExecution(boot.execution),
-      },
       skill: { materialize: async () => [] },
     },
   });
@@ -659,7 +656,6 @@ describe("ACP driver backend lifecycle", () => {
     } satisfies DriverBootPayload;
     const payload = createDriverStartInputFromBootPayload(boot);
     const logger = createDisabledLogger();
-    let hostSnapshots = 0;
     let materializations = 0;
     const context = createAgentDriverContext({
       eventSink: {
@@ -670,12 +666,6 @@ describe("ACP driver backend lifecycle", () => {
       payload,
       permission: { request: async () => "reject_once" },
       ports: {
-        hostIntegration: {
-          snapshot: async () => {
-            hostSnapshots += 1;
-            return createDriverHostIntegrationSnapshotFromBootExecution(boot.execution);
-          },
-        },
         skill: {
           materialize: async () => {
             materializations += 1;
@@ -690,7 +680,6 @@ describe("ACP driver backend lifecycle", () => {
       await expect(backend.start(context, new AbortController().signal)).rejects.toMatchObject({
         code: "ENOENT",
       });
-      expect(hostSnapshots).toBe(0);
       expect(materializations).toBe(0);
       await expect(
         Promise.all([
@@ -1052,21 +1041,17 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
       const gate = harness.blockNext("run.cancel.requested");
       const cancel = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await gate.entered;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/cancel")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/cancel"),
+        "ACP session/cancel request",
+      );
 
       expect(await harness.methods()).toContain("session/cancel");
       expect(
@@ -1101,22 +1086,18 @@ describe("ACP driver backend lifecycle", () => {
           DRIVER_TEST_IDS.runId as RunId,
         );
         void input.catch(() => {});
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          if ((await harness.methods()).includes("session/prompt")) {
-            break;
-          }
-          await Bun.sleep(5);
-        }
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
 
         await expect(
           harness.backend.cancelActiveTurn(harness.context, "test cancellation"),
         ).resolves.toBeUndefined();
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          if ((await harness.methods()).includes("session/resume")) {
-            break;
-          }
-          await Bun.sleep(5);
-        }
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/resume"),
+          "ACP session/resume request",
+        );
 
         expect(await harness.methods()).toContain("session/resume");
         expect(harness.events).not.toContainEqual(
@@ -1174,12 +1155,10 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       await expect(
         harness.backend.cancelActiveTurn(harness.context, "test cancellation"),
@@ -1204,12 +1183,10 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       await harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await expect(input).rejects.toThrow("cancelled");
@@ -1263,7 +1240,6 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
         connection,
         "native-session-1",
-        createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
         clientRequests,
       );
       void input.catch(() => {});
@@ -1318,7 +1294,6 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
         connection,
         "native-session-1",
-        createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
         clientRequests,
       );
       void input.catch(() => {});
@@ -1381,7 +1356,6 @@ describe("ACP driver backend lifecycle", () => {
           DRIVER_TEST_IDS.runId as RunId,
           connection,
           "native-session-1",
-          createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
           clientRequests,
         ),
       ).rejects.toThrow("terminal settlement rejected");
@@ -1435,7 +1409,6 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
         connection,
         "native-session-1",
-        createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
         clientRequests,
       );
       void input.catch(() => {});
@@ -1708,12 +1681,10 @@ describe("ACP driver backend lifecycle", () => {
       const requestId = await requestedDelivered.promise;
       expect(broker.resolve(requestId, "allow_once")).toBe(true);
       await permissionSettled.promise;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.responses()).length > 0) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.responses()).length > 0,
+        "ACP nested permission response",
+      );
       expect(await harness.responses()).toHaveLength(1);
 
       const cancel = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
@@ -1939,23 +1910,19 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("terminal/wait_for_exit")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("terminal/wait_for_exit"),
+        "ACP terminal/wait_for_exit request",
+      );
 
       expect(await harness.methods()).toContain("terminal/wait_for_exit");
       await harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await expect(input).rejects.toThrow("cancelled");
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.responses()).length > 0) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.responses()).length > 0,
+        "ACP nested terminal response",
+      );
 
       expect(await harness.responses()).toContainEqual(
         expect.objectContaining({
@@ -1979,12 +1946,10 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       expect(await harness.methods()).toContain("session/prompt");
       await expect(
@@ -2062,12 +2027,10 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       const gate = harness.blockNext("usage.updated");
       const stop = harness.backend.stop(

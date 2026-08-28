@@ -125,6 +125,7 @@ describe("OpenAi app-server event bridge", () => {
       { kind: "message.started" },
       { kind: "item.started" },
       { kind: "tool.call.updated", payload: { status: "running", toolCallId: "tool-1" } },
+      { kind: "agent.tasks.replaced", payload: { tasks: [] } },
       { kind: "run.cancel.requested", runId: DRIVER_TEST_IDS.runId },
       { kind: "message.cancelled" },
       { kind: "tool.call.updated", payload: { status: "cancelled", toolCallId: "tool-1" } },
@@ -400,6 +401,36 @@ describe("OpenAi app-server event bridge", () => {
         .events()
         .filter((event) => event.kind === "message.added" || event.kind === "message.completed"),
     ).toHaveLength(2);
+  });
+
+  test("replays a full task snapshot before committing its active set", async () => {
+    const harness = createHarness({ failReasonOnce: "driver.openai.item.completed" });
+    const notification = {
+      item: {
+        agentPath: "/root/worker",
+        agentThreadId: "agent-1",
+        id: "activity-1",
+        kind: "started",
+        type: "subAgentActivity",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    } as const;
+
+    await expect(
+      harness.bridge.handleNotification(harness.context, "item/completed", notification),
+    ).rejects.toThrow("first attempt");
+    await harness.bridge.handleNotification(harness.context, "item/completed", notification);
+    await harness.bridge.handleNotification(harness.context, "item/completed", notification);
+
+    const attempts = harness.attempts.filter(
+      ({ reason }) => reason === "driver.openai.item.completed",
+    );
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]!.events).toEqual(attempts[1]!.events);
+    expect(harness.events().filter((event) => event.kind === "agent.tasks.replaced")).toMatchObject(
+      [{ payload: { tasks: [{ taskId: "agent-1" }] } }],
+    );
   });
 
   test("replays a plan delta after delivery rejection without duplicating content", async () => {

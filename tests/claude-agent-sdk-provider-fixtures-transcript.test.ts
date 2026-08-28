@@ -89,21 +89,26 @@ describe("Claude Agent SDK provider fixtures", () => {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
 
-    const taskEvents = events().filter((event) => event.kind === "agent.task.updated");
+    const taskEvents = events().filter((event) => event.kind === "agent.tasks.replaced");
     expect(taskEvents).toHaveLength(2);
     expect(taskEvents.at(0)).toMatchObject({
       delivery: "lossless",
       payload: {
-        active: true,
-        taskId: "task-1",
-        taskType: "local_agent",
-        title: "Inspect the repository",
+        tasks: [
+          {
+            taskId: "task-1",
+            taskType: "local_agent",
+            title: "Inspect the repository",
+          },
+        ],
       },
+      visibility: "participant",
     });
     expect(taskEvents.at(1)).toEqual({
       delivery: "lossless",
-      kind: "agent.task.updated",
-      payload: { active: false, taskId: "task-1" },
+      kind: "agent.tasks.replaced",
+      payload: { tasks: [] },
+      visibility: "participant",
     });
     expect(JSON.stringify(taskEvents)).not.toContain("private");
     expect(events().filter((event) => event.kind === "diagnostic.reported")).toHaveLength(4);
@@ -146,8 +151,9 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(terminalIndex).toBeGreaterThan(0);
     expect(events().slice(0, terminalIndex)).toContainEqual({
       delivery: "lossless",
-      kind: "agent.task.updated",
-      payload: { active: false, taskId: "task-1" },
+      kind: "agent.tasks.replaced",
+      payload: { tasks: [] },
+      visibility: "participant",
     });
 
     const beforeReset = events().length;
@@ -171,13 +177,17 @@ describe("Claude Agent SDK provider fixtures", () => {
     );
     expect(events().slice(beforeReset)).toContainEqual({
       delivery: "lossless",
-      kind: "agent.task.updated",
+      kind: "agent.tasks.replaced",
       payload: {
-        active: true,
-        taskId: "task-1",
-        taskType: "local_agent",
-        title: "Inspect the repository again",
+        tasks: [
+          {
+            taskId: "task-1",
+            taskType: "local_agent",
+            title: "Inspect the repository again",
+          },
+        ],
       },
+      visibility: "participant",
     });
   });
 

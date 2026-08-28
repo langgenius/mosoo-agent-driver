@@ -255,6 +255,14 @@
       "visibility": "owner_debug"
     },
     {
+      "delivery": "lossless",
+      "kind": "agent.tasks.replaced",
+      "payload": { "tasks": [] },
+      "runId": "<driver-id>",
+      "sourceEventId": "openai.turn.completed.closure:turn-root:0",
+      "visibility": "participant"
+    },
+    {
       "kind": "run.completed",
       "native": {
         "eventName": "turn.completed",

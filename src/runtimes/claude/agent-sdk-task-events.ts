@@ -3,32 +3,22 @@ import { createHash } from "node:crypto";
 import type { SDKBackgroundTasksChangedMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
-import { assertClaudeDurableEventFits } from "./agent-sdk-event-writer";
-
-interface ClaudeBackgroundTask {
-  readonly taskType?: string | undefined;
-  readonly title?: string | undefined;
-}
-
-export interface ClaudeTaskProjection {
-  readonly beforePublish: (index: number) => void;
-  readonly commit: () => void;
-  readonly commitAccepted: (index: number) => void;
-  readonly events: readonly DriverEventInput[];
-}
+import {
+  assertClaudeDurableEventFits,
+  ClaudeDurableEventTooLargeError,
+} from "./agent-sdk-event-writer";
 
 const MAX_CLAUDE_TASK_ID_BYTES = 256;
 const MAX_CLAUDE_BACKGROUND_TASK_ENTRIES = 1_024;
 const MAX_CLAUDE_TASK_TEXT_LENGTH = 4_096;
 const MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS = 256;
-const EMPTY_CLAUDE_TASK_PROJECTION: ClaudeTaskProjection = {
-  beforePublish: () => {},
-  commit: () => {},
-  commitAccepted: () => {},
-  events: [],
-};
 
-function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeTaskProjection {
+export interface ClaudeBackgroundTasksProjection {
+  readonly diagnostic?: DriverEventInput;
+  readonly snapshot: DriverEventInput | null;
+}
+
+function taskSnapshotDiagnostic(code: string, taskCount: number): DriverEventInput {
   const event: DriverEventInput = {
     delivery: "best_effort",
     kind: "diagnostic.reported",
@@ -42,7 +32,11 @@ function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeTaskProjec
     visibility: "owner_debug",
   };
   assertClaudeDurableEventFits(event, code, "background task snapshot diagnostic");
-  return { ...EMPTY_CLAUDE_TASK_PROJECTION, events: [event] };
+  return event;
+}
+
+function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeBackgroundTasksProjection {
+  return { diagnostic: taskSnapshotDiagnostic(code, taskCount), snapshot: null };
 }
 
 function publicTaskId(nativeTaskId: string): string | null {
@@ -62,145 +56,77 @@ function boundedTaskText(value: string): string | undefined {
   return bounded.length === 0 ? undefined : bounded;
 }
 
-function taskEvent(taskId: string, payload: Record<string, unknown>): DriverEventInput {
-  const event: DriverEventInput = {
+export function claudeBackgroundTasksClosedEvent(): DriverEventInput {
+  return {
     delivery: "lossless",
-    kind: "agent.task.updated",
-    payload: { taskId, ...payload },
+    kind: "agent.tasks.replaced",
+    payload: { tasks: [] },
+    visibility: "participant",
   };
-  assertClaudeDurableEventFits(event, "claude.task_update_too_large", "task update");
-  return event;
 }
 
-export class ClaudeAgentSdkTaskEvents {
-  #backgroundTasks = new Map<string, ClaudeBackgroundTask>();
-
-  reset(): void {
-    this.#backgroundTasks.clear();
+export function projectClaudeBackgroundTasksSnapshot(
+  message: SDKBackgroundTasksChangedMessage,
+): ClaudeBackgroundTasksProjection {
+  if (message.tasks.length > MAX_CLAUDE_BACKGROUND_TASK_ENTRIES) {
+    return rejectedTaskSnapshot("claude.background_tasks_snapshot_too_large", message.tasks.length);
   }
 
-  prepare(message: SDKBackgroundTasksChangedMessage): ClaudeTaskProjection {
-    if (message.tasks.length > MAX_CLAUDE_BACKGROUND_TASK_ENTRIES) {
-      return rejectedTaskSnapshot(
-        "claude.background_tasks_snapshot_too_large",
-        message.tasks.length,
-      );
+  const tasks = new Map<
+    string,
+    { readonly taskId: string; readonly taskType?: string; readonly title?: string }
+  >();
+  for (const task of message.tasks) {
+    if (task.ambient === true) {
+      continue;
     }
 
-    const next = new Map<string, ClaudeBackgroundTask>();
-    for (const task of message.tasks) {
-      if (task.ambient === true) {
-        continue;
-      }
-      if (next.size >= MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS) {
-        return rejectedTaskSnapshot(
-          "claude.visible_background_tasks_too_many",
-          message.tasks.length,
-        );
-      }
-      const taskId = publicTaskId(task.task_id);
-      if (taskId !== null) {
-        next.set(taskId, {
-          taskType: boundedTaskText(task.task_type),
-          title: boundedTaskText(task.description),
-        });
-      }
+    const taskId = publicTaskId(task.task_id);
+    if (taskId === null) {
+      continue;
     }
 
-    const changes: Array<{
-      readonly optimistic: boolean;
-      readonly task: ClaudeBackgroundTask | null;
-      readonly taskId: string;
-    }> = [];
-    const events: DriverEventInput[] = [];
-    const working = new Map(this.#backgroundTasks);
-    const add = (
-      event: DriverEventInput,
-      taskId: string,
-      task: ClaudeBackgroundTask | null,
-      optimistic = false,
-    ): void => {
-      events.push(event);
-      changes.push({ optimistic, task, taskId });
+    const taskType = boundedTaskText(task.task_type);
+    const title = boundedTaskText(task.description);
+    tasks.set(taskId, {
+      taskId,
+      ...(taskType === undefined ? {} : { taskType }),
+      ...(title === undefined ? {} : { title }),
+    });
+    if (tasks.size > MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS) {
+      return rejectedTaskSnapshot("claude.visible_background_tasks_too_many", message.tasks.length);
+    }
+  }
+
+  const event: DriverEventInput = {
+    delivery: "lossless",
+    kind: "agent.tasks.replaced",
+    payload: { tasks: [...tasks.values()] },
+    visibility: "participant",
+  };
+
+  try {
+    assertClaudeDurableEventFits(event, "claude.tasks_snapshot_too_large", "task snapshot");
+  } catch (error) {
+    if (!(error instanceof ClaudeDurableEventTooLargeError)) {
+      throw error;
+    }
+    const membership: DriverEventInput = {
+      ...event,
+      payload: {
+        tasks: [...tasks.values()].map(({ taskId }) => ({ taskId })),
+      },
     };
-
-    for (const taskId of this.#backgroundTasks.keys()) {
-      if (!next.has(taskId)) {
-        working.delete(taskId);
-        add(taskEvent(taskId, { active: false }), taskId, null);
-      }
-    }
-
-    for (const [taskId, task] of next) {
-      const previous = working.get(taskId);
-      const normalizedTask = {
-        taskType: task.taskType ?? previous?.taskType,
-        title: task.title ?? previous?.title,
-      };
-      next.set(taskId, normalizedTask);
-      if (previous === undefined) {
-        working.set(taskId, normalizedTask);
-        add(
-          taskEvent(taskId, {
-            active: true,
-            ...(normalizedTask.taskType === undefined ? {} : { taskType: normalizedTask.taskType }),
-            ...(normalizedTask.title === undefined ? {} : { title: normalizedTask.title }),
-          }),
-          taskId,
-          normalizedTask,
-          true,
-        );
-        continue;
-      }
-
-      const patch: Record<string, unknown> = {};
-      if (normalizedTask.taskType !== undefined && previous.taskType !== normalizedTask.taskType) {
-        patch["taskType"] = normalizedTask.taskType;
-      }
-      if (normalizedTask.title !== undefined && previous.title !== normalizedTask.title) {
-        patch["title"] = normalizedTask.title;
-      }
-      if (Object.keys(patch).length > 0) {
-        working.set(taskId, normalizedTask);
-        add(taskEvent(taskId, patch), taskId, normalizedTask);
-      }
-    }
-
+    assertClaudeDurableEventFits(
+      membership,
+      "claude.tasks_membership_snapshot_too_large",
+      "task membership snapshot",
+    );
     return {
-      beforePublish: (index) => {
-        const change = changes[index];
-        if (change?.optimistic === true && change.task !== null) {
-          this.#backgroundTasks.set(change.taskId, change.task);
-        }
-      },
-      commit: () => {
-        this.#backgroundTasks = next;
-      },
-      commitAccepted: (index) => {
-        const change = changes[index];
-        if (change !== undefined) {
-          if (change.task === null) this.#backgroundTasks.delete(change.taskId);
-          else this.#backgroundTasks.set(change.taskId, change.task);
-        }
-      },
-      events,
+      diagnostic: taskSnapshotDiagnostic("claude.tasks_snapshot_too_large", message.tasks.length),
+      snapshot: membership,
     };
   }
 
-  prepareClosure(): ClaudeTaskProjection {
-    const taskIds = [...this.#backgroundTasks.keys()];
-    const events = taskIds.map((taskId) => taskEvent(taskId, { active: false }));
-
-    return {
-      beforePublish: () => {},
-      commit: () => {
-        this.#backgroundTasks.clear();
-      },
-      commitAccepted: (index) => {
-        const taskId = taskIds[index];
-        if (taskId !== undefined) this.#backgroundTasks.delete(taskId);
-      },
-      events,
-    };
-  }
+  return { snapshot: event };
 }

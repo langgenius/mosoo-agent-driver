@@ -3,7 +3,7 @@ import type { AgentCapabilities, ClientContext } from "@agentclientprotocol/sdk"
 import { describe, expect, test } from "bun:test";
 
 import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
-import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
+import { driverStartInput } from "./driver-boot-payload-fixture";
 
 const EXISTING_SESSION_ID = "native-session-existing";
 
@@ -49,7 +49,6 @@ function setupInput(input: {
   return {
     ...input,
     payload: input.payload ?? driverStartInput,
-    sessionContext: driverBootPayload.execution.session.context,
   };
 }
 
@@ -91,6 +90,10 @@ describe("ACP session setup", () => {
     );
 
     expect(requests[0]?.params["additionalDirectories"]).toEqual(["/workspace/extra"]);
+    expect(requests[0]?.params["_meta"]).toEqual({
+      "mosoo.ai/origin": driverStartInput.execution.session.context.origin,
+      "mosoo.ai/sessionContext": driverStartInput.execution.session.context,
+    });
   });
 
   test("prefers resume without entering the load replay scope", async () => {

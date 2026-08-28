@@ -8,6 +8,7 @@ import {
   toInitializeEvents,
   toSessionReadyEvents,
 } from "../src/runtimes/acp/acp-session-events";
+import { beginAcpTranscript } from "./acp-test-helpers";
 
 const RUN_ID = "run-1" as RunId;
 
@@ -42,12 +43,7 @@ function requireEvent(events: readonly DriverEventInput[], kind: string): Driver
 
 describe("ACP runtime event translation", () => {
   test("starts permission tool calls through the turn event state", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const translation = state.translatePermission({
       params: {
@@ -76,12 +72,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("closes unfinished tool calls when a turn completes", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -115,12 +106,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("fails open items when max turn requests stops a prompt", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -164,9 +150,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("cancels every open item when the prompt is cancelled", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript({ runId: RUN_ID });
     const events = [
       ...state.translateUpdate({
         update: {
@@ -211,12 +195,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("fails an empty end turn instead of reporting a blank completed run", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = state.completePrompt("end_turn", {
       inputTokens: 0,
@@ -236,12 +215,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("ignores ACP user message echo chunks because driver input is the source of truth", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     expect(
       state.translateUpdate({
@@ -257,12 +231,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("promotes message-scoped thought-only ACP output into an assistant message", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const streamed = [
       ...state.translateUpdate({
@@ -313,12 +282,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("treats a different native thought as the final assistant message boundary", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const progressText = "PROGRESS：正在整理资料。";
     const finalText = "FINAL：中文表格与结论均已完成。";
@@ -375,12 +339,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("fails closed when an anonymous thought follows identified progress", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -420,12 +379,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("closes open stream items before a failed turn event", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -649,8 +603,7 @@ describe("ACP runtime event translation", () => {
       "ACP auth.session.updated event exceeds 524288 UTF-8 bytes",
     );
 
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript({ runId: RUN_ID });
     const sourceEventId = state.translateUpdate({
       update: {
         content: { text: "hello", type: "text" },
@@ -723,12 +676,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("normalizes ACP usage sources to the mosoo usage contract", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const sessionUsage = state.translateUpdate({
       update: {
@@ -785,8 +733,7 @@ describe("ACP runtime event translation", () => {
     ["unsafe", Number.MAX_SAFE_INTEGER + 1],
     ["non-finite", Number.POSITIVE_INFINITY],
   ] as const)("drops wholly invalid %s usage without blocking Run completion", (_name, value) => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript({ runId: RUN_ID });
     state.translateUpdate({
       update: {
         content: { text: "done", type: "text" },
@@ -816,8 +763,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps valid usage fields while omitting malformed siblings", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const [sessionUsage] = state.translateUpdate({
       update: {

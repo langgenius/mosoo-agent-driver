@@ -19,6 +19,7 @@ const commandFixtures = [
 ] as const;
 
 const runtimeEventFixtures = [
+  "agent-tasks-replaced",
   "diagnostic-reported",
   "message-delta",
   "permission-requested",
@@ -132,6 +133,50 @@ describe("Driver golden fixtures", () => {
         }),
       ).toMatchObject({ status: "rejected" });
     }
+  });
+
+  test("enforces the agent task replacement envelope and payload contract", () => {
+    const context = createRuntimeEventContext();
+    const event = {
+      delivery: "lossless" as const,
+      kind: "agent.tasks.replaced" as const,
+      payload: {
+        tasks: [{ taskId: "task-1", taskType: "local_agent", title: "Inspect repository" }],
+      },
+      visibility: "participant" as const,
+    };
+
+    expect(ingestRuntimeEventInput(context, event)).toMatchObject({ status: "accepted" });
+
+    for (const input of [
+      { ...event, delivery: "best_effort" },
+      { ...event, visibility: "owner_debug" },
+      { ...event, payload: {} },
+      { ...event, payload: { tasks: [{ taskId: "" }] } },
+      { ...event, payload: { tasks: [{ private: true, taskId: "task-1" }] } },
+      { ...event, payload: { tasks: [{ taskId: "task-1" }, { taskId: "task-1" }] } },
+    ]) {
+      expect(ingestRuntimeEventInput(context, input)).toMatchObject({ status: "rejected" });
+    }
+
+    expect(
+      ingestRuntimeEventInput({ ...context, driverInstanceId: undefined }, event),
+    ).toMatchObject({ status: "rejected" });
+    expect(ingestRuntimeEventInput({ ...context, runId: undefined }, event)).toMatchObject({
+      status: "rejected",
+    });
+
+    expect(
+      ingestRuntimeEventInput(context, {
+        ...event,
+        payload: {
+          tasks: Array.from({ length: 256 }, (_, index) => ({
+            taskId: `task-${String(index)}`,
+            title: "界".repeat(4_096),
+          })),
+        },
+      }),
+    ).toMatchObject({ status: "rejected" });
   });
 
   test("bounds control reasons without dropping their commands", () => {

@@ -24,7 +24,7 @@ export function readProviderFixture<T>(
   return value as T;
 }
 
-type ProviderFixtureKind = "claude" | "openai";
+type ProviderFixtureKind = "acp" | "claude" | "openai";
 
 function collectDriverIds(
   value: unknown,
@@ -107,7 +107,7 @@ function normalizeValue(
 
   const entries = Object.entries(value);
   return Object.fromEntries(
-    provider === "claude"
+    provider !== "openai"
       ? entries.flatMap(([key, entry]) =>
           entry === undefined ? [] : [[key, normalizeValue(entry, aliases, provider, key)]],
         )
@@ -122,11 +122,25 @@ function normalizeProviderEvents(
   const aliases = new Map<string, string>();
 
   for (const event of events) {
-    collectDriverIds(event, aliases, provider);
+    if (provider === "acp") {
+      const payload = isRecord(event.payload) ? event.payload : null;
+      const messageId = payload?.["messageId"];
+
+      if (
+        event.kind === "message.started" &&
+        payload?.["role"] === "agent" &&
+        typeof messageId === "string" &&
+        !aliases.has(messageId)
+      ) {
+        aliases.set(messageId, `assistant-message-${aliases.size + 1}`);
+      }
+    } else {
+      collectDriverIds(event, aliases, provider);
+    }
   }
 
   return events.map((event) => {
-    if (provider === "claude") {
+    if (provider !== "openai") {
       return normalizeValue(event, aliases, provider) as Record<string, unknown>;
     }
 
@@ -144,6 +158,12 @@ function normalizeProviderEvents(
 
     return normalized;
   });
+}
+
+export function normalizeAcpProviderEvents(
+  events: readonly DriverEventInput[],
+): Record<string, unknown>[] {
+  return normalizeProviderEvents(events, "acp");
 }
 
 export function normalizeClaudeProviderEvents(

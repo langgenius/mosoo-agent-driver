@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ClientSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
-import { createDisabledLogger } from "../src/observability";
 import {
   ACP_PROTOCOL_VERSION,
   appendOpenCodeInstruction,
@@ -17,8 +13,7 @@ import {
   supportsSessionClose,
   supportsSessionResume,
 } from "../src/runtimes/acp/acp-configuration";
-import { AcpDriverBackend, limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
 import { bootPayload } from "./driver-runtime-boundary-fixtures";
 
 function createInitializeResult(protocolVersion: number | string | null) {
@@ -293,42 +288,5 @@ describe("ACP runtime configuration", () => {
 
     expect(env["HTTPS_PROXY"]).toBe("http://explicit-proxy:7897");
     expect(env["NO_PROXY"]).toBe("metadata.google.internal");
-  });
-
-  test("requires host integration snapshot before starting", async () => {
-    const root = await mkdtemp(join(tmpdir(), "driver-acp-configuration-"));
-    const payload = {
-      ...bootPayload,
-      execution: {
-        ...bootPayload.execution,
-        session: {
-          ...bootPayload.execution.session,
-          cwd: root,
-          homePath: join(root, "home"),
-          sharedRootPath: root,
-        },
-      },
-    };
-    const backend = new AcpDriverBackend(payload);
-    const context = createAgentDriverContext({
-      eventSink: {
-        commandUpdate: async () => {},
-        currentRunId: () => null,
-        pushEvents: async () => ({ accepted: [] }),
-      },
-      logger: createDisabledLogger(),
-      payload,
-      permission: {
-        request: async () => "reject_once",
-      },
-    });
-
-    try {
-      await expect(backend.start(context, new AbortController().signal)).rejects.toThrow(
-        "ACP fallback requires a host integration snapshot.",
-      );
-    } finally {
-      await rm(root, { force: true, recursive: true });
-    }
   });
 });

@@ -214,6 +214,10 @@ describe("OpenAi app-server event bridge", () => {
         },
       },
       {
+        kind: "agent.tasks.replaced",
+        payload: { tasks: [] },
+      },
+      {
         kind: "run.completed",
         payload: {
           stopReason: "end_turn",
@@ -281,6 +285,10 @@ describe("OpenAi app-server event bridge", () => {
     expect(events()).toMatchObject([
       {
         kind: "run.started",
+      },
+      {
+        kind: "agent.tasks.replaced",
+        payload: { tasks: [] },
       },
       {
         kind: "run.failed",

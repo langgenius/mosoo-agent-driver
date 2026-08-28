@@ -210,6 +210,7 @@ export class OpenAiAppServerEventBridge {
       return;
     }
     const publicTurnId = this.publicTurnId(turnId);
+    const [taskClosure, ...itemClosures] = this.#itemEvents.terminalEvents({ kind: "cancelled" });
 
     try {
       await this.#options.pushTerminal(
@@ -218,6 +219,7 @@ export class OpenAiAppServerEventBridge {
         turnClosureEvents({
           eventName: "turn.cancelled",
           events: [
+            taskClosure,
             {
               ...turnEventFields({ eventName: "turn.cancel.requested", publicTurnId, runId }),
               kind: "run.cancel.requested",
@@ -227,7 +229,7 @@ export class OpenAiAppServerEventBridge {
                 targetRunId: runId,
               },
             },
-            ...this.#itemEvents.terminalEvents({ kind: "cancelled" }),
+            ...itemClosures,
           ],
           publicTurnId,
           runId,
@@ -310,7 +312,9 @@ export class OpenAiAppServerEventBridge {
     this.#itemEvents.reset();
   }
 
-  turnStartTerminalEvents(outcome: OpenAiTerminalOutcome): DriverEventInput[] {
+  turnStartTerminalEvents(
+    outcome: OpenAiTerminalOutcome,
+  ): [DriverEventInput, ...DriverEventInput[]] {
     return this.#itemEvents.terminalEvents(outcome);
   }
 

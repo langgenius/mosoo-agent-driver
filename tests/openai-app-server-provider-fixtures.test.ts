@@ -1133,6 +1133,24 @@ describe("OpenAI app-server provider fixtures", () => {
           },
           sourceEventId: `openai.item.completed:turn-1:activity-${activityKind}:0`,
         },
+        {
+          delivery: "lossless",
+          kind: "agent.tasks.replaced",
+          payload: {
+            tasks:
+              activityKind === "started" || activityKind === "interacted"
+                ? [
+                    {
+                      taskId: "agent-1",
+                      taskType: "openai_subagent",
+                      title: "/root/worker",
+                    },
+                  ]
+                : [],
+          },
+          sourceEventId: `openai.item.completed:turn-1:activity-${activityKind}:1`,
+          visibility: "participant",
+        },
       ]);
     },
   );
@@ -1176,6 +1194,14 @@ describe("OpenAI app-server provider fixtures", () => {
       },
       sourceEventId: "openai.item.completed:turn-snapshot:activity-replayed:0",
     });
+    const snapshots = events().filter((event) => event.kind === "agent.tasks.replaced");
+    expect(snapshots).toMatchObject([
+      { payload: { tasks: [{ taskId: "agent-replayed" }] } },
+      { delivery: "lossless", payload: { tasks: [] }, visibility: "participant" },
+    ]);
+    expect(events().findIndex((event) => event.kind === "agent.tasks.replaced")).toBeLessThan(
+      events().findIndex((event) => event.kind === "run.completed"),
+    );
   });
 
   test.each([

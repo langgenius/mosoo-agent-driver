@@ -48,6 +48,13 @@
       "sourceEventId": "openai.turn.started:turn-1"
     },
     {
+      "delivery": "lossless",
+      "kind": "agent.tasks.replaced",
+      "payload": { "tasks": [] },
+      "sourceEventId": "openai.turn.failed.closure:turn-1:0",
+      "visibility": "participant"
+    },
+    {
       "kind": "run.failed",
       "native": {
         "eventName": "turn.failed",

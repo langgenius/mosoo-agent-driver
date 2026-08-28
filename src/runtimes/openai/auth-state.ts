@@ -1,7 +1,6 @@
 import { join } from "node:path";
 
 import type { JsonObject, JsonValue } from "../../protocol/json";
-import { isJsonObject } from "../../protocol/json";
 import { writeFileAtomicallyAtPath } from "../atomic-file";
 import { mergeProviderOptions } from "../provider-options";
 interface OpenAiApiKeyAuthStateInput {
@@ -43,78 +42,6 @@ function readOpenAiApiKey(env: NodeJS.ProcessEnv): string | null {
 function readEnvVar(env: NodeJS.ProcessEnv, key: string): string | null {
   const value = env[key]?.trim();
   return value || null;
-}
-
-function toTomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function toTomlKeySegment(value: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(value) ? value : toTomlString(value);
-}
-
-function toTomlInlineValue(value: JsonValue, path: string): string {
-  if (value === null) {
-    throw new Error(`OpenAI provider option ${path} cannot be null in config.toml.`);
-  }
-
-  if (typeof value === "string") {
-    return toTomlString(value);
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((entry, index) => toTomlInlineValue(entry, `${path}[${index}]`)).join(", ")}]`;
-  }
-
-  return `{ ${Object.entries(value)
-    .map(
-      ([key, entry]) => `${toTomlKeySegment(key)} = ${toTomlInlineValue(entry, `${path}.${key}`)}`,
-    )
-    .join(", ")} }`;
-}
-
-function isTomlTable(value: unknown): value is JsonObject {
-  return isJsonObject(value);
-}
-
-function appendTomlObject(
-  lines: string[],
-  object: Record<string, JsonValue>,
-  path: string[] = [],
-): void {
-  if (path.length > 0) {
-    if (lines.length > 0 && lines.at(-1) !== "") {
-      lines.push("");
-    }
-
-    lines.push(`[${path.map(toTomlKeySegment).join(".")}]`);
-  }
-
-  const nestedEntries: [string, JsonObject][] = [];
-
-  for (const [key, value] of Object.entries(object)) {
-    if (isTomlTable(value)) {
-      nestedEntries.push([key, value]);
-    } else {
-      lines.push(
-        `${toTomlKeySegment(key)} = ${toTomlInlineValue(value, [...path, key].join("."))}`,
-      );
-    }
-  }
-
-  for (const [key, value] of nestedEntries) {
-    appendTomlObject(lines, value, [...path, key]);
-  }
-}
-
-function stringifyToml(object: Record<string, JsonValue>): string {
-  const lines: string[] = [];
-  appendTomlObject(lines, object);
-  return `${lines.join("\n")}\n`;
 }
 
 export async function materializeOpenAiApiKeyAuthState(
@@ -194,7 +121,7 @@ export async function materializeOpenAiModelProviderConfig(
 
   const config = mergeProviderOptions(generatedConfig, input.providerOptions ?? {});
 
-  const written = await writeFileAtomicallyAtPath(configTomlPath, stringifyToml(config), {
+  const written = await writeFileAtomicallyAtPath(configTomlPath, Bun.TOML.stringify(config)!, {
     mode: 0o666,
     skipIfUnchanged: true,
   });

@@ -150,7 +150,6 @@ describe("contract protocol IDs", () => {
     ["canonical", "01J00000000000000000000009", "01J00000000000000000000009"],
     ["lowercase", "01j00000000000000000000009", "01J00000000000000000000009"],
     ["maximum timestamp", "7ZZZZZZZZZZZZZZZZZZZZZZZZZ", "7ZZZZZZZZZZZZZZZZZZZZZZZZZ"],
-    ["overflowing timestamp", "80000000000000000000000000", "80000000000000000000000000"],
   ] as const)("accepts and canonicalizes a %s ULID", (_case, input, expected) => {
     expect(protocolIdSchema.parse(input)).toBe(expected);
     expect(isDriverId(expected)).toBe(true);
@@ -159,6 +158,7 @@ describe("contract protocol IDs", () => {
   test.each([
     ["UUID", "00000000-0000-4000-8000-000000000001"],
     ["excluded alphabet character", "01J0000000000000000000000I"],
+    ["overflowing timestamp", "80000000000000000000000000"],
     ["wrong length", "01J0000000000000000000000"],
   ] as const)("rejects a %s", (_case, input) => {
     expect(protocolIdSchema.safeParse(input).success).toBe(false);

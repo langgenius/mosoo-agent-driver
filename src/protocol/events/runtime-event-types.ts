@@ -6,6 +6,7 @@ export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
   "account.updated",
   "agent.task.updated",
+  "agent.tasks.replaced",
   "auth.methods.updated",
   "auth.session.updated",
   "catalog.updated",

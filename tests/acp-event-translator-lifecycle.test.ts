@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { RequestError } from "@agentclientprotocol/sdk";
-import {
-  zAgentResponse,
-  zPromptRequest,
-  zSessionNotification,
-} from "../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js";
+import type { PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
@@ -28,12 +24,17 @@ import {
   driverBootPayload,
   driverStartInput,
 } from "./driver-boot-payload-fixture";
+import { beginAcpTranscript } from "./acp-test-helpers";
 
 const RUN_ID = "run-1" as RunId;
 const SECOND_RUN_ID = "run-2" as RunId;
 
 function eventKinds(events: readonly DriverEventInput[]): string[] {
   return events.map((event) => event.kind);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function eventPayload(event: DriverEventInput): Record<string, unknown> {
@@ -72,17 +73,16 @@ describe("ACP runtime event translation", () => {
     const decoded = JSON.parse(
       await new Response(limitAcpInput(new Blob([wire]).stream())).text(),
     ) as unknown;
-    const response = zAgentResponse.parse(decoded);
+    if (!isRecord(decoded) || decoded["id"] !== 1 || decoded["jsonrpc"] !== "2.0") {
+      throw new Error("Expected an official ACP response envelope.");
+    }
+    const error = decoded["error"];
 
-    if (!("error" in response)) {
+    if (!isRecord(error) || error["code"] !== -32_603 || typeof error["message"] !== "string") {
       throw new Error("Expected an official ACP error response.");
     }
 
-    const requestError = new RequestError(
-      response.error.code,
-      response.error.message,
-      response.error.data,
-    );
+    const requestError = new RequestError(error["code"], error["message"], error["data"]);
     const state = new AcpAssistantTranscriptState();
     state.begin({
       messageId: "message-1",
@@ -184,27 +184,27 @@ describe("ACP runtime event translation", () => {
   });
 
   test("bounds official ACP prompt text before provider dispatch", async () => {
-    const parseText = (text: string): string => {
-      const prompt = zPromptRequest.parse({
+    const promptText = (text: string): string => {
+      const prompt = {
         prompt: [{ text, type: "text" }],
         sessionId: "native-session-1",
-      }).prompt[0];
+      } satisfies PromptRequest;
 
-      return prompt?.type === "text" ? prompt.text : "";
+      return prompt.prompt[0]!.text;
     };
 
     expect(() =>
       toPromptStartEvents({
         messageId: "message-1",
         runId: DRIVER_TEST_IDS.runId,
-        text: parseText("x".repeat(1_100_000)),
+        text: promptText("x".repeat(1_100_000)),
       }),
     ).toThrow("ACP message.added event exceeds 524288 UTF-8 bytes");
 
     const events = toPromptStartEvents({
       messageId: "message-1",
       runId: DRIVER_TEST_IDS.runId,
-      text: parseText("x".repeat(500_000)),
+      text: promptText("x".repeat(500_000)),
     });
     const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
     let recordCount = 0;
@@ -237,35 +237,39 @@ describe("ACP runtime event translation", () => {
     });
 
     for (const sessionUpdate of ["agent_message_chunk", "agent_thought_chunk"] as const) {
-      const notification = zSessionNotification.parse({
+      const notification = {
         sessionId: "native-session-1",
         update: { content: { text: "", type: "text" }, sessionUpdate },
-      });
+      } satisfies SessionNotification;
       expect(state.translateUpdate(notification)).toEqual([]);
     }
 
-    const message = state.translateUpdate(
-      zSessionNotification.parse({
-        sessionId: "native-session-1",
-        update: {
-          content: { text: "ok", type: "text" },
-          sessionUpdate: "agent_message_chunk",
-        },
-      }),
-    );
+    const message = state.translateUpdate({
+      sessionId: "native-session-1",
+      update: {
+        content: { text: "ok", type: "text" },
+        sessionUpdate: "agent_message_chunk",
+      },
+    } satisfies SessionNotification);
     expect(eventKinds(message)).toEqual(["message.started", "message.delta"]);
     expect(message[1]?.sourceEventId).toBe(`acp:${DRIVER_TEST_IDS.runId}:agent-message:1`);
 
     for (const sessionUpdate of ["tool_call", "tool_call_update"] as const) {
-      const notification = zSessionNotification.parse({
-        sessionId: "native-session-1",
-        update: {
-          sessionUpdate,
-          title: "",
-          toolCallId: sessionUpdate,
-          ...(sessionUpdate === "tool_call" ? { kind: "execute" } : {}),
-        },
-      });
+      const notification =
+        sessionUpdate === "tool_call"
+          ? ({
+              sessionId: "native-session-1",
+              update: {
+                kind: "execute",
+                sessionUpdate,
+                title: "",
+                toolCallId: sessionUpdate,
+              },
+            } satisfies SessionNotification)
+          : ({
+              sessionId: "native-session-1",
+              update: { sessionUpdate, title: "", toolCallId: sessionUpdate },
+            } satisfies SessionNotification);
       const events = state.translateUpdate(notification);
       const update = requireEvent(events, "tool.call.updated");
 
@@ -384,8 +388,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("evicts bounded settled assistant IDs without suppressing the oldest message", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     const first = state.translateUpdate({
       update: {
@@ -432,10 +435,9 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps the maximum admitted assistant text inside the shared terminal budget", () => {
-    const state = new AcpAssistantTranscriptState();
+    const state = beginAcpTranscript();
     const content = "x".repeat(8 * 1_024);
 
-    state.begin({ messageId: "message-1", runId: RUN_ID });
     for (let index = 0; index < 47; index += 1) {
       state.translateUpdate({
         update: {
@@ -454,8 +456,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps the maximum retained item closures inside the shared terminal budget", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     for (let index = 0; index < 509; index += 1) {
       state.translateUpdate({
@@ -482,9 +483,8 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps prompt usage extensions out of the lossless terminal budget", () => {
-    const state = new AcpAssistantTranscriptState();
+    const state = beginAcpTranscript();
     const fallbackToolId = "request-".repeat(40_000);
-    state.begin({ messageId: "message-1", runId: RUN_ID });
     state.translatePermission({
       params: {
         options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
@@ -617,12 +617,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("maps ACP turn updates onto canonical runtime events with one tool lifecycle", () => {
-    const state = new AcpAssistantTranscriptState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-    });
+    const state = beginAcpTranscript();
 
     const events = [
       ...state.translateUpdate({
@@ -683,8 +678,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("projects an execute tool with a nonzero raw exit as failed", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
     state.translateUpdate({
       update: {
         kind: "execute",
@@ -719,8 +713,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("deduplicates identical ACP tool content and fails closed on oversized output", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
     state.translateUpdate({
       update: {
         kind: "execute",
@@ -758,8 +751,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("fails closed on an oversized permission tool payload", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     expect(() =>
       state.translatePermission({
@@ -789,8 +781,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("accounts for a permission request ID retained as the fallback tool ID", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     expect(() =>
       state.translatePermission({
@@ -816,8 +807,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps a nonzero execute exit across partial updates", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
     state.translateUpdate({
       update: {
         kind: "execute",
@@ -858,8 +848,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("does not reset tool identity fields omitted by a partial update", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     const started = state.translateUpdate({
       update: {
@@ -903,8 +892,7 @@ describe("ACP runtime event translation", () => {
   ] as const)(
     "keeps a terminal tool completed while merging a later %s patch",
     (_name, patch, expected) => {
-      const state = new AcpAssistantTranscriptState();
-      state.begin({ messageId: "message-1", runId: RUN_ID });
+      const state = beginAcpTranscript();
       const initial = state.translateUpdate({
         update: {
           kind: "shell",
@@ -949,8 +937,7 @@ describe("ACP runtime event translation", () => {
   );
 
   test("evicts completed replay history only after projecting its late update", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     for (const toolCallId of ["tool-0", "tool-1"]) {
       state.translateUpdate({
@@ -991,8 +978,7 @@ describe("ACP runtime event translation", () => {
   ] as const)(
     "keeps the first %s status across a late %s update %s",
     (initialStatus, lateStatus, contentCase) => {
-      const state = new AcpAssistantTranscriptState();
-      state.begin({ messageId: "message-1", runId: RUN_ID });
+      const state = beginAcpTranscript();
       state.translateUpdate({
         update: {
           sessionUpdate: "tool_call",
@@ -1027,8 +1013,7 @@ describe("ACP runtime event translation", () => {
   );
 
   test("emits an empty plan as a full replacement", () => {
-    const state = new AcpAssistantTranscriptState();
-    state.begin({ messageId: "message-1", runId: RUN_ID });
+    const state = beginAcpTranscript();
 
     expect(
       state.translateUpdate({

@@ -73,6 +73,14 @@
       }
     },
     {
+      "delivery": "lossless",
+      "kind": "agent.tasks.replaced",
+      "payload": {
+        "tasks": []
+      },
+      "visibility": "participant"
+    },
+    {
       "kind": "run.failed",
       "payload": {
         "error": {

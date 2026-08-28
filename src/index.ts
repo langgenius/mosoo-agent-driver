@@ -89,7 +89,6 @@ export type {
   AgentDriverMcpPort,
   AgentDriverSkillPort,
   AgentDriverFilePort,
-  AgentDriverHostIntegrationPort,
 } from "./host-ports";
 export type {
   AgentDriverBackend,
@@ -123,7 +122,6 @@ export type {
   DriverExecutionRunInput,
   DriverExecutionSessionInput,
 } from "./protocol/execution";
-export type { DriverHostIntegrationSnapshot } from "./protocol/host-integration";
 export type { DriverStartInput } from "./protocol/start";
 export {
   createDriverId,

@@ -32,6 +32,7 @@
     "stopReason": "end_turn",
     "usage": null
   },
+  "updates": [],
   "expectedEvents": [
     {
       "kind": "message.started",

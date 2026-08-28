@@ -1,4 +1,5 @@
 import { jsonValueSchema } from "../../contract/common";
+import { z } from "zod";
 import type { DriverInstanceId, EventId, SessionId, RunId } from "../id";
 import {
   RUNTIME_EVENT_KINDS,
@@ -50,6 +51,49 @@ import {
 export * from "./runtime-event-types";
 
 const runtimeEventKindSet = new Set<string>(RUNTIME_EVENT_KINDS);
+const MAX_AGENT_TASKS_REPLACED_PAYLOAD_BYTES = 1_020 * 1_024;
+const agentTasksReplacedPayloadSchema = z
+  .object({
+    tasks: z
+      .array(
+        z
+          .object({
+            taskId: z
+              .string()
+              .min(1)
+              .refine((value) => Buffer.byteLength(value, "utf8") <= 256),
+            taskType: z.string().min(1).max(4_096).optional(),
+            title: z.string().min(1).max(4_096).optional(),
+          })
+          .strict(),
+      )
+      .max(256)
+      .superRefine((tasks, context) => {
+        const taskIds = new Set<string>();
+        for (const [index, task] of tasks.entries()) {
+          if (taskIds.has(task.taskId)) {
+            context.addIssue({
+              code: "custom",
+              message: "Task IDs must be unique.",
+              path: [index, "taskId"],
+            });
+          }
+          taskIds.add(task.taskId);
+        }
+      }),
+  })
+  .strict()
+  .superRefine((payload, context) => {
+    if (
+      Buffer.byteLength(JSON.stringify(payload), "utf8") > MAX_AGENT_TASKS_REPLACED_PAYLOAD_BYTES
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Task snapshot exceeds the durable event capacity.",
+        path: ["tasks"],
+      });
+    }
+  });
 const runtimeEventActors = new Set<string>(["agent", "api", "driver", "system", "tool", "user"]);
 const runtimeEventOrigins = new Set<string>([
   "api",
@@ -197,10 +241,12 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
   const payload = admitRuntimeEventPayload(
     {
       ...(driverInstanceId === undefined ? {} : { driverInstanceId }),
+      delivery,
       kind,
       ...(runId === undefined ? {} : { runId }),
       sessionId,
       ...(traceId === undefined ? {} : { traceId }),
+      visibility,
     },
     value["payload"],
   );
@@ -327,11 +373,13 @@ function defaultVisibility(kind: RuntimeEventKind): RuntimeEventVisibility {
 
 function admitRuntimeEventPayload(
   context: {
+    readonly delivery: RuntimeEventDelivery;
     readonly driverInstanceId?: DriverInstanceId | undefined;
     readonly kind: RuntimeEventKind;
     readonly runId?: RunId | undefined;
     readonly sessionId: SessionId;
     readonly traceId?: string | undefined;
+    readonly visibility: RuntimeEventVisibility;
   },
   payload: unknown,
 ): unknown {
@@ -357,6 +405,20 @@ function admitRuntimeEventPayload(
         requireOptionalString(record, field, context.kind);
       }
       return omitPayloadIdentity(record);
+    }
+    case "agent.tasks.replaced": {
+      if (context.delivery !== "lossless" || context.visibility !== "participant") {
+        throw new Error(`Runtime event ${context.kind} must be lossless and participant-visible.`);
+      }
+      if (context.driverInstanceId === undefined || context.runId === undefined) {
+        throw new Error(`Runtime event ${context.kind} requires a run ID and driver instance ID.`);
+      }
+      const record = requirePayloadRecord(context.kind, canonicalPayload);
+      const parsed = agentTasksReplacedPayloadSchema.safeParse(omitPayloadIdentity(record));
+      if (!parsed.success) {
+        throw new Error(`Runtime event ${context.kind} payload is invalid.`);
+      }
+      return parsed.data;
     }
     case "diagnostic.reported": {
       const record = requirePayloadRecord(context.kind, canonicalPayload);

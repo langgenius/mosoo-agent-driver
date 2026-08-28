@@ -12,8 +12,8 @@ export type SessionId = SemanticDriverId<"SessionId">;
 export type MessageId = SemanticDriverId<"MessageId">;
 export type RunId = SemanticDriverId<"RunId">;
 
-export const DRIVER_ID_PATTERN = "^[0-9A-HJKMNP-TV-Z]{26}$";
-export const DRIVER_ID_INPUT_PATTERN = "^[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}$";
+export const DRIVER_ID_PATTERN = "^[0-7][0-9A-HJKMNP-TV-Z]{25}$";
+export const DRIVER_ID_INPUT_PATTERN = "^[0-7][0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25}$";
 
 const canonicalDriverIdPattern = new RegExp(DRIVER_ID_PATTERN, "u");
 const inputDriverIdPattern = new RegExp(DRIVER_ID_INPUT_PATTERN, "u");

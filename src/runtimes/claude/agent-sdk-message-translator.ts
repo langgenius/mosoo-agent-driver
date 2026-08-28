@@ -28,7 +28,10 @@ import {
   isClaudeResultSuccessful,
 } from "./agent-sdk-outcomes";
 import { ClaudeAgentSdkMessageState, readClaudeSdkSessionId } from "./agent-sdk-message-state";
-import { ClaudeAgentSdkTaskEvents } from "./agent-sdk-task-events";
+import {
+  claudeBackgroundTasksClosedEvent,
+  projectClaudeBackgroundTasksSnapshot,
+} from "./agent-sdk-task-events";
 import { isToolUseBlock, toToolCallId, toToolCallName, toToolResultText } from "./agent-sdk-tools";
 import type { ClaudePermissionDenialAdvisory } from "./agent-sdk-outcomes";
 interface ClaudeMessageTranslatorOptions {
@@ -67,18 +70,15 @@ export class ClaudeAgentSdkMessageTranslator {
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #permissionDenialAdvisories = new Map<string, ClaudePermissionDenialAdvisory>();
   readonly #state = new ClaudeAgentSdkMessageState();
-  readonly #tasks: ClaudeAgentSdkTaskEvents;
 
   constructor(options: ClaudeMessageTranslatorOptions) {
     this.#options = options;
     this.#events = new ClaudeAgentSdkEventWriter({ push: options.push });
-    this.#tasks = new ClaudeAgentSdkTaskEvents();
   }
 
   resetTurnMessageState(): void {
     this.#state.reset();
     this.#events.resetTurnState();
-    this.#tasks.reset();
     this.#permissionDenialAdvisories.clear();
   }
 
@@ -94,13 +94,9 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     await this.#events.finishTools(context, "cancelled");
-    const taskClosure = this.#tasks.prepareClosure();
-    for (const [index, event] of taskClosure.events.entries()) {
-      taskClosure.beforePublish(index);
-      await this.#options.push(context, "driver.claude.tasks.finished", [event]);
-      taskClosure.commitAccepted(index);
-    }
-    taskClosure.commit();
+    await this.#options.push(context, "driver.claude.tasks.finished", [
+      claudeBackgroundTasksClosedEvent(),
+    ]);
   }
 
   async finishTurnWithTerminal(
@@ -110,15 +106,13 @@ export class ClaudeAgentSdkMessageTranslator {
     reason: string,
   ): Promise<void> {
     const closure = this.#events.prepareTurnClosure(toolStatus);
-    const taskClosure = this.#tasks.prepareClosure();
     await this.#options.pushTerminal(
       context,
       reason,
-      [...closure.events, ...taskClosure.events],
+      [...closure.events, claudeBackgroundTasksClosedEvent()],
       terminal,
     );
     closure.commit();
-    taskClosure.commit();
 
     this.#state.clearThoughtIds();
     for (const [messageId, runId] of this.#state.assistantMessages()) {
@@ -693,13 +687,11 @@ export class ClaudeAgentSdkMessageTranslator {
     context: AgentDriverContext,
     message: Extract<SDKMessage, { subtype: "background_tasks_changed"; type: "system" }>,
   ): Promise<void> {
-    const projection = this.#tasks.prepare(message);
-    for (const [index, event] of projection.events.entries()) {
-      projection.beforePublish(index);
-      await this.#options.push(context, "driver.claude.task.updated", [event]);
-      projection.commitAccepted(index);
-    }
-    projection.commit();
+    const { diagnostic, snapshot } = projectClaudeBackgroundTasksSnapshot(message);
+    await this.#options.push(context, "driver.claude.tasks.replaced", [
+      ...(snapshot === null ? [] : [snapshot]),
+      ...(diagnostic === undefined ? [] : [diagnostic]),
+    ]);
   }
 
   async #retractWireItems(

@@ -1,30 +1,26 @@
 import { delimiter, isAbsolute } from "node:path";
+import { z } from "zod";
 
 import type { DriverInstanceId } from "../id";
 import type { JsonObject } from "../json";
 import { readJsonObject } from "../json";
-import type { DriverNativeRuntimeRef, DriverRuntime, DriverRuntimeTransport } from "../runtime";
+import type { DriverNativeRuntimeRef } from "../runtime";
 import {
   isSupportedDriverRuntime,
   isSupportedDriverRuntimeTransport,
+  parseDriverNativeRuntimeRef,
   SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS,
   SUPPORTED_DRIVER_RUNTIMES,
   SUPPORTED_DRIVER_RUNTIME_TRANSPORTS,
 } from "../runtime";
 import type { CredentialId, McpServerId, SandboxId, SkillId, SkillSnapshotId } from "./host-ids";
-import type { DriverConfigRevision, DriverExecutionSessionContext } from "./host-snapshot";
-import { readConfigRevision, readExecutionSessionContext } from "./host-snapshot";
 import {
-  parseId,
-  readArray,
-  readInteger,
-  readNonEmptyString,
-  readNumber,
-  readOptionalNullableString,
-  readRecord,
-  readString,
-  readStringArray,
-} from "./readers";
+  createDriverIdSchema,
+  driverConfigRevisionSchema,
+  driverExecutionSessionContextSchema,
+  ownArraySchema,
+  ownObjectSchema,
+} from "./host-snapshot";
 
 export type {
   AccountId,
@@ -70,104 +66,191 @@ export type {
   DriverRuntimeTransport,
 } from "../runtime";
 
-export interface DriverExecutionEnvironment {
-  readonly paths?: {
-    readonly executable: string[];
-    readonly node: string[];
-    readonly python: string[];
-  };
-  readonly variables: Record<string, string>;
+const nonEmptyStringSchema = z.string().min(1);
+const nullableOptionalStringSchema = z.string().nullable().optional();
+const resolutionModeSchema = z.enum(["auto", "explicit", "tombstone"]);
+const runtimeTransportByRuntime = {
+  "acp-fallback": "acp-fallback",
+  "claude-agent-sdk": "claude-agent-sdk",
+  "openai-runtime": "openai-app-server",
+} as const;
+const controlUrlSchema = z
+  .url()
+  .refine((value) => /^(?:https?|wss?):/iu.test(value), "must use http, https, ws, or wss");
+
+function omitUndefinedProperties<Value extends Record<string, unknown>>(value: Value): Value {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined),
+  ) as Value;
 }
 
-export type DriverBuiltInToolName =
-  | "bash"
-  | "edit"
-  | "glob"
-  | "grep"
-  | "read"
-  | "web_fetch"
-  | "web_search"
-  | "write";
+const absolutePathSchema = nonEmptyStringSchema.refine(
+  (path) => isAbsolute(path) && !path.includes("\0") && !path.includes(delimiter),
+  "must be an absolute path without null bytes or path delimiters",
+);
 
-export interface DriverBuiltInToolConfig {
-  readonly enabled: boolean;
-  readonly name: DriverBuiltInToolName;
-}
+const environmentEntrySchema = z.tuple([
+  z
+    .string()
+    .refine(
+      (name) => name.length > 0 && !name.includes("=") && !name.includes("\0"),
+      "must be a valid environment entry",
+    ),
+  z.string().refine((value) => !value.includes("\0"), "must be a valid environment entry"),
+]);
 
-function readBoolean(value: unknown, label: string): boolean {
-  if (typeof value !== "boolean") {
-    throw new TypeError(`${label} must be a boolean.`);
+const environmentVariablesSchema = z
+  .unknown()
+  .refine(
+    (value) => typeof value === "object" && value !== null && !Array.isArray(value),
+    "must be an object",
+  )
+  .transform((value) => Object.entries(value as Record<string, unknown>))
+  .pipe(z.array(environmentEntrySchema))
+  .transform((entries) => Object.fromEntries(entries));
+
+const jsonObjectSchema = z.unknown().transform((value, context): JsonObject => {
+  try {
+    return readJsonObject(value, "execution.providerOptions");
+  } catch (error) {
+    context.addIssue({
+      code: "custom",
+      message: error instanceof Error ? error.message : "must be a JSON object",
+    });
+    return z.NEVER;
   }
+});
 
-  return value;
-}
+const driverExecutionEnvironmentSchema = ownObjectSchema({
+  paths: ownObjectSchema({
+    executable: ownArraySchema(absolutePathSchema),
+    node: ownArraySchema(absolutePathSchema),
+    python: ownArraySchema(absolutePathSchema),
+  }).optional(),
+  variables: environmentVariablesSchema,
+}).transform(omitUndefinedProperties);
 
-export interface DriverSkillCatalogFrontmatterSummary {
-  readonly author: string | null;
-  readonly description: string | null;
-  readonly version: string | null;
-}
+export type DriverExecutionEnvironment = z.infer<typeof driverExecutionEnvironmentSchema>;
 
-export interface DriverSkillCatalogEntry {
-  readonly frontmatter: DriverSkillCatalogFrontmatterSummary;
-  readonly mountPath: string;
-  readonly resolutionMode: "auto" | "explicit" | "tombstone";
-  readonly skillId: SkillId;
-  readonly skillName: string;
-}
+const driverBuiltInToolNameSchema = z.enum([
+  "bash",
+  "edit",
+  "glob",
+  "grep",
+  "read",
+  "web_fetch",
+  "web_search",
+  "write",
+]);
 
-export interface DriverResolvedSkill {
-  readonly archiveFormat: "zip";
-  readonly blobSha256: string;
-  readonly compression: "deflate";
-  readonly downloadUrl: string;
-  readonly materializationStatus: "failed" | "pending" | "ready" | "skipped";
-  readonly mountPath: string;
-  readonly resolutionMode: "auto" | "explicit" | "tombstone";
-  readonly skillId: SkillId;
-  readonly skillName: string;
-  readonly snapshotId?: SkillSnapshotId | null | undefined;
-  readonly warningCode?: string | null | undefined;
-}
+export type DriverBuiltInToolName = z.infer<typeof driverBuiltInToolNameSchema>;
 
-export interface AuthorizedDriverBootMcpServer {
-  readonly authType: string;
-  readonly authorizationState: "active";
-  readonly credentialId: CredentialId;
-  readonly credentialScope: string;
-  readonly credentialStatus: string;
-  readonly name: string;
-  readonly proxyGrantId: string;
-  readonly proxyUrl: string;
-  readonly serverId: McpServerId;
-  readonly subjectLabel?: string | null | undefined;
-}
+const driverBuiltInToolConfigSchema = ownObjectSchema({
+  enabled: z.boolean(),
+  name: driverBuiltInToolNameSchema,
+});
 
-export interface UnavailableDriverBootMcpServer {
-  readonly authType: string;
-  readonly authorizationState: "authorization_required" | "disabled" | "expired" | "revoked";
-  readonly credentialScope: string;
-  readonly credentialStatus: string;
-  readonly name: string;
-  readonly serverId: McpServerId;
-  readonly subjectLabel?: string | null | undefined;
-}
+export type DriverBuiltInToolConfig = z.infer<typeof driverBuiltInToolConfigSchema>;
 
-export type DriverBootMcpServer = AuthorizedDriverBootMcpServer | UnavailableDriverBootMcpServer;
+const driverSkillCatalogFrontmatterSummarySchema = ownObjectSchema({
+  author: nullableOptionalStringSchema.transform((value) => value ?? null),
+  description: nullableOptionalStringSchema.transform((value) => value ?? null),
+  version: nullableOptionalStringSchema.transform((value) => value ?? null),
+});
 
-export interface DriverRecoveryMessage {
-  readonly content: string;
-  readonly role: "assistant" | "user";
-}
+export type DriverSkillCatalogFrontmatterSummary = z.infer<
+  typeof driverSkillCatalogFrontmatterSummarySchema
+>;
 
-export interface DriverExecutionSessionSpec {
-  readonly additionalDirectories: string[];
-  readonly context: DriverExecutionSessionContext;
-  readonly cwd: string;
-  readonly mcpServers: DriverBootMcpServer[];
-  readonly nativeResumeRef: DriverNativeRuntimeRef | null;
-  readonly recoveryMessages: DriverRecoveryMessage[];
-}
+const driverSkillCatalogEntrySchema = ownObjectSchema({
+  frontmatter: driverSkillCatalogFrontmatterSummarySchema,
+  mountPath: nonEmptyStringSchema,
+  resolutionMode: resolutionModeSchema,
+  skillId: createDriverIdSchema<SkillId>(),
+  skillName: nonEmptyStringSchema,
+});
+
+export type DriverSkillCatalogEntry = z.infer<typeof driverSkillCatalogEntrySchema>;
+
+const driverResolvedSkillSchema = ownObjectSchema({
+  archiveFormat: z.literal("zip"),
+  blobSha256: nonEmptyStringSchema,
+  compression: z.literal("deflate"),
+  downloadUrl: nonEmptyStringSchema,
+  materializationStatus: z.enum(["failed", "pending", "ready", "skipped"]),
+  mountPath: nonEmptyStringSchema,
+  resolutionMode: resolutionModeSchema,
+  skillId: createDriverIdSchema<SkillId>(),
+  skillName: nonEmptyStringSchema,
+  snapshotId: createDriverIdSchema<SkillSnapshotId>().nullable().optional(),
+  warningCode: nullableOptionalStringSchema,
+}).transform(omitUndefinedProperties);
+
+export type DriverResolvedSkill = z.infer<typeof driverResolvedSkillSchema>;
+
+const bootMcpServerCommonShape = {
+  authType: nonEmptyStringSchema,
+  credentialScope: nonEmptyStringSchema,
+  credentialStatus: nonEmptyStringSchema,
+  name: nonEmptyStringSchema,
+  serverId: createDriverIdSchema<McpServerId>(),
+  subjectLabel: nullableOptionalStringSchema,
+};
+
+const authorizedDriverBootMcpServerSchema = ownObjectSchema({
+  ...bootMcpServerCommonShape,
+  authorizationState: z.literal("active"),
+  credentialId: createDriverIdSchema<CredentialId>(),
+  proxyGrantId: nonEmptyStringSchema,
+  proxyUrl: nonEmptyStringSchema,
+});
+
+export type AuthorizedDriverBootMcpServer = z.infer<typeof authorizedDriverBootMcpServerSchema>;
+
+const unavailableDriverBootMcpServerSchema = ownObjectSchema({
+  ...bootMcpServerCommonShape,
+  authorizationState: z.enum(["authorization_required", "disabled", "expired", "revoked"]),
+});
+
+export type UnavailableDriverBootMcpServer = z.infer<typeof unavailableDriverBootMcpServerSchema>;
+
+const driverBootMcpServerSchema = z
+  .union([authorizedDriverBootMcpServerSchema, unavailableDriverBootMcpServerSchema])
+  .transform(omitUndefinedProperties);
+
+export type DriverBootMcpServer = z.infer<typeof driverBootMcpServerSchema>;
+
+const driverRecoveryMessageSchema = ownObjectSchema({
+  content: nonEmptyStringSchema,
+  role: z.enum(["assistant", "user"]),
+});
+
+export type DriverRecoveryMessage = z.infer<typeof driverRecoveryMessageSchema>;
+
+const driverNativeRuntimeRefSchema = z
+  .unknown()
+  .transform((value, context): DriverNativeRuntimeRef => {
+    try {
+      return parseDriverNativeRuntimeRef(value);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : "must be a valid native runtime ref",
+      });
+      return z.NEVER;
+    }
+  });
+
+const driverExecutionSessionSpecSchema = ownObjectSchema({
+  additionalDirectories: ownArraySchema(nonEmptyStringSchema),
+  context: driverExecutionSessionContextSchema,
+  cwd: nonEmptyStringSchema,
+  mcpServers: ownArraySchema(driverBootMcpServerSchema),
+  nativeResumeRef: driverNativeRuntimeRefSchema.nullable(),
+  recoveryMessages: ownArraySchema(driverRecoveryMessageSchema).default([]),
+});
+
+export type DriverExecutionSessionSpec = z.infer<typeof driverExecutionSessionSpecSchema>;
 
 /**
  * How the driver mediates tool-permission requests.
@@ -179,390 +262,83 @@ export interface DriverExecutionSessionSpec {
  *   the control plane for an interactive allow/deny decision. Providers may
  *   still auto-approve actions they classify as trusted or read-only.
  */
-export type DriverPermissionPolicy = "full_access" | "supervised";
+const driverPermissionPolicySchema = z
+  .enum(["full_access", "supervised"])
+  .nullish()
+  .transform((value) => value ?? "full_access");
+
+export type DriverPermissionPolicy = z.infer<typeof driverPermissionPolicySchema>;
 
 export const DEFAULT_DRIVER_PERMISSION_POLICY = "full_access" satisfies DriverPermissionPolicy;
 
-export interface DriverExecutionSpec {
-  readonly builtInTools: DriverBuiltInToolConfig[];
-  readonly configRevision: DriverConfigRevision;
-  readonly environment: DriverExecutionEnvironment;
-  readonly model: string;
-  readonly permissionPolicy: DriverPermissionPolicy;
-  readonly profilePrompt: string;
-  readonly provider: string;
-  readonly providerOptions: JsonObject;
-  readonly session: DriverExecutionSessionSpec;
-  readonly skillCatalog: DriverSkillCatalogEntry[];
-  readonly skills: DriverResolvedSkill[];
-}
+const driverExecutionSpecSchema = ownObjectSchema({
+  builtInTools: ownArraySchema(driverBuiltInToolConfigSchema),
+  configRevision: driverConfigRevisionSchema,
+  environment: driverExecutionEnvironmentSchema,
+  model: nonEmptyStringSchema,
+  permissionPolicy: driverPermissionPolicySchema,
+  profilePrompt: z.string(),
+  provider: nonEmptyStringSchema,
+  providerOptions: jsonObjectSchema.default({}),
+  session: driverExecutionSessionSpecSchema,
+  skillCatalog: ownArraySchema(driverSkillCatalogEntrySchema),
+  skills: ownArraySchema(driverResolvedSkillSchema),
+});
 
-export interface DriverBootPayload {
-  readonly bootToken: string;
-  readonly controlUrl: string;
-  readonly driverControlPort: number;
-  readonly driverGeneration: number;
-  readonly driverInstanceId: DriverInstanceId;
-  readonly execution: DriverExecutionSpec;
-  readonly heartbeatIntervalMs: number;
-  readonly protocolVersion: typeof DRIVER_PROTOCOL_VERSION;
-  readonly runtime: DriverRuntime;
-  readonly runtimeTransport: DriverRuntimeTransport;
-  readonly sandboxId: SandboxId;
-  readonly traceparent: string;
-}
+export type DriverExecutionSpec = z.infer<typeof driverExecutionSpecSchema>;
 
-function readVariables(value: unknown): Record<string, string> {
-  const record = readRecord(value, "execution.environment.variables");
-  const entries = Object.entries(record);
-
-  for (const [key, entry] of entries) {
-    if (
-      key.length === 0 ||
-      key.includes("=") ||
-      key.includes("\0") ||
-      typeof entry !== "string" ||
-      entry.includes("\0")
-    ) {
-      throw new TypeError(
-        `execution.environment.variables.${key} must be a valid environment entry.`,
-      );
-    }
+const driverBootPayloadSchema = ownObjectSchema({
+  bootToken: nonEmptyStringSchema,
+  controlUrl: controlUrlSchema,
+  driverControlPort: z.number().int().min(DRIVER_CONTROL_PORT_MIN).max(DRIVER_CONTROL_PORT_MAX),
+  driverGeneration: z.number().int().nonnegative(),
+  driverInstanceId: createDriverIdSchema<DriverInstanceId>(),
+  execution: driverExecutionSpecSchema,
+  heartbeatIntervalMs: z.number().finite().min(250),
+  protocolVersion: z.literal(DRIVER_PROTOCOL_VERSION, {
+    error: `protocolVersion must be ${DRIVER_PROTOCOL_VERSION}`,
+  }),
+  runtime: z.enum(SUPPORTED_DRIVER_RUNTIMES),
+  runtimeTransport: z.enum(SUPPORTED_DRIVER_RUNTIME_TRANSPORTS),
+  sandboxId: createDriverIdSchema<SandboxId>(),
+  traceparent: nonEmptyStringSchema,
+}).superRefine((payload, context) => {
+  if (payload.sandboxId !== payload.execution.session.context.sandboxId) {
+    context.addIssue({
+      code: "custom",
+      message: "Driver boot payload sandbox IDs must match",
+      path: ["sandboxId"],
+    });
   }
 
-  return Object.fromEntries(entries) as Record<string, string>;
-}
-
-function readAbsolutePathArray(record: Record<string, unknown>, field: string): string[] {
-  const label = "execution.environment.paths";
-  return readStringArray(record, field, label).map((path, index) => {
-    if (!isAbsolute(path) || path.includes("\0") || path.includes(delimiter)) {
-      throw new TypeError(
-        `${label}.${field}[${index}] must be an absolute path without null bytes or path delimiters.`,
-      );
-    }
-
-    return path;
-  });
-}
-
-function readEnvironmentPaths(value: unknown): NonNullable<DriverExecutionEnvironment["paths"]> {
-  const paths = readRecord(value, "execution.environment.paths");
-  return {
-    executable: readAbsolutePathArray(paths, "executable"),
-    node: readAbsolutePathArray(paths, "node"),
-    python: readAbsolutePathArray(paths, "python"),
-  };
-}
-
-function readNativeRuntimeRef(value: unknown): DriverNativeRuntimeRef | null {
-  if (value === null) {
-    return null;
+  if (payload.runtimeTransport !== runtimeTransportByRuntime[payload.runtime]) {
+    context.addIssue({
+      code: "custom",
+      message: `runtime ${payload.runtime} does not match transport ${payload.runtimeTransport}`,
+      path: ["runtimeTransport"],
+    });
   }
 
-  const record = readRecord(value, "execution.session.nativeResumeRef");
-  const kind = readNonEmptyString(record, "kind", "execution.session.nativeResumeRef");
-  const runtimeId = readNonEmptyString(record, "runtimeId", "execution.session.nativeResumeRef");
-
-  if (kind !== "openai_thread_id" && kind !== "claude_session_id" && kind !== "acp_session_id") {
-    throw new TypeError("execution.session.nativeResumeRef.kind is unsupported.");
+  const nativeResumeRef = payload.execution.session.nativeResumeRef;
+  if (nativeResumeRef !== null && nativeResumeRef.runtimeId !== payload.runtime) {
+    context.addIssue({
+      code: "custom",
+      message: `native resume runtime ${nativeResumeRef.runtimeId} does not match runtime ${payload.runtime}`,
+      path: ["execution", "session", "nativeResumeRef", "runtimeId"],
+    });
   }
+});
 
-  if (!isSupportedDriverRuntime(runtimeId)) {
-    throw new TypeError("execution.session.nativeResumeRef.runtimeId is unsupported.");
-  }
-
-  return {
-    kind,
-    runtimeId,
-    value: readNonEmptyString(record, "value", "execution.session.nativeResumeRef"),
-  };
-}
-
-function readSkillFrontmatter(value: unknown, label: string): DriverSkillCatalogFrontmatterSummary {
-  const record = readRecord(value, `${label}.frontmatter`);
-
-  return {
-    author: readOptionalNullableString(record, "author", `${label}.frontmatter`) ?? null,
-    description: readOptionalNullableString(record, "description", `${label}.frontmatter`) ?? null,
-    version: readOptionalNullableString(record, "version", `${label}.frontmatter`) ?? null,
-  };
-}
-
-function readResolutionMode(value: unknown, label: string): DriverResolvedSkill["resolutionMode"] {
-  if (value === "auto" || value === "explicit" || value === "tombstone") {
-    return value;
-  }
-
-  throw new TypeError(`${label}.resolutionMode is unsupported.`);
-}
-
-function readSkillCatalogEntry(value: unknown, index: number): DriverSkillCatalogEntry {
-  const label = `execution.skillCatalog[${index}]`;
-  const record = readRecord(value, label);
-
-  return {
-    frontmatter: readSkillFrontmatter(record["frontmatter"], label),
-    mountPath: readNonEmptyString(record, "mountPath", label),
-    resolutionMode: readResolutionMode(record["resolutionMode"], label),
-    skillId: parseId(record["skillId"], `${label}.skillId`) as SkillId,
-    skillName: readNonEmptyString(record, "skillName", label),
-  };
-}
-
-function readResolvedSkill(value: unknown, index: number): DriverResolvedSkill {
-  const label = `execution.skills[${index}]`;
-  const record = readRecord(value, label);
-  const archiveFormat = readNonEmptyString(record, "archiveFormat", label);
-  const compression = readNonEmptyString(record, "compression", label);
-  const materializationStatus = readNonEmptyString(record, "materializationStatus", label);
-  const snapshotId = readOptionalNullableString(record, "snapshotId", label);
-  const warningCode = readOptionalNullableString(record, "warningCode", label);
-
-  if (archiveFormat !== "zip") {
-    throw new TypeError(`${label}.archiveFormat must be zip.`);
-  }
-
-  if (compression !== "deflate") {
-    throw new TypeError(`${label}.compression must be deflate.`);
-  }
-
-  if (
-    materializationStatus !== "failed" &&
-    materializationStatus !== "pending" &&
-    materializationStatus !== "ready" &&
-    materializationStatus !== "skipped"
-  ) {
-    throw new TypeError(`${label}.materializationStatus is unsupported.`);
-  }
-
-  return {
-    archiveFormat,
-    blobSha256: readNonEmptyString(record, "blobSha256", label),
-    compression,
-    downloadUrl: readNonEmptyString(record, "downloadUrl", label),
-    materializationStatus,
-    mountPath: readNonEmptyString(record, "mountPath", label),
-    resolutionMode: readResolutionMode(record["resolutionMode"], label),
-    skillId: parseId(record["skillId"], `${label}.skillId`) as SkillId,
-    skillName: readNonEmptyString(record, "skillName", label),
-    ...(snapshotId === undefined
-      ? {}
-      : {
-          snapshotId:
-            snapshotId === null
-              ? null
-              : (parseId(snapshotId, `${label}.snapshotId`) as SkillSnapshotId),
-        }),
-    ...(warningCode === undefined ? {} : { warningCode }),
-  };
-}
-
-function readBuiltInToolName(value: unknown, label: string): DriverBuiltInToolName {
-  if (
-    value === "bash" ||
-    value === "edit" ||
-    value === "glob" ||
-    value === "grep" ||
-    value === "read" ||
-    value === "web_fetch" ||
-    value === "web_search" ||
-    value === "write"
-  ) {
-    return value;
-  }
-
-  throw new TypeError(`${label} is unsupported.`);
-}
-
-function readBuiltInTool(value: unknown, index: number): DriverBuiltInToolConfig {
-  const label = `execution.builtInTools[${index}]`;
-  const record = readRecord(value, label);
-
-  return {
-    enabled: readBoolean(record["enabled"], `${label}.enabled`),
-    name: readBuiltInToolName(record["name"], `${label}.name`),
-  };
-}
-
-function readBootMcpServer(value: unknown, index: number): DriverBootMcpServer {
-  const label = `execution.session.mcpServers[${index}]`;
-  const record = readRecord(value, label);
-  const authorizationState = readNonEmptyString(record, "authorizationState", label);
-  const subjectLabel = readOptionalNullableString(record, "subjectLabel", label);
-  const common = {
-    authType: readNonEmptyString(record, "authType", label),
-    credentialScope: readNonEmptyString(record, "credentialScope", label),
-    credentialStatus: readNonEmptyString(record, "credentialStatus", label),
-    name: readNonEmptyString(record, "name", label),
-    serverId: parseId(record["serverId"], `${label}.serverId`) as McpServerId,
-    ...(subjectLabel === undefined ? {} : { subjectLabel }),
-  };
-
-  if (authorizationState === "active") {
-    return {
-      ...common,
-      authorizationState,
-      credentialId: parseId(record["credentialId"], `${label}.credentialId`) as CredentialId,
-      proxyGrantId: readNonEmptyString(record, "proxyGrantId", label),
-      proxyUrl: readNonEmptyString(record, "proxyUrl", label),
-    };
-  }
-
-  if (
-    authorizationState !== "authorization_required" &&
-    authorizationState !== "disabled" &&
-    authorizationState !== "expired" &&
-    authorizationState !== "revoked"
-  ) {
-    throw new TypeError(`${label}.authorizationState is unsupported.`);
-  }
-
-  return {
-    ...common,
-    authorizationState,
-  };
-}
-
-function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
-  const record = readRecord(value, "execution.session");
-  const recoveryMessages =
-    record["recoveryMessages"] === undefined
-      ? []
-      : readArray(record["recoveryMessages"], "execution.session.recoveryMessages").map(
-          (entry, index): DriverRecoveryMessage => {
-            const label = `execution.session.recoveryMessages[${index}]`;
-            const message = readRecord(entry, label);
-            const role = readNonEmptyString(message, "role", label);
-
-            if (role !== "assistant" && role !== "user") {
-              throw new TypeError(`${label}.role is unsupported.`);
-            }
-
-            return {
-              content: readNonEmptyString(message, "content", label),
-              role,
-            };
-          },
-        );
-
-  return {
-    additionalDirectories: readStringArray(record, "additionalDirectories", "execution.session"),
-    context: readExecutionSessionContext(record["context"]),
-    cwd: readNonEmptyString(record, "cwd", "execution.session"),
-    mcpServers: readArray(record["mcpServers"], "execution.session.mcpServers").map(
-      readBootMcpServer,
-    ),
-    nativeResumeRef: readNativeRuntimeRef(record["nativeResumeRef"]),
-    recoveryMessages,
-  };
-}
-
-function readPermissionPolicy(value: unknown): DriverPermissionPolicy {
-  if (value === undefined || value === null) {
-    return DEFAULT_DRIVER_PERMISSION_POLICY;
-  }
-
-  if (value === "full_access" || value === "supervised") {
-    return value;
-  }
-
-  throw new TypeError("execution.permissionPolicy is unsupported.");
-}
-
-function readExecution(value: unknown): DriverExecutionSpec {
-  const record = readRecord(value, "execution");
-  const environment = readRecord(record["environment"], "execution.environment");
-
-  return {
-    builtInTools: readArray(record["builtInTools"], "execution.builtInTools").map(readBuiltInTool),
-    configRevision: readConfigRevision(record["configRevision"]),
-    environment: {
-      ...(environment["paths"] === undefined
-        ? {}
-        : { paths: readEnvironmentPaths(environment["paths"]) }),
-      variables: readVariables(environment["variables"]),
-    },
-    model: readNonEmptyString(record, "model", "execution"),
-    permissionPolicy: readPermissionPolicy(record["permissionPolicy"]),
-    profilePrompt: readString(record, "profilePrompt", "execution"),
-    provider: readNonEmptyString(record, "provider", "execution"),
-    providerOptions:
-      record["providerOptions"] === undefined
-        ? {}
-        : readJsonObject(record["providerOptions"], "execution.providerOptions"),
-    session: readExecutionSession(record["session"]),
-    skillCatalog: readArray(record["skillCatalog"], "execution.skillCatalog").map(
-      readSkillCatalogEntry,
-    ),
-    skills: readArray(record["skills"], "execution.skills").map(readResolvedSkill),
-  };
-}
+export type DriverBootPayload = z.infer<typeof driverBootPayloadSchema>;
 
 export function parseDriverBootPayload(value: unknown): DriverBootPayload {
-  const record = readRecord(value, "Driver boot payload");
-  const driverControlPort = readInteger(record, "driverControlPort", "Driver boot payload");
-  const driverGeneration = readInteger(record, "driverGeneration", "Driver boot payload");
-  const heartbeatIntervalMs = readNumber(record, "heartbeatIntervalMs", "Driver boot payload");
-  const protocolVersion = readInteger(record, "protocolVersion", "Driver boot payload");
-  const runtime = readNonEmptyString(record, "runtime", "Driver boot payload");
-  const runtimeTransport = readNonEmptyString(record, "runtimeTransport", "Driver boot payload");
+  const result = driverBootPayloadSchema.safeParse(value);
 
-  if (driverControlPort < DRIVER_CONTROL_PORT_MIN || driverControlPort > DRIVER_CONTROL_PORT_MAX) {
-    throw new TypeError(
-      `Driver boot payload.driverControlPort must be between ${DRIVER_CONTROL_PORT_MIN} and ${DRIVER_CONTROL_PORT_MAX}.`,
-    );
+  if (!result.success) {
+    throw new TypeError(z.prettifyError(result.error));
   }
 
-  if (driverGeneration < 0) {
-    throw new TypeError("Driver boot payload.driverGeneration must be non-negative.");
-  }
-
-  if (heartbeatIntervalMs < 250) {
-    throw new TypeError("Driver boot payload.heartbeatIntervalMs must be at least 250.");
-  }
-
-  if (protocolVersion !== DRIVER_PROTOCOL_VERSION) {
-    throw new TypeError(`Driver boot payload.protocolVersion must be ${DRIVER_PROTOCOL_VERSION}.`);
-  }
-
-  if (!isSupportedDriverRuntime(runtime)) {
-    throw new TypeError(`Unsupported runtime: ${runtime}.`);
-  }
-
-  if (!isSupportedDriverRuntimeTransport(runtimeTransport)) {
-    throw new TypeError(`Unsupported runtime transport: ${runtimeTransport}.`);
-  }
-
-  const controlUrl = readNonEmptyString(record, "controlUrl", "Driver boot payload");
-
-  try {
-    void new URL(controlUrl);
-  } catch {
-    throw new TypeError("Driver boot payload.controlUrl must be an absolute URL.");
-  }
-
-  const execution = readExecution(record["execution"]);
-  const sandboxId = parseId(record["sandboxId"], "Driver sandbox ID") as SandboxId;
-
-  if (sandboxId !== execution.session.context.sandboxId) {
-    throw new TypeError("Driver boot payload sandbox IDs must match.");
-  }
-
-  return {
-    bootToken: readNonEmptyString(record, "bootToken", "Driver boot payload"),
-    controlUrl,
-    driverControlPort,
-    driverGeneration,
-    driverInstanceId: parseId(record["driverInstanceId"], "Driver instance ID") as DriverInstanceId,
-    execution,
-    heartbeatIntervalMs,
-    protocolVersion,
-    runtime,
-    runtimeTransport,
-    sandboxId,
-    traceparent: readNonEmptyString(record, "traceparent", "Driver boot payload"),
-  };
+  return result.data;
 }
 
 export function parseDriverBootPayloadJson(raw: string): DriverBootPayload {

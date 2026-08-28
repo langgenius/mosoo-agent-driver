@@ -14,7 +14,6 @@ import { Readable, Writable } from "node:stream";
 
 import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
-import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
@@ -76,7 +75,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #clientRequests: AcpClientRequestHandler;
   #connection: ClientConnection | null = null;
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
-  #hostSnapshot: DriverHostIntegrationSnapshot | null = null;
   #nativeSessionId: string | null = null;
   #nativeInstructionPath: string | null = null;
   readonly #payload: DriverStartInput;
@@ -122,13 +120,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     try {
       await raceWithAbort(this.#clientRequests.initializePathScope(), signal);
-      const hostSnapshot = await raceWithAbort(context.ports.hostIntegration.snapshot(), signal);
-
-      if (hostSnapshot === null) {
-        throw new Error("ACP fallback requires a host integration snapshot.");
-      }
-
-      this.#hostSnapshot = hostSnapshot;
       const materializedSkills = await context.ports.skill.materialize(
         this.#payload.execution,
         signal,
@@ -432,7 +423,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
       runId,
       this.#requireConnection(),
       this.#requireSessionId(),
-      this.#requireHostSnapshot(),
       this.#clientRequests,
       signal,
     );
@@ -723,14 +713,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return this.#nativeSessionId;
   }
 
-  #requireHostSnapshot(): DriverHostIntegrationSnapshot {
-    if (this.#hostSnapshot === null) {
-      throw new Error("ACP driver backend host integration snapshot is not initialized.");
-    }
-
-    return this.#hostSnapshot;
-  }
-
   async #joinStop(): Promise<void> {
     if (this.#stopFailure !== null) {
       throw this.#stopFailure.error;
@@ -803,7 +785,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
   }
 
   async #setupSession(signal: AbortSignal): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
-    const hostSnapshot = this.#requireHostSnapshot();
     signal.throwIfAborted();
     const deferredUpdates =
       this.#nativeSessionId === null ||
@@ -819,7 +800,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
           connection: this.#requireConnection(),
           currentSessionId: this.#nativeSessionId,
           payload: this.#payload,
-          sessionContext: hostSnapshot.sessionContext,
           replaySession: async (operation) => this.#clientRequests.withSessionReplay(operation),
         }),
         signal,

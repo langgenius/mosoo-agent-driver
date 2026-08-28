@@ -1088,6 +1088,7 @@ describe("OpenAI app-server startup", () => {
         ["message.started", undefined],
         ["item.started", undefined],
         ["tool.call.updated", "running"],
+        ["agent.tasks.replaced", undefined],
         ["run.started", undefined],
         ["run.cancel.requested", undefined],
         ["message.cancelled", undefined],
@@ -1457,7 +1458,7 @@ describe("OpenAI app-server startup", () => {
         harness.events
           .filter((event) => event.runId === DRIVER_TEST_IDS.runId)
           .map((event) => event.kind),
-      ).toEqual(["run.started", "run.failed"]);
+      ).toEqual(["agent.tasks.replaced", "run.started", "run.failed"]);
     } finally {
       await harness.releaseTurnStartResponse();
       await harness.backend
@@ -1537,7 +1538,7 @@ describe("OpenAI app-server startup", () => {
         harness.events
           .filter((event) => event.runId === DRIVER_TEST_IDS.runId)
           .map((event) => event.kind),
-      ).toEqual(["run.started", "run.failed"]);
+      ).toEqual(["agent.tasks.replaced", "run.started", "run.failed"]);
       const terminal = harness.events.find((event) => event.kind === "run.failed");
       expect(terminal).toMatchObject({
         payload: {
