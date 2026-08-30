@@ -119,16 +119,14 @@ describe("public API", () => {
       "/workspace/se/session-1/session-files",
     );
     expect(getSessionResourceBackingPathFromSubpath("session-1")).toBe(
-      "/workspace/se/session-1/.mosoo-session-files-session-1",
+      "/workspace/.mosoo/session-files/session-1",
     );
     expect(
-      isSandboxSessionResourceBackingPath(
-        "/workspace/se/session-1/.mosoo-session-files-session-1/nested.txt",
-      ),
+      isSandboxSessionResourceBackingPath("/workspace/.mosoo/session-files/session-1/nested.txt"),
     ).toBe(true);
     expect(
       isSandboxSessionResourceBackingPath(
-        "/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt",
+        "/workspace/.mosoo/session-files-other/session-1/nested.txt",
       ),
     ).toBe(false);
     expect(
@@ -137,9 +135,7 @@ describe("public API", () => {
       ),
     ).toBe(false);
     expect(() =>
-      normalizeSandboxFileBrowserPath(
-        "/workspace/se/session-1/.mosoo-session-files-session-1/nested.txt",
-      ),
+      normalizeSandboxFileBrowserPath("/workspace/.mosoo/session-files/session-1/nested.txt"),
     ).toThrow("Session resource backing is not visible");
     expect(
       normalizeSandboxFileBrowserPath(
