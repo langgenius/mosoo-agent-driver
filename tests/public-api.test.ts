@@ -37,7 +37,13 @@ import {
   parseDriverReadyInput as parseDriverReadyInputFromOrpcSubpath,
 } from "@mosoo/agent-driver/orpc";
 import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "@mosoo/agent-driver/orpc";
-import { SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH } from "@mosoo/agent-driver/paths";
+import {
+  SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH,
+  getSessionResourceBackingPath as getSessionResourceBackingPathFromSubpath,
+  getSessionResourceRootPath as getSessionResourceRootPathFromSubpath,
+  isSandboxSessionResourceBackingPath,
+  normalizeSandboxFileBrowserPath,
+} from "@mosoo/agent-driver/paths";
 import { filterOpenAiPrivateCitations } from "@mosoo/agent-driver/provider-output";
 import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "@mosoo/agent-driver/runtime";
 
@@ -109,6 +115,37 @@ describe("public API", () => {
     });
     expect(isSupportedDriverRuntimeFromSubpath("openai-runtime")).toBe(true);
     expect(SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH).toBe("/workspace/memory");
+    expect(getSessionResourceRootPathFromSubpath("session-1")).toBe(
+      "/workspace/se/session-1/session-files",
+    );
+    expect(getSessionResourceBackingPathFromSubpath("session-1")).toBe(
+      "/workspace/se/session-1/.mosoo-session-files-session-1",
+    );
+    expect(
+      isSandboxSessionResourceBackingPath(
+        "/workspace/se/session-1/.mosoo-session-files-session-1/nested.txt",
+      ),
+    ).toBe(true);
+    expect(
+      isSandboxSessionResourceBackingPath(
+        "/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt",
+      ),
+    ).toBe(false);
+    expect(
+      isSandboxSessionResourceBackingPath(
+        "/workspace/se/session-1/public/.mosoo-session-files-session-1",
+      ),
+    ).toBe(false);
+    expect(() =>
+      normalizeSandboxFileBrowserPath(
+        "/workspace/se/session-1/.mosoo-session-files-session-1/nested.txt",
+      ),
+    ).toThrow("Session resource backing is not visible");
+    expect(
+      normalizeSandboxFileBrowserPath(
+        "/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt",
+      ),
+    ).toBe("/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt");
     expect(filterOpenAiPrivateCitations("plain text")).toEqual({
       privateCitationCount: 0,
       text: "plain text",

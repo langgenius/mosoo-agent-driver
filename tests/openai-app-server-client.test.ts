@@ -2,7 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -15,6 +15,7 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import * as childProcessHelpers from "../src/runtimes/child-process";
 import { OpenAiAppServerClient, limitNdjsonLines } from "../src/runtimes/openai/app-server-client";
+import * as openAiAuthState from "../src/runtimes/openai/auth-state";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/app-server-protocol";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
@@ -28,6 +29,55 @@ const initializeResult = {
   userAgent: "test-app-server/0.151.0",
 } as const;
 const initializeResultJson = JSON.stringify(initializeResult);
+const nativeResumeResultJson = JSON.stringify({
+  activePermissionProfile: null,
+  approvalPolicy: "on-request",
+  approvalsReviewer: "user",
+  cwd: "/workspace",
+  instructionSources: [],
+  model: "gpt-5.6",
+  modelProvider: "openai",
+  multiAgentMode: "explicitRequestOnly",
+  reasoningEffort: "high",
+  runtimeWorkspaceRoots: ["/workspace"],
+  sandbox: {
+    excludeSlashTmp: false,
+    excludeTmpdirEnvVar: false,
+    networkAccess: false,
+    type: "workspaceWrite",
+    writableRoots: ["/workspace"],
+  },
+  serviceTier: null,
+  thread: {
+    agentNickname: null,
+    agentRole: null,
+    canAcceptDirectInput: true,
+    cliVersion: "0.151.0",
+    createdAt: 1,
+    cwd: "/workspace",
+    ephemeral: false,
+    extra: null,
+    forkedFromId: null,
+    gitInfo: null,
+    historyMode: "paginated",
+    id: "thread-1",
+    modelProvider: "openai",
+    name: null,
+    parentThreadId: null,
+    path: null,
+    preview: "retained",
+    projectId: null,
+    recencyAt: null,
+    section: null,
+    sectionEnteredAt: null,
+    sessionId: "thread-1",
+    source: "appServer",
+    status: { type: "idle" },
+    threadSource: null,
+    turns: [],
+    updatedAt: 2,
+  },
+});
 
 function isProcessRunning(pid: number): boolean {
   try {
@@ -57,6 +107,7 @@ async function createClientHarness(
   requestPermission: AgentDriverPermissionPort["request"] = async () => "allow_once",
   interpreter = "bun",
   environment: DriverExecutionEnvironment = driverBootPayload.execution.environment,
+  runtimeOptions: { driverGeneration?: number; homePath?: string } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "mosoo-openai-client-"));
   temporaryDirectories.push(directory);
@@ -67,6 +118,7 @@ async function createClientHarness(
 
   const payload = createDriverStartInputFromBootPayload({
     ...driverBootPayload,
+    driverGeneration: runtimeOptions.driverGeneration ?? driverBootPayload.driverGeneration,
     execution: {
       ...driverBootPayload.execution,
       environment,
@@ -74,7 +126,7 @@ async function createClientHarness(
         ...driverBootPayload.execution.session,
         context: {
           ...driverBootPayload.execution.session.context,
-          homePath: join(directory, "home"),
+          homePath: runtimeOptions.homePath ?? join(directory, "home"),
           sessionOrganizationPath: directory,
         },
         cwd: directory,
@@ -120,6 +172,196 @@ afterEach(async () => {
 });
 
 describe("OpenAi app-server client", () => {
+  test("keeps transient API-key auth for the fake app-server lifetime", async () => {
+    const harness = await createClientHarness(
+      (directory) => `
+await Bun.write(${JSON.stringify(join(directory, "runtime-env.json"))}, JSON.stringify({
+  codexHome: process.env.CODEX_HOME,
+  sqliteHome: process.env.CODEX_SQLITE_HOME,
+}));
+await Bun.write(process.env.CODEX_SQLITE_HOME + "/state.sqlite", "sqlite-state");
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      undefined,
+      "bun",
+      {
+        ...driverBootPayload.execution.environment,
+        variables: { OPENAI_API_KEY: "client-lifetime-key" },
+      },
+    );
+
+    try {
+      await harness.client.start();
+      const runtimeEnv = JSON.parse(
+        await readFile(join(harness.directory, "runtime-env.json"), "utf8"),
+      ) as { codexHome: string; sqliteHome: string };
+      const authJsonPath = join(runtimeEnv.codexHome, "auth.json");
+
+      expect(runtimeEnv.codexHome).not.toBe(join(harness.directory, "home"));
+      expect(runtimeEnv.sqliteHome).toBe(join(harness.directory, "home"));
+      expect((await lstat(authJsonPath)).isFile()).toBe(true);
+      expect((await lstat(authJsonPath)).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(authJsonPath, "utf8"))).toMatchObject({
+        OPENAI_API_KEY: "client-lifetime-key",
+      });
+      await expect(harness.client.start()).rejects.toThrow("cannot be started more than once");
+      expect(await readFile(authJsonPath, "utf8")).toContain("client-lifetime-key");
+      await harness.client.stop();
+      await expect(lstat(runtimeEnv.codexHome)).rejects.toThrow();
+      expect((await lstat(join(runtimeEnv.sqliteHome, "sessions"))).isDirectory()).toBe(true);
+      expect(await readFile(join(runtimeEnv.sqliteHome, "state.sqlite"), "utf8")).toBe(
+        "sqlite-state",
+      );
+      await expect(lstat(join(runtimeEnv.sqliteHome, "auth.json"))).rejects.toThrow();
+    } finally {
+      await harness.client.stop().catch(() => {});
+    }
+  });
+
+  test("cleans transient API-key auth when fake app-server startup fails", async () => {
+    const harness = await createClientHarness(
+      (directory) => `
+await Bun.write(${JSON.stringify(join(directory, "failed-runtime-home"))}, process.env.CODEX_HOME);
+process.stdin.once("data", (chunk) => {
+  const request = JSON.parse(String(chunk).trim());
+  process.stdout.write(JSON.stringify({
+    error: { code: -32000, message: "initialize rejected" },
+    id: request.id,
+  }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      undefined,
+      "bun",
+      {
+        ...driverBootPayload.execution.environment,
+        variables: { OPENAI_API_KEY: "failed-start-key" },
+      },
+    );
+
+    try {
+      await expect(harness.client.start()).rejects.toThrow("initialize rejected");
+      const runtimeHome = await readFile(join(harness.directory, "failed-runtime-home"), "utf8");
+      await expect(lstat(runtimeHome)).rejects.toThrow();
+      await expect(lstat(join(harness.directory, "home", "auth.json"))).rejects.toThrow();
+    } finally {
+      await harness.client.stop().catch(() => {});
+    }
+  });
+
+  test("lists and resumes persistent native state across Driver generations", async () => {
+    const sharedRoot = await mkdtemp(join(tmpdir(), "mosoo-openai-native-state-"));
+    temporaryDirectories.push(sharedRoot);
+    const persistentRuntimeHome = join(sharedRoot, "home");
+    const environment = {
+      ...driverBootPayload.execution.environment,
+      variables: { OPENAI_API_KEY: "native-state-key" },
+    };
+    const first = await createClientHarness(
+      (directory) => `
+await Bun.write(process.env.CODEX_HOME + "/sessions/thread-1.jsonl", "rollout");
+await Bun.write(process.env.CODEX_SQLITE_HOME + "/state.sqlite", "sqlite");
+await Bun.write(${JSON.stringify(join(directory, "runtime-home"))}, process.env.CODEX_HOME);
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.id !== undefined) {
+      process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+    }
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      undefined,
+      "bun",
+      environment,
+      { driverGeneration: 1, homePath: persistentRuntimeHome },
+    );
+
+    let firstRuntimeHome = "";
+    try {
+      await first.client.start();
+      firstRuntimeHome = await readFile(join(first.directory, "runtime-home"), "utf8");
+    } finally {
+      await first.client.stop().catch(() => {});
+    }
+    await expect(lstat(firstRuntimeHome)).rejects.toThrow();
+    expect(await readFile(join(persistentRuntimeHome, "sessions", "thread-1.jsonl"), "utf8")).toBe(
+      "rollout",
+    );
+    expect(await readFile(join(persistentRuntimeHome, "state.sqlite"), "utf8")).toBe("sqlite");
+
+    const successor = await createClientHarness(
+      (directory) => `
+import { readdirSync, readFileSync } from "node:fs";
+await Bun.write(${JSON.stringify(join(directory, "observation.json"))}, JSON.stringify({
+  codexHome: process.env.CODEX_HOME,
+  sessions: readdirSync(process.env.CODEX_HOME + "/sessions"),
+  sqlite: readFileSync(process.env.CODEX_SQLITE_HOME + "/state.sqlite", "utf8"),
+}));
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) >= 0) {
+    const request = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (request.id === undefined) continue;
+    const result = request.method === "thread/resume"
+      ? ${nativeResumeResultJson}
+      : ${initializeResultJson};
+    process.stdout.write(JSON.stringify({ id: request.id, result }) + "\\n");
+  }
+});
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      undefined,
+      "bun",
+      environment,
+      { driverGeneration: 2, homePath: persistentRuntimeHome },
+    );
+
+    try {
+      await successor.client.start();
+      const observation = JSON.parse(
+        await readFile(join(successor.directory, "observation.json"), "utf8"),
+      ) as { codexHome: string; sessions: string[]; sqlite: string };
+      expect(observation.codexHome).not.toBe(firstRuntimeHome);
+      expect(observation.sessions).toContain("thread-1.jsonl");
+      expect(observation.sqlite).toBe("sqlite");
+      await expect(
+        successor.client.request("thread/resume", { threadId: "thread-1" }),
+      ).resolves.toMatchObject({ thread: { id: "thread-1" } });
+      await successor.client.stop();
+      await expect(lstat(observation.codexHome)).rejects.toThrow();
+    } finally {
+      await successor.client.stop().catch(() => {});
+    }
+  });
+
   test("declares only initialized server-request capabilities it handles", async () => {
     const harness = await createClientHarness(
       (directory) => `
@@ -626,6 +868,109 @@ setInterval(() => {}, 1000);
       expect(await Bun.file(join(harness.directory, "spawned")).exists()).toBe(false);
     } finally {
       await harness.client.stop();
+    }
+  });
+
+  test.each(["home", "auth"] as const)(
+    "waits for in-flight %s setup before cleaning the private runtime home",
+    async (phase) => {
+      const entered = Promise.withResolvers<string>();
+      const release = Promise.withResolvers<void>();
+      const nativeCreate = openAiAuthState.createOpenAiRuntimeHome;
+      const nativeAuth = openAiAuthState.materializeOpenAiAuthState;
+      const createSpy = spyOn(openAiAuthState, "createOpenAiRuntimeHome");
+      const authSpy = spyOn(openAiAuthState, "materializeOpenAiAuthState");
+
+      if (phase === "home") {
+        createSpy.mockImplementation(async (input) => {
+          const state = await nativeCreate(input);
+          entered.resolve(state.runtimeHome);
+          await release.promise;
+          return state;
+        });
+      } else {
+        authSpy.mockImplementation(async (input) => {
+          entered.resolve(input.runtimeHome);
+          await release.promise;
+          return nativeAuth(input);
+        });
+      }
+
+      const harness = await createClientHarness(
+        (directory) => `
+await Bun.write(${JSON.stringify(join(directory, "setup-race-spawned"))}, "spawned");
+setInterval(() => {}, 1000);
+`,
+        undefined,
+        undefined,
+        "bun",
+        {
+          ...driverBootPayload.execution.environment,
+          variables: { OPENAI_API_KEY: "setup-race-key" },
+        },
+      );
+
+      try {
+        const start = harness.client.start();
+        void start.catch(() => {});
+        const runtimeHome = await entered.promise;
+        const stop = harness.client.stop();
+
+        await expect(
+          settlePromiseWithTimeout(stop, {
+            label: "OpenAI setup-barrier stop",
+            timeoutMs: 25,
+          }),
+        ).resolves.toMatchObject({ status: "timed_out" });
+        expect((await lstat(runtimeHome)).isDirectory()).toBe(true);
+
+        release.resolve();
+        await expect(stop).resolves.toBeUndefined();
+        await expect(start).rejects.toThrow("stopped during startup");
+        await expect(lstat(runtimeHome)).rejects.toThrow();
+        expect(await Bun.file(join(harness.directory, "setup-race-spawned")).exists()).toBe(false);
+      } finally {
+        release.resolve();
+        createSpy.mockRestore();
+        authSpy.mockRestore();
+        await harness.client.stop().catch(() => {});
+      }
+    },
+  );
+
+  test("cleans its private runtime home when startup is aborted", async () => {
+    const harness = await createClientHarness(
+      (directory) => `
+await Bun.write(${JSON.stringify(join(directory, "aborted-runtime-home"))}, process.env.CODEX_HOME);
+process.stdin.resume();
+setInterval(() => {}, 1000);
+`,
+      undefined,
+      undefined,
+      "bun",
+      {
+        ...driverBootPayload.execution.environment,
+        variables: { OPENAI_API_KEY: "aborted-start-key" },
+      },
+    );
+    const controller = new AbortController();
+
+    try {
+      const start = harness.client.start(controller.signal);
+      void start.catch(() => {});
+      const runtimeHomeFile = Bun.file(join(harness.directory, "aborted-runtime-home"));
+      for (let attempt = 0; attempt < 100 && !(await runtimeHomeFile.exists()); attempt += 1) {
+        await Bun.sleep(5);
+      }
+      const runtimeHome = await runtimeHomeFile.text();
+      controller.abort(new Error("startup aborted"));
+
+      await expect(start).rejects.toThrow("startup aborted");
+      await expect(lstat(runtimeHome)).rejects.toThrow();
+      await expect(lstat(join(harness.directory, "home", "auth.json"))).rejects.toThrow();
+    } finally {
+      controller.abort();
+      await harness.client.stop().catch(() => {});
     }
   });
 
@@ -1513,6 +1858,7 @@ setInterval(() => {}, 1000);
     const harness = await createClientHarness(
       (directory) => `
 import { spawn } from "node:child_process";
+await Bun.write(${JSON.stringify(join(directory, "runtime-home"))}, process.env.CODEX_HOME);
 const descendant = spawn("/usr/bin/setsid", [
   process.execPath,
   "-e",
@@ -1534,6 +1880,13 @@ process.stdin.on("data", (chunk) => {
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
 `,
+      undefined,
+      undefined,
+      "bun",
+      {
+        ...driverBootPayload.execution.environment,
+        variables: { OPENAI_API_KEY: "retry-stop-key" },
+      },
     );
     const nativeKill = process.kill;
     let childPid = 0;
@@ -1542,6 +1895,7 @@ setInterval(() => {}, 1000);
 
     try {
       await harness.client.start();
+      const runtimeHome = await Bun.file(join(harness.directory, "runtime-home")).text();
       childPid = Number(await Bun.file(join(harness.directory, "pid")).text());
       descendantPid = Number(await Bun.file(join(harness.directory, "descendant-pid")).text());
       process.kill = ((pid, signal) => {
@@ -1553,8 +1907,11 @@ setInterval(() => {}, 1000);
       }) as typeof process.kill;
 
       await expect(harness.client.stop()).rejects.toThrow("process tree did not exit");
+      expect(await readFile(join(runtimeHome, "auth.json"), "utf8")).toContain("retry-stop-key");
       suppressKill = false;
       await expect(harness.client.stop()).resolves.toBeUndefined();
+      await expect(lstat(runtimeHome)).rejects.toThrow();
+      expect((await lstat(join(harness.directory, "home", "sessions"))).isDirectory()).toBe(true);
     } finally {
       process.kill = nativeKill;
 

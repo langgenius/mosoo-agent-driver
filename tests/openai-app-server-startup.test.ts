@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -43,6 +43,7 @@ interface CancellationHarnessOptions {
   readonly duplicateRequestPhase?: "active_turn" | "turn_start";
   readonly emitInterruptedTurnOnStart?: boolean;
   readonly emitToolCompletionOnTurnStart?: boolean;
+  readonly environmentVariables?: Readonly<Record<string, string>>;
   readonly failCancellationRequest?: boolean;
   readonly failInitialThreadStart?: boolean;
   readonly holdCancellationRequest?: boolean;
@@ -114,7 +115,12 @@ const launchNumber = existsSync(${JSON.stringify(launchCountFile)})
   ? Number(readFileSync(${JSON.stringify(launchCountFile)}, "utf8")) + 1
   : 1;
 writeFileSync(${JSON.stringify(launchCountFile)}, String(launchNumber));
-appendFileSync(${JSON.stringify(processLog)}, JSON.stringify({ launchNumber, pid: process.pid }) + "\\n");
+appendFileSync(${JSON.stringify(processLog)}, JSON.stringify({
+  codexHome: process.env.CODEX_HOME,
+  launchNumber,
+  pid: process.pid,
+  sqliteHome: process.env.CODEX_SQLITE_HOME,
+}) + "\\n");
 const sendInterrupted = (turnId) => process.stdout.write(JSON.stringify({
   method: "turn/completed",
   params: {
@@ -414,6 +420,13 @@ process.stdin.on("data", (chunk) => {
     ...driverBootPayload,
     execution: {
       ...driverBootPayload.execution,
+      environment: {
+        ...driverBootPayload.execution.environment,
+        variables: {
+          ...driverBootPayload.execution.environment.variables,
+          ...cancellationOptions.environmentVariables,
+        },
+      },
       permissionPolicy,
       session: {
         ...driverBootPayload.execution.session,
@@ -606,6 +619,39 @@ function createCancellationHarness(options: CancellationHarnessOptions) {
 }
 
 describe("OpenAI app-server startup", () => {
+  test("keeps transient auth through fake app-server native-resume startup", async () => {
+    const harness = await createHarness(
+      "no rollout found for thread id stale-thread",
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      { environmentVariables: { OPENAI_API_KEY: "resume-startup-key" } },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      const firstLaunch = JSON.parse(
+        (await readFile(harness.processLog, "utf8")).trim().split("\n")[0] ?? "{}",
+      ) as { codexHome: string; sqliteHome: string };
+      const authJsonPath = join(firstLaunch.codexHome, "auth.json");
+
+      expect(firstLaunch.sqliteHome).toBe(harness.payload.execution.session.homePath);
+      expect(JSON.parse(await readFile(authJsonPath, "utf8"))).toMatchObject({
+        OPENAI_API_KEY: "resume-startup-key",
+      });
+      expect(await readFile(harness.requestLog, "utf8")).toContain('"method":"thread/resume"');
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await expect(lstat(firstLaunch.codexHome)).rejects.toThrow();
+      expect((await lstat(join(firstLaunch.sqliteHome, "sessions"))).isDirectory()).toBe(true);
+    } finally {
+      await harness.backend
+        .stop(harness.context, "test complete", new AbortController().signal)
+        .catch(() => {});
+    }
+  });
+
   test("maps supervised permissions to untrusted thread and turn policies", async () => {
     const harness = await createHarness(
       "no rollout found for thread id stale-thread",

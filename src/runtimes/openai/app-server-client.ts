@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
-import { mkdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import type { Interface as ReadlineInterface } from "node:readline";
 import { Transform } from "node:stream";
@@ -27,7 +26,9 @@ import { summarizeOpenAiProxyEnv } from "./app-server-env";
 import { isRecord, readNonEmptyString, toJsonRpcId } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
 import {
-  materializeOpenAiApiKeyAuthState,
+  cleanupOpenAiRuntimeHome,
+  createOpenAiRuntimeHome,
+  materializeOpenAiAuthState,
   materializeOpenAiModelProviderConfig,
 } from "./auth-state";
 import type {
@@ -68,6 +69,8 @@ interface OpenAiAppServerClientStartPhase {
 interface OpenAiAppServerClientStartResult {
   readonly phases: readonly OpenAiAppServerClientStartPhase[];
 }
+
+type OpenAiRuntimeHomeState = Awaited<ReturnType<typeof createOpenAiRuntimeHome>>;
 
 interface OpenAiClientContext extends AgentDriverContext {
   handleNotification<M extends ServerNotificationMethod>(
@@ -116,6 +119,7 @@ function summarizeJsonRpcErrorData(value: unknown): JsonObject | null {
 }
 
 const OPENAI_RUNTIME_HOME_ENV_NAME = "CODEX_HOME";
+const OPENAI_SQLITE_HOME_ENV_NAME = "CODEX_SQLITE_HOME";
 const DEFAULT_OPENAI_RUNTIME_EXECUTABLE = "codex";
 const APP_SERVER_TERMINATE_TIMEOUT_MS = 2_000;
 const APP_SERVER_KILL_TIMEOUT_MS = 1_000;
@@ -208,6 +212,8 @@ export class OpenAiAppServerClient {
   #protocolFailureCommit: Promise<void> | null = null;
   #protocolFailureTask: Promise<void> | null = null;
   #readline: ReadlineInterface | null = null;
+  #runtimeHomeSetup: Promise<void> | null = null;
+  #runtimeHomeState: OpenAiRuntimeHomeState | null = null;
   #serverMessageQueue: Promise<void> = Promise.resolve();
   #serverMessagesPaused = false;
   #startRequested = false;
@@ -236,12 +242,28 @@ export class OpenAiAppServerClient {
     }
     this.#startRequested = true;
 
+    try {
+      return await this.#performStart(signal);
+    } catch (error) {
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        const startupMessage = error instanceof Error ? error.message : "unknown error";
+        throw new AggregateError(
+          [error, cleanupError],
+          `OpenAi app-server startup failed (${startupMessage}) and cleanup also failed.`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async #performStart(signal?: AbortSignal): Promise<OpenAiAppServerClientStartResult> {
     const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
     const env = buildRuntimeChildProcessEnv(this.#payload.execution.environment.paths, {
       ...process.env,
       ...this.#payload.execution.environment.variables,
       ...mcpConfig.env,
-      [OPENAI_RUNTIME_HOME_ENV_NAME]: this.#payload.execution.session.homePath,
       LOG_FORMAT: "json",
     });
     const onAbort = () => {
@@ -257,12 +279,17 @@ export class OpenAiAppServerClient {
     signal?.addEventListener("abort", onAbort, { once: true });
 
     const phases: OpenAiAppServerClientStartPhase[] = [];
-    const measure = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
+    const measure = async <T>(
+      name: string,
+      task: () => Promise<T>,
+      abortable = true,
+    ): Promise<T> => {
       const startedAtMs = Date.now();
 
       try {
         signal?.throwIfAborted();
-        return await raceWithAbort(task(), signal);
+        const result = task();
+        return await (abortable ? raceWithAbort(result, signal) : result);
       } finally {
         phases.push({
           durationMs: toDurationMs(startedAtMs),
@@ -270,25 +297,57 @@ export class OpenAiAppServerClient {
         });
       }
     };
-    const { homePath } = this.#payload.execution.session;
-    const runtimeHome = homePath;
-    await measure("app_server.home.mkdir", () => mkdir(runtimeHome, { recursive: true }));
-
-    const authState = await measure("app_server.auth_state", () =>
-      materializeOpenAiApiKeyAuthState({
-        runtimeHome,
-        env,
-      }),
+    const persistentRuntimeHome = this.#payload.execution.session.homePath;
+    const setupTask = (async () => {
+      const runtimeHomeState = await measure(
+        "app_server.home.create",
+        async () => {
+          const state = await createOpenAiRuntimeHome({
+            driverGeneration: this.#payload.driverGeneration,
+            driverInstanceId: this.#payload.driverInstanceId,
+            persistentRuntimeHome,
+            ...(signal === undefined ? {} : { signal }),
+          });
+          this.#runtimeHomeState = state;
+          return state;
+        },
+        false,
+      );
+      signal?.throwIfAborted();
+      const { persistentRuntimeHome: sqliteHome, runtimeHome } = runtimeHomeState;
+      env[OPENAI_RUNTIME_HOME_ENV_NAME] = runtimeHome;
+      env[OPENAI_SQLITE_HOME_ENV_NAME] = sqliteHome;
+      const authState = await measure(
+        "app_server.auth_state",
+        () => materializeOpenAiAuthState({ env, runtimeHome }),
+        false,
+      );
+      signal?.throwIfAborted();
+      const modelProviderConfig = await measure(
+        "app_server.config",
+        () =>
+          materializeOpenAiModelProviderConfig({
+            env,
+            mcpServers: mcpConfig.mcpServers,
+            provider: this.#payload.execution.provider,
+            providerOptions: this.#payload.execution.providerOptions,
+            runtimeHome,
+          }),
+        false,
+      );
+      return { authState, modelProviderConfig };
+    })();
+    const setupBarrier = setupTask.then(
+      () => undefined,
+      () => undefined,
     );
-    const modelProviderConfig = await measure("app_server.config", () =>
-      materializeOpenAiModelProviderConfig({
-        env,
-        mcpServers: mcpConfig.mcpServers,
-        provider: this.#payload.execution.provider,
-        providerOptions: this.#payload.execution.providerOptions,
-        runtimeHome,
-      }),
-    );
+    this.#runtimeHomeSetup = setupBarrier;
+    void setupBarrier.finally(() => {
+      if (this.#runtimeHomeSetup === setupBarrier) {
+        this.#runtimeHomeSetup = null;
+      }
+    });
+    const { authState, modelProviderConfig } = await raceWithAbort(setupTask, signal);
 
     this.#context.logger.debug("driver.openai.auth_state.prepared", {
       authJsonWritten: authState.written,
@@ -636,6 +695,12 @@ export class OpenAiAppServerClient {
   }
 
   async #performStop(signal?: AbortSignal): Promise<void> {
+    await this.#runtimeHomeSetup;
+    await this.#stopProcess(signal);
+    await this.#cleanupRuntimeHome();
+  }
+
+  async #stopProcess(signal?: AbortSignal): Promise<void> {
     const child = this.#process;
     const target = this.#processTarget;
     const processClosed = this.#processClosed;
@@ -709,6 +774,19 @@ export class OpenAiAppServerClient {
       }
     } finally {
       signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #cleanupRuntimeHome(): Promise<void> {
+    const state = this.#runtimeHomeState;
+
+    if (state === null) {
+      return;
+    }
+
+    await cleanupOpenAiRuntimeHome(state);
+    if (this.#runtimeHomeState === state) {
+      this.#runtimeHomeState = null;
     }
   }
 

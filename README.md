@@ -181,6 +181,16 @@ The image contract in `environment-package-managers.json` exposes `npm` and `pip
 - public entries include typed exports
 - live artifact tests are gated by environment credentials
 
+## OpenAI Credential Boundary
+
+Each OpenAI app-server process receives a private temporary `CODEX_HOME` that is deleted only after its supervised process tree stops.
+
+OpenAI persistence in the session home is limited to native rollout, memory, and SQLite state.
+
+It must never contain `auth.json` or be used as a credential archive.
+
+The Driver fails closed when it finds legacy credentials there and accepts OpenAI API-key auth only from the current execution environment.
+
 ## Artifact Live Tests
 
 Every live test launches `dist/driver.mjs` as a child process and talks to it only through the production boot payload and control protocol.

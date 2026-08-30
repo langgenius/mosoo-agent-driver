@@ -6,6 +6,7 @@ export const SANDBOX_SESSION_STATE_DIR = ".state";
 export const SANDBOX_SESSION_ROOT = `${SANDBOX_WORKSPACE_ROOT}/se`;
 
 const SESSION_RESOURCE_MOUNT_DIR = "session-files";
+const SESSION_RESOURCE_BACKING_PREFIX = ".mosoo-session-files-";
 
 export function getSessionWorkspacePath(sessionId: string): string {
   return `${SANDBOX_SESSION_ROOT}/${sessionId}`;
@@ -21,6 +22,10 @@ export function getSessionStateRootPath(sessionId: string): string {
 
 export function getSessionResourceRootPath(sessionId: string): string {
   return `${getSessionWorkspacePath(sessionId)}/${SESSION_RESOURCE_MOUNT_DIR}`;
+}
+
+export function getSessionResourceBackingPath(sessionId: string): string {
+  return `${getSessionWorkspacePath(sessionId)}/${SESSION_RESOURCE_BACKING_PREFIX}${sessionId}`;
 }
 
 export function getSessionRuntimeStatePath(sessionId: string, runtimeId: string): string {
@@ -56,6 +61,20 @@ export function isSandboxSessionStatePath(path: string): boolean {
 
   return (
     sessionId !== undefined && sessionId.length > 0 && stateSegment === SANDBOX_SESSION_STATE_DIR
+  );
+}
+
+export function isSandboxSessionResourceBackingPath(path: string): boolean {
+  if (!isSandboxSessionPath(path)) {
+    return false;
+  }
+
+  const [sessionId, backingSegment] = path.slice(SANDBOX_SESSION_ROOT.length + 1).split("/");
+
+  return (
+    sessionId !== undefined &&
+    sessionId.length > 0 &&
+    backingSegment === `${SESSION_RESOURCE_BACKING_PREFIX}${sessionId}`
   );
 }
 
@@ -142,6 +161,10 @@ export function normalizeSandboxFileBrowserPath(rawPath: string): string {
 
   if (isSandboxSessionStatePath(path)) {
     throw new Error("Session runtime state is not visible in the Agent File Browser.");
+  }
+
+  if (isSandboxSessionResourceBackingPath(path)) {
+    throw new Error("Session resource backing is not visible in the Agent File Browser.");
   }
 
   if (!isAllowedSandboxFileBrowserPath(path)) {
