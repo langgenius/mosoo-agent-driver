@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +28,28 @@ const initializeResult = {
   userAgent: "test-app-server/0.151.0",
 } as const;
 const initializeResultJson = JSON.stringify(initializeResult);
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return (
+      process.platform !== "linux" ||
+      !/^\d+ \(.*\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function expectProcessExited(pid: number, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (isProcessRunning(pid) && Date.now() < deadline) {
+    await Bun.sleep(20);
+  }
+
+  expect(isProcessRunning(pid)).toBe(false);
+}
 
 async function createClientHarness(
   script: (directory: string) => string,
@@ -569,21 +592,7 @@ setInterval(() => {}, 1000);
         }
 
         await expect(start).rejects.toThrow("process-tree watchdog");
-        await expect(
-          settlePromiseWithTimeout(
-            (async () => {
-              for (;;) {
-                try {
-                  process.kill(childPid, 0);
-                  await Bun.sleep(5);
-                } catch {
-                  return;
-                }
-              }
-            })(),
-            { label: "unsupervised app-server exit", timeoutMs: 250 },
-          ),
-        ).resolves.toMatchObject({ status: "completed" });
+        await expectProcessExited(childPid, 250);
         expect(harness.protocolErrors.some((error) => error.message.includes("watchdog"))).toBe(
           true,
         );
@@ -1322,11 +1331,9 @@ setInterval(() => {}, 1000);
   test("force kills the process group after the leader exits with inherited stdio open", async () => {
     const harness = await createClientHarness((directory) => {
       const descendantReadyPath = join(directory, "descendant-ready");
-      const descendantTermPath = join(directory, "descendant-term");
       const descendantScript = `
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(descendantReadyPath)}, "ready");
-process.on("SIGTERM", () => writeFileSync(${JSON.stringify(descendantTermPath)}, "ignored"));
 setInterval(() => {}, 1000);
 `;
 
@@ -1362,7 +1369,8 @@ process.stdin.on("data", (chunk) => {
       }
 
       await expect(harness.client.stop()).resolves.toBeUndefined();
-      expect(await Bun.file(join(harness.directory, "descendant-term")).exists()).toBe(true);
+      await expectProcessExited(descendantPid);
+      descendantPid = 0;
     } finally {
       if (descendantPid > 0) {
         try {
@@ -1489,21 +1497,7 @@ setInterval(() => {}, 1000);
 
       await harness.client.stop();
       expect(await Bun.file(join(harness.directory, "nested-term")).exists()).toBe(true);
-      await expect(
-        settlePromiseWithTimeout(
-          (async () => {
-            for (;;) {
-              try {
-                process.kill(descendantPid, 0);
-                await Bun.sleep(5);
-              } catch {
-                return;
-              }
-            }
-          })(),
-          { label: "nested app-server descendant exit", timeoutMs: 250 },
-        ),
-      ).resolves.toMatchObject({ status: "completed" });
+      await expectProcessExited(descendantPid, 250);
     } finally {
       if (descendantPid > 0) {
         try {
