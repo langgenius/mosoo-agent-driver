@@ -908,10 +908,10 @@ describe("Claude Agent SDK provider fixtures", () => {
         return [];
       }
 
-      const rawInput = event.payload["rawInput"];
+      const rawInputDelta = event.payload["rawInputDelta"];
       const toolCallId = event.payload["toolCallId"];
-      return typeof rawInput === "string" && typeof toolCallId === "string"
-        ? [{ rawInput, toolCallId }]
+      return typeof rawInputDelta === "string" && typeof toolCallId === "string"
+        ? [{ rawInputDelta, toolCallId }]
         : [];
     });
     const thoughtDeltas = events().flatMap((event) => {
@@ -930,9 +930,9 @@ describe("Claude Agent SDK provider fixtures", () => {
     );
 
     expect(toolArguments).toEqual([
-      { rawInput: '{"a":', toolCallId: "tool-a" },
-      { rawInput: '{"b":1}', toolCallId: "tool-b" },
-      { rawInput: "1}", toolCallId: "tool-a" },
+      { rawInputDelta: '{"a":', toolCallId: "tool-a" },
+      { rawInputDelta: '{"b":1}', toolCallId: "tool-b" },
+      { rawInputDelta: "1}", toolCallId: "tool-a" },
     ]);
     expect(thoughts["A1"]).toBe(thoughts["A2"]);
     expect(thoughts["A1"]).not.toBe(thoughts["B1"]);

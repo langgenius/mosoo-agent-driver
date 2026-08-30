@@ -2,5 +2,6 @@
   "commandId": "command-permission-1",
   "decision": "allow_once",
   "kind": "permission.resolve",
-  "requestId": "permission-1"
+  "requestId": "permission-1",
+  "runId": "01J00000000000000000000012"
 }

@@ -13,7 +13,7 @@ describe("DriverEventPublisher", () => {
         const accepted = attempts.length === 1 ? events.slice(0, 1) : [];
         return {
           accepted: accepted.map((event, index) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -60,7 +60,7 @@ describe("DriverEventPublisher", () => {
           recovered.resolve();
           return {
             accepted: events.map((event, index) => ({
-              eventId: event.sourceEventId,
+              eventId: event.sourceEventId!,
               seq: index + 1,
               type: event.kind,
             })),

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
@@ -10,10 +14,12 @@ import {
   type DriverRuntimeEventPort,
 } from "../src/core/driver-runtime-io";
 import type { DriverEventInput } from "../src/protocol/events";
+import { createDisabledLogger } from "../src/observability";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
 import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { beginAcpTranscript } from "./acp-test-helpers";
+import { driverStartInput } from "./driver-boot-payload-fixture";
 
 const BASE_HANDLER_OPTIONS = {
   allowedRoots: [],
@@ -25,6 +31,162 @@ const BASE_HANDLER_OPTIONS = {
 } satisfies Omit<ConstructorParameters<typeof AcpClientRequestHandler>[0], "push" | "turnEvents">;
 
 describe("ACP client request handler", () => {
+  test("drains a committed file report and fences writes admitted after stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-drain-"));
+    const reportEntered = Promise.withResolvers<void>();
+    const releaseReport = Promise.withResolvers<void>();
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+      ports: {
+        file: {
+          reportChanged: async () => {
+            reportEntered.resolve();
+            await releaseReport.promise;
+          },
+        },
+      },
+    });
+    const path = join(root, "committed.txt");
+
+    try {
+      await handler.initializePathScope();
+      const write = handler.writeTextFile(context, {
+        content: "committed",
+        path,
+        sessionId: "native-session-1",
+      });
+      await reportEntered.promise;
+      expect(await readFile(path, "utf8")).toBe("committed");
+
+      handler.beginStop();
+      const drain = handler.drainFileWrites();
+      let drained = false;
+      void drain.then(() => {
+        drained = true;
+      });
+      await Bun.sleep(0);
+      expect(drained).toBe(false);
+      await expect(
+        handler.writeTextFile(context, {
+          content: "late",
+          path: join(root, "late.txt"),
+          sessionId: "native-session-1",
+        }),
+      ).rejects.toThrow("stopping");
+
+      releaseReport.resolve();
+      await expect(Promise.all([write, drain])).resolves.toEqual([{}, undefined]);
+    } finally {
+      releaseReport.resolve();
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("fails the file drain when notification fails after atomic commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-failure-"));
+    const failure = new Error("committed file report failed");
+    const fatalFailures: Error[] = [];
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      onUpdateFailure: (error) => fatalFailures.push(error),
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+      ports: {
+        file: { reportChanged: async () => Promise.reject(failure) },
+      },
+    });
+    const path = join(root, "committed.txt");
+
+    try {
+      await handler.initializePathScope();
+      await expect(
+        handler.writeTextFile(context, {
+          content: "committed",
+          path,
+          sessionId: "native-session-1",
+        }),
+      ).rejects.toBe(failure);
+      expect(await readFile(path, "utf8")).toBe("committed");
+      await expect(handler.drainFileWrites()).rejects.toBe(failure);
+      await expect(handler.drainFileWrites()).resolves.toBeUndefined();
+      expect(fatalFailures).toEqual([failure]);
+    } finally {
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("does not poison turn or stop drains when a write fails before commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-precommit-"));
+    const fatalFailures: Error[] = [];
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      onUpdateFailure: (error) => fatalFailures.push(error),
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+    });
+    const cancellation = new AbortController();
+    const failure = new Error("pre-commit cancellation");
+
+    try {
+      await handler.initializePathScope();
+      handler.openFileWriteIngress();
+      cancellation.abort(failure);
+      await expect(
+        handler.writeTextFile(
+          context,
+          {
+            content: "not committed",
+            path: join(root, "cancelled.txt"),
+            sessionId: "native-session-1",
+          },
+          cancellation.signal,
+        ),
+      ).rejects.toBe(failure);
+      handler.closeFileWriteIngress();
+      await expect(handler.drainTurnFileWrites()).resolves.toBeUndefined();
+      handler.beginStop();
+      await expect(handler.drainFileWrites()).resolves.toBeUndefined();
+      expect(fatalFailures).toEqual([]);
+    } finally {
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("rejects permission requests outside an active turn", async () => {
     let permissionRequests = 0;
     let pushes = 0;
@@ -1009,7 +1171,7 @@ describe("ACP client request handler", () => {
     await expect(handler.drainPermissions()).resolves.toBeUndefined();
   });
 
-  test("fences a late cancelled permission resolution after run ownership changes", async () => {
+  test("closes a late cancelled permission on its captured run after ownership changes", async () => {
     const requestedPublishing = Promise.withResolvers<void>();
     const releaseRequested = Promise.withResolvers<void>();
     let activeRunId = "run-1";
@@ -1030,6 +1192,7 @@ describe("ACP client request handler", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -1079,8 +1242,8 @@ describe("ACP client request handler", () => {
     releaseRequested.resolve();
     await drained;
 
-    expect(resolvedRunId).toBeNull();
-    expect(order).toEqual(["run.cancelled"]);
+    expect(resolvedRunId).toBe("run-1");
+    expect(order).toEqual(["permission.resolved", "run.cancelled"]);
   });
 
   test("closes update ingress and drains accepted work before stopping", async () => {

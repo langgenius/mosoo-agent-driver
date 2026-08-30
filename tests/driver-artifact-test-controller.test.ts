@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   ForbiddenSecretScanner,
   DriverArtifactTestController,
@@ -40,7 +41,7 @@ await rpc("/driver/hello", {
   capabilities: [],
   driverVersion: "test",
   pid: process.pid,
-  protocolVersion: 2,
+  protocolVersion: ${String(DRIVER_PROTOCOL_VERSION)},
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
@@ -70,7 +71,6 @@ if (process.env.TEST_MODE === "terminal") {
   await rpc("/driver/commandUpdate", {
     commandId: "command-1",
     driverInstanceId: payload.driverInstanceId,
-    result: null,
     status: "completed",
   });
 }
@@ -259,20 +259,29 @@ describe("driver artifact test controller", () => {
     const hello = parseDriverHelloInput({
       capabilities: [{ details: undefined, id: "input_start", status: "supported", version: 1 }],
       driverVersion: "test",
-      ignored: true,
       pid: 1,
-      protocolVersion: 2,
+      protocolVersion: DRIVER_PROTOCOL_VERSION,
       runtime: "acp-fallback",
       startedAt: "now",
     });
-    expect(Object.hasOwn(hello, "ignored")).toBeFalse();
     expect(Object.hasOwn(hello.capabilities[0]!, "details")).toBeFalse();
     expect(() =>
       parseDriverHelloInput({
         capabilities: [],
         driverVersion: "test",
+        ignored: true,
+        pid: 1,
+        protocolVersion: DRIVER_PROTOCOL_VERSION,
+        runtime: "acp-fallback",
+        startedAt: "now",
+      }),
+    ).toThrow("ignored");
+    expect(() =>
+      parseDriverHelloInput({
+        capabilities: [],
+        driverVersion: "test",
         pid: 0,
-        protocolVersion: 2,
+        protocolVersion: DRIVER_PROTOCOL_VERSION,
         runtime: "acp-fallback",
         startedAt: "now",
       }),
@@ -283,21 +292,22 @@ describe("driver artifact test controller", () => {
         driverInstanceId: "driver-1",
         status: "invented",
       }),
-    ).toThrow("status is not a supported runtime command status");
-    expect(
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        result: {
-          isError: true,
-          outputText: "failed",
-          requestId: "request-1",
-          serverId: "server-1",
-          toolName: "tool-1",
-        },
-        status: "completed",
-      }).result,
-    ).toMatchObject({ isError: true });
+    ).toThrow("accepted' | 'cancelled' | 'completed' | 'failed");
+    const completed = parseDriverCommandUpdateInput({
+      commandId: "command-1",
+      driverInstanceId: "driver-1",
+      result: {
+        isError: true,
+        outputText: "failed",
+        requestId: "request-1",
+        serverId: "server-1",
+        toolName: "tool-1",
+      },
+      status: "completed",
+    });
+    expect(completed.status === "completed" ? completed.result : undefined).toMatchObject({
+      isError: true,
+    });
     expect(() =>
       parseDriverCommandUpdateInput({
         commandId: "command-1",
@@ -305,7 +315,7 @@ describe("driver artifact test controller", () => {
         result: { outputText: "partial", requestId: "request-1" },
         status: "completed",
       }),
-    ).toThrow("serverId");
+    ).toThrow();
     expect(() =>
       parseDriverCommandUpdateInput({
         commandId: "command-1",
@@ -313,7 +323,7 @@ describe("driver artifact test controller", () => {
         result: { isError: true, requestId: "request-1" },
         status: "completed",
       }),
-    ).toThrow("outputText");
+    ).toThrow();
     expect(() =>
       parseDriverCommandUpdateInput({
         commandId: "command-1",
@@ -321,7 +331,7 @@ describe("driver artifact test controller", () => {
         result: { outputText: undefined, requestId: "request-1" },
         status: "completed",
       }),
-    ).toThrow("outputText");
+    ).toThrow();
     expect(() =>
       parseDriverHelloInput({
         capabilities: [
@@ -330,7 +340,7 @@ describe("driver artifact test controller", () => {
         ],
         driverVersion: "test",
         pid: 1,
-        protocolVersion: 2,
+        protocolVersion: DRIVER_PROTOCOL_VERSION,
         runtime: "acp-fallback",
         startedAt: "now",
       }),
@@ -344,12 +354,14 @@ describe("driver artifact test controller", () => {
           message: "failed",
           retryable: false,
         },
+        runId: "run-1",
       }),
     ).toThrow("driver failure details.nested must be a primitive value");
     const details = JSON.parse('{"__proto__":"preserved"}') as Record<string, unknown>;
     const failure = parseDriverFailureInput({
       driverInstanceId: "driver-1",
       error: { code: "failed", details, message: "failed", retryable: false },
+      runId: "run-1",
     });
     expect(Object.hasOwn(failure.error.details, "__proto__")).toBeTrue();
     expect(() =>
@@ -369,7 +381,7 @@ describe("driver artifact test controller", () => {
     });
     expect(commandUpdate.success).toBeFalse();
     expect(commandUpdate.error?.issues).toContainEqual(
-      expect.objectContaining({ path: ["result", "serverId"] }),
+      expect.objectContaining({ path: ["result"] }),
     );
 
     const events = driverRuntimeRpcSchemas.driver.pushEvents.input.safeParse({

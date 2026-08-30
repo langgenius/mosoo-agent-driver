@@ -57,6 +57,7 @@ const ACP_STOP_BUDGET_MS = 4_000;
 const ACP_RECYCLE_BUDGET_MS = 4_500;
 const ACP_SESSION_SHUTDOWN_TIMEOUT_MS = 750;
 const ACP_UPDATE_DRAIN_TIMEOUT_MS = 750;
+const MAX_ACTIVE_ACP_CLIENT_REQUESTS = 8;
 
 function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
@@ -220,7 +221,39 @@ export class AcpDriverBackend implements AgentDriverBackend {
     );
     const agentProcess = startedProcess.process;
     this.#agentProcess = agentProcess;
+    let activeClientRequests = 0;
     let connection: ClientConnection | null = null;
+    const serveRequest = async <T>(
+      requestSignal: AbortSignal,
+      operation: (signal: AbortSignal) => Promise<T> | T,
+    ): Promise<T> => {
+      const signal = this.#requestSignal(requestSignal);
+
+      if (this.#stopRequested || signal.aborted) {
+        throw RequestError.requestCancelled();
+      }
+      if (activeClientRequests >= MAX_ACTIVE_ACP_CLIENT_REQUESTS) {
+        const error = RequestError.internalError(
+          { maxActiveRequests: MAX_ACTIVE_ACP_CLIENT_REQUESTS },
+          "ACP client request capacity exceeded",
+        );
+        connection?.close(error);
+        throw error;
+      }
+      activeClientRequests += 1;
+
+      try {
+        return await operation(signal);
+      } catch (error) {
+        if (signal.aborted) {
+          throw RequestError.requestCancelled();
+        }
+
+        throw error;
+      } finally {
+        activeClientRequests -= 1;
+      }
+    };
 
     try {
       await startedProcess.ready;
@@ -234,42 +267,42 @@ export class AcpDriverBackend implements AgentDriverBackend {
           this.#clientRequests.enqueueUpdate(context, params),
         )
         .onRequest(acpMethods.client.session.requestPermission, ({ params, requestId, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.requestPermission(context, requestId, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.fs.readTextFile, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.readTextFile(params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.fs.writeTextFile, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.writeTextFile(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.create, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.createTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.kill, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.killTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.output, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.terminalOutput(params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.release, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.releaseTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.waitForExit, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.waitForTerminalExit(params, requestSignal),
           ),
         );
@@ -451,10 +484,11 @@ export class AcpDriverBackend implements AgentDriverBackend {
       .finally(() => this.#clientRequests.closePathScope());
     const task = operation
       .then(() => {
+        this.#stopFailure = null;
         this.#stopSucceeded = true;
       })
       .catch((error: unknown) => {
-        this.#stopFailure ??= { error };
+        this.#stopFailure = { error };
         throw error;
       })
       .finally(() => {
@@ -525,6 +559,12 @@ export class AcpDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const deadline = Date.now() + ACP_STOP_BUDGET_MS;
     this.#turnController.abort("ACP driver backend stopped.");
+    this.#clientRequests.beginStop();
+    const fileWriteDrainTask = settlePromiseWithTimeout(this.#clientRequests.drainFileWrites(), {
+      label: "ACP committed file report drain",
+      signal,
+      timeoutMs: this.#remainingStopMs(deadline),
+    });
     const terminalCleanupTask = settlePromiseWithTimeout(
       this.#clientRequests.stopTerminals(context),
       {
@@ -588,6 +628,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
       });
     }
 
+    const fileWriteDrain = await fileWriteDrainTask;
+
+    if (fileWriteDrain.status !== "completed") {
+      context.logger.warn("driver.acp.files.drain.failed", {
+        message: toErrorMessage(fileWriteDrain.error, "committed file report drain failed"),
+        reason,
+      });
+    }
+
     transport?.close(new Error("ACP driver backend stopped."));
     if (this.#connection === transport) {
       this.#connection = null;
@@ -618,6 +667,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     if (updateDrain.status !== "completed") {
       throw updateDrain.error;
+    }
+
+    if (fileWriteDrain.status !== "completed") {
+      throw fileWriteDrain.error;
     }
 
     if (terminalCleanup.status !== "completed") {
@@ -714,15 +767,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
   }
 
   async #joinStop(): Promise<void> {
-    if (this.#stopFailure !== null) {
-      throw this.#stopFailure.error;
-    }
     if (this.#stopTask !== null) {
       await this.#stopTask;
       return;
     }
     if (this.#stopSucceeded) {
       return;
+    }
+    if (this.#stopFailure !== null) {
+      throw this.#stopFailure.error;
     }
     throw new Error("ACP driver stop was requested without an owned cleanup barrier.");
   }
@@ -765,23 +818,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
   #requestSignal(signal: AbortSignal): AbortSignal {
     const turnSignal = this.#turnController.activeSignal();
     return turnSignal === undefined ? signal : AbortSignal.any([signal, turnSignal]);
-  }
-
-  async #serveRequest<T>(
-    signal: AbortSignal,
-    operation: (signal: AbortSignal) => Promise<T> | T,
-  ): Promise<T> {
-    const requestSignal = this.#requestSignal(signal);
-
-    try {
-      return await operation(requestSignal);
-    } catch (error) {
-      if (requestSignal.aborted) {
-        throw RequestError.requestCancelled();
-      }
-
-      throw error;
-    }
   }
 
   async #setupSession(signal: AbortSignal): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {

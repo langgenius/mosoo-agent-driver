@@ -4,8 +4,9 @@ import { once } from "node:events";
 
 import type { DriverEventInput } from "../../protocol/events";
 import { createDriverId } from "../../protocol/id";
-import { settlePromiseWithTimeout } from "../../utils/async";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import { DriverEventRejectedError } from "../../core/driver-runtime-io";
+import { settlePromiseWithTimeout } from "../../utils/async";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
@@ -30,20 +31,26 @@ import { AcpPathScope } from "./acp-path-scope";
 interface AcpTerminalState {
   readonly closed: Promise<void>;
   closedStatus: AcpTerminalExitStatus | null;
-  committed: boolean;
+  createEvent: DriverEventInput | null;
+  createEventTask: Promise<void> | null;
   cleanupTakenOver: boolean;
   completionTask: Promise<void> | null;
   readonly exited: Promise<AcpTerminalExitStatus>;
+  exitEvent: DriverEventInput | null;
   exitEventTask: Promise<void> | null;
   exitStatus: AcpTerminalExitStatus | null;
   readonly id: string;
+  killEvent: DriverEventInput | null;
+  killTask: Promise<void> | null;
   readonly marker: string;
+  hostMayOwn: boolean;
   orphaned: boolean;
   output: string;
   readonly outputByteLimit: number;
   readonly process: ChildProcessWithoutNullStreams;
   readonly rejectExit: (reason?: unknown) => void;
   readonly reservation: AcpTerminalReservation;
+  releaseEvent: DriverEventInput | null;
   releaseTask: Promise<void> | null;
   readonly resolveExit: (status: AcpTerminalExitStatus) => void;
   supervisionFailure: Error | null;
@@ -77,6 +84,7 @@ const DEFAULT_MAX_TERMINALS = 32;
 const DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT = 1024 * 1024;
 const TERMINAL_EXIT_TIMEOUT_MS = 2_000;
 const TERMINAL_FORCE_KILL_TIMEOUT_MS = 1_000;
+const TERMINAL_KILL_WAIT_TIMEOUT_MS = TERMINAL_EXIT_TIMEOUT_MS + TERMINAL_FORCE_KILL_TIMEOUT_MS * 2;
 
 class AcpTerminalCleanupError extends Error {
   override readonly name = "AcpTerminalCleanupError";
@@ -211,20 +219,26 @@ export class AcpTerminalManager {
     const terminal: AcpTerminalState = {
       closed,
       closedStatus: null,
-      committed: false,
+      createEvent: null,
+      createEventTask: null,
       cleanupTakenOver: false,
       completionTask: null,
       exited,
+      exitEvent: null,
       exitEventTask: null,
       exitStatus: null,
       id: terminalId,
+      killEvent: null,
+      killTask: null,
       marker: processTree.marker,
+      hostMayOwn: false,
       orphaned: false,
       output: "",
       outputByteLimit,
       process: child,
       rejectExit,
       reservation,
+      releaseEvent: null,
       releaseTask: null,
       resolveExit,
       supervisionFailure: null,
@@ -315,23 +329,23 @@ export class AcpTerminalManager {
         throw new Error(`ACP terminal ${terminalId} lost ownership during creation.`);
       }
 
-      await this.#push(context, "driver.acp.terminal.created", [
-        {
-          kind: "terminal.created",
-          payload: {
-            command,
-            cwd: cwdPath,
-            outputByteLimit,
-            terminalId,
-          },
+      terminal.createEvent = {
+        kind: "terminal.created",
+        payload: {
+          command,
+          cwd: cwdPath,
+          outputByteLimit,
+          terminalId,
         },
-      ]);
+        sourceEventId: `acp.terminal.created:${terminalId}`,
+      };
+      await this.#publishCreated(context, terminal);
 
       if (this.#terminals.get(terminalId) !== terminal) {
         throw new Error(`ACP terminal ${terminalId} lost ownership during creation.`);
       }
 
-      terminal.committed = true;
+      terminal.hostMayOwn = true;
       await this.#publishExit(context, terminal);
       signal?.throwIfAborted();
 
@@ -339,7 +353,18 @@ export class AcpTerminalManager {
         throw new Error("ACP terminal manager is stopping.");
       }
     } catch (error) {
-      if (terminal.committed) {
+      if (
+        !terminal.hostMayOwn &&
+        terminal.createEvent !== null &&
+        !(
+          error instanceof DriverEventRejectedError &&
+          error.sourceEventId === terminal.createEvent.sourceEventId
+        )
+      ) {
+        terminal.hostMayOwn = true;
+      }
+
+      if (terminal.hostMayOwn) {
         try {
           await this.#releaseTerminal(context, terminal);
         } catch (cleanupError) {
@@ -382,24 +407,47 @@ export class AcpTerminalManager {
   ): Promise<Record<string, never>> {
     signal?.throwIfAborted();
     const terminal = this.#requireTerminal(params);
-
-    if (terminal.exitStatus === null) {
-      signalAcpTerminalProcess(terminal, "SIGKILL");
-      await terminal.exited;
-    }
-    await raceWithAbort(
-      this.#push(context, "driver.acp.terminal.killed", [
-        {
-          kind: "terminal.killed",
-          payload: {
-            terminalId: terminal.id,
-          },
-        },
-      ]),
-      signal,
-    );
+    await raceWithAbort(this.#killTerminal(context, terminal), signal);
 
     return {};
+  }
+
+  #killTerminal(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
+    if (terminal.killTask !== null) {
+      return terminal.killTask;
+    }
+
+    terminal.killEvent ??= {
+      kind: "terminal.killed",
+      payload: {
+        terminalId: terminal.id,
+      },
+      sourceEventId: `acp.terminal.killed:${terminal.id}`,
+    };
+    const operation = this.#runKill(context, terminal);
+    let task: Promise<void>;
+    task = operation.catch((error: unknown) => {
+      if (terminal.killTask === task) {
+        terminal.killTask = null;
+      }
+      throw error;
+    });
+    terminal.killTask = task;
+    return task;
+  }
+
+  async #runKill(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
+    if (terminal.exitStatus === null) {
+      signalAcpTerminalProcess(terminal, "SIGKILL");
+      const exited = await this.#waitForExit(terminal, TERMINAL_KILL_WAIT_TIMEOUT_MS);
+      if (!exited) {
+        throw new Error(
+          `ACP terminal ${terminal.id} cleanup did not finish within ${TERMINAL_KILL_WAIT_TIMEOUT_MS}ms after force kill.`,
+        );
+      }
+    }
+    await this.#publishExit(context, terminal);
+    await this.#push(context, "driver.acp.terminal.killed", [terminal.killEvent!]);
   }
 
   output(
@@ -457,6 +505,11 @@ export class AcpTerminalManager {
 
   async #stop(context: AgentDriverContext, turn?: number): Promise<void> {
     const ownsTurn = (ownedTurn: number): boolean => turn === undefined || ownedTurn === turn;
+    const admittedKills = new Map(
+      [...this.#terminals.values()].flatMap((terminal) =>
+        ownsTurn(terminal.reservation.turn) ? [[terminal, terminal.killTask] as const] : [],
+      ),
+    );
     const creations = await Promise.allSettled(
       [...this.#createTasks].flatMap(([creation, ownedTurn]) =>
         ownsTurn(ownedTurn) ? [creation] : [],
@@ -464,7 +517,15 @@ export class AcpTerminalManager {
     );
     const releases = await Promise.allSettled(
       [...this.#terminals.values()].flatMap((terminal) =>
-        ownsTurn(terminal.reservation.turn) ? [this.#releaseTerminal(context, terminal)] : [],
+        ownsTurn(terminal.reservation.turn)
+          ? [
+              this.#releaseTerminal(
+                context,
+                terminal,
+                admittedKills.get(terminal) ?? terminal.killTask,
+              ),
+            ]
+          : [],
       ),
     );
     const failures = [
@@ -481,16 +542,26 @@ export class AcpTerminalManager {
     }
   }
 
-  #releaseTerminal(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
-    return (terminal.releaseTask ??= this.#runRelease(context, terminal).catch((error: unknown) => {
-      if (this.#terminals.get(terminal.id) === terminal) {
-        terminal.releaseTask = null;
-      }
-      throw error;
-    }));
+  #releaseTerminal(
+    context: AgentDriverContext,
+    terminal: AcpTerminalState,
+    admittedKill: Promise<void> | null = terminal.killTask,
+  ): Promise<void> {
+    return (terminal.releaseTask ??= this.#runRelease(context, terminal, admittedKill).catch(
+      (error: unknown) => {
+        if (this.#terminals.get(terminal.id) === terminal) {
+          terminal.releaseTask = null;
+        }
+        throw error;
+      },
+    ));
   }
 
-  async #runRelease(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
+  async #runRelease(
+    context: AgentDriverContext,
+    terminal: AcpTerminalState,
+    admittedKill: Promise<void> | null,
+  ): Promise<void> {
     const wasRunning = terminal.closedStatus === null;
 
     if (wasRunning) {
@@ -542,18 +613,27 @@ export class AcpTerminalManager {
       }
       terminal.exitStatus = terminal.closedStatus;
     }
+    if (terminal.hostMayOwn) {
+      await this.#publishCreated(context, terminal);
+    }
     await this.#publishExit(context, terminal);
     terminal.resolveExit(terminal.exitStatus);
 
-    if (terminal.committed) {
-      await this.#push(context, "driver.acp.terminal.released", [
-        {
-          kind: "terminal.released",
-          payload: {
-            terminalId: terminal.id,
-          },
+    if (admittedKill !== null) {
+      await admittedKill;
+    } else if (terminal.killEvent !== null) {
+      await this.#killTerminal(context, terminal);
+    }
+
+    if (terminal.hostMayOwn) {
+      terminal.releaseEvent ??= {
+        kind: "terminal.released",
+        payload: {
+          terminalId: terminal.id,
         },
-      ]);
+        sourceEventId: `acp.terminal.released:${terminal.id}`,
+      };
+      await this.#push(context, "driver.acp.terminal.released", [terminal.releaseEvent]);
     }
 
     if (this.#terminals.get(terminal.id) === terminal) {
@@ -622,8 +702,11 @@ export class AcpTerminalManager {
     }
 
     terminal.exitStatus = status;
-    await this.#publishExit(context, terminal);
+    const publication = this.#publishExit(context, terminal);
     terminal.resolveExit(status);
+    void publication.catch((error: unknown) => {
+      this.#warnPushFailure(context, "driver.acp.terminal.exited", error);
+    });
   }
 
   #failSupervision(context: AgentDriverContext, terminal: AcpTerminalState, error: Error): void {
@@ -647,7 +730,7 @@ export class AcpTerminalManager {
     terminal.output = appended.output;
     terminal.truncated ||= appended.truncated;
 
-    if (!terminal.committed) {
+    if (!terminal.hostMayOwn) {
       return;
     }
 
@@ -716,28 +799,65 @@ export class AcpTerminalManager {
     events: DriverEventInput[],
   ): Promise<void> {
     return this.#push(context, reason, events).catch((error: unknown) => {
-      context.logger.warn("driver.acp.terminal.event_push.failed", {
-        message: error instanceof Error ? error.message : "terminal event push failed",
-        reason,
-      });
+      this.#warnPushFailure(context, reason, error);
+    });
+  }
+
+  #warnPushFailure(context: AgentDriverContext, reason: string, error: unknown): void {
+    context.logger.warn("driver.acp.terminal.event_push.failed", {
+      message: error instanceof Error ? error.message : "terminal event push failed",
+      reason,
     });
   }
 
   #publishExit(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
-    if (!terminal.committed || terminal.exitStatus === null) {
+    if (!terminal.hostMayOwn || terminal.exitStatus === null) {
       return Promise.resolve();
     }
 
-    return (terminal.exitEventTask ??= this.#pushBestEffort(context, "driver.acp.terminal.exited", [
-      {
-        kind: "terminal.exited",
-        payload: {
-          exitCode: terminal.exitStatus.exitCode,
-          signal: terminal.exitStatus.signal,
-          terminalId: terminal.id,
-        },
+    terminal.exitEvent ??= {
+      kind: "terminal.exited",
+      payload: {
+        exitCode: terminal.exitStatus.exitCode,
+        signal: terminal.exitStatus.signal,
+        terminalId: terminal.id,
       },
-    ]));
+      sourceEventId: `acp.terminal.exited:${terminal.id}`,
+    };
+    if (terminal.exitEventTask !== null) {
+      return terminal.exitEventTask;
+    }
+
+    const operation = this.#push(context, "driver.acp.terminal.exited", [terminal.exitEvent]);
+    let task: Promise<void>;
+    task = operation.catch((error: unknown) => {
+      if (terminal.exitEventTask === task) {
+        terminal.exitEventTask = null;
+      }
+      throw error;
+    });
+    terminal.exitEventTask = task;
+    return task;
+  }
+
+  #publishCreated(context: AgentDriverContext, terminal: AcpTerminalState): Promise<void> {
+    if (terminal.createEvent === null) {
+      return Promise.resolve();
+    }
+    if (terminal.createEventTask !== null) {
+      return terminal.createEventTask;
+    }
+
+    const operation = this.#push(context, "driver.acp.terminal.created", [terminal.createEvent]);
+    let task: Promise<void>;
+    task = operation.catch((error: unknown) => {
+      if (terminal.createEventTask === task) {
+        terminal.createEventTask = null;
+      }
+      throw error;
+    });
+    terminal.createEventTask = task;
+    return task;
   }
 
   #requireTerminal(params: unknown): AcpTerminalState {
@@ -749,7 +869,11 @@ export class AcpTerminalManager {
 
     const terminal = this.#terminals.get(terminalId);
 
-    if (!terminal || (!terminal.committed && !terminal.orphaned)) {
+    if (
+      !terminal ||
+      terminal.releaseTask !== null ||
+      (!terminal.hostMayOwn && !terminal.orphaned)
+    ) {
       throw new Error(`ACP terminal does not exist: ${terminalId}.`);
     }
 

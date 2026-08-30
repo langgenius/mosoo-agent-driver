@@ -60,7 +60,7 @@ export function toPermissionRequest(input: {
       rawInput: stringifyForDisplay(toolCall?.["rawInput"]),
       requestId: input.requestId,
       title,
-      toolCallId: nativeToolCallId,
+      toolCallId,
       toolKind: readNonEmptyString(toolCall, "kind"),
     },
     targetItemId: toolCallId,

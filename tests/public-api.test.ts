@@ -8,7 +8,12 @@ import {
   protocolVersionSchema as protocolVersionSchemaFromContract,
   sessionSnapshotSchema as sessionSnapshotSchemaFromContract,
 } from "@mosoo/agent-driver/contract";
-import { parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath } from "@mosoo/agent-driver/events";
+import {
+  RUNTIME_EVENT_KINDS as RUNTIME_EVENT_KINDS_FROM_SUBPATH,
+  RUNTIME_EVENT_SCHEMA_VERSION as RUNTIME_EVENT_SCHEMA_VERSION_FROM_SUBPATH,
+  parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath,
+  toRuntimeEventInput as toRuntimeEventInputFromSubpath,
+} from "@mosoo/agent-driver/events";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   AgentDriverKernelCore,
@@ -62,13 +67,16 @@ describe("public API", () => {
   test("imports public subpath entries without process side effects", () => {
     const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
 
-    expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(2);
+    expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(3);
     expect(PROTOCOL_VERSION_FROM_CONTRACT).toBe(2);
     expect(protocolVersionSchemaFromContract.parse(2)).toBe(2);
     expect(sessionSnapshotSchemaFromContract.parse).toBeFunction();
     expect(createCmaHttpHandlerFromSubpath).toBe(createCmaHttpHandler);
     expect(CmaSdkClientFromSubpath).toBe(CmaSdkClient);
     expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();
+    expect(toRuntimeEventInputFromSubpath).toBeFunction();
+    expect(RUNTIME_EVENT_SCHEMA_VERSION_FROM_SUBPATH).toBe("2026-08-29");
+    expect(RUNTIME_EVENT_KINDS_FROM_SUBPATH).toContain("agent.tasks.replaced");
     expect(heartbeatReason).toBe("ping");
     expect(parseDriverHeartbeatInputFromOrpcSubpath({ at: "now", pid: 1, reason: "ping" })).toEqual(
       {
@@ -82,7 +90,7 @@ describe("public API", () => {
         capabilities: [],
         driverVersion: "0.1.0",
         pid: 1,
-        protocolVersion: 2,
+        protocolVersion: DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH,
         runtime: "openai-runtime",
         startedAt: "now",
       }),

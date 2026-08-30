@@ -140,10 +140,15 @@ export type {
   MessageId,
   RunId,
 } from "./protocol/id";
-export { parseRuntimeCommand } from "./runtime-command";
+export {
+  createMcpUnknownEffectRunError,
+  createMcpUnsettledEffectRunError,
+  parseRuntimeCommand,
+} from "./runtime-command";
 export type {
   DriverCapability,
   DriverCapabilityId,
+  DriverCommandUpdate,
   InputStartCommand,
   InputStartCommandResult,
   McpExecuteCommand,

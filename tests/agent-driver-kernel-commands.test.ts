@@ -8,9 +8,18 @@ import type {
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import type { DriverEventInput } from "../src/protocol/events";
-import type { RuntimeCommand } from "../src/runtime-command";
+import {
+  RUNTIME_COMMAND_MAX_UTF8_BYTES,
+  measureRuntimeCommandJson,
+  type RuntimeCommand,
+} from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
-import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
+import {
+  DRIVER_TEST_IDS,
+  bootPayload,
+  createBackend,
+  settleBackendInput,
+} from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
   test("does not publish diagnostics after an adapter run terminal", async () => {
@@ -24,6 +33,10 @@ describe("AgentDriverKernelCore", () => {
             payload: { startedAt: new Date().toISOString() },
             runId,
           },
+        ],
+      });
+      await context.ports.eventSink.pushEvents({
+        events: [
           {
             kind: "run.failed",
             payload: {
@@ -131,31 +144,99 @@ describe("AgentDriverKernelCore", () => {
         },
       },
     });
-    const text = "x".repeat(17 * 1_024 * 1_024);
+    const commandAtSize = (index: number) => {
+      const base = {
+        commandId: `large-command-${String(index)}`,
+        input: { text: "" },
+        kind: "input.start" as const,
+        requestId: `large-request-${String(index)}`,
+        runId: DRIVER_TEST_IDS.runId,
+      };
+      return {
+        ...base,
+        input: { text: "x".repeat(800 * 1_024 - measureRuntimeCommandJson(base)) },
+      };
+    };
 
     await kernel.start(bootPayload);
     await pollEntered.promise;
-    const first = kernel.dispatch({
-      commandId: "large-command-1",
-      input: { text },
-      kind: "input.start",
-      requestId: "large-request-1",
-      runId: DRIVER_TEST_IDS.runId,
-    });
-    void first.catch(() => {});
-    await expect(
-      kernel.dispatch({
-        commandId: "large-command-2",
-        input: { text },
-        kind: "input.start",
-        requestId: "large-request-2",
-        runId: DRIVER_TEST_IDS.runId,
-      }),
-    ).rejects.toThrow("UTF-8 JSON bytes");
+    const queued = Array.from({ length: 40 }, (_, index) => kernel.dispatch(commandAtSize(index)));
+    for (const pending of queued) void pending.catch(() => {});
+
+    expect(measureRuntimeCommandJson(commandAtSize(0))).toBe(800 * 1_024);
+    expect(800 * 1_024).toBeLessThan(RUNTIME_COMMAND_MAX_UTF8_BYTES);
+    await expect(kernel.dispatch(commandAtSize(40))).rejects.toThrow("UTF-8 JSON bytes");
 
     (context as AgentDriverContext | null)?.lifecycle.fail(failure);
-    await expect(first).rejects.toBe(failure);
+    for (const pending of queued) await expect(pending).rejects.toBe(failure);
     await expect(kernel.stop("join failure")).rejects.toBe(failure);
+  });
+
+  test("rejects an oversized MCP command before external effects", async () => {
+    const calls: string[] = [];
+    const base = {
+      argumentsJson: "",
+      commandId: "oversized-mcp",
+      kind: "mcp.execute" as const,
+      requestId: "request-1",
+      runId: DRIVER_TEST_IDS.runId,
+      serverId: "server-1",
+      toolCallId: "tool-call-1",
+      toolName: "tool-1",
+    };
+    const command = {
+      ...base,
+      argumentsJson: "x".repeat(
+        RUNTIME_COMMAND_MAX_UTF8_BYTES + 1 - measureRuntimeCommandJson(base),
+      ),
+    };
+    const kernel = new AgentDriverKernelCore({
+      backendFactory: () => createBackend(),
+      externalToolEffectLedger: {
+        async claimExternalToolEffect() {
+          calls.push("claim");
+          throw new Error("unexpected claim");
+        },
+        async observeExternalToolEffect() {
+          calls.push("observe");
+          throw new Error("unexpected observe");
+        },
+        async settleExternalToolEffect() {
+          calls.push("settle");
+          throw new Error("unexpected settle");
+        },
+      },
+      hostPorts: {
+        mcp: {
+          async prepare() {
+            calls.push("prepare");
+            throw new Error("unexpected prepare");
+          },
+        },
+      },
+    });
+
+    expect(measureRuntimeCommandJson(command)).toBe(RUNTIME_COMMAND_MAX_UTF8_BYTES + 1);
+    await kernel.start(bootPayload);
+    await expect(kernel.dispatch(command)).rejects.toThrow("UTF-8 bytes");
+    expect(calls).toEqual([]);
+    await expect(kernel.stop("test.stop")).resolves.toBeUndefined();
+  });
+
+  test("publishes one unscoped completion when an idle driver stops", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const events = kernel.events()[Symbol.asyncIterator]();
+
+    await kernel.start(bootPayload);
+    await expect(kernel.stop("idle stop")).resolves.toBeUndefined();
+    const terminal = await events.next();
+
+    expect(terminal).toMatchObject({
+      done: false,
+      value: { kind: "run.completed" },
+    });
+    expect(terminal.value).not.toHaveProperty("runId");
+    await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 
   test.each([
@@ -193,6 +274,7 @@ describe("AgentDriverKernelCore", () => {
                 currentRunId: () => null,
                 pushEvents: async ({ events }) => ({
                   accepted: events.map((event, index) => ({
+                    eventId: event.sourceEventId!,
                     seq: index + 1,
                     type: event.kind,
                   })),
@@ -210,8 +292,8 @@ describe("AgentDriverKernelCore", () => {
           ? kernel
               .dispatch({
                 commandId: "blocked-accepted-command",
-                kind: "turn.cancel",
-                reason: "test.cancel",
+                kind: "session.stop",
+                reason: "test.stop",
               })
               .catch(() => {})
           : null;
@@ -273,6 +355,7 @@ describe("AgentDriverKernelCore", () => {
     backend.handleInput = async () => {
       inputEntered.resolve();
       await releaseInput.promise;
+      throw failure;
     };
     backend.stop = async (_context, _reason, signal) => {
       stopEntered.resolve();
@@ -346,24 +429,22 @@ describe("AgentDriverKernelCore", () => {
 
       releaseInput.resolve();
       await expect(input).rejects.toBe(failure);
-      await expect(observed).resolves.toEqual({
+      await expect(observed).resolves.toMatchObject({
         kind: "event",
         value: {
           done: false,
           value: {
-            kind: "run.failed",
+            kind: "diagnostic.reported",
             payload: {
-              error: {
-                code: "driver.runtime_failed",
-                details: {},
-                message: failure.message,
-                retryable: false,
-              },
-              recoverable: false,
+              code: "driver.command_failed",
+              message: failure.message,
             },
-            runId: DRIVER_TEST_IDS.runId,
           },
         },
+      });
+      await expect(events.next()).resolves.toMatchObject({
+        done: false,
+        value: { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
       });
       await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
       await expect(kernel.stop("join backend failure")).rejects.toBe(failure);
@@ -390,6 +471,7 @@ describe("AgentDriverKernelCore", () => {
     backend.handleInput = async () => {
       inputEntered.resolve();
       await releaseInput.promise;
+      throw failure;
     };
     backend.stop = async () => {
       cleanupEntered.resolve();
@@ -414,13 +496,17 @@ describe("AgentDriverKernelCore", () => {
     const stop = kernel.stop("wait for failure cleanup");
     void stop.catch(() => {});
     await cleanupEntered.promise;
-    const terminal = events.next();
-    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+    const diagnostic = events.next();
+    expect(await Promise.race([diagnostic.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
       false,
     );
     releaseCleanup.resolve();
     await expect(stop).rejects.toBe(failure);
-    await expect(terminal).resolves.toMatchObject({
+    await expect(diagnostic).resolves.toMatchObject({
+      done: false,
+      value: { kind: "diagnostic.reported" },
+    });
+    await expect(events.next()).resolves.toMatchObject({
       done: false,
       value: { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
     });
@@ -438,6 +524,7 @@ describe("AgentDriverKernelCore", () => {
     backend.handleInput = async () => {
       inputEntered.resolve();
       await releaseInput.promise;
+      throw failure;
     };
     backend.stop = async () => {
       releaseInput.resolve();
@@ -459,6 +546,10 @@ describe("AgentDriverKernelCore", () => {
 
     await expect(input).rejects.toBe(failure);
     await expect(kernel.stop("wait for failed cleanup")).rejects.toBe(failure);
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: { kind: "diagnostic.reported" },
+    });
     const terminal = events.next();
     expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
       false,
@@ -488,6 +579,7 @@ describe("AgentDriverKernelCore", () => {
       });
       permissionEntered.resolve();
       await permission;
+      throw failure;
     };
     backend.stop = async () => {
       cleanupEntered.resolve();
@@ -559,14 +651,25 @@ describe("AgentDriverKernelCore", () => {
       done: false,
       value: {
         kind: "diagnostic.reported",
+        payload: { code: "permission.cancelled" },
         runId: DRIVER_TEST_IDS.runId,
       },
     });
     await cleanupEntered.promise;
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "diagnostic.reported",
+        payload: { code: "driver.command_failed" },
+      },
+    });
     const terminal = events.next();
-    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
-      false,
-    );
+    expect(
+      await Promise.race([
+        terminal.then((value) => ({ kind: "event" as const, value })),
+        Bun.sleep(20).then(() => ({ kind: "pending" as const })),
+      ]),
+    ).toEqual({ kind: "pending" });
     releaseCleanup.resolve();
     await expect(terminal).resolves.toMatchObject({
       done: false,
@@ -586,9 +689,10 @@ describe("AgentDriverKernelCore", () => {
     const inputEntered = Promise.withResolvers<void>();
     const releaseInput = Promise.withResolvers<void>();
     let stopCount = 0;
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       inputEntered.resolve();
       await releaseInput.promise;
+      await settleBackendInput(context, runId, signal);
     };
     backend.stop = async () => {
       stopCount += 1;
@@ -610,19 +714,6 @@ describe("AgentDriverKernelCore", () => {
         .catch(() => {}),
     ];
     await inputEntered.promise;
-    pending.push(
-      kernel
-        .dispatch({
-          commandId: "queued-input",
-          input: { text: "wait again" },
-          kind: "input.start",
-          requestId: "queued-request",
-          runId: DRIVER_TEST_IDS.runId,
-        })
-        .catch(() => {}),
-    );
-    await Bun.sleep(0);
-
     for (let index = 0; index < 1_024; index += 1) {
       pending.push(
         kernel
@@ -630,6 +721,7 @@ describe("AgentDriverKernelCore", () => {
             commandId: `queued-cancel-${index}`,
             kind: "turn.cancel",
             reason: "queued",
+            runId: DRIVER_TEST_IDS.runId,
           })
           .catch(() => {}),
       );
@@ -640,7 +732,7 @@ describe("AgentDriverKernelCore", () => {
     expect(stopCount).toBe(1);
     await expect(events.next()).resolves.toMatchObject({
       done: false,
-      value: { kind: "run.completed" },
+      value: { kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId },
     });
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
@@ -650,9 +742,10 @@ describe("AgentDriverKernelCore", () => {
     const inputEntered = Promise.withResolvers<void>();
     const releaseInput = Promise.withResolvers<void>();
     let stopCount = 0;
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       inputEntered.resolve();
       await releaseInput.promise;
+      await settleBackendInput(context, runId, signal);
     };
     backend.cancelActiveTurn = async (_context, reason) => {
       backend.cancelledReasons.push(reason);
@@ -815,6 +908,7 @@ describe("AgentDriverKernelCore", () => {
           commandId: "after-stop-failure",
           kind: "turn.cancel",
           reason: "test",
+          runId: DRIVER_TEST_IDS.runId,
         }),
       ).rejects.toThrow("not accepting commands: failed");
     },
@@ -883,23 +977,27 @@ describe("AgentDriverKernelCore", () => {
       const [skill] = await context.ports.skill.materialize(context.payload.execution, signal);
       materializedSkillName = skill?.skillName ?? null;
     };
-    backend.handleInput = async (context: AgentDriverContext) => {
+    backend.handleInput = async (context: AgentDriverContext, _input, runId, signal) => {
       const command = {
         argumentsJson: '{"ok":true}',
         commandId: "mcp-port-1",
         kind: "mcp.execute" as const,
         requestId: "request-1",
+        runId: DRIVER_TEST_IDS.runId,
         serverId: "server-1",
         toolCallId: "tool-1",
         toolName: "complete",
       };
-      const signal = new AbortController().signal;
-      await using prepared = await context.ports.mcp.prepare(command, signal);
+      const mcpSignal = new AbortController().signal;
+      await using prepared = await context.ports.mcp.prepare(command, mcpSignal);
       const result = await prepared.execute({
+        attempt: 1,
         effectId: "effect-1",
         idempotencyKey: "effect-1",
+        kind: "claimed",
       });
       mcpOutput = result.outputText;
+      await settleBackendInput(context, runId, signal);
     };
     const kernel = new AgentDriverKernelCore({
       backendFactory: () => backend,

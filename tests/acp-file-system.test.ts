@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { truncateSync } from "node:fs";
 import {
   chmod,
@@ -21,11 +21,13 @@ import { join } from "node:path";
 
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import type { AgentDriverFilePort } from "../src/host-ports";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { AcpFileSystem } from "../src/runtimes/acp/acp-file-system";
 import { AcpPathScope } from "../src/runtimes/acp/acp-path-scope";
+import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
 const pathScopes = new Set<AcpPathScope>();
@@ -46,7 +48,10 @@ afterEach(async () => {
   pathScopes.clear();
 });
 
-function createContext(events: DriverEventInput[]): AgentDriverContext {
+function createContext(
+  events: DriverEventInput[],
+  reportChanged?: AgentDriverFilePort["reportChanged"],
+): AgentDriverContext {
   return createAgentDriverContext({
     eventSink: {
       currentRunId: () => null,
@@ -54,6 +59,7 @@ function createContext(events: DriverEventInput[]): AgentDriverContext {
         events.push(...input.events);
         return {
           accepted: input.events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -65,6 +71,7 @@ function createContext(events: DriverEventInput[]): AgentDriverContext {
     permission: {
       request: async () => "reject_once",
     },
+    ...(reportChanged === undefined ? {} : { ports: { file: { reportChanged } } }),
   });
 }
 
@@ -132,6 +139,61 @@ describe("ACP file system bridge", () => {
       });
       expect(isDriverId(events[0]?.sourceEventId)).toBe(true);
     } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("closes the write directory before bounded committed-file reporting", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-fs-report-"));
+    const directory = join(root, "nested");
+    const path = join(directory, "note.txt");
+    const reportEntered = Promise.withResolvers<void>();
+    const releaseReport = Promise.withResolvers<void>();
+    const reportDeadline = new AbortController();
+    const timeout = spyOn(AbortSignal, "timeout").mockReturnValue(reportDeadline.signal);
+    const request = new AbortController();
+    let directoryHandleOpen = true;
+    let receivedSignal: AbortSignal | undefined;
+    const context = createContext([], async (_change, signal) => {
+      receivedSignal = signal;
+      const directoryPath = await realpath(directory);
+      const openPaths = await Promise.all(
+        (await readdir(`/proc/${process.pid}/fd`)).map((fd) =>
+          readlink(`/proc/${process.pid}/fd/${fd}`).catch(() => ""),
+        ),
+      );
+      directoryHandleOpen = openPaths.includes(directoryPath);
+      reportEntered.resolve();
+      await releaseReport.promise;
+    });
+    const reportAbort = new Error("file report deadline");
+
+    try {
+      const write = createFileSystem(root).writeTextFile(
+        context,
+        { content: "committed", path },
+        request.signal,
+      );
+      await reportEntered.promise;
+
+      expect(directoryHandleOpen).toBe(false);
+      expect(receivedSignal).toBe(reportDeadline.signal);
+      expect(receivedSignal).not.toBe(request.signal);
+      request.abort(new Error("late turn cancellation"));
+      expect(
+        await settlePromiseWithTimeout(write, {
+          label: "blocked ACP file report",
+          timeoutMs: 10,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+
+      reportDeadline.abort(reportAbort);
+      await expect(write).rejects.toBe(reportAbort);
+      expect(await readFile(path, "utf8")).toBe("committed");
+    } finally {
+      reportDeadline.abort(reportAbort);
+      releaseReport.resolve();
+      timeout.mockRestore();
       await rm(root, { force: true, recursive: true });
     }
   });

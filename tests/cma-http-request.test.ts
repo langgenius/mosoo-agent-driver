@@ -8,6 +8,7 @@ import {
   CMA_DEFAULT_BETA_HEADER_VALUE,
   createCmaHttpHandler,
 } from "../src/surfaces/cma-http";
+import { readCmaJsonBody } from "../src/surfaces/cma-http/request";
 
 function cmaRequest(path: string, init: RequestInit = {}): Request {
   const headers = new Headers(init.headers);
@@ -178,6 +179,21 @@ describe("CMA HTTP surface", () => {
 
     expect(response.status).toBe(413);
     expect(canceled).toBe(true);
+  });
+
+  test("propagates request cancellation while reading a streaming body", async () => {
+    const controller = new AbortController();
+    const reason = new Error("client disconnected");
+    const request = new Request("https://driver.test/v1/agents", {
+      body: new ReadableStream({ pull() {} }),
+      method: "POST",
+      signal: controller.signal,
+    });
+    const pending = readCmaJsonBody(request);
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
   });
 
   test("rejects an inbound event whose admitted record exceeds the wire limit", async () => {

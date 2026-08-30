@@ -1,17 +1,21 @@
 import { z } from "zod";
 
 import {
+  DURABLE_RUN_ERROR_MAX_UTF8_BYTES,
   DRIVER_CAPABILITY_IDS,
+  RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES,
+  measureRuntimeCommandJson,
   parseRuntimeCommand,
-  RUNTIME_COMMAND_STATUSES,
 } from "../../runtime-command";
 import { DRIVER_PROTOCOL_VERSION } from "../boot";
-import { parseDriverEventEnvelope } from "../events";
+import { RUNTIME_EVENT_KINDS, parseDriverEventEnvelope } from "../events";
 import { SUPPORTED_DRIVER_RUNTIMES } from "../runtime";
 
 const nonEmptyStringSchema = z.string().min(1);
+const lowercaseUuidV4Schema = z.uuidv4().regex(/^[0-9a-f-]+$/u, "UUID must be lowercase.");
 const primitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
-const okSchema = z.object({ ok: z.literal(true) });
+const okSchema = z.strictObject({ ok: z.literal(true) });
+const driverRpcBatchMaxSize = 64;
 
 function omitUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T;
@@ -80,7 +84,7 @@ function primitiveRecordSchema(label: string) {
 }
 
 const driverCapabilitySchema = z
-  .object({
+  .strictObject({
     details: z.string().optional(),
     id: z.enum(DRIVER_CAPABILITY_IDS, { error: "capability id is unsupported." }),
     status: z.enum(["supported", "unsupported"], {
@@ -101,53 +105,49 @@ const driverCapabilitiesSchema = z
     }
   });
 
-const runErrorSchema = z.object({
-  code: nonEmptyStringSchema,
-  details: primitiveRecordSchema("driver failure details"),
-  message: z.string(),
-  retryable: z.boolean(),
-});
+const durableRunErrorSchema = z
+  .strictObject({
+    code: nonEmptyStringSchema,
+    details: primitiveRecordSchema("driver failure details"),
+    message: nonEmptyStringSchema,
+    retryable: z.boolean(),
+  })
+  .refine((error) => measureRuntimeCommandJson(error) <= DURABLE_RUN_ERROR_MAX_UTF8_BYTES, {
+    error: `Driver error must not exceed ${String(DURABLE_RUN_ERROR_MAX_UTF8_BYTES)} UTF-8 bytes.`,
+  });
 
-const inputStartCommandResultSchema = z.object({
+const inputStartCommandResultSchema = z.strictObject({
   requestId: nonEmptyStringSchema,
 });
 
 const mcpExecuteCommandResultSchema = z
-  .object({
+  .strictObject({
     isError: z.boolean().optional(),
     outputText: z.string(),
     requestId: nonEmptyStringSchema,
     serverId: nonEmptyStringSchema,
     toolName: nonEmptyStringSchema,
   })
-  .transform(omitUndefined);
+  .transform(omitUndefined)
+  .refine(
+    (result) =>
+      measureRuntimeCommandJson(result) <= RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES,
+    {
+      error: `MCP command result must not exceed ${String(RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES)} UTF-8 bytes.`,
+    },
+  );
 
-const runtimeCommandResultSchema = z.unknown().transform((value, ctx) => {
-  if (value === null) {
-    return null;
-  }
+const runtimeCommandResultSchema = z
+  .union([inputStartCommandResultSchema, mcpExecuteCommandResultSchema])
+  .refine(
+    (result) =>
+      measureRuntimeCommandJson(result) <= RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES,
+    {
+      error: `Driver command result must not exceed ${String(RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES)} UTF-8 bytes.`,
+    },
+  );
 
-  const record = value as Record<string, unknown>;
-  const result = (
-    record !== null &&
-    typeof record === "object" &&
-    !Array.isArray(record) &&
-    ["isError", "outputText", "serverId", "toolName"].some((field) => Object.hasOwn(record, field))
-      ? mcpExecuteCommandResultSchema
-      : inputStartCommandResultSchema
-  ).safeParse(value);
-
-  if (result.success) {
-    return result.data;
-  }
-
-  for (const issue of result.error.issues) {
-    ctx.addIssue({ code: "custom", message: issue.message, path: issue.path });
-  }
-  return z.NEVER;
-});
-
-const driverHelloInputSchema = z.object({
+const driverHelloInputSchema = z.strictObject({
   capabilities: driverCapabilitiesSchema,
   driverVersion: nonEmptyStringSchema,
   pid: positiveSafeIntegerSchema("pid"),
@@ -158,39 +158,44 @@ const driverHelloInputSchema = z.object({
   startedAt: nonEmptyStringSchema,
 });
 
-const driverHelloOutputSchema = z.object({
+const driverHelloOutputSchema = z.strictObject({
   acceptedCapabilities: driverCapabilitiesSchema,
   connectionId: nonEmptyStringSchema,
   driverInstanceId: nonEmptyStringSchema,
   heartbeatIntervalMs: positiveSafeIntegerSchema("Driver heartbeat interval", 250),
-  runConfig: z.object({
-    commandLeaseMs: z.number().nonnegative(),
+  runConfig: z.strictObject({
+    commandLeaseMs: nonNegativeSafeIntegerSchema("Driver command lease"),
     envPolicy: z.literal("strict"),
-    eventBatchMaxSize: positiveSafeIntegerSchema("Driver event batch max size"),
+    eventBatchMaxSize: positiveSafeIntegerSchema("Driver event batch max size").refine(
+      (value) => value <= driverRpcBatchMaxSize,
+      {
+        error: `Driver event batch max size must not exceed ${String(driverRpcBatchMaxSize)}.`,
+      },
+    ),
     organizationPath: nonEmptyStringSchema,
   }),
   runId: nonEmptyStringSchema.nullable(),
 });
 
-const driverHeartbeatInputSchema = z.object({
+const driverHeartbeatInputSchema = z.strictObject({
   at: nonEmptyStringSchema,
   pid: positiveSafeIntegerSchema("pid"),
   reason: z.enum(["interval", "ping"], { error: "reason must be interval or ping." }),
 });
 
-const driverHeartbeatOutputSchema = z.object({
+const driverHeartbeatOutputSchema = z.strictObject({
   heartbeatCount: nonNegativeSafeIntegerSchema("heartbeatCount"),
   ok: z.literal(true),
 });
 
-const driverReadyInputSchema = z.object({
+const driverReadyInputSchema = z.strictObject({
   at: nonEmptyStringSchema,
   driverInstanceId: nonEmptyStringSchema,
   pid: positiveSafeIntegerSchema("pid"),
 });
 
 const driverLogContextSchema = z
-  .object({
+  .strictObject({
     parentSpanId: z.string().optional(),
     requestId: z.string().optional(),
     sandboxId: z.string().optional(),
@@ -201,7 +206,7 @@ const driverLogContextSchema = z
   .transform(omitUndefined);
 
 const driverLogErrorSchema = z
-  .object({
+  .strictObject({
     code: z.union([z.string(), z.number()]).optional(),
     message: z.string(),
     name: z.string(),
@@ -210,7 +215,7 @@ const driverLogErrorSchema = z
   .transform(omitUndefined);
 
 const driverLogEntrySchema = z
-  .object({
+  .strictObject({
     context: driverLogContextSchema.optional(),
     error: driverLogErrorSchema.optional(),
     fields: primitiveRecordSchema("driver log fields").optional(),
@@ -224,87 +229,135 @@ const driverLogEntrySchema = z
   })
   .transform(omitUndefined);
 
-const driverLogBatchInputSchema = z.object({
+const driverLogBatchInputSchema = z.strictObject({
   driverInstanceId: nonEmptyStringSchema,
-  logs: z.array(driverLogEntrySchema),
+  logs: z.array(driverLogEntrySchema).max(driverRpcBatchMaxSize),
 });
 
-const driverFailureInputSchema = z.object({
+const driverFailureInputSchema = z.strictObject({
   driverInstanceId: nonEmptyStringSchema,
-  error: runErrorSchema,
+  error: durableRunErrorSchema,
+  runId: nonEmptyStringSchema,
 });
 
-const driverCommandUpdateInputSchema = z
-  .object({
-    commandId: nonEmptyStringSchema,
-    driverInstanceId: nonEmptyStringSchema,
-    error: runErrorSchema.optional(),
+const driverCommandUpdateIdentitySchema = {
+  commandId: nonEmptyStringSchema,
+  driverInstanceId: nonEmptyStringSchema,
+} as const;
+const driverCommandUpdateInputSchema = z.discriminatedUnion("status", [
+  z.strictObject({ ...driverCommandUpdateIdentitySchema, status: z.literal("accepted") }),
+  z.strictObject({ ...driverCommandUpdateIdentitySchema, status: z.literal("cancelled") }),
+  z.strictObject({
+    ...driverCommandUpdateIdentitySchema,
     result: runtimeCommandResultSchema.optional(),
-    status: z.enum(RUNTIME_COMMAND_STATUSES, {
-      error: "status is not a supported runtime command status.",
-    }),
-  })
-  .transform(omitUndefined);
+    status: z.literal("completed"),
+  }),
+  z.strictObject({
+    ...driverCommandUpdateIdentitySchema,
+    error: durableRunErrorSchema,
+    status: z.literal("failed"),
+  }),
+]);
 
-const driverExternalToolEffectClaimInputSchema = z.object({
+const driverExternalToolEffectObserveInputSchema = z.strictObject({
+  commandId: nonEmptyStringSchema,
+  driverInstanceId: nonEmptyStringSchema,
+});
+
+const driverExternalToolEffectIntentSchema = z.strictObject({
+  effectId: nonEmptyStringSchema,
+  kind: z.literal("intent"),
+});
+
+const driverExternalToolEffectClaimedSchema = z.strictObject({
+  attempt: positiveSafeIntegerSchema("attempt"),
+  effectId: nonEmptyStringSchema,
+  idempotencyKey: nonEmptyStringSchema,
+  kind: z.literal("claimed"),
+});
+
+const driverExternalToolEffectSucceededSchema = z.strictObject({
+  effectId: nonEmptyStringSchema,
+  kind: z.literal("succeeded"),
+  result: mcpExecuteCommandResultSchema,
+});
+
+const driverExternalToolEffectUnknownSchema = z.strictObject({
+  effectId: nonEmptyStringSchema,
+  kind: z.literal("unknown"),
+});
+
+const driverExternalToolEffectStateSchema = z.discriminatedUnion("kind", [
+  driverExternalToolEffectIntentSchema,
+  driverExternalToolEffectClaimedSchema,
+  driverExternalToolEffectSucceededSchema,
+  driverExternalToolEffectUnknownSchema,
+]);
+
+const driverExternalToolEffectClaimInputSchema = z.strictObject({
+  claimToken: lowercaseUuidV4Schema,
   commandId: nonEmptyStringSchema,
   driverInstanceId: nonEmptyStringSchema,
 });
 
 const driverExternalToolEffectClaimOutputSchema = z.discriminatedUnion("kind", [
-  z.object({
-    attempt: positiveSafeIntegerSchema("attempt"),
-    effectId: nonEmptyStringSchema,
-    idempotencyKey: nonEmptyStringSchema,
-    kind: z.literal("execute"),
-  }),
-  z.object({
-    effectId: nonEmptyStringSchema,
-    kind: z.literal("completed"),
-    result: mcpExecuteCommandResultSchema,
-  }),
-  z.object({
-    effectId: nonEmptyStringSchema,
-    kind: z.literal("unknown"),
-  }),
+  driverExternalToolEffectClaimedSchema,
+  driverExternalToolEffectSucceededSchema,
+  driverExternalToolEffectUnknownSchema,
 ]);
 
-const driverExternalToolEffectCompleteInputSchema = z
-  .object({
-    commandId: nonEmptyStringSchema,
-    driverInstanceId: nonEmptyStringSchema,
-    providerReceiptJson: z.string().nullable().optional(),
-    result: mcpExecuteCommandResultSchema,
-  })
-  .transform(omitUndefined);
+const driverExternalToolEffectSettlementSchema = z
+  .discriminatedUnion("kind", [
+    z.strictObject({
+      kind: z.literal("succeeded"),
+      providerReceiptJson: z.string().nullable().optional(),
+      result: mcpExecuteCommandResultSchema,
+    }),
+    z.strictObject({ kind: z.literal("unknown") }),
+  ])
+  .refine(
+    (settlement) =>
+      measureRuntimeCommandJson(settlement) <= RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES,
+    {
+      error: `MCP settlement must not exceed ${String(RUNTIME_COMMAND_TERMINAL_PAYLOAD_MAX_UTF8_BYTES)} UTF-8 bytes.`,
+    },
+  );
 
-const driverExternalToolEffectUnknownInputSchema = z.object({
+const driverExternalToolEffectSettleInputSchema = z.strictObject({
+  claimToken: lowercaseUuidV4Schema,
   commandId: nonEmptyStringSchema,
   driverInstanceId: nonEmptyStringSchema,
+  effectId: nonEmptyStringSchema,
+  settlement: driverExternalToolEffectSettlementSchema,
 });
 
-const driverEventBatchInputSchema = z.object({
+const driverEventBatchInputSchema = z.strictObject({
   driverInstanceId: nonEmptyStringSchema,
-  events: z.array(parsedSchema(parseDriverEventEnvelope)),
+  events: z.array(parsedSchema(parseDriverEventEnvelope)).max(driverRpcBatchMaxSize),
 });
 
 const driverEventReceiptSchema = z
-  .object({
-    eventId: z.string().optional(),
+  .strictObject({
+    eventId: nonEmptyStringSchema,
     seq: nonNegativeSafeIntegerSchema("Driver event receipt seq"),
-    type: z.string(),
+    type: z.enum(RUNTIME_EVENT_KINDS),
   })
   .transform(omitUndefined);
 
-const driverEventBatchOutputSchema = z.object({
+const driverEventBatchOutputSchema = z.strictObject({
   accepted: z.array(driverEventReceiptSchema),
 });
 
-const driverInstanceInputSchema = z.object({
+const driverInstanceInputSchema = z.strictObject({
   driverInstanceId: nonEmptyStringSchema,
 });
 
-const driverNextCommandOutputSchema = z.object({
+const driverCompletionInputSchema = z.strictObject({
+  driverInstanceId: nonEmptyStringSchema,
+  runId: nonEmptyStringSchema,
+});
+
+const driverNextCommandOutputSchema = z.strictObject({
   command: parsedSchema(parseRuntimeCommand).nullable(),
 });
 
@@ -334,22 +387,22 @@ type SchemaValue<Schema extends z.ZodType> = DeepReadonly<z.output<Schema>>;
 
 export const driverRuntimeRpcSchemas = {
   driver: {
+    observeExternalToolEffect: {
+      input: driverExternalToolEffectObserveInputSchema,
+      output: driverExternalToolEffectStateSchema,
+    },
     claimExternalToolEffect: {
       input: driverExternalToolEffectClaimInputSchema,
       output: driverExternalToolEffectClaimOutputSchema,
     },
     commandUpdate: { input: driverCommandUpdateInputSchema, output: okSchema },
-    completeExternalToolEffect: {
-      input: driverExternalToolEffectCompleteInputSchema,
-      output: okSchema,
-    },
-    completeRun: { input: driverInstanceInputSchema, output: okSchema },
+    completeRun: { input: driverCompletionInputSchema, output: okSchema },
     failRun: { input: driverFailureInputSchema, output: okSchema },
     heartbeat: { input: driverHeartbeatInputSchema, output: driverHeartbeatOutputSchema },
     hello: { input: driverHelloInputSchema, output: driverHelloOutputSchema },
-    markExternalToolEffectUnknown: {
-      input: driverExternalToolEffectUnknownInputSchema,
-      output: okSchema,
+    settleExternalToolEffect: {
+      input: driverExternalToolEffectSettleInputSchema,
+      output: driverExternalToolEffectStateSchema,
     },
     pushEvents: { input: driverEventBatchInputSchema, output: driverEventBatchOutputSchema },
     pushLogs: { input: driverLogBatchInputSchema, output: okSchema },
@@ -392,24 +445,25 @@ export type DriverLogBatchInput = Omit<SchemaValue<typeof driverLogBatchInputSch
 export type DriverLogBatchOutput = SchemaValue<typeof okSchema>;
 export type DriverFailureInput = SchemaValue<typeof driverFailureInputSchema>;
 export type DriverCommandUpdateInput = SchemaValue<typeof driverCommandUpdateInputSchema>;
+export type DriverExternalToolEffectObserveInput = SchemaValue<
+  typeof driverExternalToolEffectObserveInputSchema
+>;
+export type DriverExternalToolEffectState = SchemaValue<typeof driverExternalToolEffectStateSchema>;
 export type DriverExternalToolEffectClaimInput = SchemaValue<
   typeof driverExternalToolEffectClaimInputSchema
 >;
 export type DriverExternalToolEffectClaimOutput = SchemaValue<
   typeof driverExternalToolEffectClaimOutputSchema
 >;
-export type DriverExternalToolEffectCompleteInput = SchemaValue<
-  typeof driverExternalToolEffectCompleteInputSchema
->;
-export type DriverExternalToolEffectUnknownInput = SchemaValue<
-  typeof driverExternalToolEffectUnknownInputSchema
+export type DriverExternalToolEffectSettleInput = SchemaValue<
+  typeof driverExternalToolEffectSettleInputSchema
 >;
 export type DriverEventBatchInput = SchemaValue<typeof driverEventBatchInputSchema>;
 export type DriverEventReceipt = SchemaValue<typeof driverEventReceiptSchema>;
 export type DriverEventBatchOutput = SchemaValue<typeof driverEventBatchOutputSchema>;
 export type DriverNextCommandInput = SchemaValue<typeof driverInstanceInputSchema>;
 export type DriverNextCommandOutput = SchemaValue<typeof driverNextCommandOutputSchema>;
-export type DriverCompletionInput = SchemaValue<typeof driverInstanceInputSchema>;
+export type DriverCompletionInput = SchemaValue<typeof driverCompletionInputSchema>;
 
 export function parseDriverHelloInput(value: unknown): DriverHelloInput {
   return driverHelloInputSchema.parse(value);
@@ -427,26 +481,26 @@ export function parseDriverCommandUpdateInput(value: unknown): DriverCommandUpda
   return driverCommandUpdateInputSchema.parse(value);
 }
 
+export function parseDriverExternalToolEffectObserveInput(
+  value: unknown,
+): DriverExternalToolEffectObserveInput {
+  return driverExternalToolEffectObserveInputSchema.parse(value);
+}
+
 export function parseDriverExternalToolEffectClaimInput(
   value: unknown,
 ): DriverExternalToolEffectClaimInput {
   return driverExternalToolEffectClaimInputSchema.parse(value);
 }
 
-export function parseDriverExternalToolEffectCompleteInput(
+export function parseDriverExternalToolEffectSettleInput(
   value: unknown,
-): DriverExternalToolEffectCompleteInput {
-  return driverExternalToolEffectCompleteInputSchema.parse(value);
-}
-
-export function parseDriverExternalToolEffectUnknownInput(
-  value: unknown,
-): DriverExternalToolEffectUnknownInput {
-  return driverExternalToolEffectUnknownInputSchema.parse(value);
+): DriverExternalToolEffectSettleInput {
+  return driverExternalToolEffectSettleInputSchema.parse(value);
 }
 
 export function parseDriverCompletionInput(value: unknown): DriverCompletionInput {
-  return driverInstanceInputSchema.parse(value);
+  return driverCompletionInputSchema.parse(value);
 }
 
 export function parseDriverFailureInput(value: unknown): DriverFailureInput {

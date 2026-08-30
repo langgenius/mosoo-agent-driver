@@ -95,9 +95,6 @@ describe("Claude Agent SDK task snapshots", () => {
 
     const maximum = snapshot(Array.from({ length: 256 }, (_, index) => task(`task-${index}`)));
     expect(maximum).toMatchObject({ kind: "agent.tasks.replaced" });
-    if (maximum === null) {
-      throw new Error("Expected a task replacement snapshot.");
-    }
     expect((maximum.payload as { tasks: unknown[] }).tasks).toHaveLength(256);
 
     expect(
@@ -108,16 +105,37 @@ describe("Claude Agent SDK task snapshots", () => {
         payload: { code: "claude.visible_background_tasks_too_many" },
         visibility: "owner_debug",
       },
-      snapshot: null,
+      snapshot: claudeBackgroundTasksClosedEvent(),
+    });
+    const unreadTail = task("unread-tail");
+    Object.defineProperty(unreadTail, "ambient", {
+      get() {
+        throw new Error("Tasks after the visible limit must not be inspected.");
+      },
+    });
+    expect(
+      projection([
+        ...Array.from({ length: 257 }, (_, index) => task(`bounded-${index}`)),
+        unreadTail,
+      ]),
+    ).toMatchObject({
+      diagnostic: { payload: { code: "claude.visible_background_tasks_too_many" } },
+      snapshot: claudeBackgroundTasksClosedEvent(),
     });
     expect(
       projection(Array.from({ length: 1_025 }, (_, index) => task(`ambient-${index}`, "x", true))),
     ).toMatchObject({
-      diagnostic: {
-        kind: "diagnostic.reported",
-        payload: { code: "claude.background_tasks_snapshot_too_large" },
-      },
-      snapshot: null,
+      diagnostic: { payload: { code: "claude.background_tasks_snapshot_too_large" } },
+      snapshot: claudeBackgroundTasksClosedEvent(),
+    });
+    expect(
+      projection([
+        ...Array.from({ length: 1_023 }, (_, index) => task(`ambient-${index}`, "x", true)),
+        task("visible"),
+      ]),
+    ).toMatchObject({ snapshot: { payload: { tasks: [{ taskId: "visible" }] } } });
+    expect(projection(Array.from({ length: 1_024 }, () => task("duplicate")))).toMatchObject({
+      snapshot: { payload: { tasks: [{ taskId: "duplicate" }] } },
     });
     const oversizedMetadata = projection(
       Array.from({ length: 100 }, (_, index) => ({
@@ -137,9 +155,6 @@ describe("Claude Agent SDK task snapshots", () => {
         visibility: "participant",
       },
     });
-    if (oversizedMetadata.snapshot === null) {
-      throw new Error("Expected an ID-only membership snapshot.");
-    }
     expect(
       (oversizedMetadata.snapshot.payload as { tasks: Array<Record<string, unknown>> }).tasks,
     ).toEqual(Array.from({ length: 100 }, (_, index) => ({ taskId: `large-${index}` })));

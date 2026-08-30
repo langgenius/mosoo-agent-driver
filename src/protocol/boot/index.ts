@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseTraceparent } from "vestig";
 
 import type { DriverInstanceId } from "../id";
 import type { JsonObject } from "../json";
@@ -41,11 +42,11 @@ export type {
 } from "./host-snapshot";
 
 /**
- * Version 2 requires the durable external-tool-effect RPCs. Refusing an older
+ * Version 3 requires the durable external-tool-effect RPCs. Refusing an older
  * Driver is safer than letting it invoke an MCP tool without the persistence
  * fence during a rolling deployment.
  */
-export const DRIVER_PROTOCOL_VERSION = 2;
+export const DRIVER_PROTOCOL_VERSION = 3;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";
@@ -76,6 +77,31 @@ const runtimeTransportByRuntime = {
 const controlUrlSchema = z
   .url()
   .refine((value) => /^(?:https?|wss?):/iu.test(value), "must use http, https, ws, or wss");
+const traceparentPattern = /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/u;
+
+export function parseDriverTraceparent(value: string): { traceId: string; spanId: string } {
+  const parsed = parseTraceparent(value);
+
+  if (
+    parsed === null ||
+    !traceparentPattern.test(value) ||
+    parsed.traceId === "0".repeat(32) ||
+    parsed.spanId === "0".repeat(16)
+  ) {
+    throw new TypeError("traceparent must be a valid W3C traceparent header");
+  }
+
+  return parsed;
+}
+
+const traceparentSchema = nonEmptyStringSchema.refine((value) => {
+  try {
+    parseDriverTraceparent(value);
+    return true;
+  } catch {
+    return false;
+  }
+}, "must be a valid W3C traceparent header");
 
 function omitUndefinedProperties<Value extends Record<string, unknown>>(value: Value): Value {
   return Object.fromEntries(
@@ -300,7 +326,7 @@ const driverBootPayloadSchema = ownObjectSchema({
   runtime: z.enum(SUPPORTED_DRIVER_RUNTIMES),
   runtimeTransport: z.enum(SUPPORTED_DRIVER_RUNTIME_TRANSPORTS),
   sandboxId: createDriverIdSchema<SandboxId>(),
-  traceparent: nonEmptyStringSchema,
+  traceparent: traceparentSchema,
 }).superRefine((payload, context) => {
   if (payload.sandboxId !== payload.execution.session.context.sandboxId) {
     context.addIssue({

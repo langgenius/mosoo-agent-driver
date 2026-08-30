@@ -448,13 +448,8 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     const { input } = block;
-    if (input) {
-      await this.#events.pushToolArguments({
-        context,
-        delta: stringifyForDisplay(input),
-        reason: "driver.claude.tool.args",
-        toolCallId,
-      });
+    if (input && (!isRecord(input) || Object.keys(input).length > 0)) {
+      await this.#events.pushToolSnapshot(context, toolCallId, stringifyForDisplay(input));
     }
   }
 
@@ -689,7 +684,7 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const { diagnostic, snapshot } = projectClaudeBackgroundTasksSnapshot(message);
     await this.#options.push(context, "driver.claude.tasks.replaced", [
-      ...(snapshot === null ? [] : [snapshot]),
+      snapshot,
       ...(diagnostic === undefined ? [] : [diagnostic]),
     ]);
   }
@@ -896,7 +891,7 @@ export class ClaudeAgentSdkMessageTranslator {
       // resume can omit every assistant frame, so the result is materialized
       // above only when no competing text candidate exists.
       const finalMessage =
-        structuredOutput !== undefined || resultText === null
+        structuredOutput !== undefined || resultText === null || resultText.trim().length === 0
           ? null
           : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
 

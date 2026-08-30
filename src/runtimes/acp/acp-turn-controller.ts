@@ -69,6 +69,7 @@ async function drainTurnWork(
   signal?: AbortSignal,
 ): Promise<void> {
   const results = await Promise.allSettled([
+    clientRequests.drainTurnFileWrites(signal),
     clientRequests.drainPermissions(signal),
     signal === undefined
       ? clientRequests.drainUpdates()
@@ -192,6 +193,7 @@ export class AcpTurnController {
       throw new Error("ACP driver backend already has an active turn.");
     }
 
+    clientRequests.openFileWriteIngress();
     const messageId = createDriverId() as MessageId;
     const active = createActiveTurn(runId, clientRequests.beginTurnTerminals());
     this.#active = active;
@@ -264,6 +266,7 @@ export class AcpTurnController {
       );
 
       if (active.cancelRequested) {
+        clientRequests.closeFileWriteIngress();
         clientRequests.closePermissionIngress();
         clientRequests.closeTurnTranscriptIngress();
         await drain();
@@ -289,6 +292,7 @@ export class AcpTurnController {
         prompt: [{ text: input.text, type: "text" }],
         sessionId,
       });
+      clientRequests.closeFileWriteIngress();
       if (active.fatal !== null) {
         throw active.fatal.error;
       }
@@ -331,6 +335,7 @@ export class AcpTurnController {
       }
     } catch (error) {
       active.providerPromptSettled.resolve(active.providerPromptAdmitted && active.cancelRequested);
+      clientRequests.closeFileWriteIngress();
       clientRequests.closePermissionIngress();
       clientRequests.closeTurnTranscriptIngress();
       if (preserveEventState) {
@@ -438,6 +443,7 @@ export class AcpTurnController {
       );
       throw error;
     } finally {
+      clientRequests.closeFileWriteIngress();
       clientRequests.closePermissionIngress();
       clientRequests.closeTurnTranscriptIngress();
       if (active.drainDeadline !== null) {

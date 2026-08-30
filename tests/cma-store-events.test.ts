@@ -36,7 +36,7 @@ function driverEvent(
     origin: "driver",
     payload,
     ...(options.runId === undefined ? {} : { runId: options.runId }),
-    schemaVersion: "2026-05-26",
+    schemaVersion: "2026-08-29",
     sessionId,
     ...(options.sourceEventId === undefined ? {} : { sourceEventId: options.sourceEventId }),
     visibility: options.visibility ?? "participant",
@@ -50,13 +50,13 @@ describe("CMA memory store lifecycle", () => {
     const sourceEventId = createDriverId();
     const store = createCmaMemoryStore({ sessions: [{ id: sessionId }] });
     const payload = JSON.parse(
-      '{"__proto__":{"recoverable":true},"error":{"code":"fatal","details":{},"message":"failed","retryable":false}}',
+      '{"__proto__":{"recoverable":true},"error":{"code":"fatal","details":{},"message":"failed","retryable":false},"recoverable":false}',
     );
     const event = driverEvent(sessionId, "run.failed", payload, { runId, sourceEventId });
     const eventPayload = event.payload as Record<string, unknown>;
 
     expect(Object.hasOwn(eventPayload, "__proto__")).toBe(true);
-    expect(eventPayload["recoverable"]).toBeUndefined();
+    expect(eventPayload["recoverable"]).toBe(false);
     const first = await store.appendDriverEvent(sessionId, event);
 
     expect(first).toMatchObject([
@@ -140,7 +140,10 @@ describe("CMA memory store lifecycle", () => {
       ),
     ).rejects.toBeInstanceOf(CmaStoreConflictError);
     await expect(
-      store.appendDriverEvent(sessionId, driverEvent(otherSessionId, "message.completed", {})),
+      store.appendDriverEvent(
+        sessionId,
+        driverEvent(otherSessionId, "message.completed", { messageId: "message-1" }),
+      ),
     ).rejects.toThrow("sessionId");
     expect(await store.listSessionEvents(otherSessionId)).toHaveLength(0);
   });

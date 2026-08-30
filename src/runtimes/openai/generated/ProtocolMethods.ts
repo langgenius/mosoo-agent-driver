@@ -1,6 +1,6 @@
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
-// Derived from the matching runtime JSON Schemas by scripts/prune-openai-generated-types.mjs.
+// Derived from the matching runtime JSON Schemas by scripts/sync-openai-generated.mjs.
 export type ServerNotificationMethod =
   | "error"
   | "thread/started"

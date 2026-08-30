@@ -23,6 +23,7 @@ interface RecordingSocket extends DriverRuntimeEventPort {
 function acceptEvents(events: readonly DriverEventInput[]): DriverEventBatchOutput {
   return {
     accepted: events.map((event, index) => ({
+      eventId: event.sourceEventId!,
       seq: index + 1,
       type: event.kind,
     })),
@@ -222,7 +223,7 @@ describe("DriverPermissionBroker", () => {
         pushedEvents.push(...events);
         return {
           accepted: events.map((event) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: (sequence += 1),
             type: event.kind,
           })),
@@ -279,11 +280,11 @@ describe("DriverPermissionBroker", () => {
     expect(() => new DriverPermissionBroker(() => null, { requestTimeoutMs: 0 })).not.toThrow();
   });
 
-  test.each(["resolve", "abort", "rejectAll", "timeout", "publish failure"] as const)(
+  test.each(["resolve", "abort", "rejectAll", "timeout", "publish retry"] as const)(
     "returns pending capacity after %s",
     async (mode) => {
       const controller = new AbortController();
-      let failPublish = mode === "publish failure";
+      let failPublish = mode === "publish retry";
       const socket: DriverRuntimeEventPort = {
         currentRunId: () => runId,
         pushEvents: async ({ events }) => {
@@ -308,8 +309,9 @@ describe("DriverPermissionBroker", () => {
           controller.abort();
           await expect(first).resolves.toBe("reject_once");
           break;
-        case "publish failure":
-          await expect(first).rejects.toBeInstanceOf(PermissionEventDeliveryError);
+        case "publish retry":
+          expect(broker.resolve(permissionInput.requestId, "allow_once")).toBe(true);
+          await expect(first).resolves.toBe("allow_once");
           break;
         case "rejectAll":
           broker.rejectAll();
@@ -509,7 +511,7 @@ describe("DriverPermissionBroker", () => {
         phase: "resolved",
         requestId: permissionInput.requestId,
       });
-      expect((outcome.error as Error).cause).toBe(deliveryFailure);
+      expect(((outcome.error as Error).cause as Error).cause).toBe(deliveryFailure);
     }
 
     failResolution = false;
@@ -687,40 +689,53 @@ describe("DriverPermissionBroker", () => {
     expect(broker.hasPending()).toBe(false);
   });
 
-  test("wraps a rejected request delivery and releases its identity", async () => {
-    const deliveryFailure = new Error("event sink unavailable");
-    let fail = true;
+  test("replays one stable lifecycle when persisted permission ACKs are lost", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const persisted = new Map<string, string>();
+    const phaseAttempts = new Map<string, number>();
     const broker = new DriverPermissionBroker(() => null);
     const socket: DriverRuntimeEventPort = {
       currentRunId: () => runId,
       pushEvents: async ({ events }) => {
-        if (fail) {
-          fail = false;
-          throw deliveryFailure;
+        const owned = structuredClone(events);
+        attempts.push(owned);
+        for (const event of owned) {
+          const sourceEventId = event.sourceEventId!;
+          const content = JSON.stringify(event);
+          const previous = persisted.get(sourceEventId);
+          expect(previous === undefined || previous === content).toBe(true);
+          persisted.set(sourceEventId, content);
         }
 
-        return acceptEvents(events);
+        const phase = owned[0]!.kind;
+        const attempt = (phaseAttempts.get(phase) ?? 0) + 1;
+        phaseAttempts.set(phase, attempt);
+        if (attempt === 1) {
+          throw new Error(`${phase} ACK lost after persistence`);
+        }
+        return acceptEvents(owned);
       },
     };
 
-    const outcome = await settlePromiseWithTimeout(broker.request(socket, permissionInput), {
-      label: "rejected permission request delivery",
-      timeoutMs: 100,
-    });
-    expect(outcome.status).toBe("failed");
-    if (outcome.status === "failed") {
-      expect(outcome.error).toBeInstanceOf(PermissionEventDeliveryError);
-      expect(outcome.error).toMatchObject({
-        phase: "requested",
-        requestId: permissionInput.requestId,
-      });
-      expect((outcome.error as Error).cause).toBe(deliveryFailure);
+    for (let replay = 0; replay < 2; replay += 1) {
+      const request = broker.request(socket, permissionInput);
+      await Promise.resolve();
+      broker.rejectAll();
+      await expect(request).resolves.toBe("reject_once");
     }
 
-    const retry = broker.request(socket, permissionInput);
-    await Promise.resolve();
-    expect(broker.resolve(permissionInput.requestId, "reject_once")).toBe(true);
-    await expect(retry).resolves.toBe("reject_once");
+    expect(attempts.map((events) => events.map(({ kind }) => kind))).toEqual([
+      ["permission.requested"],
+      ["permission.requested"],
+      ["permission.resolved", "diagnostic.reported"],
+      ["permission.resolved", "diagnostic.reported"],
+      ["permission.requested"],
+      ["permission.resolved", "diagnostic.reported"],
+    ]);
+    expect(persisted.size).toBe(3);
+    expect(
+      [...persisted.keys()].every((sourceEventId) => sourceEventId.startsWith("permission:")),
+    ).toBe(true);
   });
 
   test("rejects unsupported interactive permission requests instead of allowing them", async () => {

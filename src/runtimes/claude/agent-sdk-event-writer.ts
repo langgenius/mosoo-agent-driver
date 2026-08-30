@@ -350,11 +350,7 @@ export class ClaudeAgentSdkEventWriter {
       runId,
       kind: "run.completed",
       payload: {
-        ...(finalMessage === null
-          ? {}
-          : {
-              finalMessageId: finalMessage.id,
-            }),
+        ...(finalMessage === null ? {} : { finalMessageId: finalMessage.id }),
         stopReason: "end_turn",
         ...(structuredOutput === undefined ? {} : { structuredOutput }),
       },
@@ -533,7 +529,7 @@ export class ClaudeAgentSdkEventWriter {
         delivery: "best_effort",
         kind: "tool.call.updated",
         payload: {
-          rawInput: delta,
+          rawInputDelta: delta,
           status: "running",
           toolCallId,
         },

@@ -193,6 +193,8 @@ export async function readCmaJsonBody(request: Request): Promise<unknown> {
     );
     return JSON.parse(new TextDecoder().decode(body)) as unknown;
   } catch (error) {
+    request.signal.throwIfAborted();
+
     if (error instanceof CmaHttpRequestError) {
       throw error;
     }

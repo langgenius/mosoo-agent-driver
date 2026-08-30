@@ -67,6 +67,17 @@ interface QueuedPush {
   readonly terminalKey: string | null;
 }
 
+interface PendingAdoption {
+  readonly events: DriverEventInput[];
+  readonly sourceEventIds: string[];
+}
+
+interface EventSettlement {
+  readonly promise: Promise<void>;
+  readonly reject: (reason?: unknown) => void;
+  readonly resolve: () => void;
+}
+
 class QueuedPushDeliveryError extends Error {
   readonly deliveryCause: unknown;
   readonly retainedSourceEventIds: readonly string[];
@@ -88,6 +99,7 @@ export class DriverEventPublisher {
   readonly #runtime: DriverRuntime;
   #acceptedInFlightSourceEventIds = new Set<string>();
   #drainTask: Promise<void> | null = null;
+  #eventSettlements = new Map<string, EventSettlement>();
   #inFlightEvents: readonly QueuedDriverEvent[] | null = null;
   #lastAcceptedSeq = 0;
   #pendingEvents: QueuedDriverEvent[] = [];
@@ -183,7 +195,6 @@ export class DriverEventPublisher {
 
     if (
       terminalSettlement === undefined &&
-      activeRunId !== null &&
       [...explicitRunIds].some((runId) => runId !== activeRunId)
     ) {
       if (events.some(isLosslessDriverEvent)) {
@@ -239,28 +250,113 @@ export class DriverEventPublisher {
       return Promise.resolve();
     }
 
-    const entry = this.#admit(context, reason, events, activeRunId, terminalSettlement?.signal);
+    const candidates = [
+      ...(this.#inFlightEvents ?? this.#pendingEvents),
+      ...this.#queue.flatMap((queued) => queued.events),
+    ];
+    const adoption =
+      terminalSettlement === undefined
+        ? this.#adoptPending(events, activeRunId, candidates)
+        : { events: [...events], sourceEventIds: [] };
+    const entry =
+      adoption.events.length === 0
+        ? null
+        : this.#admit(context, reason, adoption.events, activeRunId, terminalSettlement?.signal);
 
-    if (entry === null) {
+    if (entry === null && adoption.sourceEventIds.length === 0) {
       this.#requestPendingDrain(context, reason);
       return Promise.resolve();
     }
 
-    if (terminalSettlement === undefined) {
-      const unresolvedSourceEventIds = new Set(
-        [
-          ...(this.#inFlightEvents ?? this.#pendingEvents),
-          ...this.#queue.flatMap((queued) => queued.events),
-        ].map(({ event }) => event.sourceEventId),
-      );
+    if (entry !== null && terminalSettlement === undefined) {
+      const unresolvedSourceEventIds = new Set(candidates.map(({ event }) => event.sourceEventId));
 
       if (entry.events.some(({ event }) => unresolvedSourceEventIds.has(event.sourceEventId))) {
         throw new Error("Driver source event ID conflicts with a pending event.");
       }
     }
 
-    this.#enqueue(entry);
-    return entry.losslessCount === 0 && !entry.terminalBatch ? Promise.resolve() : entry.promise;
+    const deliveries: Promise<void>[] = [];
+
+    if (entry !== null) {
+      this.#enqueue(entry);
+      if (entry.losslessCount > 0 || entry.terminalBatch) {
+        deliveries.push(entry.promise);
+      }
+    }
+
+    if (adoption.sourceEventIds.length > 0) {
+      const acknowledged = Promise.all(
+        adoption.sourceEventIds.map((sourceEventId) => {
+          const settlement = this.#eventSettlements.get(sourceEventId);
+          if (settlement === undefined) {
+            throw new Error("Driver pending event settlement is missing.");
+          }
+          return settlement.promise;
+        }),
+      ).then(() => undefined);
+      const retry = this.#createPendingRetry(
+        context,
+        reason,
+        adoption.sourceEventIds,
+        terminalSettlement?.signal,
+      );
+      this.#enqueue(retry);
+      deliveries.push(Promise.race([acknowledged, retry.promise.then(() => acknowledged)]));
+    }
+
+    return deliveries.length === 0
+      ? Promise.resolve()
+      : Promise.all(deliveries).then(() => undefined);
+  }
+
+  #adoptPending(
+    events: readonly DriverEventInput[],
+    activeRunId: RunId | null,
+    candidates: readonly QueuedDriverEvent[],
+  ): PendingAdoption {
+    const adopted = new Set<number>();
+    const fresh: DriverEventInput[] = [];
+    const sourceEventIds: string[] = [];
+
+    for (const event of events) {
+      if (!isLosslessDriverEvent(event)) {
+        fresh.push(event);
+        continue;
+      }
+
+      const explicitSourceEventId =
+        typeof event.sourceEventId === "string" && event.sourceEventId.length > 0
+          ? event.sourceEventId
+          : undefined;
+      if (explicitSourceEventId === undefined) {
+        fresh.push(event);
+        continue;
+      }
+      const candidateIndex = candidates.findIndex(
+        ({ event: candidate }) => candidate.sourceEventId === explicitSourceEventId,
+      );
+
+      if (candidateIndex < 0) {
+        fresh.push(event);
+        continue;
+      }
+
+      const retryKey = losslessDriverEventRetryKey(event, activeRunId)!;
+      if (adopted.has(candidateIndex)) {
+        throw new Error("Driver event push requires unique source event IDs.");
+      }
+
+      const candidate = candidates[candidateIndex]!.event;
+      if (losslessDriverEventRetryKey(candidate, activeRunId) !== retryKey) {
+        throw new Error("Driver source event ID conflicts with a pending event.");
+      }
+
+      adopted.add(candidateIndex);
+      sourceEventIds.push(candidate.sourceEventId!);
+    }
+
+    return { events: fresh, sourceEventIds };
   }
 
   async #retryPending(
@@ -512,6 +608,21 @@ export class DriverEventPublisher {
   }
 
   #enqueue(entry: QueuedPush): void {
+    for (const { event } of entry.events) {
+      const sourceEventId = event.sourceEventId;
+      if (
+        !isLosslessDriverEvent(event) ||
+        sourceEventId === undefined ||
+        this.#eventSettlements.has(sourceEventId)
+      ) {
+        continue;
+      }
+
+      const settlement = Promise.withResolvers<void>();
+      void settlement.promise.catch(() => {});
+      this.#eventSettlements.set(sourceEventId, settlement);
+    }
+
     this.#queue.push(entry);
     this.#queuedEventBytes += entry.eventBytes;
     this.#queuedEventCount += entry.eventCount;
@@ -755,6 +866,7 @@ export class DriverEventPublisher {
 
               remainingLossless.splice(retainedIndex, 1);
               this.#rejectedInFlight.set(error.sourceEventId, error);
+              this.#eventSettlements.get(error.sourceEventId)?.reject(error);
 
               const settlement = this.#terminalSettlement;
 
@@ -767,17 +879,17 @@ export class DriverEventPublisher {
                 settlement.rejection ??= error;
               }
 
-              if (rejected!.owner === null) {
-                for (const entry of entries) {
-                  if (
-                    entry.awaitPending &&
-                    entry.retrySourceEventIds.includes(error.sourceEventId) &&
-                    !ownerErrors.has(entry.id)
-                  ) {
-                    ownerErrors.set(entry.id, error);
-                  }
+              for (const entry of entries) {
+                if (
+                  entry.awaitPending &&
+                  entry.retrySourceEventIds.includes(error.sourceEventId) &&
+                  !ownerErrors.has(entry.id)
+                ) {
+                  ownerErrors.set(entry.id, error);
                 }
-              } else if (!ownerErrors.has(rejected!.owner)) {
+              }
+
+              if (rejected!.owner !== null && !ownerErrors.has(rejected!.owner)) {
                 ownerErrors.set(rejected!.owner, error);
               }
             }
@@ -808,6 +920,16 @@ export class DriverEventPublisher {
     }
 
     this.#setPending(remainingLossless, terminalKey);
+    const pendingSourceEventIds = new Set(
+      this.#pendingEvents.map(({ event }) => event.sourceEventId),
+    );
+
+    for (const { event } of queuedEvents) {
+      const sourceEventId = event.sourceEventId;
+      if (sourceEventId !== undefined && !pendingSourceEventIds.has(sourceEventId)) {
+        this.#eventSettlements.delete(sourceEventId);
+      }
+    }
 
     context.logger.debug("driver.runtime.events.sent", {
       acceptedEventCount,
@@ -824,9 +946,7 @@ export class DriverEventPublisher {
         .filter(
           ({ event, owner }) =>
             owner === entry.id ||
-            (entry.awaitPending &&
-              owner === null &&
-              entry.retrySourceEventIds.includes(event.sourceEventId!)),
+            (entry.awaitPending && entry.retrySourceEventIds.includes(event.sourceEventId!)),
         )
         .map(({ event }) => event.sourceEventId!);
       const error =
@@ -885,6 +1005,7 @@ export class DriverEventPublisher {
     for (const event of events) {
       if (event.sourceEventId !== undefined) {
         this.#acceptedInFlightSourceEventIds.add(event.sourceEventId);
+        this.#eventSettlements.get(event.sourceEventId)?.resolve();
       }
     }
 

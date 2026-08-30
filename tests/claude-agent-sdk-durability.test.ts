@@ -335,7 +335,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
           }
           return {
             accepted: batch.map((event) => ({
-              eventId: event.sourceEventId,
+              eventId: event.sourceEventId!,
               seq: (sequence += 1),
               type: event.kind,
             })),

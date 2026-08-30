@@ -1,5 +1,6 @@
 {
   "commandId": "command-cancel-1",
   "kind": "turn.cancel",
-  "reason": "user"
+  "reason": "user",
+  "runId": "01J00000000000000000000012"
 }

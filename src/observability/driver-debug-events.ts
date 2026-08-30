@@ -71,10 +71,14 @@ function addDriverEventToSummary(summary: DriverEventBatchSummary, event: Driver
 
   if (event.kind === "tool.call.updated") {
     const payload = isUnknownRecord(event.payload) ? event.payload : {};
-    if (typeof payload["rawInput"] === "string") {
+    if (typeof payload["rawInput"] === "string" || typeof payload["rawInputDelta"] === "string") {
       summary.toolCallArgsCount += 1;
     }
-    if (typeof payload["rawOutput"] === "string" || typeof payload["content"] === "string") {
+    if (
+      typeof payload["rawOutput"] === "string" ||
+      typeof payload["rawOutputDelta"] === "string" ||
+      typeof payload["content"] === "string"
+    ) {
       summary.toolCallResultCount += 1;
     }
   }

@@ -25,9 +25,7 @@
       "event": {
         "content_block": {
           "id": "tool-1",
-          "input": {
-            "command": "pwd"
-          },
+          "input": {},
           "name": "Bash",
           "type": "tool_use"
         },
@@ -39,7 +37,7 @@
     {
       "event": {
         "delta": {
-          "partial_json": "{\"cwd\":\"/workspace\"}",
+          "partial_json": "{\"command\":\"pwd\",\"cwd\":\"/workspace\"}",
           "type": "input_json_delta"
         },
         "index": 1,
@@ -165,16 +163,7 @@
       "delivery": "best_effort",
       "kind": "tool.call.updated",
       "payload": {
-        "rawInput": "{\"command\":\"pwd\"}",
-        "status": "running",
-        "toolCallId": "tool-1"
-      }
-    },
-    {
-      "delivery": "best_effort",
-      "kind": "tool.call.updated",
-      "payload": {
-        "rawInput": "{\"cwd\":\"/workspace\"}",
+        "rawInputDelta": "{\"command\":\"pwd\",\"cwd\":\"/workspace\"}",
         "status": "running",
         "toolCallId": "tool-1"
       }

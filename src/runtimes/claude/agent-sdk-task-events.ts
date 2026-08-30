@@ -15,7 +15,7 @@ const MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS = 256;
 
 export interface ClaudeBackgroundTasksProjection {
   readonly diagnostic?: DriverEventInput;
-  readonly snapshot: DriverEventInput | null;
+  readonly snapshot: DriverEventInput;
 }
 
 function taskSnapshotDiagnostic(code: string, taskCount: number): DriverEventInput {
@@ -36,7 +36,10 @@ function taskSnapshotDiagnostic(code: string, taskCount: number): DriverEventInp
 }
 
 function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeBackgroundTasksProjection {
-  return { diagnostic: taskSnapshotDiagnostic(code, taskCount), snapshot: null };
+  return {
+    diagnostic: taskSnapshotDiagnostic(code, taskCount),
+    snapshot: claudeBackgroundTasksClosedEvent(),
+  };
 }
 
 function publicTaskId(nativeTaskId: string): string | null {
@@ -94,7 +97,7 @@ export function projectClaudeBackgroundTasksSnapshot(
       ...(title === undefined ? {} : { title }),
     });
     if (tasks.size > MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS) {
-      return rejectedTaskSnapshot("claude.visible_background_tasks_too_many", message.tasks.length);
+      return rejectedTaskSnapshot("claude.visible_background_tasks_too_many", tasks.size);
     }
   }
 

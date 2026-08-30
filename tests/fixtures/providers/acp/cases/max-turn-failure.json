@@ -86,7 +86,8 @@
       "payload": {
         "error": {
           "code": "acp.max_turn_requests",
-          "message": "ACP prompt stopped with max_turn_requests."
+          "message": "ACP prompt stopped with max_turn_requests.",
+          "retryable": false
         },
         "recoverable": false,
         "stopReason": "max_turn_requests"

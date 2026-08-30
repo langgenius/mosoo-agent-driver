@@ -3,13 +3,14 @@ import { describe, expect, test } from "bun:test";
 import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
-import type { RuntimeCommand } from "../src/runtime-command";
+import type { McpExternalToolExecutionResult, RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import {
   FakeDriverRuntimeIo,
   createBackend,
   createDispatcher,
+  settleBackendInput,
   waitForUpdate,
 } from "./driver-runtime-boundary-fixtures";
 
@@ -30,6 +31,7 @@ describe("driver runtime boundary", () => {
         commandId: "cancel-with-lossless-terminal",
         kind: "turn.cancel",
         reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
       },
     ]);
     const nativeSetTimeout = globalThis.setTimeout;
@@ -45,15 +47,7 @@ describe("driver runtime boundary", () => {
       await new Promise<void>((resolve) => {
         signal!.addEventListener("abort", () => nativeSetTimeout(resolve, 30), { once: true });
       });
-      await context.ports.eventSink.pushEvents({
-        events: [
-          {
-            kind: "run.cancelled",
-            payload: { reason: "test.cancel" },
-            runId,
-          },
-        ],
-      });
+      await settleBackendInput(context, runId, signal);
     };
     const { dispatcher, logger } = createDispatcher({
       backend,
@@ -102,9 +96,10 @@ describe("driver runtime boundary", () => {
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const backend = createBackend();
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       entered.resolve();
       await release.promise;
+      await settleBackendInput(context, runId, signal);
     };
     const shutdown = new AbortController();
     const runtimeState = new DriverRuntimeStateMachine("ready");
@@ -160,7 +155,16 @@ describe("driver runtime boundary", () => {
       const runtimeState = new DriverRuntimeStateMachine("ready");
       let boundarySignal: AbortSignal | undefined;
       const socket = new FakeDriverRuntimeIo(
-        boundary === "poll" ? [] : [{ commandId: "accepted-never-settles", kind: "turn.cancel" }],
+        boundary === "poll"
+          ? []
+          : [
+              {
+                commandId: "accepted-never-settles",
+                kind: "turn.cancel",
+                runId: DRIVER_TEST_IDS.runId,
+              },
+            ],
+        boundary === "poll" ? undefined : DRIVER_TEST_IDS.runId,
       );
       if (boundary === "poll") {
         socket.nextCommand = async (signal) => {
@@ -211,13 +215,17 @@ describe("driver runtime boundary", () => {
       const entered = Promise.withResolvers<void>();
       const late = Promise.withResolvers<void>();
       const runtimeState = new DriverRuntimeStateMachine("ready");
-      const socket = new FakeDriverRuntimeIo([
-        {
-          commandId: "accepted-timeout",
-          kind: "turn.cancel",
-          reason: "must not run",
-        },
-      ]);
+      const socket = new FakeDriverRuntimeIo(
+        [
+          {
+            commandId: "accepted-timeout",
+            kind: "turn.cancel",
+            reason: "must not run",
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        ],
+        DRIVER_TEST_IDS.runId,
+      );
       let acceptedSignal: AbortSignal | undefined;
       socket.commandUpdate = async (update, signal) => {
         if (update.status === "accepted") {
@@ -265,17 +273,21 @@ describe("driver runtime boundary", () => {
   test("keeps MCP commands explicit at the API boundary", async () => {
     const backend = createBackend();
     const runtimeState = new DriverRuntimeStateMachine("ready");
-    const socket = new FakeDriverRuntimeIo([
-      {
-        argumentsJson: '{"issue":"A-1"}',
-        commandId: "mcp-1",
-        kind: "mcp.execute",
-        requestId: "mcp-request-1",
-        serverId: "mcp-linear",
-        toolCallId: "tool-mcp-1",
-        toolName: "createIssue",
-      },
-    ]);
+    const socket = new FakeDriverRuntimeIo(
+      [
+        {
+          argumentsJson: '{"issue":"A-1"}',
+          commandId: "mcp-1",
+          kind: "mcp.execute",
+          requestId: "mcp-request-1",
+          runId: DRIVER_TEST_IDS.runId,
+          serverId: "mcp-linear",
+          toolCallId: "tool-mcp-1",
+          toolName: "createIssue",
+        },
+      ],
+      DRIVER_TEST_IDS.runId,
+    );
     const { commandReads, dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () =>
@@ -334,20 +346,24 @@ describe("driver runtime boundary", () => {
     ]);
   });
 
-  test("reports remote MCP execute failures as diagnostics", async () => {
+  test("fences remote MCP execute failures as unknown diagnostics", async () => {
     const backend = createBackend();
     const runtimeState = new DriverRuntimeStateMachine("ready");
-    const socket = new FakeDriverRuntimeIo([
-      {
-        argumentsJson: '{"issue":"A-1"}',
-        commandId: "mcp-1",
-        kind: "mcp.execute",
-        requestId: "mcp-request-1",
-        serverId: "mcp-linear",
-        toolCallId: "tool-mcp-1",
-        toolName: "createIssue",
-      },
-    ]);
+    const socket = new FakeDriverRuntimeIo(
+      [
+        {
+          argumentsJson: '{"issue":"A-1"}',
+          commandId: "mcp-1",
+          kind: "mcp.execute",
+          requestId: "mcp-request-1",
+          runId: DRIVER_TEST_IDS.runId,
+          serverId: "mcp-linear",
+          toolCallId: "tool-mcp-1",
+          toolName: "createIssue",
+        },
+      ],
+      DRIVER_TEST_IDS.runId,
+    );
     const { dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () =>
@@ -368,8 +384,16 @@ describe("driver runtime boundary", () => {
       {
         commandId: "mcp-1",
         error: {
-          code: "driver.command_failed.mcp.execute",
-          message: "MCP upstream failed",
+          code: "driver.external_tool_effect_unknown",
+          details: {
+            commandId: "mcp-1",
+            effectId: "test-effect-mcp-1",
+            requestId: "mcp-request-1",
+            serverId: "mcp-linear",
+            toolName: "createIssue",
+          },
+          message: expect.stringContaining("unknown outcome"),
+          retryable: false,
         },
         status: "failed",
       },
@@ -391,7 +415,7 @@ describe("driver runtime boundary", () => {
           {
             kind: "tool.call.updated",
             payload: {
-              rawOutput: "MCP upstream failed",
+              rawOutput: expect.stringContaining("unknown outcome"),
               status: "failed",
               toolCallId: "tool-mcp-1",
             },
@@ -410,7 +434,7 @@ describe("driver runtime boundary", () => {
                 serverId: "mcp-linear",
                 toolName: "createIssue",
               },
-              message: "MCP upstream failed",
+              message: expect.stringContaining("unknown outcome"),
               severity: "error",
               source: "core",
             },
@@ -420,55 +444,54 @@ describe("driver runtime boundary", () => {
     ]);
   });
 
-  test("lets session stop preempt a stuck MCP command", async () => {
+  test("lets session stop preempt polling and join a committed MCP effect", async () => {
     const backend = createBackend();
-    const aborted = Promise.withResolvers<void>();
-    const releaseCleanup = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const execution = Promise.withResolvers<McpExternalToolExecutionResult>();
     const runtimeState = new DriverRuntimeStateMachine("ready");
-    const socket = new FakeDriverRuntimeIo([
-      {
-        argumentsJson: "{}",
-        commandId: "mcp-stuck",
-        kind: "mcp.execute",
-        requestId: "mcp-request-stuck",
-        serverId: "mcp-linear",
-        toolCallId: "tool-mcp-stuck",
-        toolName: "waitForever",
-      },
-      {
-        commandId: "stop-1",
-        kind: "session.stop",
-        reason: "test.stop",
-      },
-    ]);
+    const socket = new FakeDriverRuntimeIo(
+      [
+        {
+          argumentsJson: "{}",
+          commandId: "mcp-stuck",
+          kind: "mcp.execute",
+          requestId: "mcp-request-stuck",
+          runId: DRIVER_TEST_IDS.runId,
+          serverId: "mcp-linear",
+          toolCallId: "tool-mcp-stuck",
+          toolName: "waitForever",
+        },
+        {
+          commandId: "stop-1",
+          kind: "session.stop",
+          reason: "test.stop",
+        },
+      ],
+      DRIVER_TEST_IDS.runId,
+    );
     const { dispatcher, logger, shutdownCalls } = createDispatcher({
       backend,
       isShuttingDown: () => socket.isDrained(),
-      mcpExecute: async (_command, signal) => {
-        return await new Promise<never>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            async () => {
-              aborted.resolve();
-              await releaseCleanup.promise;
-              reject(signal.reason);
-            },
-            { once: true },
-          );
-        });
+      mcpExecute: async () => {
+        entered.resolve();
+        return execution.promise;
       },
       runtimeState,
     });
 
     const run = dispatcher.run(socket, logger);
-    await aborted.promise;
+    await entered.promise;
+    await waitForUpdate(
+      socket,
+      (update) => update.commandId === "stop-1" && update.status === "accepted",
+    );
     expect(await Promise.race([run.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
-    releaseCleanup.resolve();
+    execution.reject(new Error("provider response lost"));
 
     await run;
     await waitForUpdate(
       socket,
-      (update) => update.commandId === "mcp-stuck" && update.status === "cancelled",
+      (update) => update.commandId === "mcp-stuck" && update.status === "failed",
     );
 
     expect(runtimeState.status()).toBe("stopped");
@@ -476,7 +499,23 @@ describe("driver runtime boundary", () => {
     expect(socket.updates).toEqual(
       expect.arrayContaining([
         { commandId: "mcp-stuck", status: "accepted" },
-        { commandId: "mcp-stuck", status: "cancelled" },
+        {
+          commandId: "mcp-stuck",
+          error: {
+            code: "driver.external_tool_effect_unknown",
+            details: {
+              commandId: "mcp-stuck",
+              effectId: "test-effect-mcp-stuck",
+              requestId: "mcp-request-stuck",
+              runId: DRIVER_TEST_IDS.runId,
+              serverId: "mcp-linear",
+              toolName: "waitForever",
+            },
+            message: expect.stringContaining("unknown outcome"),
+            retryable: false,
+          },
+          status: "failed",
+        },
         { commandId: "stop-1", status: "accepted" },
         { commandId: "stop-1", status: "completed" },
       ]),
@@ -488,13 +527,17 @@ describe("driver runtime boundary", () => {
     const updateEntered = Promise.withResolvers<void>();
     const updateResult = Promise.withResolvers<void>();
     const runtimeState = new DriverRuntimeStateMachine("ready");
-    const socket = new FakeDriverRuntimeIo([
-      {
-        commandId: "cancel-during-shutdown",
-        kind: "turn.cancel",
-        reason: "test.cancel",
-      },
-    ]);
+    const socket = new FakeDriverRuntimeIo(
+      [
+        {
+          commandId: "cancel-during-shutdown",
+          kind: "turn.cancel",
+          reason: "test.cancel",
+          runId: DRIVER_TEST_IDS.runId,
+        },
+      ],
+      DRIVER_TEST_IDS.runId,
+    );
     socket.commandUpdate = async () => {
       updateEntered.resolve();
       await updateResult.promise;
@@ -527,6 +570,7 @@ describe("driver runtime boundary", () => {
         commandId: `mcp-${index}`,
         kind: "mcp.execute" as const,
         requestId: `mcp-request-${index}`,
+        runId: DRIVER_TEST_IDS.runId,
         serverId: "mcp-linear",
         toolCallId: `tool-mcp-${index}`,
         toolName: "waitForever",
@@ -537,21 +581,32 @@ describe("driver runtime boundary", () => {
         reason: "test.stop",
       },
     ];
-    const socket = new FakeDriverRuntimeIo(commands);
+    const socket = new FakeDriverRuntimeIo(commands, DRIVER_TEST_IDS.runId);
     let executeCalls = 0;
+    const releaseExecutions = Promise.withResolvers<void>();
     const { dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () => socket.isDrained(),
-      mcpExecute: async (_command, signal) => {
+      mcpExecute: async (command) => {
         executeCalls += 1;
-        return await new Promise<never>((_resolve, reject) => {
-          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-        });
+        await releaseExecutions.promise;
+        return {
+          outputText: "finished after stop",
+          requestId: command.requestId,
+          serverId: command.serverId,
+          toolName: command.toolName,
+        };
       },
       runtimeState,
     });
 
-    await dispatcher.run(socket, logger);
+    const run = dispatcher.run(socket, logger);
+    await waitForUpdate(
+      socket,
+      (update) => update.commandId === "stop-after-mcp-limit" && update.status === "accepted",
+    );
+    releaseExecutions.resolve();
+    await run;
     await waitForUpdate(
       socket,
       (update) => update.commandId === "mcp-32" && update.status === "failed",

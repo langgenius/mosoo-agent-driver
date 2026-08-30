@@ -70,7 +70,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "messageId": "<driver-id>",
-        "rawOutput": "hello",
+        "rawOutputDelta": "hello",
         "status": "running",
         "toolCallId": "cmd-1"
       }
@@ -80,7 +80,7 @@
       "kind": "tool.call.updated",
       "payload": {
         "messageId": "<driver-id>",
-        "rawOutput": " world",
+        "rawOutputDelta": " world",
         "status": "running",
         "toolCallId": "cmd-1"
       }

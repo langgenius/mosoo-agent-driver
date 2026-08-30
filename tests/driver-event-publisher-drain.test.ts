@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
@@ -25,6 +24,7 @@ describe("DriverEventPublisher", () => {
         const acceptedEvents = attempts.length === 1 ? events.slice(0, 1) : events;
         return {
           accepted: acceptedEvents.map((event) => ({
+            eventId: event.sourceEventId!,
             seq: nextSeq++,
             type: event.kind,
           })),
@@ -64,6 +64,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: 50 + index,
             type: event.kind,
           })),
@@ -94,7 +95,7 @@ describe("DriverEventPublisher", () => {
 
         if (attempts.length === 1) {
           return {
-            accepted: [{ seq: 40, type: events[0]!.kind }],
+            accepted: [{ eventId: events[0]!.sourceEventId!, seq: 40, type: events[0]!.kind }],
           };
         }
 
@@ -104,6 +105,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: 50 + index,
             type: event.kind,
           })),
@@ -145,6 +147,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: attempts.length * 2_000 + index,
             type: event.kind,
           })),
@@ -194,7 +197,11 @@ describe("DriverEventPublisher", () => {
         }
 
         return {
-          accepted: events.map((event, index) => ({ seq: index + 1, type: event.kind })),
+          accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
+            seq: index + 1,
+            type: event.kind,
+          })),
         };
       },
     });
@@ -233,7 +240,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -332,7 +339,7 @@ describe("DriverEventPublisher", () => {
           return {
             accepted: [
               {
-                eventId: events[1]?.sourceEventId,
+                eventId: events[1]!.sourceEventId!,
                 seq: 1,
                 type: events[0]!.kind,
               },
@@ -342,7 +349,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: index + 2,
             type: event.kind,
           })),
@@ -355,27 +362,6 @@ describe("DriverEventPublisher", () => {
     await expect(publisher.push(context, "mismatched", firstBatch)).rejects.toThrow("event ID");
     await publisher.push(context, "retry", [createEvent("message.started")]);
     expect(attempt).toBe(2);
-  });
-
-  test("gives a reused draft object a new identity after a successful push", async () => {
-    const attempts: DriverEventInput[][] = [];
-    const context = createContext({
-      pushEvents: async (events) => {
-        attempts.push(events);
-        return {
-          accepted: events.map((event, index) => ({ seq: index + 1, type: event.kind })),
-        };
-      },
-    });
-    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-    const event = createEvent("message.completed");
-
-    await publisher.push(context, "first", [event]);
-    await publisher.push(context, "second", [event]);
-
-    expect(attempts[1]?.[0]?.sourceEventId).not.toBe(attempts[0]?.[0]?.sourceEventId);
-    expect(isDriverId(attempts[0]?.[0]?.sourceEventId)).toBe(true);
-    expect(isDriverId(attempts[1]?.[0]?.sourceEventId)).toBe(true);
   });
 
   test.each([
@@ -411,11 +397,19 @@ describe("DriverEventPublisher", () => {
           attempts.push(events);
 
           if (attempts.length === 1) {
-            return { accepted: malformedReceipts };
+            return {
+              accepted: malformedReceipts.map(
+                (receipt: { readonly seq: number; readonly type: string }, index: number) => ({
+                  ...receipt,
+                  eventId: events[index]?.sourceEventId ?? "extra-event-id",
+                }),
+              ),
+            };
           }
 
           return {
             accepted: events.map((event, index) => ({
+              eventId: event.sourceEventId!,
               seq: 50 + index,
               type: event.kind,
             })),

@@ -1,6 +1,6 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
-import type { RunId } from "../../protocol/id";
+import { createDriverId, type RunId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import {
@@ -104,6 +104,7 @@ function toOpenAiWarningEvents(
       ...(chunks.length === 1 ? {} : { chunkCount: chunks.length, chunkIndex: index }),
       content,
       level: "warning",
+      messageId: createDriverId(),
       role: "agent",
       subtype: method === "guardianWarning" ? "guardian_warning" : "warning",
     },
@@ -412,6 +413,7 @@ export class OpenAiAppServerEventBridge {
               content:
                 "This request requires additional safety checks; tool calls may take longer.",
               level: "warning",
+              messageId: createDriverId(),
               role: "agent",
               subtype: "strict_review_required",
             },
@@ -949,6 +951,7 @@ export class OpenAiAppServerEventBridge {
           extraCount,
           failedScan,
           level: "warning",
+          messageId: createDriverId(),
           role: "agent",
           samplePaths,
           subtype: "windows_world_writable_warning",
@@ -993,6 +996,10 @@ export class OpenAiAppServerEventBridge {
       params,
       turnId,
     );
+    const authoritativeFinalSnapshot =
+      authoritativeFinalMessage !== null && authoritativeFinalMessage.text.trim().length > 0
+        ? authoritativeFinalMessage
+        : null;
     if (!this.#turns.beginSettlement(turnId)) {
       return;
     }
@@ -1088,11 +1095,9 @@ export class OpenAiAppServerEventBridge {
           }),
           kind: "run.completed",
           payload: {
-            ...(authoritativeFinalMessage === null
+            ...(authoritativeFinalSnapshot === null
               ? {}
-              : {
-                  finalMessageId: authoritativeFinalMessage.id,
-                }),
+              : { finalMessageId: authoritativeFinalSnapshot.id }),
             stopReason: "end_turn",
           },
         },

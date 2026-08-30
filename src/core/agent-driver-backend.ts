@@ -68,11 +68,13 @@ function toAgentDriverEventSink(
       throw new Error("Driver external tool effect ledger is not configured.");
     },
     commandUpdate: async () => {},
-    completeExternalToolEffect: async () => {
+    observeExternalToolEffect: async () => {
       throw new Error("Driver external tool effect ledger is not configured.");
     },
     currentRunId: eventSink.currentRunId.bind(eventSink),
-    markExternalToolEffectUnknown: async () => {},
+    settleExternalToolEffect: async () => {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    },
     pushEvents: (input) => eventSink.pushEvents(input),
   };
 }
@@ -90,7 +92,7 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
           }),
     eventSink,
     file: {
-      reportChanged: async (fileChange) => {
+      reportChanged: async (fileChange, signal) => {
         const event = {
           kind: "file.changed",
           payload: {
@@ -100,7 +102,7 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
           },
         } satisfies DriverEventInput;
 
-        await pushLosslessEvents(eventSink, [event]);
+        await pushLosslessEvents(eventSink, [event], undefined, signal);
       },
     },
     mcp: {

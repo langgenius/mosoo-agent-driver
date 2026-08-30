@@ -405,10 +405,11 @@ describe("OpenAi app-server event bridge", () => {
 
   test("replays a full task snapshot before committing its active set", async () => {
     const harness = createHarness({ failReasonOnce: "driver.openai.item.completed" });
+    const nativeTaskId = "agent".repeat(100);
     const notification = {
       item: {
         agentPath: "/root/worker",
-        agentThreadId: "agent-1",
+        agentThreadId: nativeTaskId,
         id: "activity-1",
         kind: "started",
         type: "subAgentActivity",
@@ -428,9 +429,13 @@ describe("OpenAi app-server event bridge", () => {
     );
     expect(attempts).toHaveLength(2);
     expect(attempts[0]!.events).toEqual(attempts[1]!.events);
-    expect(harness.events().filter((event) => event.kind === "agent.tasks.replaced")).toMatchObject(
-      [{ payload: { tasks: [{ taskId: "agent-1" }] } }],
-    );
+    const taskUpdate = harness.events().find((event) => event.kind === "agent.task.updated");
+    const taskSnapshot = harness.events().find((event) => event.kind === "agent.tasks.replaced");
+    const taskId = taskUpdate === undefined ? null : readEventPayloadString(taskUpdate, "taskId");
+    expect(taskId).toMatch(/^openai-task:[\da-f]{64}$/);
+    expect(taskSnapshot).toMatchObject({
+      payload: { tasks: [{ taskId }] },
+    });
   });
 
   test("replays a plan delta after delivery rejection without duplicating content", async () => {

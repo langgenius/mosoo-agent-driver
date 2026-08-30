@@ -5,7 +5,8 @@ import { lstat, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { isRecord, readNonEmptyString, readNumber } from "./acp-types";
+import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../../core/driver-runtime-io";
+import { isRecord, raceWithAbort, readNonEmptyString, readNumber } from "./acp-types";
 import { AcpPathScope } from "./acp-path-scope";
 
 interface AcpFileSystemOptions {
@@ -72,6 +73,7 @@ export class AcpFileSystem {
     context: AgentDriverContext,
     params: unknown,
     signal?: AbortSignal,
+    onCommitted?: () => void,
   ): Promise<Record<string, never>> {
     signal?.throwIfAborted();
     const record = isRecord(params) ? params : {};
@@ -91,6 +93,7 @@ export class AcpFileSystem {
     const destinationPath = join(path.directory.procPath, path.name);
     let temporaryCreated = false;
     let committed = false;
+    let changedPath: string;
 
     try {
       const mode = await readExistingMode(destinationPath);
@@ -126,17 +129,13 @@ export class AcpFileSystem {
         signal?.throwIfAborted();
         await rename(temporaryPath, destinationPath);
         committed = true;
+        onCommitted?.();
         await path.directory.file.sync();
       } finally {
         await temporary.close();
       }
 
-      const changedPath = join(await this.#pathScope.identify(path.directory), path.name);
-      await context.ports.file.reportChanged({
-        change: "upsert",
-        path: changedPath,
-        reason: "acp.fs",
-      });
+      changedPath = join(await this.#pathScope.identify(path.directory), path.name);
     } finally {
       try {
         if (temporaryCreated && !committed) {
@@ -146,6 +145,19 @@ export class AcpFileSystem {
         await path.directory.file.close();
       }
     }
+
+    const reportSignal = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
+    await raceWithAbort(
+      context.ports.file.reportChanged(
+        {
+          change: "upsert",
+          path: changedPath,
+          reason: "acp.fs",
+        },
+        reportSignal,
+      ),
+      reportSignal,
+    );
 
     return {};
   }

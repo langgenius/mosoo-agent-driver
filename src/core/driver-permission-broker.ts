@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { summarizeDriverPermissionRequest } from "../observability/driver-debug";
 import type { Logger } from "../observability";
 import type { DriverPermissionRequest } from "../host-ports";
@@ -5,7 +7,7 @@ import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import { promiseWithTimeout, settlePromiseWithTimeout } from "../utils/async";
 import { createDriverDiagnosticEvent } from "./driver-diagnostics";
-import { pushLosslessEvents } from "./driver-runtime-io";
+import { DriverEventDeliveryOutcomeUnknownError, pushLosslessEvents } from "./driver-runtime-io";
 import type { DriverRuntimeEventPort } from "./driver-runtime-io";
 
 const PERMISSION_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
@@ -41,6 +43,11 @@ interface PermissionCancellationDelivery {
   useTurnBudget(): void;
 }
 
+interface PermissionDeliveryFailure {
+  readonly error: PermissionEventDeliveryError;
+  recover(): Promise<void>;
+}
+
 export interface DriverPermissionBrokerOptions {
   eventDeliveryTimeoutMs?: number;
   interactiveRequests?: boolean;
@@ -60,6 +67,8 @@ export class DriverPermissionBroker {
   #activeRequestBytes = 0;
   readonly #cancellationDeliveries = new Map<string, PermissionCancellationDelivery>();
   #cancellationTask: Promise<void> | null = null;
+  #closedRunId: RunId | null = null;
+  readonly #deliveryFailures = new Map<string, PermissionDeliveryFailure>();
   #idle: PromiseWithResolvers<void> | null = null;
   readonly #resolvers = new Map<string, (resolution: PermissionResolution) => void>();
 
@@ -134,7 +143,7 @@ export class DriverPermissionBroker {
     this.#rejectAll(reason);
 
     if (!this.hasPending()) {
-      return Promise.resolve();
+      return this.#recoverDeliveryFailures();
     }
     if (this.#cancellationTask !== null) {
       return this.#cancellationTask;
@@ -144,7 +153,7 @@ export class DriverPermissionBroker {
     const task = promiseWithTimeout(idle.promise, {
       label: "Driver permission cancellation",
       timeoutMs: this.#eventDeliveryTimeoutMs * 2,
-    });
+    }).then(() => this.#recoverDeliveryFailures());
     this.#cancellationTask = task;
     const clear = () => {
       if (this.#cancellationTask === task) {
@@ -153,6 +162,51 @@ export class DriverPermissionBroker {
     };
     void task.then(clear, clear);
     return task;
+  }
+
+  rejectRunAndWait(
+    runId: RunId,
+    reason: PermissionResolutionReason = "cancelled",
+  ): Promise<void> | void {
+    this.#closedRunId = runId;
+    if (!this.hasPending() && this.#deliveryFailures.size === 0) {
+      this.#rejectAll(reason);
+      return;
+    }
+    return this.rejectAllAndWait(reason);
+  }
+
+  async #recoverDeliveryFailures(): Promise<void> {
+    const failures = [...this.#deliveryFailures.entries()];
+    await Promise.allSettled(
+      failures.map(async ([lifecycleId, failure]) => {
+        const recovery = failure.recover();
+        const result = await settlePromiseWithTimeout(recovery, {
+          label: "Driver permission lifecycle recovery",
+          timeoutMs: this.#eventDeliveryTimeoutMs,
+        });
+        if (result.status !== "completed") {
+          if (result.status === "timed_out") {
+            void recovery.then(
+              () => {
+                if (this.#deliveryFailures.get(lifecycleId) === failure) {
+                  this.#deliveryFailures.delete(lifecycleId);
+                }
+              },
+              () => {},
+            );
+          }
+          throw result.error;
+        }
+        if (this.#deliveryFailures.get(lifecycleId) === failure) {
+          this.#deliveryFailures.delete(lifecycleId);
+        }
+      }),
+    );
+    const failure = this.#deliveryFailures.values().next().value;
+    if (failure !== undefined) {
+      throw failure.error;
+    }
   }
 
   private resolveRequest(requestId: string, resolution: PermissionResolution): boolean {
@@ -181,6 +235,12 @@ export class DriverPermissionBroker {
       return "reject_once";
     }
 
+    const runId = socket.currentRunId();
+    const isCurrentRun = ownsRun ?? (() => socket.currentRunId() === runId);
+    if (!isCurrentRun() || (runId !== null && this.#closedRunId === runId)) {
+      return "reject_once";
+    }
+
     if (this.#activeRequestIds.has(input.requestId)) {
       throw new Error(`Driver permission request ${input.requestId} is already pending.`);
     }
@@ -195,8 +255,7 @@ export class DriverPermissionBroker {
       throw new RangeError("Driver permission broker pending request byte budget is exhausted.");
     }
 
-    const runId = socket.currentRunId();
-    const isCurrentRun = ownsRun ?? (() => socket.currentRunId() === runId);
+    const lifecycleId = permissionLifecycleId(runId, input.requestId);
     const events: DriverEventInput[] = [
       {
         kind: "permission.requested",
@@ -217,6 +276,7 @@ export class DriverPermissionBroker {
           },
         },
         ...(runId === null ? {} : { runId }),
+        sourceEventId: `${lifecycleId}:requested`,
       },
     ];
 
@@ -305,36 +365,76 @@ export class DriverPermissionBroker {
         timeoutMs: this.#requestTimeoutMs,
       });
 
-      const requestedTask = pushLosslessEvents(
-        socket,
-        events,
-        undefined,
+      const deliverySignal = () =>
         AbortSignal.any([
           cancellationDelivery.signal,
           AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
-        ]),
-      );
+        ]);
+      const requestedTask = pushPermissionEvents(socket, events, deliverySignal());
       const requestedDelivery = await settlePromiseWithTimeout(requestedTask, {
         label: `Driver permission request ${input.requestId} event delivery`,
         timeoutMs: this.#eventDeliveryTimeoutMs,
       });
 
       if (requestedDelivery.status !== "completed") {
-        if (requestedDelivery.status === "timed_out") {
-          lateDelivery = requestedTask;
-        }
-        if (!isCurrentRun()) {
-          return "reject_once";
-        }
-        throw new PermissionEventDeliveryError(
+        const deliveryError = new PermissionEventDeliveryError(
           input.requestId,
           "requested",
           requestedDelivery.error,
         );
-      }
+        const outcomeUnknown =
+          requestedDelivery.status === "timed_out" ||
+          requestedDelivery.error instanceof DriverEventDeliveryOutcomeUnknownError;
 
-      if (!isCurrentRun()) {
-        return "reject_once";
+        if (!outcomeUnknown) {
+          throw deliveryError;
+        }
+
+        const cancelled: PermissionResolution = {
+          decision: "reject_once",
+          reason: "cancelled",
+        };
+        const resolutionEvents = toResolutionEvents(input, cancelled, runId, lifecycleId);
+        this.#deliveryFailures.set(lifecycleId, {
+          error: deliveryError,
+          recover: async () => {
+            await pushPermissionEvents(
+              socket,
+              [...events, ...resolutionEvents],
+              AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
+            );
+          },
+        });
+        const closeLifecycle = () =>
+          pushPermissionEvents(socket, [...events, ...resolutionEvents], deliverySignal()).then(
+            () => {
+              this.#deliveryFailures.delete(lifecycleId);
+            },
+          );
+
+        if (requestedDelivery.status === "timed_out") {
+          lateDelivery = requestedTask.then(
+            () => pushPermissionEvents(socket, resolutionEvents, deliverySignal()),
+            closeLifecycle,
+          );
+          lateDelivery = lateDelivery.then(() => {
+            this.#deliveryFailures.delete(lifecycleId);
+          });
+          throw deliveryError;
+        }
+
+        const recoveryTask = closeLifecycle();
+        const recovery = await settlePromiseWithTimeout(recoveryTask, {
+          label: `Driver permission request ${input.requestId} lifecycle recovery`,
+          timeoutMs: this.#eventDeliveryTimeoutMs,
+        });
+        if (recovery.status === "completed") {
+          return "reject_once";
+        }
+        if (recovery.status === "timed_out") {
+          lateDelivery = recoveryTask;
+        }
+        throw new PermissionEventDeliveryError(input.requestId, "requested", recovery.error);
       }
 
       this.#logger()?.debug("driver.runtime.permission.request.sent", {
@@ -344,19 +444,27 @@ export class DriverPermissionBroker {
         toolKind: input.toolKind,
       });
 
-      const result = await settlePromiseWithTimeout(deferred.promise, {
-        label: `Driver permission request ${input.requestId}`,
-        timeoutMs: this.#requestTimeoutMs,
-      });
+      const result = isCurrentRun()
+        ? await settlePromiseWithTimeout(deferred.promise, {
+            label: `Driver permission request ${input.requestId}`,
+            timeoutMs: this.#requestTimeoutMs,
+          })
+        : ({
+            status: "completed",
+            value: { decision: "reject_once", reason: "cancelled" },
+          } as const);
 
       if (result.status === "failed") {
         throw result.error;
       }
 
-      const resolution: PermissionResolution =
+      let resolution: PermissionResolution =
         result.status === "timed_out"
           ? { decision: "reject_once", reason: "timed_out" }
           : result.value;
+      if (!isCurrentRun()) {
+        resolution = { decision: "reject_once", reason: "cancelled" };
+      }
       unregister();
       const decision = resolution.decision;
 
@@ -367,49 +475,40 @@ export class DriverPermissionBroker {
         });
       }
 
-      if (!isCurrentRun()) {
-        return "reject_once";
-      }
-
-      const resolutionTask = pushLosslessEvents(
-        socket,
-        [
-          {
-            kind: "permission.resolved",
-            payload: {
-              outcome: decision,
-              permissionRequests: [],
-              reason: resolution.reason,
-              requestId: input.requestId,
-            },
-            ...(runId === null ? {} : { runId }),
-          },
-          ...toResolutionDiagnostics(input, resolution.reason, runId),
-        ],
-        undefined,
-        AbortSignal.any([
-          cancellationDelivery.signal,
-          AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
-        ]),
-      );
+      const resolutionEvents = toResolutionEvents(input, resolution, runId, lifecycleId);
+      const resolutionTask = pushPermissionEvents(socket, resolutionEvents, deliverySignal());
       const resolutionDelivery = await settlePromiseWithTimeout(resolutionTask, {
         label: `Driver permission resolution ${input.requestId} event delivery`,
         timeoutMs: this.#eventDeliveryTimeoutMs,
       });
 
       if (resolutionDelivery.status !== "completed") {
-        if (resolutionDelivery.status === "timed_out") {
-          lateDelivery = resolutionTask;
-        }
-        if (!isCurrentRun()) {
-          return "reject_once";
-        }
-        throw new PermissionEventDeliveryError(
+        const deliveryError = new PermissionEventDeliveryError(
           input.requestId,
           "resolved",
           resolutionDelivery.error,
         );
+        this.#deliveryFailures.set(lifecycleId, {
+          error: deliveryError,
+          recover: async () => {
+            await pushPermissionEvents(
+              socket,
+              resolutionEvents,
+              AbortSignal.timeout(this.#eventDeliveryTimeoutMs),
+            );
+          },
+        });
+        if (resolutionDelivery.status === "timed_out") {
+          lateDelivery = resolutionTask
+            .catch(() => pushPermissionEvents(socket, resolutionEvents, deliverySignal()))
+            .then(() => {
+              this.#deliveryFailures.delete(lifecycleId);
+            });
+        }
+        throw deliveryError;
       }
+
+      this.#deliveryFailures.delete(lifecycleId);
 
       this.#logger()?.debug("driver.runtime.permission.request.resolved", {
         decision,
@@ -433,10 +532,62 @@ export class DriverPermissionBroker {
   }
 }
 
+function permissionLifecycleId(runId: RunId | null, requestId: string): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([runId, requestId]))
+    .digest("hex");
+  return `permission:${digest}`;
+}
+
+async function pushPermissionEvents(
+  socket: Pick<DriverRuntimeEventPort, "pushEvents">,
+  events: readonly DriverEventInput[],
+  signal: AbortSignal,
+) {
+  try {
+    return await pushLosslessEvents(socket, events, undefined, signal);
+  } catch (error) {
+    if (!(error instanceof DriverEventDeliveryOutcomeUnknownError)) {
+      throw error;
+    }
+
+    try {
+      return await pushLosslessEvents(socket, events, undefined, signal);
+    } catch (retryError) {
+      throw retryError instanceof DriverEventDeliveryOutcomeUnknownError
+        ? retryError
+        : new DriverEventDeliveryOutcomeUnknownError(retryError);
+    }
+  }
+}
+
+function toResolutionEvents(
+  input: DriverPermissionRequest,
+  resolution: PermissionResolution,
+  runId: RunId | null,
+  lifecycleId: string,
+): DriverEventInput[] {
+  return [
+    {
+      kind: "permission.resolved",
+      payload: {
+        outcome: resolution.decision,
+        permissionRequests: [],
+        reason: resolution.reason,
+        requestId: input.requestId,
+      },
+      ...(runId === null ? {} : { runId }),
+      sourceEventId: `${lifecycleId}:resolved`,
+    },
+    ...toResolutionDiagnostics(input, resolution.reason, runId, lifecycleId),
+  ];
+}
+
 function toResolutionDiagnostics(
   input: DriverPermissionRequest,
   reason: PermissionResolutionReason,
   runId: RunId | null,
+  lifecycleId: string,
 ): DriverEventInput[] {
   if (reason !== "cancelled" && reason !== "timed_out") {
     return [];
@@ -460,6 +611,7 @@ function toResolutionDiagnostics(
         source: "permission",
       }),
       ...(runId === null ? {} : { runId }),
+      sourceEventId: `${lifecycleId}:diagnostic:${reason}`,
     },
   ];
 }

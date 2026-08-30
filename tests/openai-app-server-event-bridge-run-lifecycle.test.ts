@@ -579,7 +579,7 @@ describe("OpenAi app-server event bridge", () => {
         kind: "tool.call.updated",
         payload: {
           messageId: assistantMessageId,
-          rawOutput: "hello",
+          rawOutputDelta: "hello",
           status: "running",
           toolCallId: "cmd-1",
         },
@@ -588,13 +588,36 @@ describe("OpenAi app-server event bridge", () => {
         kind: "tool.call.updated",
         payload: {
           messageId: assistantMessageId,
-          rawOutput: " world",
+          rawOutputDelta: " world",
           status: "running",
           toolCallId: "cmd-1",
         },
       },
     ]);
     expect(events().some((event) => event.kind === "item.updated")).toBe(false);
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        aggregatedOutput: "hello world",
+        command: "printf 'hello world'",
+        id: "cmd-1",
+        status: "completed",
+        type: "commandExecution",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    const terminal = events()
+      .filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          readEventPayloadString(event, "toolCallId") === "cmd-1" &&
+          readEventPayloadString(event, "status") === "completed",
+      )
+      .at(-1);
+    expect(terminal?.payload).toMatchObject({ rawOutput: "hello world" });
+    expect(terminal?.payload).not.toHaveProperty("rawOutputDelta");
   });
 
   test("turn plan updates map to the session plan custom event", async () => {

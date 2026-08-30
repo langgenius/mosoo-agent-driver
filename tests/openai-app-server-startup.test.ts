@@ -27,7 +27,7 @@ const initializeResultJson = JSON.stringify({
   codexHome: "/tmp/openai-home",
   platformFamily: "unix",
   platformOs: "linux",
-  userAgent: "test-app-server/0.150.1",
+  userAgent: "test-app-server/0.151.0",
 });
 
 function eventPayloadStatus(event: DriverEventInput): unknown {
@@ -211,7 +211,7 @@ const thread = {
   ephemeral: false,
   section: null,
   sectionEnteredAt: null,
-  historyMode: "legacy",
+  historyMode: "paginated",
   modelProvider: "openai",
   createdAt: 0,
   updatedAt: 0,
@@ -219,7 +219,7 @@ const thread = {
   status: { type: "idle" },
   path: null,
   cwd: ${JSON.stringify(directory)},
-  cliVersion: "0.150.1",
+  cliVersion: "0.151.0",
   source: "appServer",
   canAcceptDirectInput: true,
   threadSource: null,
@@ -527,6 +527,7 @@ process.stdin.on("data", (chunk) => {
         }
         return {
           accepted: input.events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -636,6 +637,8 @@ describe("OpenAI app-server startup", () => {
               params?: {
                 approvalPolicy?: string;
                 cwd?: string;
+                excludeTurns?: boolean;
+                historyMode?: string;
                 input?: unknown;
                 model?: string;
                 threadId?: string;
@@ -649,6 +652,18 @@ describe("OpenAI app-server startup", () => {
           )
           .map((request) => request.params?.approvalPolicy),
       ).toEqual(["untrusted", "untrusted", "untrusted"]);
+      expect(requests.find((request) => request.method === "thread/resume")?.params).toMatchObject({
+        excludeTurns: true,
+      });
+      expect(
+        requests.find((request) => request.method === "thread/resume")?.params,
+      ).not.toHaveProperty("historyMode");
+      expect(requests.find((request) => request.method === "thread/start")?.params).toMatchObject({
+        historyMode: "paginated",
+      });
+      expect(
+        requests.find((request) => request.method === "thread/start")?.params,
+      ).not.toHaveProperty("excludeTurns");
       expect(requests.find((request) => request.method === "turn/start")?.params).toEqual({
         approvalPolicy: "untrusted",
         cwd: harness.payload.execution.session.cwd,

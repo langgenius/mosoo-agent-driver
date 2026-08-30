@@ -11,14 +11,22 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { AdditionalContextEntry } from "./AdditionalContextEntry";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
+import type { CyberAccessProgram } from "./CyberAccessProgram";
 import type { SandboxPolicy } from "./SandboxPolicy";
 import type { TurnEnvironmentParams } from "./TurnEnvironmentParams";
+import type { TurnToolOutput } from "./TurnToolOutput";
 import type { UserInput } from "./UserInput";
 
 export type TurnStartParams = {
   threadId: string;
   clientUserMessageId?: string | null;
   input: Array<UserInput>;
+  /**
+   * Optional source classification for the caller that starts this turn.
+   * Ignored when this request steers an already-active turn.
+   */
+  turnTrigger?: string | null;
+  toolOutput?: TurnToolOutput | null;
   /**
    * Optional metadata to enrich Codex's ResponsesAPI turn metadata.
    *
@@ -77,6 +85,12 @@ export type TurnStartParams = {
    */
   serviceTier?: string | null | null;
   /**
+   * Override the service tier only when this request starts a new turn.
+   * Use "default" for standard speed. Omitted or null inherits the thread's tier.
+   * Does not change the thread's tier or a turn being steered.
+   */
+  serviceTierForTurn?: string | null;
+  /**
    * Override the reasoning effort for this turn and subsequent turns.
    */
   effort?: ReasoningEffort | null;
@@ -105,4 +119,9 @@ export type TurnStartParams = {
    * @deprecated Ignored. Use `effort: "ultra"` for proactive multi-agent behavior.
    */
   multiAgentMode?: MultiAgentMode | null;
+  /**
+   * EXPERIMENTAL - Request a workspace-authorized cyber program for this
+   * turn. Omission preserves automatic behavior. This does not grant access.
+   */
+  cyberAccessProgram?: CyberAccessProgram | null;
 };

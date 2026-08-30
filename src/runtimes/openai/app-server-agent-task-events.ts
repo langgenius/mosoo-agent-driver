@@ -30,7 +30,7 @@ interface OpenAiAgentTaskUpdate {
   readonly events: DriverEventInput[];
 }
 
-function publicTaskId(nativeTaskId: string): string {
+export function toOpenAiAgentTaskId(nativeTaskId: string): string {
   return Buffer.byteLength(nativeTaskId, "utf8") <= MAX_OPENAI_AGENT_TASK_ID_BYTES
     ? nativeTaskId
     : `openai-task:${createHash("sha256").update(nativeTaskId).digest("hex")}`;
@@ -84,7 +84,7 @@ export class OpenAiAgentTaskState {
   prepare(activity: OpenAiSubAgentActivity): OpenAiAgentTaskUpdate {
     const closedTaskIds = new Set(this.#closedTaskIds);
     const tasks = new Map(this.#tasks);
-    const taskId = publicTaskId(activity.agentId);
+    const taskId = toOpenAiAgentTaskId(activity.agentId);
 
     if (activity.kind === "interacted") {
       closedTaskIds.delete(taskId);

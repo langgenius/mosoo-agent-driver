@@ -216,6 +216,7 @@ export class AcpAssistantTranscriptState {
           error: {
             code: `acp.${stopReason}`,
             message: terminalError,
+            retryable: false,
           },
           recoverable: false,
           stopReason,
@@ -229,6 +230,7 @@ export class AcpAssistantTranscriptState {
           error: {
             code: "acp.empty_turn",
             message: "ACP prompt ended without assistant output or tool activity.",
+            retryable: true,
           },
           recoverable: true,
           stopReason,
@@ -239,7 +241,7 @@ export class AcpAssistantTranscriptState {
       events.push({
         kind: "run.completed",
         payload: {
-          ...(finalMessage === null
+          ...(finalMessage === null || !finalMessage.hasVisibleText
             ? {}
             : {
                 finalMessageId: finalMessage.id,
@@ -298,6 +300,7 @@ export class AcpAssistantTranscriptState {
           code: error.code,
           ...(message === error.message ? {} : { details: { originalMessageUtf8Bytes } }),
           message,
+          retryable: error.recoverable ?? false,
         },
         recoverable: error.recoverable ?? false,
       },

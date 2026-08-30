@@ -1,6 +1,6 @@
 import type { DriverInstanceId, EventId, RunId, SessionId } from "../id";
 
-export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-05-26";
+export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-08-29";
 
 export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
@@ -123,6 +123,23 @@ export type RuntimeTimingStage =
   | "prewarm";
 
 export type RuntimeEventRecord = Record<string, unknown>;
+
+type RuntimeToolCallInput =
+  | { readonly rawInput?: undefined; readonly rawInputDelta?: undefined }
+  | { readonly rawInput: string; readonly rawInputDelta?: undefined }
+  | { readonly rawInput?: undefined; readonly rawInputDelta: string };
+
+type RuntimeToolCallOutput =
+  | { readonly rawOutput?: undefined; readonly rawOutputDelta?: undefined }
+  | { readonly rawOutput: string; readonly rawOutputDelta?: undefined }
+  | { readonly rawOutput?: undefined; readonly rawOutputDelta: string };
+
+export type RuntimeToolCallUpdatedPayload = RuntimeEventRecord &
+  RuntimeToolCallInput &
+  RuntimeToolCallOutput & {
+    readonly status: "cancelled" | "completed" | "failed" | "running";
+    readonly toolCallId: string;
+  };
 
 export interface RuntimeEventNativeRef {
   readonly eventName?: string | undefined;

@@ -3,15 +3,18 @@ import type { DriverExecutionInput } from "../protocol/execution";
 import type { RunId } from "../protocol/id";
 import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type {
+  DriverCommandUpdate,
   McpExecuteCommand,
-  McpExecuteCommandResult,
   McpExternalToolEffectClaim,
   McpExternalToolEffectExecution,
+  McpExternalToolEffectSettlement,
+  McpExternalToolEffectState,
   McpExternalToolExecutionResult,
-  RunError,
   RuntimeCommand,
-  RuntimeCommandResult,
 } from "../runtime-command";
+
+/** Maximum provider-call duration after the durable MCP claim commits. */
+export const AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS = 60_000;
 
 export interface AgentDriverCommandSource {
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
@@ -19,28 +22,24 @@ export interface AgentDriverCommandSource {
 
 export interface AgentDriverEventSink {
   claimExternalToolEffect?(
-    input: { commandId: string },
+    input: { claimToken: string; commandId: string },
     signal: AbortSignal,
   ): Promise<McpExternalToolEffectClaim>;
-  commandUpdate(
+  commandUpdate(input: DriverCommandUpdate, signal: AbortSignal): Promise<void>;
+  observeExternalToolEffect?(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectState>;
+  settleExternalToolEffect?(
     input: {
+      claimToken: string;
       commandId: string;
-      error?: RunError;
-      result?: RuntimeCommandResult;
-      status: "accepted" | "cancelled" | "completed" | "failed";
+      effectId: string;
+      settlement: McpExternalToolEffectSettlement;
     },
     signal: AbortSignal,
-  ): Promise<void>;
-  completeExternalToolEffect?(
-    input: {
-      commandId: string;
-      providerReceiptJson?: string | null | undefined;
-      result: McpExecuteCommandResult;
-    },
-    signal: AbortSignal,
-  ): Promise<void>;
+  ): Promise<McpExternalToolEffectState>;
   currentRunId(): RunId | null;
-  markExternalToolEffectUnknown?(input: { commandId: string }, signal: AbortSignal): Promise<void>;
   pushEvents(input: {
     events: DriverEventInput[];
     signal?: AbortSignal;
@@ -72,10 +71,15 @@ export interface DriverPermissionRequest {
 }
 
 export interface AgentDriverMcpExecution extends AsyncDisposable {
+  /**
+   * Runs after the durable effect claim commits. Implementations must bound
+   * this call independently instead of reusing the cancellable prepare signal.
+   */
   execute(effect: McpExternalToolEffectExecution): Promise<McpExternalToolExecutionResult>;
 }
 
 export interface AgentDriverMcpPort {
+  /** Prepares provider state without invoking the external tool. */
   prepare(command: McpExecuteCommand, signal: AbortSignal): Promise<AgentDriverMcpExecution>;
 }
 
@@ -95,11 +99,14 @@ export interface AgentDriverSkillPort {
 }
 
 export interface AgentDriverFilePort {
-  reportChanged(input: {
-    change: "delete" | "upsert";
-    path: string;
-    reason: string;
-  }): Promise<void>;
+  reportChanged(
+    input: {
+      change: "delete" | "upsert";
+      path: string;
+      reason: string;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 export interface AgentDriverHostPorts {

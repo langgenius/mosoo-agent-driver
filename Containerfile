@@ -1,13 +1,13 @@
 ARG BUN_VERSION=1.4.0
 FROM docker.io/oven/bun:${BUN_VERSION}@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS bun-runtime
 
-FROM docker.io/cloudflare/sandbox:0.12.8@sha256:822501de5f0c52a012c125c4e5e4c0080421a8e93ca4ce0ba3d247148021989f
+FROM docker.io/cloudflare/sandbox:0.12.9@sha256:4a56a37a3cfd9b38d65bb4b5d0b341e6490a3a4c0226274ae4c1cca4948e85fe
 
 # Keep this pin in sync with downstream mosoo apps/api/package.json -> @cloudflare/sandbox.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.251
 ARG BUN_VERSION
-ARG OPENAI_RUNTIME_VERSION=0.150.1
-ARG OPENCODE_VERSION=1.18.23
+ARG OPENAI_RUNTIME_VERSION=0.151.0
+ARG OPENCODE_VERSION=1.18.25
 
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 RUN test "$(bun --version)" = "$BUN_VERSION"

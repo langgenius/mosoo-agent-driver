@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId } from "../src/protocol/id";
+import { DriverEventRejectedError } from "../src/core/driver-runtime-io";
 import { spawnLinuxProcessTreeWatchdog } from "../src/runtimes/child-process";
 import { AcpPathScope } from "../src/runtimes/acp/acp-path-scope";
 import { AcpTerminalManager } from "../src/runtimes/acp/acp-terminal-manager";
@@ -892,6 +893,257 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     }
   });
 
+  test("coalesces concurrent and repeated terminal kills into one durable event", async () => {
+    const killPublishing = Promise.withResolvers<void>();
+    const allowKill = Promise.withResolvers<void>();
+    let killPushes = 0;
+    const harness = createHarness(async (reason) => {
+      if (reason === "driver.acp.terminal.killed") {
+        killPushes += 1;
+        killPublishing.resolve();
+        await allowKill.promise;
+      }
+    });
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      await waitForTerminalOutput(harness.manager, terminal);
+
+      const first = harness.manager.kill(harness.context, terminal);
+      await killPublishing.promise;
+      const second = harness.manager.kill(harness.context, terminal);
+      allowKill.resolve();
+
+      await expect(Promise.all([first, second])).resolves.toEqual([{}, {}]);
+      await expect(harness.manager.kill(harness.context, terminal)).resolves.toEqual({});
+      expect(killPushes).toBe(1);
+      expect(harness.events.filter((event) => event.kind === "terminal.killed")).toHaveLength(1);
+
+      await harness.manager.release(harness.context, terminal);
+    } finally {
+      allowKill.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
+
+  test.each(["release", "stopAll"] as const)(
+    "retains a terminal when a concurrent %s observes failed kill publication",
+    async (action) => {
+      let killedDraft: DriverEventInput | undefined;
+      let killPushes = 0;
+      const harness = createHarness(
+        async (reason, events) => {
+          if (reason !== "driver.acp.terminal.killed") {
+            return;
+          }
+
+          const draft = events[0]!;
+          killedDraft ??= draft;
+          expect(draft).toBe(killedDraft);
+          killPushes += 1;
+          if (killPushes === 1) {
+            throw new Error("kill publication failed");
+          }
+        },
+        1,
+        true,
+      );
+
+      try {
+        const terminal = await harness.manager.create(harness.context, {
+          args: ["-e", "process.exit(0)"],
+          command: process.execPath,
+        });
+        await harness.manager.waitForExit(terminal);
+        const firstKill = harness.manager.kill(harness.context, terminal);
+        const secondKill = harness.manager.kill(harness.context, terminal);
+        const cleanup =
+          action === "release"
+            ? harness.manager.release(harness.context, terminal)
+            : harness.manager.stopAll(harness.context);
+        const results = await Promise.allSettled([firstKill, secondKill, cleanup]);
+
+        expect(results.map((result) => result.status)).toEqual([
+          "rejected",
+          "rejected",
+          "rejected",
+        ]);
+        expect(killPushes).toBe(1);
+        expect(() => harness.manager.output(terminal)).not.toThrow();
+        expect(harness.events.some((event) => event.kind === "terminal.killed")).toBe(false);
+        expect(harness.events.some((event) => event.kind === "terminal.released")).toBe(false);
+        if (action === "release") {
+          await expect(
+            harness.manager.create(harness.context, {
+              args: ["-e", "process.exit(0)"],
+              command: process.execPath,
+            }),
+          ).rejects.toThrow("terminal limit of 1 is exhausted");
+        }
+
+        await expect(
+          action === "release"
+            ? harness.manager.release(harness.context, terminal).then(() => {})
+            : harness.manager.stopAll(harness.context),
+        ).resolves.toBeUndefined();
+        expect(killPushes).toBe(2);
+        expect(
+          harness.events
+            .filter((event) =>
+              [
+                "terminal.created",
+                "terminal.exited",
+                "terminal.killed",
+                "terminal.released",
+              ].includes(event.kind),
+            )
+            .map((event) => event.kind),
+        ).toEqual(["terminal.created", "terminal.exited", "terminal.killed", "terminal.released"]);
+        expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+      } finally {
+        await harness.manager.stopAll(harness.context).catch(() => {});
+      }
+    },
+  );
+
+  test("retains a terminal until its exit event is durably published", async () => {
+    let exitDraft: DriverEventInput | undefined;
+    let exitPushes = 0;
+    let failExit = true;
+    const harness = createHarness(
+      async (reason, events) => {
+        if (reason !== "driver.acp.terminal.exited") {
+          return;
+        }
+
+        const draft = events[0]!;
+        exitDraft ??= draft;
+        expect(draft).toBe(exitDraft);
+        exitPushes += 1;
+        if (failExit) {
+          throw new Error("exit publication failed");
+        }
+      },
+      1,
+      true,
+    );
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.stdout.write(String(process.pid));setInterval(() => {}, 1000)"],
+        command: process.execPath,
+      });
+      await waitForTerminalOutput(harness.manager, terminal, "non-empty");
+      process.kill(Number.parseInt(harness.manager.output(terminal).output, 10), "SIGTERM");
+      await harness.manager.waitForExit(terminal);
+      await Bun.sleep(0);
+
+      await expect(harness.manager.release(harness.context, terminal)).rejects.toThrow(
+        "exit publication failed",
+      );
+      expect(exitPushes).toBe(2);
+      expect(() => harness.manager.output(terminal)).not.toThrow();
+      expect(harness.events.some((event) => event.kind === "terminal.exited")).toBe(false);
+      expect(harness.events.some((event) => event.kind === "terminal.released")).toBe(false);
+
+      failExit = false;
+      await expect(harness.manager.release(harness.context, terminal)).resolves.toEqual({});
+      expect(exitPushes).toBe(3);
+      expect(
+        harness.events
+          .filter((event) =>
+            ["terminal.created", "terminal.exited", "terminal.released"].includes(event.kind),
+          )
+          .map((event) => event.kind),
+      ).toEqual(["terminal.created", "terminal.exited", "terminal.released"]);
+      expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+    } finally {
+      failExit = false;
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
+
+  test("keeps a kill admitted before release ahead of the released event", async () => {
+    const killPublishing = Promise.withResolvers<void>();
+    const allowKill = Promise.withResolvers<void>();
+    const harness = createHarness(
+      async (reason) => {
+        if (reason === "driver.acp.terminal.killed") {
+          killPublishing.resolve();
+          await allowKill.promise;
+        }
+      },
+      undefined,
+      true,
+    );
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      await waitForTerminalOutput(harness.manager, terminal);
+
+      const kill = harness.manager.kill(harness.context, terminal);
+      await killPublishing.promise;
+      const release = harness.manager.release(harness.context, terminal);
+      expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+      await Bun.sleep(0);
+      expect(harness.events.some((event) => event.kind === "terminal.released")).toBe(false);
+
+      allowKill.resolve();
+      await expect(Promise.all([kill, release])).resolves.toEqual([{}, {}]);
+      expect(
+        harness.events
+          .filter((event) => event.kind === "terminal.killed" || event.kind === "terminal.released")
+          .map((event) => event.kind),
+      ).toEqual(["terminal.killed", "terminal.released"]);
+    } finally {
+      allowKill.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
+
+  test("invalidates every public terminal operation while release is in flight", async () => {
+    const releasePublishing = Promise.withResolvers<void>();
+    const allowRelease = Promise.withResolvers<void>();
+    const harness = createHarness(async (reason) => {
+      if (reason === "driver.acp.terminal.released") {
+        releasePublishing.resolve();
+        await allowRelease.promise;
+      }
+    });
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(terminal);
+      const release = harness.manager.release(harness.context, terminal);
+      await releasePublishing.promise;
+
+      expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+      for (const operation of [
+        () => harness.manager.waitForExit(terminal),
+        () => harness.manager.kill(harness.context, terminal),
+        () => harness.manager.release(harness.context, terminal),
+      ]) {
+        await expect(operation()).rejects.toThrow("does not exist");
+      }
+
+      allowRelease.resolve();
+      await expect(release).resolves.toEqual({});
+      expect(harness.events.some((event) => event.kind === "terminal.killed")).toBe(false);
+    } finally {
+      allowRelease.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
+
   test("aborts an SDK terminal wait without abandoning the terminal", async () => {
     const harness = createHarness();
 
@@ -911,6 +1163,57 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       await harness.manager.stopAll(harness.context);
     }
   });
+
+  test("aborts an SDK terminal kill without abandoning cleanup ownership", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      await waitForTerminalOutput(harness.manager, terminal);
+      const controller = new AbortController();
+      const killed = harness.manager.kill(harness.context, terminal, controller.signal);
+      controller.abort();
+
+      await expect(killed).rejects.toBeInstanceOf(DOMException);
+      expect(() => harness.manager.output(terminal)).not.toThrow();
+      expect(harness.events.some((event) => event.kind === "terminal.killed")).toBe(false);
+
+      await expect(harness.manager.release(harness.context, terminal)).resolves.toEqual({});
+      expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+    } finally {
+      cleanup.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
+
+  test("bounds an SDK terminal kill and retains cleanup ownership after timeout", async () => {
+    const cleanup = Promise.withResolvers<void>();
+    const harness = createHarness(undefined, undefined, false, fakeWatchdog(cleanup.promise));
+
+    try {
+      const terminal = await harness.manager.create(harness.context, {
+        args: ["-e", 'process.stdout.write("ready");setInterval(() => {}, 1000)'],
+        command: process.execPath,
+      });
+      await waitForTerminalOutput(harness.manager, terminal);
+
+      await expect(harness.manager.kill(harness.context, terminal)).rejects.toThrow(
+        "cleanup did not finish within 4000ms after force kill",
+      );
+      expect(() => harness.manager.output(terminal)).not.toThrow();
+      expect(harness.events.some((event) => event.kind === "terminal.killed")).toBe(false);
+
+      await expect(harness.manager.release(harness.context, terminal)).resolves.toEqual({});
+      expect(() => harness.manager.output(terminal)).toThrow("does not exist");
+    } finally {
+      cleanup.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  }, 8_000);
 
   test.each([
     ["cooperative", "", "SIGTERM"],
@@ -998,42 +1301,166 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
     }
   });
 
-  test("retains a terminal for shutdown retry when failed creation cleanup cannot confirm exit", async () => {
-    const cleanup = Promise.withResolvers<void>();
+  test("closes an ACK-unknown creation with the same durable identity", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mosoo-acp-created-ack-"));
+    const pidPath = join(directory, "terminal.pid");
+    let createdDraft: DriverEventInput | undefined;
+    let createdPushes = 0;
+    let releaseDraft: DriverEventInput | undefined;
+    let releasePushes = 0;
     const harness = createHarness(
-      async (reason) => {
+      async (reason, events) => {
         if (reason === "driver.acp.terminal.created") {
-          throw new Error("event sink unavailable");
+          if (createdDraft === undefined) {
+            createdDraft = events[0];
+            createdPushes += 1;
+            throw new Error("creation receipt lost after commit");
+          }
+          if (events[0]?.sourceEventId === createdDraft.sourceEventId) {
+            expect(events[0]).toBe(createdDraft);
+            createdPushes += 1;
+          }
+        }
+        if (reason === "driver.acp.terminal.released") {
+          releaseDraft ??= events[0];
+          expect(events[0]).toBe(releaseDraft);
+          if (releasePushes++ === 0) {
+            throw new Error("release receipt lost after commit");
+          }
         }
       },
-      undefined,
+      1,
       false,
-      fakeWatchdog(cleanup.promise),
     );
 
     try {
       await expect(
         harness.manager.create(harness.context, {
-          args: ["-e", "setInterval(() => {}, 1000);"],
+          args: [
+            "-e",
+            `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));setInterval(() => {}, 1000);`,
+          ],
           command: process.execPath,
         }),
-      ).rejects.toThrow();
-      const terminalId = (
-        harness.events.find((event) => event.kind === "terminal.created")?.payload as
-          | Record<string, unknown>
-          | undefined
-      )?.["terminalId"];
+      ).rejects.toThrow("creation cleanup failed");
+      const pid = await waitForPidFile(pidPath);
+      await waitForProcessExit(pid);
 
-      expect(terminalId).toBeString();
+      expect(createdPushes).toBe(2);
+      expect(createdDraft?.sourceEventId).toMatch(/^acp\.terminal\.created:/);
+      expect(releasePushes).toBe(1);
+      const terminalId = (createdDraft!.payload as { terminalId: string }).terminalId;
       expect(() => harness.manager.output({ terminalId })).not.toThrow();
-
+      await expect(
+        harness.manager.create(harness.context, {
+          args: ["-e", "process.exit(0)"],
+          command: process.execPath,
+        }),
+      ).rejects.toThrow("terminal limit of 1 is exhausted");
+      expect(
+        [...new Map(harness.events.map((event) => [event.sourceEventId, event])).values()].map(
+          (event) => event.kind,
+        ),
+      ).toEqual(["terminal.created", "terminal.exited", "terminal.released"]);
       await expect(harness.manager.stopAll(harness.context)).resolves.toBeUndefined();
+      expect(releasePushes).toBe(2);
       expect(() => harness.manager.output({ terminalId })).toThrow("does not exist");
     } finally {
-      cleanup.resolve();
+      await harness.manager.stopAll(harness.context).catch(() => {});
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("cleans a creation that the durable sink rejects before commit", async () => {
+    let rejectCreated = true;
+    const harness = createHarness(
+      async (reason, events) => {
+        if (rejectCreated && reason === "driver.acp.terminal.created") {
+          throw new DriverEventRejectedError(
+            events[0]!.sourceEventId!,
+            new Error("creation rejected before commit"),
+          );
+        }
+      },
+      1,
+      true,
+    );
+
+    try {
+      await expect(
+        harness.manager.create(harness.context, {
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          command: process.execPath,
+        }),
+      ).rejects.toThrow("creation rejected before commit");
+      expect(harness.events).toHaveLength(0);
+
+      rejectCreated = false;
+      const next = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(next);
+      await harness.manager.release(harness.context, next);
+    } finally {
+      rejectCreated = false;
       await harness.manager.stopAll(harness.context).catch(() => {});
     }
-  }, 5_000);
+  });
+
+  test("treats a mismatched rejection identity as an ACK-unknown creation", async () => {
+    let createdDraft: DriverEventInput | undefined;
+    let createdPushes = 0;
+    const harness = createHarness(
+      async (reason, events) => {
+        if (reason !== "driver.acp.terminal.created") {
+          return;
+        }
+        if (createdPushes >= 2) {
+          return;
+        }
+
+        createdDraft ??= events[0];
+        expect(events[0]).toBe(createdDraft);
+        createdPushes += 1;
+        if (createdPushes === 1) {
+          throw new DriverEventRejectedError(
+            "different-source-event",
+            new Error("different creation rejected"),
+          );
+        }
+      },
+      1,
+      false,
+    );
+
+    try {
+      await expect(
+        harness.manager.create(harness.context, {
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          command: process.execPath,
+        }),
+      ).rejects.toThrow("different creation rejected");
+
+      expect(createdPushes).toBe(2);
+      expect(
+        [...new Map(harness.events.map((event) => [event.sourceEventId, event])).values()].map(
+          (event) => event.kind,
+        ),
+      ).toEqual(["terminal.created", "terminal.exited", "terminal.released"]);
+      const terminalId = (createdDraft!.payload as { terminalId: string }).terminalId;
+      expect(() => harness.manager.output({ terminalId })).toThrow("does not exist");
+
+      const next = await harness.manager.create(harness.context, {
+        args: ["-e", "process.exit(0)"],
+        command: process.execPath,
+      });
+      await harness.manager.waitForExit(next);
+      await harness.manager.release(harness.context, next);
+    } finally {
+      await harness.manager.stopAll(harness.context).catch(() => {});
+    }
+  });
 
   test("stopAll joins an in-progress release and emits it once", async () => {
     const releasePublishing = Promise.withResolvers<void>();

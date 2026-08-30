@@ -1,6 +1,7 @@
 import {
   Client,
   InsufficientScopeError,
+  LATEST_PROTOCOL_VERSION,
   ProtocolError,
   ProtocolErrorCode,
   SdkError,
@@ -12,7 +13,9 @@ import {
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 
 import { AGENT_DRIVER_VERSION } from "../../core/version";
+import { AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS } from "../../host-ports";
 import type { AgentDriverMcpExecution } from "../../host-ports";
+import type { Logger } from "../../observability";
 import type { DriverStartInput } from "../../protocol/start";
 import type { McpExecuteCommand, McpExternalToolExecutionResult } from "../../runtime-command";
 import { settlePromiseWithTimeout } from "../../utils/async";
@@ -20,9 +23,67 @@ import { settlePromiseWithTimeout } from "../../utils/async";
 type SessionMcpServer = DriverStartInput["execution"]["session"]["mcpServers"][number];
 type ActiveMcpServer = Extract<SessionMcpServer, { authorizationState: "active" }>;
 
-const MCP_REQUEST_TIMEOUT_MS = 60_000;
+const MCP_CONNECT_TIMEOUT_MS = 60_000;
 const MCP_CLEANUP_TIMEOUT_MS = 2_000;
+const MCP_RESPONSE_MAX_BYTES = 8 * 1_024 * 1_024;
 const MOSOO_TOOL_CALL_ID_HEADER = "X-Mosoo-Tool-Call-Id";
+
+class McpResponseTooLargeError extends RangeError {
+  constructor() {
+    super(`MCP response exceeds ${String(MCP_RESPONSE_MAX_BYTES)} bytes.`);
+    this.name = "McpResponseTooLargeError";
+  }
+}
+
+async function boundedMcpFetch(
+  input: string | URL | Request,
+  init?: RequestInit,
+): Promise<Response> {
+  const response = await fetch(input, init);
+  const contentLength = response.headers.get("content-length");
+
+  if (contentLength !== null && Number(contentLength) > MCP_RESPONSE_MAX_BYTES) {
+    void response.body?.cancel().catch(() => {});
+    const body =
+      response.body === null
+        ? null
+        : new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new McpResponseTooLargeError());
+            },
+          });
+
+    return new Response(body, {
+      headers: response.headers,
+      status: response.status,
+      statusText: response.statusText,
+    });
+  }
+  if (response.body === null) {
+    return response;
+  }
+
+  let bytes = 0;
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (chunk.byteLength > MCP_RESPONSE_MAX_BYTES - bytes) {
+          controller.error(new McpResponseTooLargeError());
+          return;
+        }
+
+        bytes += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+
+  return new Response(body, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
 
 function parseToolArguments(command: McpExecuteCommand): Record<string, unknown> {
   try {
@@ -218,30 +279,137 @@ function mapMcpExecutionError(
   return new Error(`Failed to execute MCP tool ${command.toolName} on ${server.name}.`);
 }
 
-async function closeMcpConnection(
-  client: Client,
-  transport: StreamableHTTPClientTransport,
-): Promise<void> {
-  await settlePromiseWithTimeout(
-    Promise.resolve().then(() => transport.terminateSession()),
-    {
-      label: "MCP session termination",
-      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+function cleanupFailureMessage(
+  result: Awaited<ReturnType<typeof settlePromiseWithTimeout>>,
+): string {
+  if (result.status === "completed") {
+    return "Cleanup completed.";
+  }
+
+  return result.error instanceof Error ? result.error.message : "Unknown cleanup failure.";
+}
+
+function createMcpTransport(
+  proxyUrl: URL,
+  authProvider: AuthProvider,
+  command: McpExecuteCommand,
+  session?: { readonly protocolVersion?: string; readonly sessionId: string },
+): StreamableHTTPClientTransport {
+  return new StreamableHTTPClientTransport(proxyUrl, {
+    authProvider,
+    fetch: boundedMcpFetch,
+    requestInit: {
+      headers: { [MOSOO_TOOL_CALL_ID_HEADER]: command.toolCallId },
     },
-  );
-  await settlePromiseWithTimeout(
+    ...session,
+  });
+}
+
+async function closeMcpClient(
+  client: Client,
+  logger: Logger,
+  command: McpExecuteCommand,
+): Promise<void> {
+  const close = await settlePromiseWithTimeout(
     Promise.resolve().then(() => client.close()),
     {
       label: "MCP client close",
       timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
     },
   );
+  if (close.status !== "completed") {
+    logger.warn("driver.mcp.client-close.failed", {
+      commandId: command.commandId,
+      message: cleanupFailureMessage(close),
+      serverId: command.serverId,
+      status: close.status,
+    });
+  }
+}
+
+async function terminateFailedConnectionSession(
+  proxyUrl: URL,
+  authProvider: AuthProvider,
+  session: { readonly protocolVersion?: string; readonly sessionId: string },
+  logger: Logger,
+  command: McpExecuteCommand,
+): Promise<void> {
+  const cleanupTransport = createMcpTransport(proxyUrl, authProvider, command, session);
+  const termination = await settlePromiseWithTimeout(
+    Promise.resolve().then(async () => {
+      await cleanupTransport.start();
+      await cleanupTransport.terminateSession();
+    }),
+    {
+      label: "Failed MCP connection session termination",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    },
+  );
+  const close = await settlePromiseWithTimeout(
+    Promise.resolve().then(() => cleanupTransport.close()),
+    {
+      label: "Failed MCP connection cleanup transport close",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    },
+  );
+
+  if (termination.status !== "completed") {
+    logger.warn("driver.mcp.session-termination.failed", {
+      commandId: command.commandId,
+      message: cleanupFailureMessage(termination),
+      serverId: command.serverId,
+      status: termination.status,
+    });
+  }
+  if (close.status !== "completed") {
+    logger.warn("driver.mcp.cleanup-transport-close.failed", {
+      commandId: command.commandId,
+      message: cleanupFailureMessage(close),
+      serverId: command.serverId,
+      status: close.status,
+    });
+  }
+}
+
+async function closeMcpConnection(
+  client: Client,
+  transport: StreamableHTTPClientTransport,
+  logger: Logger,
+  command: McpExecuteCommand,
+): Promise<void> {
+  let termination = await settlePromiseWithTimeout(
+    Promise.resolve().then(() => transport.terminateSession()),
+    {
+      label: "MCP session termination",
+      timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+    },
+  );
+
+  if (termination.status === "failed") {
+    termination = await settlePromiseWithTimeout(
+      Promise.resolve().then(() => transport.terminateSession()),
+      {
+        label: "MCP session termination retry",
+        timeoutMs: MCP_CLEANUP_TIMEOUT_MS,
+      },
+    );
+  }
+  if (termination.status !== "completed") {
+    logger.warn("driver.mcp.session-termination.failed", {
+      commandId: command.commandId,
+      message: cleanupFailureMessage(termination),
+      serverId: command.serverId,
+      status: termination.status,
+    });
+  }
+  await closeMcpClient(client, logger, command);
 }
 
 export async function prepareRemoteHttpMcpCommand(
   payload: DriverStartInput,
   command: McpExecuteCommand,
   signal: AbortSignal,
+  logger: Logger,
 ): Promise<AgentDriverMcpExecution> {
   signal.throwIfAborted();
   const server = resolveActiveMcpServer(payload, command);
@@ -259,34 +427,46 @@ export async function prepareRemoteHttpMcpCommand(
       versionNegotiation: { mode: "auto" },
     },
   );
-  const transport = new StreamableHTTPClientTransport(proxyUrl, {
-    authProvider,
-    requestInit: {
-      headers: { [MOSOO_TOOL_CALL_ID_HEADER]: command.toolCallId },
-    },
-  });
-  const connectSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
+  const transport = createMcpTransport(proxyUrl, authProvider, command);
+  const connectSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_CONNECT_TIMEOUT_MS)]);
 
   try {
     await client.connect(transport, {
       signal: connectSignal,
-      timeout: MCP_REQUEST_TIMEOUT_MS,
+      timeout: MCP_CONNECT_TIMEOUT_MS,
     });
   } catch (error) {
-    await closeMcpConnection(client, transport);
+    const failedSession =
+      transport.sessionId === undefined
+        ? undefined
+        : {
+            protocolVersion: transport.protocolVersion ?? LATEST_PROTOCOL_VERSION,
+            sessionId: transport.sessionId,
+          };
+
+    await closeMcpClient(client, logger, command);
+    if (failedSession !== undefined) {
+      await terminateFailedConnectionSession(
+        proxyUrl,
+        authProvider,
+        failedSession,
+        logger,
+        command,
+      );
+    }
     throw mapMcpExecutionError(command, server, error);
   }
 
-  let disposed = false;
+  let disposeTask: Promise<void> | null = null;
   let executed = false;
 
   return {
     async execute(effect): Promise<McpExternalToolExecutionResult> {
-      if (disposed || executed) {
+      if (disposeTask !== null || executed) {
         throw new Error(`Prepared MCP command ${command.commandId} can only be executed once.`);
       }
       executed = true;
-      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MCP_REQUEST_TIMEOUT_MS)]);
+      const requestSignal = AbortSignal.timeout(AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS);
 
       try {
         const result = await client.callTool(
@@ -299,7 +479,7 @@ export async function prepareRemoteHttpMcpCommand(
           },
           {
             signal: requestSignal,
-            timeout: MCP_REQUEST_TIMEOUT_MS,
+            timeout: AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS,
           },
         );
 
@@ -309,11 +489,7 @@ export async function prepareRemoteHttpMcpCommand(
       }
     },
     async [Symbol.asyncDispose](): Promise<void> {
-      if (disposed) {
-        return;
-      }
-      disposed = true;
-      await closeMcpConnection(client, transport);
+      return (disposeTask ??= closeMcpConnection(client, transport, logger, command));
     },
   };
 }

@@ -191,6 +191,43 @@ describe("Claude Agent SDK provider fixtures", () => {
     });
   });
 
+  test("clears the prior task snapshot when the visible-task bound is exceeded", async () => {
+    const { context, events, translator } = createHarness();
+    const message = (tasks: Array<{ description: string; task_id: string; task_type: string }>) =>
+      ({
+        session_id: "native-session-1",
+        subtype: "background_tasks_changed",
+        tasks,
+        type: "system",
+        uuid: `background-tasks-${String(tasks.length)}`,
+      }) as unknown as SDKMessage;
+
+    await translator.handleSdkMessage(
+      context,
+      message([{ description: "Inspect", task_id: "task-1", task_type: "local_agent" }]),
+      "run-1" as RunId,
+    );
+    await translator.handleSdkMessage(
+      context,
+      message(
+        Array.from({ length: 257 }, (_, index) => ({
+          description: "Inspect",
+          task_id: `task-${String(index)}`,
+          task_type: "local_agent",
+        })),
+      ),
+      "run-1" as RunId,
+    );
+
+    expect(events().filter((event) => event.kind === "agent.tasks.replaced")).toMatchObject([
+      { payload: { tasks: [{ taskId: "task-1" }] } },
+      { payload: { tasks: [] } },
+    ]);
+    expect(events().filter((event) => event.kind === "diagnostic.reported")).toMatchObject([
+      { payload: { code: "claude.visible_background_tasks_too_many" } },
+    ]);
+  });
+
   test("projects informational, local command, mirror failure, and conversation reset frames", async () => {
     const { context, events, nativeSessionResets, translator } = createHarness();
     const messages = [
@@ -939,6 +976,24 @@ describe("Claude Agent SDK provider fixtures", () => {
       await translator.handleSdkMessage(context, message, "run-1" as RunId);
     }
 
+    expect(
+      events().filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          event.delivery === "best_effort" &&
+          isRecord(event.payload) &&
+          event.payload["toolCallId"] === "tool-1",
+      ),
+    ).toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ rawInputDelta: '{"path":"partial' }),
+      }),
+    );
+    expect(events()).not.toContainEqual(
+      expect.objectContaining({
+        payload: expect.objectContaining({ rawInput: "{}", toolCallId: "tool-1" }),
+      }),
+    );
     expect(
       events().filter(
         (event) =>

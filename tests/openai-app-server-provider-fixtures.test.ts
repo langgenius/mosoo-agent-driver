@@ -203,7 +203,7 @@ function createThreadFixture(id = "thread-1") {
     agentNickname: null,
     agentRole: null,
     canAcceptDirectInput: true,
-    cliVersion: "0.150.1",
+    cliVersion: "0.151.0",
     createdAt: 1_700_000_000,
     cwd: "/workspace",
     ephemeral: false,
@@ -480,7 +480,7 @@ describe("OpenAI app-server provider fixtures", () => {
         codexHome: "/tmp/openai-home",
         platformFamily: "unix",
         platformOs: "linux",
-        userAgent: "test-app-server/0.150.1",
+        userAgent: "test-app-server/0.151.0",
       };
       delete response[missing];
 
@@ -493,7 +493,7 @@ describe("OpenAI app-server provider fixtures", () => {
       codexHome: "/tmp/openai-home",
       platformFamily: "unix",
       platformOs: "linux",
-      userAgent: "test-app-server/0.150.1",
+      userAgent: "test-app-server/0.151.0",
     };
 
     expect(CLIENT_RESULT_SCHEMAS.initialize.parse(response)).toEqual(response);
@@ -579,6 +579,7 @@ describe("OpenAI app-server provider fixtures", () => {
         additionalDetails: "HTTP 502 from upstream.",
         codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
         message: "Response stream disconnected.",
+        misalignment: null,
       },
       status: "failed",
     };
@@ -621,7 +622,7 @@ describe("OpenAI app-server provider fixtures", () => {
         willRetry: false,
       }),
     ).toEqual({
-      error: { additionalDetails: null, message: "Provider failed." },
+      error: { additionalDetails: null, message: "Provider failed.", misalignment: null },
       threadId: "thread-1",
       turnId: "turn-1",
       willRetry: false,
@@ -1078,15 +1079,29 @@ describe("OpenAI app-server provider fixtures", () => {
         id: "hook-echo-1",
         type: "hookPrompt",
       },
+      {
+        id: "function-output-echo-1",
+        name: "lookup",
+        namespace: "project",
+        output: "provider echo",
+        type: "functionCallOutput",
+      },
     ] as const) {
-      await dispatchProviderNotification(
-        {
-          method: "item/completed",
-          params: { completedAtMs: 3, item, threadId: "thread-1", turnId: "turn-1" },
-        },
-        bridge,
-        context,
-      );
+      for (const method of ["item/started", "item/completed"] as const) {
+        await dispatchProviderNotification(
+          {
+            method,
+            params: {
+              ...(method === "item/started" ? { startedAtMs: 2 } : { completedAtMs: 3 }),
+              item,
+              threadId: "thread-1",
+              turnId: "turn-1",
+            },
+          },
+          bridge,
+          context,
+        );
+      }
     }
     expect(events()).toHaveLength(eventCount);
   });
@@ -1155,7 +1170,7 @@ describe("OpenAI app-server provider fixtures", () => {
     },
   );
 
-  test("publishes sub-agent activity from a terminal turn snapshot", async () => {
+  test("publishes sub-agent activity and ignores tool-output echo from a terminal snapshot", async () => {
     const { bridge, context, events } = createHarness();
 
     await dispatchProviderNotification(
@@ -1166,6 +1181,13 @@ describe("OpenAI app-server provider fixtures", () => {
           turn: {
             id: "turn-snapshot",
             items: [
+              {
+                id: "function-output-snapshot",
+                name: "lookup",
+                namespace: null,
+                output: "provider echo",
+                type: "functionCallOutput",
+              },
               {
                 agentPath: "/root/replayed-worker",
                 agentThreadId: "agent-replayed",

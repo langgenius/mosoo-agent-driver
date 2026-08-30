@@ -61,3 +61,9 @@ jobs:
 
       - name: Check
         run: vp run check
+
+      - name: Build image
+        run: buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .
+
+      - name: Test image environment
+        run: vp run test:image:environment

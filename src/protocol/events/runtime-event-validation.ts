@@ -16,11 +16,38 @@ const payloadIdentityFields = new Set<string>([
   "traceId",
 ]);
 
+export function requireExactKeys(
+  value: RuntimeEventRecord,
+  allowedKeys: ReadonlySet<string>,
+  label: string,
+): void {
+  const unexpected = Object.keys(value).find((key) => !allowedKeys.has(key));
+
+  if (unexpected !== undefined) {
+    throw new Error(`${label} ${unexpected} is not allowed.`);
+  }
+}
+
 export function isRuntimeEventRecord(value: unknown): value is RuntimeEventRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function parseNativeRef(value: RuntimeEventRecord): RuntimeEventNativeRef {
+  requireExactKeys(
+    value,
+    new Set([
+      "eventName",
+      "itemId",
+      "protocolVersion",
+      "provider",
+      "requestId",
+      "sequence",
+      "threadId",
+      "turnId",
+    ]),
+    "Runtime event native reference",
+  );
+
   return {
     ...(readOptionalString(value, "eventName", "Runtime event native reference") === undefined
       ? {}
@@ -320,18 +347,26 @@ export function assertTimestamp(value: string, label: string): void {
 
 export function readPrimitiveRecord(
   value: unknown,
+  label: string,
 ): Record<string, string | number | boolean | null> {
-  if (!isRuntimeEventRecord(value)) {
+  if (value === undefined) {
     return {};
   }
 
-  return Object.fromEntries(
-    Object.entries(value).filter(
-      ([, entry]) =>
-        entry === null ||
-        typeof entry === "string" ||
-        typeof entry === "number" ||
-        typeof entry === "boolean",
-    ),
-  ) as Record<string, string | number | boolean | null>;
+  if (!isRuntimeEventRecord(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+
+  for (const [field, entry] of Object.entries(value)) {
+    if (
+      entry !== null &&
+      typeof entry !== "string" &&
+      typeof entry !== "number" &&
+      typeof entry !== "boolean"
+    ) {
+      throw new Error(`${label}.${field} must be a primitive JSON value.`);
+    }
+  }
+
+  return value as Record<string, string | number | boolean | null>;
 }

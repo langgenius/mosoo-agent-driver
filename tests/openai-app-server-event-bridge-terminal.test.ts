@@ -46,6 +46,19 @@ function expectRunFinalReferences(
   expect(messageId).not.toBeNull();
   expect(snapshots[0]?.kind).toBe("message.added");
   expect(content).toBe(expectedContent);
+  const lastSnapshotIndex = events.findLastIndex(
+    (event) =>
+      readEventPayloadString(event, "messageId") === messageId &&
+      (event.kind === "message.added" || event.kind === "message.delta"),
+  );
+  const sealIndex = events.findIndex(
+    (event, index) =>
+      index > lastSnapshotIndex &&
+      event.kind === "message.completed" &&
+      readEventPayloadString(event, "messageId") === messageId,
+  );
+  expect(sealIndex).toBeGreaterThan(lastSnapshotIndex);
+  expect(events.findIndex((event) => event === terminal)).toBeGreaterThan(sealIndex);
   expect(terminal!.payload).not.toHaveProperty("finalMessageText");
 }
 
@@ -91,7 +104,7 @@ function createPublisherHarness(
         delivered.push(...acceptedEvents);
         return {
           accepted: acceptedEvents.map((event) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: nextSeq++,
             type: event.kind,
           })),
@@ -710,16 +723,21 @@ describe("OpenAi app-server event bridge", () => {
       expect(events.map((event) => readEventPayloadString(event, "content")).join("")).toBe(large);
       expect(events.length).toBeGreaterThan(1);
       expect(events.every((event) => event.delivery === "lossless")).toBe(true);
+      const messageIds = new Set(events.map((event) => readEventPayloadString(event, "messageId")));
+      expect(messageIds.size).toBe(events.length);
+      expect([...messageIds].every(isDriverId)).toBe(true);
     }
     const strictReview = delivered.find(
       (event) => readEventPayloadString(event, "subtype") === "strict_review_required",
     );
     expect(strictReview?.delivery).toBe("lossless");
     expect(strictReview?.payload).toMatchObject({ startedAtMs: 1 });
+    expect(isDriverId(readEventPayloadString(strictReview!, "messageId"))).toBe(true);
     const worldWritable = delivered.find(
       (event) => readEventPayloadString(event, "subtype") === "windows_world_writable_warning",
     );
     expect(worldWritable?.payload).toMatchObject({ extraCount: 3, samplePaths: [] });
+    expect(isDriverId(readEventPayloadString(worldWritable!, "messageId"))).toBe(true);
     expect(delivered.every((event) => Buffer.byteLength(JSON.stringify(event)) < 1_048_576)).toBe(
       true,
     );
@@ -736,7 +754,16 @@ describe("OpenAi app-server event bridge", () => {
         turn: {
           completedAt: 2,
           durationMs: 1,
-          error: { additionalDetails: large, codexErrorInfo: null, message: large },
+          error: {
+            additionalDetails: large,
+            codexErrorInfo: null,
+            message: large,
+            misalignment: {
+              detailedExplanation: large,
+              errorType: large,
+              steer: { message: large },
+            },
+          },
           id: "turn-1",
           items: [],
           itemsView: "notLoaded",
@@ -750,19 +777,23 @@ describe("OpenAi app-server event bridge", () => {
     await bridge.handleNotification(context, notification!.method, notification!.params);
     await expect(trackedTurn).rejects.toThrow("was omitted");
 
-    const terminal = delivered.at(-1);
-    expect(terminal).toMatchObject({
+    const terminal = delivered.at(-1)!;
+    const [canonical] = toDriverEventEnvelopes(driverBootPayload, terminal, DRIVER_TEST_IDS.runId);
+    expect(canonical?.event).toMatchObject({
       kind: "run.failed",
       payload: {
         error: {
           details: {
             additionalDetailsUtf8Bytes: 1_100_000,
             messageUtf8Bytes: 1_100_000,
+            misalignmentDetailedExplanationUtf8Bytes: 1_100_000,
+            misalignmentErrorTypeUtf8Bytes: 1_100_000,
+            misalignmentSteerMessageUtf8Bytes: 1_100_000,
           },
         },
       },
     });
-    expect(Buffer.byteLength(JSON.stringify(terminal))).toBeLessThan(1_048_576);
+    expect(Buffer.byteLength(JSON.stringify(canonical))).toBeLessThan(1_048_576);
   });
 
   test("removes OpenAI private citation markup from streamed and final assistant text", async () => {

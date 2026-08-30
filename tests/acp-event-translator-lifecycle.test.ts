@@ -385,6 +385,16 @@ describe("ACP runtime event translation", () => {
           event.kind === "message.added" && eventPayload(event)["messageId"] === finalMessageId,
       )?.payload,
     ).toMatchObject({ content: finalText });
+    const finalSnapshotIndex = events.findIndex(
+      (event) =>
+        event.kind === "message.added" && eventPayload(event)["messageId"] === finalMessageId,
+    );
+    const finalSealIndex = events.findIndex(
+      (event) =>
+        event.kind === "message.completed" && eventPayload(event)["messageId"] === finalMessageId,
+    );
+    expect(finalSealIndex).toBeGreaterThan(finalSnapshotIndex);
+    expect(events.indexOf(completed)).toBeGreaterThan(finalSealIndex);
   });
 
   test("evicts bounded settled assistant IDs without suppressing the oldest message", () => {
@@ -610,6 +620,7 @@ describe("ACP runtime event translation", () => {
     expect(eventPayload(anonymousFailed)).toMatchObject({
       error: {
         code: "acp.empty_turn",
+        retryable: true,
       },
       recoverable: true,
       stopReason: "end_turn",
@@ -1097,5 +1108,13 @@ describe("ACP runtime event translation", () => {
       { kind: "allow_once", name: "Allow once", optionId: "allow" },
       { kind: "reject_once", name: "Reject once", optionId: "reject" },
     ]);
+
+    expect(
+      toPermissionRequest({
+        params: { toolCall: { kind: "shell", title: "Run command" } },
+        requestId: "rpc-fallback",
+        runId: RUN_ID,
+      }).request.toolCallId,
+    ).toBe("rpc-fallback");
   });
 });

@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   DriverArtifactTestController,
   expectedDriverCapabilities,
@@ -893,7 +894,7 @@ function createBootPayload(input: {
       skills: [],
     },
     heartbeatIntervalMs: 60_000,
-    protocolVersion: 2,
+    protocolVersion: DRIVER_PROTOCOL_VERSION,
     runtime: runtimeCase.runtime,
     runtimeTransport: runtimeCase.transport,
     sandboxId,
@@ -2177,6 +2178,7 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
           commandId: startBoundaryCancelId,
           kind: "turn.cancel",
           reason: "live.cancel.start_boundary",
+          runId: startBoundary.runId,
         });
         await controller.waitForCommandUpdate(
           (update) => update.commandId === startBoundaryCancelId && update.status === "accepted",
@@ -2256,7 +2258,12 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         }
       });
       const cancelId = `cancel-${createTestId()}`;
-      controller.enqueue({ commandId: cancelId, kind: "turn.cancel", reason: "live.cancel" });
+      controller.enqueue({
+        commandId: cancelId,
+        kind: "turn.cancel",
+        reason: "live.cancel",
+        runId: active.runId,
+      });
       const [inputUpdate, cancelUpdate, cancelledEvent] = await Promise.all([
         controller.waitForCommandTerminal(active.commandId, LIVE_TURN_TIMEOUT_MS),
         controller.waitForCommandTerminal(cancelId, LIVE_TURN_TIMEOUT_MS),
@@ -2289,7 +2296,12 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         "run.cancelled",
       );
       const replayIndex = controller.commandUpdates.length;
-      controller.enqueue({ commandId: cancelId, kind: "turn.cancel", reason: "live.cancel" });
+      controller.enqueue({
+        commandId: cancelId,
+        kind: "turn.cancel",
+        reason: "live.cancel",
+        runId: active.runId,
+      });
       expect(
         (await controller.waitForCommandTerminal(cancelId, LIVE_STOP_TIMEOUT_MS, replayIndex))
           .status,
@@ -2309,10 +2321,11 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         commandId: idleCancelId,
         kind: "turn.cancel",
         reason: "live.idle.cancel",
+        runId: active.runId,
       });
       expect(
         (await controller.waitForCommandTerminal(idleCancelId, LIVE_STOP_TIMEOUT_MS)).status,
-      ).toBe("completed");
+      ).toBe("failed");
 
       const events = await runTurn(
         controller,
@@ -2426,6 +2439,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         commandId: cancelId,
         kind: "turn.cancel",
         reason: "live.permission.cancel",
+        runId: cancelled.runId,
       });
       const [inputUpdate, cancelUpdate, cancelledEvent, cancelledResolution] = await Promise.all([
         controller.waitForCommandTerminal(cancelled.commandId, LIVE_TURN_TIMEOUT_MS),
@@ -2478,10 +2492,11 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "allow_once",
         kind: "permission.resolve",
         requestId: cancelledRequestId,
+        runId: cancelled.runId,
       });
       expect(
         (await controller.waitForCommandTerminal(lateResolveId, LIVE_STOP_TIMEOUT_MS)).status,
-      ).toBe("completed");
+      ).toBe("failed");
       expect(
         controller.events.filter(
           (event) =>
@@ -2507,6 +2522,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "reject_once",
         kind: "permission.resolve",
         requestId: rejectedRequestId,
+        runId: rejected.runId,
       });
       const [rejectUpdate, rejectedUpdate, rejectedResolution, rejectedEvent] = await Promise.all([
         controller.waitForCommandTerminal(rejectId, LIVE_TURN_TIMEOUT_MS),
@@ -2563,6 +2579,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "allow_once",
         kind: "permission.resolve",
         requestId: allowedRequestId,
+        runId: allowed.runId,
       });
       const [resolveUpdate, allowedUpdate, allowedResolution, completedEvent] = await Promise.all([
         controller.waitForCommandTerminal(resolveId, LIVE_TURN_TIMEOUT_MS),

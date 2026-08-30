@@ -374,6 +374,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     const threadStartParams = {
       ...baseThreadParams,
       ...(developerInstructions === null ? {} : { developerInstructions }),
+      historyMode: "paginated",
       sessionStartSource: "startup",
     } satisfies ThreadStartParams;
 
@@ -393,6 +394,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
             {
               ...baseThreadParams,
               ...(developerInstructions === null ? {} : { developerInstructions }),
+              excludeTurns: true,
               threadId: resumeThreadId,
             } satisfies ThreadResumeParams,
             signal,

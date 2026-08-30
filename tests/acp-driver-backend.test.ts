@@ -11,7 +11,7 @@ import {
 } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
 import { createDisabledLogger } from "../src/observability";
-import type { AgentDriverPermissionPort } from "../src/host-ports";
+import type { AgentDriverFilePort, AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
@@ -29,6 +29,9 @@ const FAKE_AGENT = String.raw`
 const { appendFileSync, existsSync } = require("node:fs");
 const { spawn } = require("node:child_process");
 const logPath = process.env.TEST_LOG_PATH;
+const agentPidPath = process.env.TEST_AGENT_PID_PATH;
+const backpressurePath = process.env.TEST_BACKPRESSURE_PATH;
+const closeWritePath = process.env.TEST_CLOSE_WRITE_PATH;
 const latePidPath = process.env.TEST_LATE_PID_PATH;
 const openCodeConfigPath = process.env.TEST_OPENCODE_CONFIG_PATH;
 const responsePath = process.env.TEST_RESPONSE_PATH;
@@ -37,13 +40,35 @@ const triggerPath = process.env.TEST_TRIGGER_PATH;
 if (openCodeConfigPath) {
   appendFileSync(openCodeConfigPath, process.env.OPENCODE_CONFIG_CONTENT || "");
 }
+if (agentPidPath) appendFileSync(agentPidPath, process.pid + "\n");
 let buffer = "";
+let floodTerminalId = null;
 let sessionReady = false;
 let updateSent = false;
 let pendingPromptId = null;
+let pendingGenerationProbePromptId = null;
 let pendingProviderCancelPromptId = null;
 let pendingEndTurnPromptId = null;
 let resumeMetadataSent = false;
+let waitingForFloodBackpressure = false;
+let pendingCloseId = null;
+const requestFloodOutput = (id) =>
+  requestClient({
+    id,
+    jsonrpc: "2.0",
+    method: "terminal/output",
+    params: { sessionId: "native-session-1", terminalId: floodTerminalId },
+  });
+const sendFloodWaits = () => {
+  for (let index = 0; index < 9; index += 1) {
+    requestClient({
+      id: "flood-wait-" + index,
+      jsonrpc: "2.0",
+      method: "terminal/wait_for_exit",
+      params: { sessionId: "native-session-1", terminalId: floodTerminalId },
+    });
+  }
+};
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const requestClient = (message) => {
   appendFileSync(logPath, message.method + "\n");
@@ -69,6 +94,48 @@ const handle = (message) => {
       }
     } else if (message.id === "nested-wait") {
       appendFileSync(responsePath, JSON.stringify(message) + "\n");
+    } else if (message.id === "flood-create") {
+      if (!message.result?.terminalId) {
+        throw new Error("Flood terminal creation failed.");
+      }
+      floodTerminalId = message.result.terminalId;
+      requestFloodOutput("flood-output-ready");
+    } else if (message.id === "flood-output-ready") {
+      if (message.result?.output?.length < 1024 * 1024) {
+        setImmediate(() => requestFloodOutput("flood-output-ready"));
+      } else {
+        waitingForFloodBackpressure = true;
+        requestFloodOutput("flood-output-blocked");
+      }
+    } else if (String(message.id).startsWith("flood-wait-")) {
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+    } else if (message.id === "generation-probe-read") {
+      if (message.result?.content !== "generation-0") {
+        throw new Error("Generation probe read failed.");
+      }
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "native-session-1",
+          update: {
+            content: { text: "reconnected", type: "text" },
+            messageId: "generation-probe-assistant",
+            sessionUpdate: "agent_message_chunk",
+          },
+        },
+      });
+      send({
+        id: pendingGenerationProbePromptId,
+        jsonrpc: "2.0",
+        result: { stopReason: "end_turn" },
+      });
+      pendingGenerationProbePromptId = null;
+    } else if (message.id === "close-write") {
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+      send({ id: pendingCloseId, jsonrpc: "2.0", result: {} });
+      pendingCloseId = null;
     }
     return;
   }
@@ -274,6 +341,82 @@ const handle = (message) => {
         });
         return;
       }
+      if (message.params.prompt[0]?.text === "request-flood") {
+        requestClient({
+          id: "flood-create",
+          jsonrpc: "2.0",
+          method: "terminal/create",
+          params: {
+            args: [
+              "-e",
+              "process.stdout.write('x'.repeat(1024 * 1024)); setInterval(() => {}, 1000)",
+            ],
+            command: process.execPath,
+            outputByteLimit: 1024 * 1024,
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
+      if (message.params.prompt[0]?.text === "generation-leak") {
+        pendingPromptId = message.id;
+        for (let index = 0; index < 8; index += 1) {
+          requestClient({
+            id: "generation-write-" + index,
+            jsonrpc: "2.0",
+            method: "fs/write_text_file",
+            params: {
+              content: "generation-" + index,
+              path: process.cwd() + "/generation-" + index + ".txt",
+              sessionId: "native-session-1",
+            },
+          });
+        }
+        return;
+      }
+      if (message.params.prompt[0]?.text === "generation-probe") {
+        pendingGenerationProbePromptId = message.id;
+        requestClient({
+          id: "generation-probe-read",
+          jsonrpc: "2.0",
+          method: "fs/read_text_file",
+          params: {
+            path: process.cwd() + "/generation-0.txt",
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
+      if (message.params.prompt[0]?.text === "ignore-file-report") {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              content: { text: "written", type: "text" },
+              messageId: "ignore-file-report-assistant",
+              sessionUpdate: "agent_message_chunk",
+            },
+          },
+        });
+        requestClient({
+          id: "ignored-write",
+          jsonrpc: "2.0",
+          method: "fs/write_text_file",
+          params: {
+            content: "committed",
+            path: process.cwd() + "/ignored-write.txt",
+            sessionId: "native-session-1",
+          },
+        });
+        const promptId = message.id;
+        setTimeout(
+          () => send({ id: promptId, jsonrpc: "2.0", result: { stopReason: "end_turn" } }),
+          50,
+        );
+        return;
+      }
       if (message.params.prompt[0]?.text === "many-tools") {
         for (let index = 0; index < 32; index += 1) {
           send({
@@ -368,6 +511,20 @@ const handle = (message) => {
       break;
     case "session/close":
       if (process.env.TEST_HANG_CLOSE === "1") return;
+      if (closeWritePath) {
+        pendingCloseId = message.id;
+        requestClient({
+          id: "close-write",
+          jsonrpc: "2.0",
+          method: "fs/write_text_file",
+          params: {
+            content: "must not be written",
+            path: closeWritePath,
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -386,6 +543,18 @@ const handle = (message) => {
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
+  if (
+    waitingForFloodBackpressure &&
+    buffer.includes('"id":"flood-output-blocked"')
+  ) {
+    if (buffer.includes("\n")) {
+      throw new Error("Flood response completed before output backpressure was established.");
+    }
+    waitingForFloodBackpressure = false;
+    process.stdin.pause();
+    appendFileSync(backpressurePath, String(Buffer.byteLength(buffer)));
+    sendFloodWaits();
+  }
   for (let newline; (newline = buffer.indexOf("\n")) >= 0; ) {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
@@ -447,6 +616,7 @@ async function createHarness(
     readonly authenticate?: boolean;
     readonly blockResume?: boolean;
     readonly failResume?: boolean;
+    readonly file?: AgentDriverFilePort;
     readonly hangClose?: boolean;
     readonly metadataOnResume?: boolean;
     readonly openCodeInstructions?: boolean;
@@ -454,9 +624,13 @@ async function createHarness(
     readonly permission?: AgentDriverPermissionPort["request"];
     readonly spawnLateChild?: boolean;
     readonly updateBeforeSessionResponse?: boolean;
+    readonly writeOnClose?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "driver-acp-backend-"));
+  const agentPidPath = join(root, "agent.pid");
+  const backpressurePath = join(root, "backpressure.log");
+  const closeWritePath = join(root, "close-write.txt");
   const logPath = join(root, "methods.log");
   const latePidPath = join(root, "late.pid");
   const openCodeConfigPath = join(root, "opencode-config.json");
@@ -475,6 +649,8 @@ async function createHarness(
       environment: {
         variables: {
           ...(options.openCodeInstructions ? { OPENCODE_CONFIG_CONTENT: "{}" } : {}),
+          TEST_AGENT_PID_PATH: agentPidPath,
+          TEST_BACKPRESSURE_PATH: backpressurePath,
           TEST_LOG_PATH: logPath,
           TEST_LATE_PID_PATH: latePidPath,
           TEST_OPENCODE_CONFIG_PATH: openCodeConfigPath,
@@ -482,6 +658,7 @@ async function createHarness(
           TEST_RESUME_GATE_PATH: resumeGatePath,
           TEST_TRIGGER_PATH: triggerPath,
           TEST_BLOCK_RESUME: options.blockResume ? "1" : "0",
+          TEST_CLOSE_WRITE_PATH: options.writeOnClose ? closeWritePath : "",
           TEST_FAIL_RESUME: options.failResume ? "1" : "0",
           TEST_HANG_CLOSE: options.hangClose ? "1" : "0",
           TEST_METADATA_ON_RESUME: options.metadataOnResume ? "1" : "0",
@@ -552,7 +729,13 @@ async function createHarness(
         options.onEvents?.(events);
 
         return {
-          accepted: events.map((event) => ({ seq: ++acceptedSeq, type: event.kind })),
+          accepted: events.map((event) => {
+            const eventId = event.sourceEventId ?? event.id;
+            if (eventId === undefined) {
+              throw new Error("Test event is missing its source identity.");
+            }
+            return { eventId, seq: ++acceptedSeq, type: event.kind };
+          }),
         };
       },
     },
@@ -566,6 +749,7 @@ async function createHarness(
     payload,
     permission: { request: options.permission ?? (async () => "reject_once") },
     ports: {
+      ...(options.file === undefined ? {} : { file: options.file }),
       skill: { materialize: async () => [] },
     },
   });
@@ -591,8 +775,29 @@ async function createHarness(
     }
   }
 
+  const handleInput = backend.handleInput.bind(backend);
+  backend.handleInput = async (inputContext, input, runId, signal) => {
+    activeRunId ??= runId;
+
+    try {
+      await handleInput(inputContext, input, runId, signal);
+    } finally {
+      if (activeRunId === runId) {
+        activeRunId = null;
+      }
+    }
+  };
+
   return {
+    agentPidPath,
     backend,
+    backpressurePath,
+    beginRun(runId: RunId) {
+      if (activeRunId !== null) {
+        throw new Error(`Test driver run ${activeRunId} is already active.`);
+      }
+      activeRunId = runId;
+    },
     blockNext(kind: string) {
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -600,6 +805,7 @@ async function createHarness(
       return { entered: entered.promise, release: release.resolve };
     },
     context,
+    closeWritePath,
     async destroy() {
       block?.release.reject(new Error("test cleanup"));
       await backend.stop(context, "test cleanup", new AbortController().signal).catch(() => {});
@@ -726,6 +932,267 @@ describe("ACP driver backend lifecycle", () => {
           },
         }),
       );
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("fails closed when ACP client request capacity is exhausted", async () => {
+    const harness = await createHarness();
+    let replacement: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      const settlement = await settlePromiseWithTimeout(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "request-flood" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+        { label: "backpressured ACP capacity close", timeoutMs: 4_000 },
+      );
+      expect(settlement).toMatchObject({
+        error: expect.objectContaining({
+          message: expect.stringContaining("ACP client request capacity exceeded"),
+        }),
+        status: "failed",
+      });
+      expect(
+        (await harness.methods()).filter((method) => method === "terminal/wait_for_exit"),
+      ).toHaveLength(9);
+      const bufferedBytes = Number.parseInt(await readFile(harness.backpressurePath, "utf8"), 10);
+      expect(bufferedBytes).toBeGreaterThan(0);
+      expect(bufferedBytes).toBeLessThan(1024 * 1024);
+      const [agentPid] = (await readFile(harness.agentPidPath, "utf8")).trim().split("\n");
+      expect(isRunning(Number.parseInt(agentPid!, 10))).toBe(false);
+
+      replacement = await createHarness();
+      await expect(
+        replacement.backend.handleInput(
+          replacement.context,
+          { text: "after backpressure" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await replacement?.destroy();
+      await harness.destroy();
+    }
+  }, 10_000);
+
+  test("drains accepted file requests before recycling their connection", async () => {
+    const blockedReports = Promise.withResolvers<void>();
+    const reportsEntered = Promise.withResolvers<void>();
+    let reportCount = 0;
+    const harness = await createHarness({
+      file: {
+        reportChanged: async (_change, _signal) => {
+          reportCount += 1;
+          if (reportCount === 8) {
+            reportsEntered.resolve();
+          }
+          await blockedReports.promise;
+        },
+      },
+    });
+
+    try {
+      const abandoned = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-leak" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void abandoned.catch(() => {});
+      await reportsEntered.promise;
+      await harness.backend.cancelActiveTurn(harness.context, "test generation recycle");
+      expect(
+        await settlePromiseWithTimeout(abandoned, {
+          label: "cancelled ACP file request drain",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+      blockedReports.resolve();
+      await expect(abandoned).rejects.toThrow("cancelled");
+
+      const probe = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-probe" },
+        DRIVER_TEST_IDS.secondRunId as RunId,
+      );
+      void probe.catch(() => {});
+      await waitForAcpTestCondition(
+        async () =>
+          (await harness.responses()).some(
+            (response) => response["id"] === "generation-probe-read",
+          ),
+        "recycled ACP client response",
+      );
+      await probe;
+    } finally {
+      blockedReports.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await harness.destroy();
+    }
+  });
+
+  test("drains committed file reports before full-stop process cleanup", async () => {
+    const blockedReports = Promise.withResolvers<void>();
+    const reportsEntered = Promise.withResolvers<void>();
+    const processStopEntered = Promise.withResolvers<void>();
+    const originalStop = acpAgentProcess.stopAcpAgentProcess;
+    const stopSpy = spyOn(acpAgentProcess, "stopAcpAgentProcess").mockImplementation(
+      async (...args) => {
+        processStopEntered.resolve();
+        await originalStop(...args);
+      },
+    );
+    let reportCount = 0;
+    let harness: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      harness = await createHarness({
+        file: {
+          reportChanged: async () => {
+            reportCount += 1;
+            if (reportCount === 8) {
+              reportsEntered.resolve();
+            }
+            await blockedReports.promise;
+          },
+        },
+      });
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-leak" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await reportsEntered.promise;
+
+      const stop = harness.backend.stop(
+        harness.context,
+        "test committed file drain",
+        new AbortController().signal,
+      );
+      void stop.catch(() => {});
+      expect(
+        await settlePromiseWithTimeout(processStopEntered.promise, {
+          label: "ACP process stop before file drain",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+
+      blockedReports.resolve();
+      await expect(stop).resolves.toBeUndefined();
+      await expect(processStopEntered.promise).resolves.toBeUndefined();
+      expect(reportCount).toBe(8);
+      await Promise.allSettled([input]);
+    } finally {
+      blockedReports.resolve();
+      await harness?.destroy();
+      stopSpy.mockRestore();
+    }
+  });
+
+  test("fails the turn before its terminal when a provider ignores a committed file report", async () => {
+    const failure = new Error("committed file.changed failed");
+    const reportEntered = Promise.withResolvers<void>();
+    const releaseReport = Promise.withResolvers<void>();
+    const harness = await createHarness({
+      file: {
+        reportChanged: async () => {
+          reportEntered.resolve();
+          await releaseReport.promise;
+          throw failure;
+        },
+      },
+    });
+
+    try {
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "ignore-file-report" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await reportEntered.promise;
+      expect(
+        await settlePromiseWithTimeout(input, {
+          label: "ACP committed file terminal fence",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+
+      releaseReport.resolve();
+      expect(
+        await settlePromiseWithTimeout(input, {
+          label: "ACP committed file turn failure",
+          timeoutMs: 2_000,
+        }),
+      ).toEqual({ error: failure, status: "failed" });
+      expect(
+        await settlePromiseWithTimeout(harness.lifecycleFailure, {
+          label: "ACP committed file lifecycle failure",
+          timeoutMs: 2_000,
+        }),
+      ).toEqual({ status: "completed", value: failure });
+      expect(
+        harness.events
+          .filter(
+            (event) =>
+              event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed",
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.failed"]);
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "must not continue" },
+          DRIVER_TEST_IDS.secondRunId as RunId,
+        ),
+      ).rejects.toThrow("connection is not initialized");
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test committed file failure cleanup",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test committed file cleanup join",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      releaseReport.resolve();
+      await harness.destroy();
+    }
+  });
+
+  test("rejects a file write arriving after the full-stop ingress fence", async () => {
+    const harness = await createHarness({ writeOnClose: true });
+
+    try {
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test close write fence",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(await harness.responses()).toContainEqual(
+        expect.objectContaining({
+          error: expect.any(Object),
+          id: "close-write",
+        }),
+      );
+      await expect(readFile(harness.closeWritePath, "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     } finally {
       await harness.destroy();
     }
@@ -1594,6 +2061,7 @@ describe("ACP driver backend lifecycle", () => {
         }
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -1655,6 +2123,7 @@ describe("ACP driver backend lifecycle", () => {
         acceptedKinds.push(...events.map((event) => event.kind));
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -2017,7 +2486,7 @@ describe("ACP driver backend lifecycle", () => {
     }
   });
 
-  test("fails an active turn after stop cleanup rejects and lets a later stop retry", async () => {
+  test("joins a successful stop retry before settling the active turn", async () => {
     const harness = await createHarness();
 
     try {
@@ -2055,7 +2524,7 @@ describe("ACP driver backend lifecycle", () => {
         new AbortController().signal,
       );
       gate.release();
-      await expect(input).rejects.toThrow("cancelled turn process recycle failed");
+      await expect(input).rejects.toThrow("cancelled");
       expect(
         harness.events
           .filter(
@@ -2065,7 +2534,7 @@ describe("ACP driver backend lifecycle", () => {
               event.kind === "run.failed",
           )
           .map((event) => event.kind),
-      ).toEqual(["run.failed"]);
+      ).toEqual(["run.cancelled"]);
       await expect(retryStop).resolves.toBeUndefined();
     } finally {
       await harness.destroy();

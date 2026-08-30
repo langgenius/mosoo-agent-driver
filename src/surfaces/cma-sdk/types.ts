@@ -1,4 +1,5 @@
-import type { RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
+import type { CmaProjectedDriverCommand } from "../../projections/cma";
+import type { RuntimeCommandResult } from "../../runtime-command";
 import type { CmaSessionEventRecord } from "../../stores/cma-store";
 
 export type CmaSdkFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -27,7 +28,7 @@ export interface CmaSdkStreamOptions extends CmaSdkRequestOptions {
 }
 
 export interface CmaSessionEventDispatchRecord {
-  readonly command: RuntimeCommand;
+  readonly command: CmaProjectedDriverCommand;
   readonly event: CmaSessionEventRecord;
   readonly result: RuntimeCommandResult | null;
   readonly status: "accepted";

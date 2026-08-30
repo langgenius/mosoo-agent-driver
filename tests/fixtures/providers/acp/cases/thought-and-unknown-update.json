@@ -74,7 +74,8 @@
       "payload": {
         "error": {
           "code": "acp.empty_turn",
-          "message": "ACP prompt ended without assistant output or tool activity."
+          "message": "ACP prompt ended without assistant output or tool activity.",
+          "retryable": true
         },
         "recoverable": true,
         "stopReason": "end_turn"

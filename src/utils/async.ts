@@ -171,7 +171,7 @@ export async function readBoundedStreamBytes(
     signal?.removeEventListener("abort", onAbort);
 
     if (!completed) {
-      await cancel();
+      void cancel();
     }
 
     reader.releaseLock();

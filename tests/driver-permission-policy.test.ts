@@ -54,7 +54,7 @@ describe("driver permission policy", () => {
     const legacyPayload: Record<string, unknown> = structuredClone(driverBootPayload);
     legacyPayload["protocolVersion"] = 1;
 
-    expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 2/);
+    expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 3/);
   });
 
   test("isDriverFullAccess reflects the payload", () => {

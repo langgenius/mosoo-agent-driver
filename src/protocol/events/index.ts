@@ -1,7 +1,14 @@
 import { timestampSchema } from "../../contract/common";
 import { parseRuntimeEventEnvelope } from "./runtime-events";
 import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "./runtime-events";
+import { requireExactKeys } from "./runtime-event-validation";
 import type { RunId } from "../id";
+
+export {
+  RUNTIME_EVENT_KINDS,
+  RUNTIME_EVENT_SCHEMA_VERSION,
+  toRuntimeEventInput,
+} from "./runtime-events";
 
 export type DriverEvent = RuntimeEventEnvelope;
 type DriverEventInputDraft = Omit<RuntimeEventInputDraft, "runId"> & {
@@ -23,6 +30,7 @@ export function parseDriverEventEnvelope(input: unknown): DriverEventEnvelope {
   if (!isRecord(input)) {
     throw new TypeError("Driver event envelope must be an object.");
   }
+  requireExactKeys(input, new Set(["event", "eventId", "occurredAt"]), "Driver event envelope");
 
   const eventId = input["eventId"];
   const occurredAt = input["occurredAt"];

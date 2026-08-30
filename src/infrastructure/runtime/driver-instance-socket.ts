@@ -1,9 +1,21 @@
-import { isDeepStrictEqual } from "node:util";
-
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
 
-import { assertDriverEventReceiptPrefix } from "../../core/driver-runtime-io";
+import {
+  assertDriverEventReceiptPrefix,
+  assertIsolatedRunTerminalBatch,
+} from "../../core/driver-runtime-io";
+import type { DriverRuntimeIo } from "../../core/driver-runtime-io";
+import type { DriverRunTerminalBarrier } from "../../core/driver-runtime-io";
+import {
+  DriverTerminalStateMachine,
+  type DriverInputOutcome,
+  type DriverInputSettlement,
+  type DriverInstanceTerminal,
+  type DriverRunSnapshot,
+  type DriverRunTerminalIdentity,
+  type DriverRunTicket,
+} from "../../core/driver-terminal-state";
 import type { DriverBootPayload } from "../../protocol/boot";
 import type { DriverEventEnvelope, DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
@@ -12,6 +24,7 @@ import type {
   DriverFailureInput,
   DriverEventBatchOutput,
   DriverExternalToolEffectClaimOutput,
+  DriverExternalToolEffectState,
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
   DriverHelloInput,
@@ -22,12 +35,12 @@ import type {
 } from "../../protocol/orpc";
 import type { DriverRuntimeClient } from "../../protocol/orpc";
 import type {
-  McpExecuteCommandResult,
+  DriverCommandUpdate,
   McpExternalToolEffectClaim,
-  RunError,
+  McpExternalToolEffectState,
   RuntimeCommand,
-  RuntimeCommandResult,
 } from "../../runtime-command";
+import { normalizeDurableRunError } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
 import { dialDriverControlSocket } from "./driver-control-dial";
 import type { DriverWireSocket } from "./driver-control-dial";
@@ -39,31 +52,6 @@ interface DriverInstanceSocketHandlers {
   onClose: (code: number, reason: string) => void;
 }
 
-type RunTerminalDelivery =
-  | {
-      delivered: boolean;
-      readonly runGeneration: number;
-      status: "completed";
-      task?: Promise<void>;
-    }
-  | {
-      delivered: boolean;
-      error: DriverFailureInput["error"];
-      readonly runGeneration: number;
-      status: "failed";
-      task?: Promise<void>;
-    };
-
-type RunEventTerminalStatus = "cancelled" | "completed" | "failed";
-
-interface RunEventTerminalSelection {
-  delivered: boolean;
-  readonly event: Pick<DriverEventEnvelope["event"], "kind" | "payload">;
-  readonly runId: RunId;
-  readonly status: RunEventTerminalStatus;
-  task?: Promise<DriverEventBatchOutput>;
-}
-
 interface PreparedEventPush {
   readonly client: DriverRuntimeClient;
   readonly delivery: DriverEventEnvelope["event"]["delivery"] | undefined;
@@ -71,9 +59,15 @@ interface PreparedEventPush {
   readonly generation: number;
   readonly hasRunScopedEvent: boolean;
   readonly maxBatchSize: number;
-  readonly runGeneration: number;
-  readonly selection: RunEventTerminalSelection | null;
+  readonly runTicket: DriverRunTicket | null;
+  readonly terminal: DriverRunTerminalIdentity | null;
+  readonly terminalSelection: "acked" | "pending" | "selected" | null;
   readonly signal: AbortSignal | undefined;
+}
+
+interface RunEventTerminalTask {
+  readonly task: Promise<DriverEventBatchOutput["accepted"][number]>;
+  readonly ticket: DriverRunTicket;
 }
 
 const DRIVER_RPC_TIMEOUT_MS = 10_000;
@@ -96,16 +90,17 @@ function toWebSocketCloseReason(reason: string): string {
 }
 
 export class DriverInstanceSocket {
-  #activeRunId: RunId | null = null;
+  #activeRunTicket: DriverRunTicket | null = null;
   #client: DriverRuntimeClient | null = null;
   #connectionGeneration = 0;
   #connectAbortController: AbortController | null = null;
   #deliveryTail: Promise<void> = Promise.resolve();
   #eventBatchMaxSize: number | null = null;
   #rpcAbortController = new AbortController();
-  #runGeneration = 0;
-  #runEventTerminal: RunEventTerminalSelection | null = null;
-  #runTerminal: RunTerminalDelivery | null = null;
+  #instanceTerminalTask: Promise<void> | null = null;
+  #runEventTerminalTask: RunEventTerminalTask | null = null;
+  #runTerminalBarrier: DriverRunTerminalBarrier | null = null;
+  readonly #terminalState = new DriverTerminalStateMachine();
   private readonly handlers: DriverInstanceSocketHandlers;
   private readonly payload: DriverBootPayload;
   #socket: DriverWireSocket | null = null;
@@ -180,57 +175,49 @@ export class DriverInstanceSocket {
     }
   }
 
-  beginRun(runId: RunId): void {
-    if (this.#activeRunId !== null) {
-      throw new Error("Cannot begin a run while another run is active.");
-    }
-    if (this.#runTerminal !== null) {
-      throw new Error("Cannot begin a run after a control terminal has been selected.");
-    }
-
-    this.#runGeneration += 1;
-    this.#activeRunId = runId;
-    this.#runEventTerminal = null;
+  beginRun(runId: RunId): DriverRunTicket {
+    const ticket = this.#terminalState.beginRun(runId);
+    this.#activeRunTicket = ticket;
+    return ticket;
   }
 
-  endRun(runId: RunId): void {
-    if (this.#activeRunId === runId) {
-      this.#runGeneration += 1;
-      this.#activeRunId = null;
+  claimRunCancellation(
+    ticket: DriverRunTicket,
+    reason: string,
+  ): "already_claimed" | "claimed" | "terminal_selected" {
+    return this.#terminalState.claimCancellation(ticket, reason);
+  }
+
+  releaseRun(ticket: DriverRunTicket, reason: "command_acked" | "driver_failing"): void {
+    this.#terminalState.releaseRun(ticket, reason);
+    if (this.#activeRunTicket === ticket) {
+      this.#activeRunTicket = null;
+      this.#runEventTerminalTask = null;
     }
   }
 
   currentRunId(): RunId | null {
-    return this.#activeRunId;
+    return this.#terminalState.currentRunId();
   }
 
-  runEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
-    const terminal = this.#runEventTerminal;
-    return terminal?.runId === runId && terminal.delivered ? terminal.status : null;
+  runSnapshot(runId?: RunId): DriverRunSnapshot | null {
+    return this.#terminalState.snapshotRun(runId);
   }
 
-  selectedRunEventTerminal(runId: RunId): "cancelled" | "completed" | "failed" | null {
-    const terminal = this.#runEventTerminal;
-    return terminal?.runId === runId ? terminal.status : null;
+  settleRunInput(ticket: DriverRunTicket, outcome: DriverInputOutcome): DriverInputSettlement {
+    return this.#terminalState.settleInput(ticket, outcome);
   }
 
-  async commandUpdate(
-    input: {
-      commandId: string;
-      error?: RunError;
-      result?: RuntimeCommandResult;
-      status: "accepted" | "cancelled" | "completed" | "delivered" | "expired" | "failed";
-    },
-    signal: AbortSignal,
-  ): Promise<void> {
+  async commandUpdate(input: DriverCommandUpdate, signal: AbortSignal): Promise<void> {
+    const update =
+      input.status === "failed"
+        ? { ...input, error: normalizeDurableRunError(input.error) }
+        : input;
     driverRuntimeRpcSchemas.driver.commandUpdate.output.parse(
       await this.#requireClient().driver.commandUpdate(
         {
-          commandId: input.commandId,
+          ...update,
           driverInstanceId: this.payload.driverInstanceId,
-          ...(input.error === undefined ? {} : { error: input.error }),
-          status: input.status,
-          ...(input.result === undefined ? {} : { result: input.result }),
         },
         this.#rpcOptions(signal),
       ),
@@ -238,12 +225,31 @@ export class DriverInstanceSocket {
   }
 
   async claimExternalToolEffect(
-    input: { commandId: string },
+    input: { claimToken: string; commandId: string },
     signal: AbortSignal,
   ): Promise<McpExternalToolEffectClaim> {
     const result: DriverExternalToolEffectClaimOutput =
       driverRuntimeRpcSchemas.driver.claimExternalToolEffect.output.parse(
         await this.#requireClient().driver.claimExternalToolEffect(
+          {
+            claimToken: input.claimToken,
+            commandId: input.commandId,
+            driverInstanceId: this.payload.driverInstanceId,
+          },
+          this.#rpcOptions(signal),
+        ),
+      );
+
+    return result;
+  }
+
+  async observeExternalToolEffect(
+    input: Parameters<DriverRuntimeIo["observeExternalToolEffect"]>[0],
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectState> {
+    const result: DriverExternalToolEffectState =
+      driverRuntimeRpcSchemas.driver.observeExternalToolEffect.output.parse(
+        await this.#requireClient().driver.observeExternalToolEffect(
           {
             commandId: input.commandId,
             driverInstanceId: this.payload.driverInstanceId,
@@ -255,27 +261,25 @@ export class DriverInstanceSocket {
     return result;
   }
 
-  async completeExternalToolEffect(
-    input: {
-      commandId: string;
-      providerReceiptJson?: string | null | undefined;
-      result: McpExecuteCommandResult;
-    },
+  async settleExternalToolEffect(
+    input: Parameters<DriverRuntimeIo["settleExternalToolEffect"]>[0],
     signal: AbortSignal,
-  ): Promise<void> {
-    driverRuntimeRpcSchemas.driver.completeExternalToolEffect.output.parse(
-      await this.#requireClient().driver.completeExternalToolEffect(
-        {
-          commandId: input.commandId,
-          driverInstanceId: this.payload.driverInstanceId,
-          ...(input.providerReceiptJson === undefined
-            ? {}
-            : { providerReceiptJson: input.providerReceiptJson }),
-          result: input.result,
-        },
-        this.#effectSettlementRpcOptions(signal),
-      ),
-    );
+  ): Promise<McpExternalToolEffectState> {
+    const result: DriverExternalToolEffectState =
+      driverRuntimeRpcSchemas.driver.settleExternalToolEffect.output.parse(
+        await this.#requireClient().driver.settleExternalToolEffect(
+          {
+            claimToken: input.claimToken,
+            commandId: input.commandId,
+            driverInstanceId: this.payload.driverInstanceId,
+            effectId: input.effectId,
+            settlement: input.settlement,
+          },
+          this.#effectSettlementRpcOptions(signal),
+        ),
+      );
+
+    return result;
   }
 
   completeRun(signal?: AbortSignal): Promise<void> {
@@ -332,29 +336,81 @@ export class DriverInstanceSocket {
     events: DriverEventInput[];
     signal?: AbortSignal;
   }): Promise<DriverEventBatchOutput> {
-    const prepared = this.#prepareEventPush(input);
-    const task = this.#enqueueDelivery(() => this.#deliverEventPush(prepared), input.signal);
-    const selection = prepared.selection;
+    input.signal?.throwIfAborted();
+    const ownedInput = { ...input, events: structuredClone(input.events) };
+    assertIsolatedRunTerminalBatch(ownedInput.events);
+    const barrier = this.#runTerminalBarrier;
+    if (barrier !== null) {
+      const pending = barrier(ownedInput.events);
+      if (pending !== undefined) {
+        await pending;
+      }
+    }
+    const prepared = this.#prepareEventPush(ownedInput);
+    const { runTicket, terminal, terminalSelection } = prepared;
 
-    if (selection !== null) {
-      selection.task = task;
+    if (terminalSelection === "acked") {
+      const snapshot = this.#terminalState.snapshotRun(terminal!.runId);
+      const receipt = snapshot?.terminal?.phase === "acked" ? snapshot.terminal.receipt : null;
+      if (receipt === null) {
+        throw new Error("Driver run terminal acknowledgement is unavailable.");
+      }
+      return { accepted: [receipt] };
+    }
+
+    if (terminalSelection === "pending" && this.#runEventTerminalTask !== null) {
+      if (this.#runEventTerminalTask.ticket !== runTicket) {
+        throw new Error("Driver active run changed during terminal delivery.");
+      }
+      return { accepted: [await this.#runEventTerminalTask.task] };
+    }
+
+    const task = this.#enqueueDelivery(() => this.#deliverEventPush(prepared), input.signal);
+    const terminalTask =
+      terminal === null || runTicket === null
+        ? null
+        : {
+            task: task.then((result) => {
+              if (result.accepted.length !== prepared.events.length) {
+                throw new Error("Driver run terminal batch was not fully acknowledged.");
+              }
+              const receipt = result.accepted.at(-1);
+              if (receipt === undefined) {
+                throw new Error("Driver run terminal receipt is missing.");
+              }
+              this.#terminalState.ackRunTerminal(runTicket, receipt);
+              return receipt;
+            }),
+            ticket: runTicket,
+          };
+
+    if (terminalTask !== null) {
+      this.#runEventTerminalTask = terminalTask;
+      void terminalTask.task.catch(() => {});
     }
 
     try {
       const result = await task;
-      if (
-        selection !== null &&
-        result.accepted.length === prepared.events.length &&
-        this.#runEventTerminal === selection
-      ) {
-        selection.delivered = true;
-      }
+      await terminalTask?.task;
       return result;
     } finally {
-      if (selection?.task === task) {
-        delete selection.task;
+      if (this.#runEventTerminalTask === terminalTask) {
+        this.#runEventTerminalTask = null;
       }
     }
+  }
+
+  registerRunTerminalBarrier(barrier: DriverRunTerminalBarrier): () => void {
+    if (this.#runTerminalBarrier !== null) {
+      throw new Error("Driver run terminal barrier is already registered.");
+    }
+
+    this.#runTerminalBarrier = barrier;
+    return () => {
+      if (this.#runTerminalBarrier === barrier) {
+        this.#runTerminalBarrier = null;
+      }
+    };
   }
 
   #prepareEventPush(input: {
@@ -368,16 +424,24 @@ export class DriverInstanceSocket {
       throw new Error("Driver hello must complete before events are pushed.");
     }
 
-    const activeRunId = this.#activeRunId;
-    const events = structuredClone(input.events).flatMap((event) =>
-      toDriverEventEnvelopes(this.payload, event, activeRunId),
-    );
+    const runTicket = this.#activeRunTicket;
+    const activeRunId = runTicket?.runId ?? null;
+    const selectedTerminal =
+      runTicket === null ? null : this.#terminalState.snapshotRun(runTicket.runId)?.terminal?.value;
+    const events = structuredClone(input.events)
+      .map((event) =>
+        selectedTerminal !== null &&
+        selectedTerminal !== undefined &&
+        event.sourceEventId === undefined &&
+        (event.kind === "run.cancelled" ||
+          event.kind === "run.completed" ||
+          event.kind === "run.failed")
+          ? { ...event, sourceEventId: selectedTerminal.sourceEventId }
+          : event,
+      )
+      .flatMap((event) => toDriverEventEnvelopes(this.payload, event, activeRunId));
     const delivery = events[0]?.event.delivery;
-    let terminal: {
-      event: Pick<DriverEventEnvelope["event"], "kind" | "payload">;
-      runId: RunId;
-      status: RunEventTerminalStatus;
-    } | null = null;
+    let terminal: DriverRunTerminalIdentity | null = null;
     let terminalIndex = -1;
     let hasRunScopedEvent = false;
 
@@ -413,8 +477,13 @@ export class DriverInstanceSocket {
       }
 
       terminal = {
-        event: { kind: event.kind, payload: structuredClone(event.payload) },
+        event: {
+          kind: event.kind,
+          payload: structuredClone(event.payload),
+          sourceEventId: event.sourceEventId ?? event.id,
+        },
         runId: event.runId,
+        sourceEventId: event.sourceEventId ?? event.id,
         status,
       };
       terminalIndex = index;
@@ -427,31 +496,21 @@ export class DriverInstanceSocket {
       throw new Error("Driver run terminal must use lossless delivery.");
     }
 
-    let selection: RunEventTerminalSelection | null = null;
-    if (hasRunScopedEvent && this.#runEventTerminal !== null) {
-      const selected = this.#runEventTerminal;
-      const retryingSelectedEvent =
-        events.length === 1 &&
-        terminal !== null &&
-        selected !== null &&
-        !selected.delivered &&
-        selected.task === undefined &&
-        selected.runId === terminal.runId &&
-        selected.status === terminal.status &&
-        isDeepStrictEqual(selected.event, terminal.event);
-
-      if (!retryingSelectedEvent) {
-        throw new Error("Driver event cannot target a terminated run.");
+    let terminalSelection: PreparedEventPush["terminalSelection"] = null;
+    if (terminal !== null) {
+      if (runTicket === null) {
+        throw new Error("Driver run terminal must target the active run.");
       }
-      selection = selected;
-    } else if (terminal !== null) {
-      selection = {
-        delivered: false,
-        event: terminal.event,
-        runId: terminal.runId,
-        status: terminal.status,
-      };
-      this.#runEventTerminal = selection;
+      const selection = this.#terminalState.selectRunTerminal(runTicket, terminal);
+      if (selection === "cancelled") {
+        throw new Error("Driver completed terminal lost the cancellation race.");
+      }
+      terminalSelection = selection;
+      if (terminalSelection !== "selected" && events.length !== 1) {
+        throw new Error("A selected driver run terminal can only be retried by itself.");
+      }
+    } else if (hasRunScopedEvent && this.#terminalState.snapshotRun()?.terminal !== null) {
+      throw new Error("Driver event cannot target a terminated run.");
     }
 
     return {
@@ -461,9 +520,10 @@ export class DriverInstanceSocket {
       generation: this.#connectionGeneration,
       hasRunScopedEvent,
       maxBatchSize,
-      runGeneration: this.#runGeneration,
-      selection,
+      runTicket,
       signal: input.signal,
+      terminal,
+      terminalSelection,
     };
   }
 
@@ -471,7 +531,7 @@ export class DriverInstanceSocket {
     const { client, delivery, events, generation, maxBatchSize, signal } = prepared;
     const accepted: DriverEventBatchOutput["accepted"][number][] = [];
     this.#assertConnection(client, generation, "event delivery");
-    this.#assertRunGeneration(prepared);
+    this.#assertRunTicket(prepared);
     const rpcOptions = this.#rpcOptions(signal);
 
     for (let index = 0; index < events.length; index += maxBatchSize) {
@@ -488,7 +548,7 @@ export class DriverInstanceSocket {
           ),
         );
         this.#assertConnection(client, generation, "event delivery");
-        this.#assertRunGeneration(prepared);
+        this.#assertRunTicket(prepared);
 
         assertDriverEventReceiptPrefix(
           remaining.map((envelope) => envelope.event),
@@ -571,21 +631,6 @@ export class DriverInstanceSocket {
     return result.command;
   }
 
-  async markExternalToolEffectUnknown(
-    input: { commandId: string },
-    signal: AbortSignal,
-  ): Promise<void> {
-    driverRuntimeRpcSchemas.driver.markExternalToolEffectUnknown.output.parse(
-      await this.#requireClient().driver.markExternalToolEffectUnknown(
-        {
-          commandId: input.commandId,
-          driverInstanceId: this.payload.driverInstanceId,
-        },
-        this.#effectSettlementRpcOptions(signal),
-      ),
-    );
-  }
-
   #deliverRunTerminal(
     status: "completed" | "failed",
     error?: DriverFailureInput["error"],
@@ -595,32 +640,27 @@ export class DriverInstanceSocket {
       return Promise.reject(new Error("Failed run terminal requires an error."));
     }
 
-    let terminal = this.#runTerminal;
-
-    if (terminal === null) {
-      terminal =
-        status === "completed"
-          ? { delivered: false, runGeneration: this.#runGeneration, status }
-          : {
-              delivered: false,
-              error: structuredClone(error!),
-              runGeneration: this.#runGeneration,
-              status,
-            };
-      this.#runTerminal = terminal;
+    const runId = this.#terminalState.terminalRunId(this.payload.execution.configRevision.runId);
+    if (runId === null) {
+      return Promise.reject(new Error("Driver run terminal requires an exact run ID."));
     }
 
-    if (terminal.status !== status) {
+    const terminal: DriverInstanceTerminal =
+      status === "completed"
+        ? { runId, status }
+        : { error: normalizeDurableRunError(structuredClone(error!)), runId, status };
+    let selection: "acked" | "pending" | "selected";
+    try {
+      selection = this.#terminalState.selectInstanceTerminal(terminal);
+    } catch (selectionError) {
+      return Promise.reject(selectionError);
+    }
+
+    if (selection === "acked") {
       return Promise.resolve();
     }
-    if (terminal.status === "failed" && !isDeepStrictEqual(terminal.error, error)) {
-      return Promise.reject(new Error("Failed run terminal was retried with a different error."));
-    }
-    if (terminal.delivered) {
-      return Promise.resolve();
-    }
-    if (terminal.task !== undefined) {
-      return terminal.task;
+    if (selection === "pending" && this.#instanceTerminalTask !== null) {
+      return this.#instanceTerminalTask;
     }
 
     const client = this.#client;
@@ -630,13 +670,13 @@ export class DriverInstanceSocket {
         throw new Error("Driver instance socket is not connected.");
       }
       this.#assertConnection(client, generation, "run terminal delivery");
-      this.#assertRunTerminal(terminal);
+      this.#assertInstanceTerminal(terminal);
       const options = this.#rpcOptions(signal);
 
       if (terminal.status === "completed") {
         driverRuntimeRpcSchemas.driver.completeRun.output.parse(
           await client.driver.completeRun(
-            { driverInstanceId: this.payload.driverInstanceId },
+            { driverInstanceId: this.payload.driverInstanceId, runId: terminal.runId },
             options,
           ),
         );
@@ -646,6 +686,7 @@ export class DriverInstanceSocket {
             {
               driverInstanceId: this.payload.driverInstanceId,
               error: structuredClone(terminal.error),
+              runId: terminal.runId,
             },
             options,
           ),
@@ -653,19 +694,19 @@ export class DriverInstanceSocket {
       }
 
       this.#assertConnection(client, generation, "run terminal delivery");
-      this.#assertRunTerminal(terminal);
+      this.#assertInstanceTerminal(terminal);
+      this.#terminalState.ackInstanceTerminal(terminal);
     }, signal);
-    terminal.task = task;
+    this.#instanceTerminalTask = task;
     void task.then(
       () => {
-        if (this.#runTerminal === terminal && terminal.task === task) {
-          terminal.delivered = true;
-          delete terminal.task;
+        if (this.#instanceTerminalTask === task) {
+          this.#instanceTerminalTask = null;
         }
       },
       () => {
-        if (this.#runTerminal === terminal && terminal.task === task) {
-          delete terminal.task;
+        if (this.#instanceTerminalTask === task) {
+          this.#instanceTerminalTask = null;
         }
       },
     );
@@ -678,16 +719,18 @@ export class DriverInstanceSocket {
     }
   }
 
-  #assertRunGeneration(prepared: PreparedEventPush): void {
-    if (prepared.hasRunScopedEvent && prepared.runGeneration !== this.#runGeneration) {
+  #assertRunTicket(prepared: PreparedEventPush): void {
+    if (
+      prepared.hasRunScopedEvent &&
+      (prepared.runTicket === null ||
+        this.#terminalState.snapshotRun()?.revision !== prepared.runTicket.revision)
+    ) {
       throw new Error("Driver active run changed during event delivery.");
     }
   }
 
-  #assertRunTerminal(terminal: RunTerminalDelivery): void {
-    if (terminal.runGeneration !== this.#runGeneration || this.#runTerminal !== terminal) {
-      throw new Error("Driver active run changed during run terminal delivery.");
-    }
+  #assertInstanceTerminal(terminal: DriverInstanceTerminal): void {
+    this.#terminalState.selectInstanceTerminal(terminal);
   }
 
   #enqueueDelivery<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {

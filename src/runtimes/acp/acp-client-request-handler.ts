@@ -44,7 +44,18 @@ interface AcpClientRequestHandlerOptions {
   readonly turnEvents: AcpAssistantTranscriptState;
 }
 
+interface AcpFileWrite {
+  failure: { readonly error: unknown } | null;
+  readonly task: Promise<unknown>;
+}
+
+interface AcpTurnFileWrites {
+  ingressClosed: boolean;
+  readonly writes: Set<AcpFileWrite>;
+}
+
 export class AcpClientRequestHandler {
+  readonly #activeFileWrites = new Set<AcpFileWrite>();
   readonly #fileSystem: AcpFileSystem;
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
@@ -55,6 +66,7 @@ export class AcpClientRequestHandler {
   #permissionIngressClosed = false;
   #stopping = false;
   #transcriptTail: Promise<void> = Promise.resolve();
+  #turnFileWrites: AcpTurnFileWrites | null = null;
   #turnTranscriptIngressClosed = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
@@ -122,7 +134,73 @@ export class AcpClientRequestHandler {
     signal?: AbortSignal,
   ): Promise<WriteTextFileResponse> {
     this.#assertSession("fs/write_text_file", params);
-    return this.#fileSystem.writeTextFile(context, params, signal);
+    if (this.#stopping) {
+      throw new Error("ACP client request handler is stopping.");
+    }
+    const turn = this.#turnFileWrites;
+    if (turn?.ingressClosed) {
+      throw new Error("ACP file write ingress is closed for the active turn.");
+    }
+
+    let committed = false;
+    const operation = this.#fileSystem.writeTextFile(context, params, signal, () => {
+      committed = true;
+    });
+    let write!: AcpFileWrite;
+    const task = operation.catch((error: unknown) => {
+      if (committed) {
+        write.failure = { error };
+        this.#onUpdateFailure(
+          error instanceof Error
+            ? error
+            : new Error("ACP committed file report failed.", { cause: error }),
+        );
+      }
+      throw error;
+    });
+    write = { failure: null, task };
+    this.#activeFileWrites.add(write);
+    turn?.writes.add(write);
+
+    return task;
+  }
+
+  beginStop(): void {
+    this.#stopping = true;
+    this.closeFileWriteIngress();
+  }
+
+  async drainFileWrites(signal?: AbortSignal): Promise<void> {
+    await this.#drainFileWrites(this.#activeFileWrites, signal);
+  }
+
+  openFileWriteIngress(): void {
+    if (this.#stopping) {
+      throw new Error("ACP client request handler is stopping.");
+    }
+    if (
+      this.#turnFileWrites !== null &&
+      (!this.#turnFileWrites.ingressClosed || this.#turnFileWrites.writes.size > 0)
+    ) {
+      throw new Error("ACP previous turn file writes have not drained.");
+    }
+
+    this.#turnFileWrites = { ingressClosed: false, writes: new Set() };
+  }
+
+  closeFileWriteIngress(): void {
+    if (this.#turnFileWrites !== null) {
+      this.#turnFileWrites.ingressClosed = true;
+    }
+  }
+
+  async drainTurnFileWrites(signal?: AbortSignal): Promise<void> {
+    const turn = this.#turnFileWrites;
+    if (turn === null) {
+      return;
+    }
+
+    await this.#drainFileWrites(turn.writes, signal);
   }
 
   async requestPermission(
@@ -290,6 +368,23 @@ export class AcpClientRequestHandler {
       signal?.aborted === true ||
       this.#turnEvents.activeRunId() === null
     );
+  }
+
+  async #drainFileWrites(writes: Set<AcpFileWrite>, signal?: AbortSignal): Promise<void> {
+    while (writes.size > 0) {
+      const pending = [...writes];
+      await raceWithAbort(Promise.allSettled(pending.map(({ task }) => task)), signal);
+      for (const write of pending) {
+        writes.delete(write);
+        this.#activeFileWrites.delete(write);
+        this.#turnFileWrites?.writes.delete(write);
+      }
+      const failure = pending.find(({ failure }) => failure !== null)?.failure;
+
+      if (failure !== null && failure !== undefined) {
+        throw failure.error;
+      }
+    }
   }
 
   async #requestPermission(

@@ -9,12 +9,18 @@ import type {
   DriverHeartbeatOutput,
 } from "../protocol/orpc";
 import type {
-  McpExecuteCommandResult,
+  DriverCommandUpdate,
   McpExternalToolEffectClaim,
-  RunError,
+  McpExternalToolEffectSettlement,
+  McpExternalToolEffectState,
   RuntimeCommand,
-  RuntimeCommandResult,
 } from "../runtime-command";
+import type {
+  DriverInputOutcome,
+  DriverInputSettlement,
+  DriverRunSnapshot,
+  DriverRunTicket,
+} from "./driver-terminal-state";
 
 export interface DriverRuntimeEventPort {
   currentRunId(): RunId | null;
@@ -22,9 +28,11 @@ export interface DriverRuntimeEventPort {
     events: DriverEventInput[];
     signal?: AbortSignal;
   }): Promise<DriverEventBatchOutput>;
-  runEventTerminal?(runId: RunId): "cancelled" | "completed" | "failed" | null;
-  selectedRunEventTerminal?(runId: RunId): "cancelled" | "completed" | "failed" | null;
 }
+
+export type DriverRunTerminalBarrier = (
+  events: readonly DriverEventInput[],
+) => Promise<void> | void;
 
 export const DRIVER_EVENT_DELIVERY_TIMEOUT_MS = 10_000;
 
@@ -35,6 +43,15 @@ export class DriverEventRejectedError extends Error {
     super(cause instanceof Error ? cause.message : "Driver event was rejected.", { cause });
     this.name = "DriverEventRejectedError";
     this.sourceEventId = sourceEventId;
+  }
+}
+
+export class DriverEventDeliveryOutcomeUnknownError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Driver event delivery outcome is unknown.", {
+      cause,
+    });
+    this.name = "DriverEventDeliveryOutcomeUnknownError";
   }
 }
 
@@ -49,6 +66,19 @@ export function withSourceEventIds(events: readonly DriverEventInput[]): DriverE
       ? event
       : { ...event, sourceEventId: createDriverId() },
   );
+}
+
+export function assertIsolatedRunTerminalBatch(events: readonly DriverEventInput[]): void {
+  const terminals = events.filter(
+    ({ kind }) => kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+  );
+
+  if (terminals.length > 1) {
+    throw new Error("Driver event batch cannot contain multiple run terminals.");
+  }
+  if (terminals.length === 1 && events.length !== 1) {
+    throw new Error("Driver run terminal must be the only event in its batch.");
+  }
 }
 
 export function assertDriverEventReceiptPrefix(
@@ -75,7 +105,7 @@ export function assertDriverEventReceiptPrefix(
     const event = events[index];
     const eventId = event?.sourceEventId ?? event?.id;
 
-    if (receipt.eventId !== undefined && receipt.eventId !== eventId) {
+    if (receipt.eventId !== eventId) {
       throw new Error(`Driver event receipt ${index} does not match the submitted event ID.`);
     }
   }
@@ -107,8 +137,12 @@ export async function pushLosslessEvents(
         signal: deadline,
       });
     } catch (error) {
-      if (error instanceof DriverEventRejectedError || !retryTransport) {
+      if (error instanceof DriverEventRejectedError) {
         throw error;
+      }
+
+      if (!retryTransport) {
+        throw new DriverEventDeliveryOutcomeUnknownError(error);
       }
 
       retryTransport = false;
@@ -131,40 +165,42 @@ export async function pushLosslessEvents(
 }
 
 export interface DriverRuntimeCommandPort {
-  commandUpdate(
-    input: {
-      commandId: string;
-      error?: RunError;
-      result?: RuntimeCommandResult;
-      status: "accepted" | "cancelled" | "completed" | "failed";
-    },
-    signal: AbortSignal,
-  ): Promise<void>;
+  commandUpdate(input: DriverCommandUpdate, signal: AbortSignal): Promise<void>;
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
 }
 
 /** API-owned durable effect ledger used only for external MCP calls. */
 export interface DriverRuntimeExternalToolEffectPort {
   claimExternalToolEffect(
-    input: { commandId: string },
+    input: { claimToken: string; commandId: string },
     signal: AbortSignal,
   ): Promise<McpExternalToolEffectClaim>;
-  completeExternalToolEffect(
+  observeExternalToolEffect(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectState>;
+  settleExternalToolEffect(
     input: {
+      claimToken: string;
       commandId: string;
-      providerReceiptJson?: string | null | undefined;
-      result: McpExecuteCommandResult;
+      effectId: string;
+      settlement: McpExternalToolEffectSettlement;
     },
     signal: AbortSignal,
-  ): Promise<void>;
-  markExternalToolEffectUnknown(input: { commandId: string }, signal: AbortSignal): Promise<void>;
+  ): Promise<McpExternalToolEffectState>;
 }
 
 export interface DriverRuntimeRunPort {
-  beginRun(runId: RunId): void;
+  beginRun(runId: RunId): DriverRunTicket;
+  claimRunCancellation(
+    ticket: DriverRunTicket,
+    reason: string,
+  ): "already_claimed" | "claimed" | "terminal_selected";
   completeRun(signal?: AbortSignal): Promise<void>;
-  endRun(runId: RunId): void;
   failRun(error: DriverFailureInput["error"], signal?: AbortSignal): Promise<void>;
+  releaseRun(ticket: DriverRunTicket, reason: "command_acked" | "driver_failing"): void;
+  runSnapshot(runId?: RunId): DriverRunSnapshot | null;
+  settleRunInput(ticket: DriverRunTicket, outcome: DriverInputOutcome): DriverInputSettlement;
 }
 
 export interface DriverRuntimeHeartbeatPort {
@@ -177,4 +213,6 @@ export interface DriverRuntimeIo
     DriverRuntimeExternalToolEffectPort,
     DriverRuntimeEventPort,
     DriverRuntimeHeartbeatPort,
-    DriverRuntimeRunPort {}
+    DriverRuntimeRunPort {
+  registerRunTerminalBarrier(barrier: DriverRunTerminalBarrier): () => void;
+}

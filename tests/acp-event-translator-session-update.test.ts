@@ -143,6 +143,7 @@ describe("ACP runtime event translation", () => {
       error: {
         code: "acp.max_turn_requests",
         message: "ACP prompt stopped with max_turn_requests.",
+        retryable: false,
       },
       recoverable: false,
       stopReason: "max_turn_requests",
@@ -208,6 +209,7 @@ describe("ACP runtime event translation", () => {
       error: {
         code: "acp.empty_turn",
         message: "ACP prompt ended without assistant output or tool activity.",
+        retryable: true,
       },
       recoverable: true,
       stopReason: "end_turn",
@@ -416,7 +418,7 @@ describe("ACP runtime event translation", () => {
       "run.failed",
     ]);
     expect(eventPayload(requireEvent(events, "run.failed"))).toMatchObject({
-      error: { message: "transport closed" },
+      error: { message: "transport closed", retryable: false },
     });
     expect(eventPayload(events[5]!)).not.toHaveProperty("error");
     expect(eventPayload(events[6]!)).not.toHaveProperty("error");

@@ -35,7 +35,7 @@ function acceptEvents(
 ): DriverEventBatchOutput {
   return {
     accepted: events.map((event, index) => ({
-      eventId: event.sourceEventId,
+      eventId: event.sourceEventId!,
       seq: sequence(index),
       type: event.kind,
     })),
@@ -43,6 +43,190 @@ function acceptEvents(
 }
 
 describe("DriverEventPublisher", () => {
+  test("joins an unresolved lossless draft by explicit identity", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+
+        if (attempts.length === 1) {
+          throw new Error("response lost");
+        }
+
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const draft = {
+      ...createEvent("message.completed"),
+      sourceEventId: "stable-source-event-id",
+    };
+
+    await expect(publisher.push(context, "first", [draft])).rejects.toThrow("response lost");
+    await expect(
+      publisher.push(context, "retry", [structuredClone(draft)]),
+    ).resolves.toBeUndefined();
+
+    expect(kinds(attempts)).toEqual([["message.completed"], ["message.completed"]]);
+    expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
+  });
+
+  test("keeps distinct implicit drafts separate when their content matches", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        if (attempts.length === 1) {
+          entered.resolve();
+          await release.promise;
+        }
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const first = publisher.push(context, "first", [createEvent("message.completed")]);
+
+    await entered.promise;
+    const second = publisher.push(context, "second", [createEvent("message.completed")]);
+    release.resolve();
+    await Promise.all([first, second]);
+
+    expect(kinds(attempts)).toEqual([["message.completed"], ["message.completed"]]);
+    expect(attempts[1]?.[0]?.sourceEventId).not.toBe(attempts[0]?.[0]?.sourceEventId);
+  });
+
+  test("joins a retained identity while admitting a fresh event", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        if (attempts.length === 1) {
+          throw new Error("response lost");
+        }
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const retained = {
+      ...createEvent("message.started"),
+      sourceEventId: "retained-source-event-id",
+    };
+
+    await expect(publisher.push(context, "first", [retained])).rejects.toThrow("response lost");
+    await publisher.push(context, "retry", [retained, createEvent("message.completed")]);
+
+    expect(kinds(attempts)).toEqual([
+      ["message.started"],
+      ["message.started", "message.completed"],
+    ]);
+    expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
+  });
+
+  test("settles an identity join when its event is acked before a blocked suffix", async () => {
+    const prefixEntered = Promise.withResolvers<void>();
+    const releasePrefix = Promise.withResolvers<void>();
+    const suffixEntered = Promise.withResolvers<void>();
+    const releaseSuffix = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        if (attempts.length === 1) {
+          prefixEntered.resolve();
+          await releasePrefix.promise;
+          return { accepted: [acceptEvents(events).accepted[0]!] };
+        }
+        suffixEntered.resolve();
+        await releaseSuffix.promise;
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const draft = {
+      ...createEvent("message.started"),
+      sourceEventId: "joined-source-event-id",
+    };
+    const first = publisher.push(context, "first", [draft, createEvent("message.completed")]);
+
+    await prefixEntered.promise;
+    let joinedSettled = false;
+    const joined = publisher.push(context, "join", [draft]).then(() => {
+      joinedSettled = true;
+    });
+    releasePrefix.resolve();
+    await suffixEntered.promise;
+    await Bun.sleep(0);
+    expect(joinedSettled).toBe(true);
+    releaseSuffix.resolve();
+    await Promise.all([first, joined]);
+
+    expect(kinds(attempts)).toEqual([
+      ["message.started", "message.completed"],
+      ["message.completed"],
+    ]);
+  });
+
+  test("rejects changed content that reuses an unresolved source ID", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        entered.resolve();
+        await release.promise;
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const first = publisher.push(context, "first", [
+      { ...createEvent("message.started"), sourceEventId: "stable-source-event-id" },
+    ]);
+
+    await entered.promise;
+    await expect(
+      publisher.push(context, "conflict", [
+        { ...createEvent("message.completed"), sourceEventId: "stable-source-event-id" },
+      ]),
+    ).rejects.toThrow("source event ID conflicts");
+    release.resolve();
+    await first;
+
+    expect(kinds(attempts)).toEqual([["message.started"]]);
+  });
+
+  test("propagates an in-flight rejection to an identity join", async () => {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        entered.resolve();
+        await release.promise;
+        throw new DriverEventRejectedError(events[0]!.sourceEventId!, new Error("rejected"));
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const draft = {
+      ...createEvent("message.completed"),
+      sourceEventId: "stable-source-event-id",
+    };
+    const first = publisher.push(context, "first", [draft]);
+
+    await entered.promise;
+    const joined = publisher.push(context, "join", [structuredClone(draft)]);
+    void first.catch(() => {});
+    void joined.catch(() => {});
+    release.resolve();
+
+    await expect(first).rejects.toThrow("rejected");
+    await expect(joined).rejects.toThrow("rejected");
+    expect(kinds(attempts)).toEqual([["message.completed"]]);
+  });
+
   test("keeps an explicit source ID across direct lossless retries", async () => {
     const attempts: DriverEventInput[][] = [];
     const events = withSourceEventIds([createEvent("message.completed")]);
@@ -76,7 +260,7 @@ describe("DriverEventPublisher", () => {
           return {
             accepted: [
               {
-                eventId: events[0]!.sourceEventId,
+                eventId: events[0]!.sourceEventId!,
                 seq: ++sequence,
                 type: events[0]!.kind,
               },
@@ -134,7 +318,7 @@ describe("DriverEventPublisher", () => {
             return {
               accepted: [
                 {
-                  eventId: events[0]?.sourceEventId,
+                  eventId: events[0]!.sourceEventId!,
                   seq: 1,
                   type: events[0]!.kind,
                 },
@@ -179,6 +363,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: 40 + index,
             type: event.kind,
           })),
@@ -778,7 +963,7 @@ describe("DriverEventPublisher", () => {
           return {
             accepted: [
               {
-                eventId: events[0]!.sourceEventId,
+                eventId: events[0]!.sourceEventId!,
                 seq: (seq += 1),
                 type: events[0]!.kind,
               },
@@ -1349,6 +1534,47 @@ describe("DriverEventPublisher", () => {
       ["message.started", null],
       ["run.completed", DRIVER_TEST_IDS.secondRunId],
     ]);
+  });
+
+  test("rejects explicit late events after their run terminal is acknowledged", async () => {
+    const attempts: DriverEventInput[][] = [];
+    let activeRunId: RunId | null = DRIVER_TEST_IDS.runId;
+    const context = createContext({
+      currentRunId: () => activeRunId,
+      pushEvents: async (events) => {
+        attempts.push(events);
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+
+    await publisher.pushTerminal(context, "terminal", [], createRunTerminal("run.completed"));
+    activeRunId = null;
+
+    const lateEvents = [
+      { ...createEvent("message.completed"), runId: DRIVER_TEST_IDS.runId },
+      {
+        kind: "tool.call.updated" as const,
+        payload: { status: "completed", toolCallId: "tool-late" },
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        kind: "file.changed" as const,
+        payload: { change: "upsert", path: "late.txt" },
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ];
+
+    for (const event of lateEvents) {
+      await expect(publisher.push(context, "late.lossless", [event])).rejects.toThrow(
+        "must target the active run",
+      );
+      await expect(
+        publisher.push(context, "late.best-effort", [{ ...event, delivery: "best_effort" }]),
+      ).resolves.toBeUndefined();
+    }
+
+    expect(kinds(attempts)).toEqual([["run.completed"]]);
   });
 
   test("keeps session events unscoped without reopening a settled run", async () => {

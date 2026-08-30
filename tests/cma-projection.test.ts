@@ -24,13 +24,17 @@ describe("CMA projection", () => {
         kind: "message.added",
         payload: {
           content: [{ text: "message", type: "text" }],
+          messageId: "message-1",
           preventContinuation: "yes",
         },
       },
-      { kind: "message.added", payload: { content: "message", phase: "final_answer" } },
       {
         kind: "message.added",
-        payload: { content: "message", memoryCitation: Symbol("bad") },
+        payload: { content: "message", messageId: "message-1", phase: "final_answer" },
+      },
+      {
+        kind: "message.added",
+        payload: { content: "message", memoryCitation: Symbol("bad"), messageId: "message-1" },
       },
       {
         kind: "tool.call.updated",
@@ -57,11 +61,13 @@ describe("CMA projection", () => {
     };
     const result = ingestRuntimeEventInput(context, {
       kind: "message.added",
-      payload: { content: "answer", memoryCitation, phase: "final" },
+      payload: { content: "answer", memoryCitation, messageId: "message-1", phase: "final" },
     });
 
     expect(result).toMatchObject({
-      event: { payload: { content: "answer", memoryCitation, phase: "final" } },
+      event: {
+        payload: { content: "answer", memoryCitation, messageId: "message-1", phase: "final" },
+      },
       status: "accepted",
     });
   });

@@ -3,6 +3,7 @@ import { createAgentDriverContext } from "../core/agent-driver-backend";
 import { AgentBackendLifecycle } from "../core/agent-backend-lifecycle";
 import { DriverCommandDispatcher } from "../core/driver-command-dispatcher";
 import { deliverRunTerminal } from "../core/driver-command-delivery";
+import type { RunTerminalUpdate } from "../core/driver-command-delivery";
 import { pushDriverDiagnosticEvent } from "../core/driver-diagnostics";
 import { DriverHeartbeatLoop } from "../core/driver-heartbeat-loop";
 import { DriverPermissionBroker } from "../core/driver-permission-broker";
@@ -45,8 +46,7 @@ export class DriverProcess {
   #backendLifecycle: AgentBackendLifecycle | null = null;
   #logger: Logger | null = null;
   #logUplink: DriverLogUplink | null = null;
-  #pendingRunCompletion = false;
-  #pendingRunFailure: RunError | null = null;
+  #pendingRunTerminal: RunTerminalUpdate | null = null;
   private readonly payload: DriverBootPayload;
   readonly #permissionBroker: DriverPermissionBroker;
   readonly #shutdownController = new AbortController();
@@ -228,7 +228,7 @@ export class DriverProcess {
           isShuttingDown: () => this.#runtimeState.isShuttingDown(),
           permissionRequests: this.#permissionBroker,
           rememberRunFailure: (error) => {
-            this.#pendingRunFailure ??= structuredClone(error);
+            this.rememberPendingRunTerminal({ error, status: "failed" });
             this.rememberTerminalCause(new Error(error.message, { cause: error }));
           },
           runtimeContextFactory: (_runtimeSocket, runtimeLogger) =>
@@ -251,12 +251,15 @@ export class DriverProcess {
       if (!shutdownAbort) {
         this.rememberTerminalCause(error);
         const failure = this.#terminalCause?.error ?? error;
-        this.#pendingRunFailure ??= {
-          code: "driver.runtime_failed",
-          details: {},
-          message: failure instanceof Error ? failure.message : "Driver runtime failed.",
-          retryable: false,
-        };
+        this.rememberPendingRunTerminal({
+          error: {
+            code: "driver.runtime_failed",
+            details: {},
+            message: failure instanceof Error ? failure.message : "Driver runtime failed.",
+            retryable: false,
+          },
+          status: "failed",
+        });
         if (!this.#runtimeState.isShuttingDown()) {
           this.#runtimeState.enter("failed");
         }
@@ -307,19 +310,16 @@ export class DriverProcess {
       socket.currentRunId() !== null &&
       (reason === "signal.sigint" || reason === "signal.sigterm")
     ) {
-      this.#pendingRunCompletion = true;
+      this.rememberPendingRunTerminal({ status: "completed" });
     }
     if (this.#runtimeState.status() !== "failed" && this.#runtimeState.status() !== "stopped") {
       this.#runtimeState.enter("stopping");
     }
-    const permissionPending = this.#permissionBroker.hasPending();
     const permissionCancellation = this.#permissionBroker.rejectAllAndWait();
     this.#shutdownController.abort(new Error(reason));
     socket.abortConnect(reason);
-    // Keep the RPC lane open long enough to publish the lossless permission cancellation.
-    if (!permissionPending) {
-      socket.abortPendingRequests(reason);
-    }
+    // Backend cleanup owns lossless terminal and committed-file reports, so the
+    // RPC lane remains open until that ownership barrier settles.
 
     // If hello never completed, a gated flush may still be pending; open the
     // gate so log teardown cannot hang shutdown.
@@ -341,6 +341,7 @@ export class DriverProcess {
       }
 
       const backendShutdown = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
+      socket.abortPendingRequests(reason);
       const failure = backendShutdown.find((result) => result.status === "rejected");
 
       if (permissionFailure !== null) {
@@ -453,15 +454,13 @@ export class DriverProcess {
       }
     }
 
-    if (this.#pendingRunFailure !== null && shutdownFailure === null) {
+    if (this.#pendingRunTerminal !== null && shutdownFailure === null) {
       try {
-        await this.reportRunFailure(socket, this.#pendingRunFailure);
-      } catch (error) {
-        terminalFailure = { error };
-      }
-    } else if (this.#pendingRunCompletion && shutdownFailure === null) {
-      try {
-        await deliverRunTerminal(socket, { status: "completed" });
+        if (this.#pendingRunTerminal.status === "failed") {
+          await this.reportRunFailure(socket, this.#pendingRunTerminal.error);
+        } else {
+          await deliverRunTerminal(socket, this.#pendingRunTerminal);
+        }
       } catch (error) {
         terminalFailure = { error };
       }
@@ -525,7 +524,7 @@ export class DriverProcess {
       ports: {
         mcp: {
           prepare: (command, signal) =>
-            prepareRemoteHttpMcpCommand(this.#startInput, command, signal),
+            prepareRemoteHttpMcpCommand(this.#startInput, command, signal, logger),
         },
         skill: {
           materialize: async (execution, signal) =>
@@ -551,6 +550,13 @@ export class DriverProcess {
 
   private rememberTerminalCause(error: unknown): void {
     this.#terminalCause ??= { error };
+  }
+
+  private rememberPendingRunTerminal(terminal: RunTerminalUpdate): void {
+    if (this.#pendingRunTerminal?.status === "failed") {
+      return;
+    }
+    this.#pendingRunTerminal = structuredClone(terminal);
   }
 
   private throwTerminalCause(): void {

@@ -309,6 +309,72 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
+  test("classifies exhausted streaming rate limits as recoverable", async () => {
+    const { bridge, context, events } = createHarness();
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        error: {
+          codexErrorInfo: "rateLimitExceeded",
+          message: "Streaming rate limit exceeded.",
+        },
+        id: "turn-1",
+        status: "failed",
+      },
+    });
+
+    await expect(trackedTurn).rejects.toThrow("Streaming rate limit exceeded.");
+    expect(events().find((event) => event.kind === "run.failed")).toMatchObject({
+      payload: {
+        error: {
+          details: { codexErrorInfo: "rateLimitExceeded" },
+          retryable: true,
+        },
+        recoverable: true,
+      },
+    });
+  });
+
+  test("preserves actionable misalignment details without making the failure retryable", async () => {
+    const { bridge, context, events } = createHarness();
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        error: {
+          codexErrorInfo: "misalignmentPolicyViolation",
+          message: "The request was blocked by policy.",
+          misalignment: {
+            detailedExplanation: "The request needs a narrower authorized scope.",
+            errorType: "scope_mismatch",
+            steer: { message: "Continue only within the authorized repository." },
+          },
+        },
+        id: "turn-1",
+        status: "failed",
+      },
+    });
+
+    await expect(trackedTurn).rejects.toThrow("The request was blocked by policy.");
+    expect(events().find((event) => event.kind === "run.failed")).toMatchObject({
+      payload: {
+        error: {
+          details: {
+            codexErrorInfo: "misalignmentPolicyViolation",
+            misalignmentDetailedExplanation: "The request needs a narrower authorized scope.",
+            misalignmentErrorType: "scope_mismatch",
+            misalignmentSteerMessage: "Continue only within the authorized repository.",
+          },
+          retryable: false,
+        },
+        recoverable: false,
+      },
+    });
+  });
+
   test("thread systemError waits for the authoritative failed turn", async () => {
     const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);

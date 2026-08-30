@@ -28,6 +28,7 @@ export function summarizeRuntimeCommand(command: RuntimeCommand): Record<string,
         ...base,
         arguments: summarizeTextDigest(command.argumentsJson),
         requestId: command.requestId,
+        runId: command.runId,
         serverId: command.serverId,
         toolName: command.toolName,
       };
@@ -37,9 +38,16 @@ export function summarizeRuntimeCommand(command: RuntimeCommand): Record<string,
         ...base,
         decision: command.decision,
         requestId: command.requestId,
+        runId: command.runId ?? null,
       };
     }
-    case "turn.cancel":
+    case "turn.cancel": {
+      return {
+        ...base,
+        reason: command.reason ?? null,
+        runId: command.runId ?? null,
+      };
+    }
     case "session.stop": {
       return {
         ...base,

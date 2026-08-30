@@ -21,6 +21,7 @@ import {
   type RuntimeTimingPhase,
   type RuntimeTimingSource,
   type RuntimeTimingStage,
+  type RuntimeToolCallUpdatedPayload,
 } from "./runtime-event-types";
 import {
   assertTimestamp,
@@ -33,6 +34,7 @@ import {
   readOptionalDriverId,
   readOptionalString,
   readPrimitiveRecord,
+  requireExactKeys,
   requireEnumValue,
   requireNonNegativeInt,
   requireNullableTimestamp,
@@ -47,7 +49,6 @@ import {
   requireString,
   requireTimestamp,
 } from "./runtime-event-validation";
-
 export * from "./runtime-event-types";
 
 const runtimeEventKindSet = new Set<string>(RUNTIME_EVENT_KINDS);
@@ -152,6 +153,26 @@ const runStatuses = new Set<string>([
 ]);
 const toolStatuses = new Set<string>(["cancelled", "completed", "failed", "running"]);
 const fileChangeKinds = new Set<string>(["delete", "upsert"]);
+const runtimeEventEnvelopeKeys = new Set([
+  "actor",
+  "correlationId",
+  "delivery",
+  "driverInstanceId",
+  "id",
+  "kind",
+  "native",
+  "occurredAt",
+  "origin",
+  "payload",
+  "receivedAt",
+  "runId",
+  "runtimeId",
+  "schemaVersion",
+  "sessionId",
+  "sourceEventId",
+  "traceId",
+  "visibility",
+]);
 function createRuntimeEvent<TPayload>(
   draft: RuntimeEventDraft<TPayload>,
 ): RuntimeEventEnvelope<TPayload> {
@@ -181,6 +202,7 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
   if (!isRuntimeEventRecord(value)) {
     throw new Error("Runtime event must be an object.");
   }
+  requireExactKeys(value, runtimeEventEnvelopeKeys, "Runtime event");
 
   if (value["schemaVersion"] !== RUNTIME_EVENT_SCHEMA_VERSION) {
     throw new Error("Runtime event schema version is unsupported.");
@@ -253,6 +275,15 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
     value["payload"],
   );
 
+  let native;
+
+  if ("native" in value && value["native"] !== undefined) {
+    if (!isRuntimeEventRecord(value["native"])) {
+      throw new Error("Runtime event native reference must be an object.");
+    }
+    native = parseNativeRef(value["native"]);
+  }
+
   return {
     actor,
     ...(correlationId === undefined ? {} : { correlationId }),
@@ -260,7 +291,7 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
     ...(driverInstanceId === undefined ? {} : { driverInstanceId }),
     id,
     kind,
-    ...(isRuntimeEventRecord(value["native"]) ? { native: parseNativeRef(value["native"]) } : {}),
+    ...(native === undefined ? {} : { native }),
     occurredAt,
     origin,
     payload,
@@ -454,7 +485,7 @@ function admitRuntimeEventPayload(
         throw new Error(`Runtime event ${context.kind} payload must include text content.`);
       }
 
-      requireOptionalString(record, "messageId", context.kind);
+      requireString(record, "messageId", context.kind);
       requireOptionalEnumValue(
         record,
         "level",
@@ -471,13 +502,17 @@ function admitRuntimeEventPayload(
     }
     case "message.cancelled":
     case "message.completed":
-    case "message.started":
+    case "message.started": {
+      const record = requirePayloadRecord(context.kind, canonicalPayload);
+      requireString(record, "messageId", context.kind);
+      requireOptionalEnumValue(record, "role", new Set(["agent", "user"]), context.kind);
+      return omitPayloadIdentity(record);
+    }
     case "thought.cancelled":
     case "thought.completed":
     case "thought.started": {
       const record = requirePayloadRecord(context.kind, canonicalPayload);
-      requireOptionalString(record, "messageId", context.kind);
-      requireOptionalString(record, "thoughtId", context.kind);
+      requireString(record, "thoughtId", context.kind);
       requireOptionalEnumValue(record, "role", new Set(["agent", "user"]), context.kind);
       return omitPayloadIdentity(record);
     }
@@ -496,7 +531,7 @@ function admitRuntimeEventPayload(
         throw new Error("Runtime event thought.delta payload must include text content.");
       }
 
-      requireOptionalString(record, "thoughtId", context.kind);
+      requireString(record, "thoughtId", context.kind);
       return omitPayloadIdentity(record);
     }
     case "permission.requested": {
@@ -605,10 +640,22 @@ function admitRuntimeEventPayload(
       requireOptionalString(record, "nonExecutionKind", context.kind);
       requireOptionalString(record, "parentMessageId", context.kind);
       requireOptionalString(record, "rawInput", context.kind);
+      requireOptionalString(record, "rawInputDelta", context.kind);
       requireOptionalString(record, "rawOutput", context.kind);
+      requireOptionalString(record, "rawOutputDelta", context.kind);
       requireOptionalNullableString(record, "title", context.kind);
       requireOptionalString(record, "userFeedback", context.kind);
-      return omitPayloadIdentity(record);
+      if (record["rawInput"] !== undefined && record["rawInputDelta"] !== undefined) {
+        throw new Error(
+          "Runtime event tool.call.updated payload cannot contain both rawInput and rawInputDelta.",
+        );
+      }
+      if (record["rawOutput"] !== undefined && record["rawOutputDelta"] !== undefined) {
+        throw new Error(
+          "Runtime event tool.call.updated payload cannot contain both rawOutput and rawOutputDelta.",
+        );
+      }
+      return omitPayloadIdentity(record) as RuntimeToolCallUpdatedPayload;
     }
     default: {
       return isRuntimeEventRecord(canonicalPayload)
@@ -633,7 +680,13 @@ function readRunPayload(
   }
 
   requireOptionalEnumValue(record, "lifecycle", runLifecycleStatuses, context.kind);
-  requireOptionalEnumValue(record, "status", runStatuses, context.kind);
+  if ("status" in record && record["status"] !== undefined) {
+    const status = requireEnumValue(record, "status", runStatuses, context.kind);
+
+    if (!isRunStatusAllowedForKind(context.kind, status)) {
+      throw new Error(`Runtime event ${context.kind} payload status is inconsistent.`);
+    }
+  }
   requireOptionalString(record, "inputSummary", context.kind);
   requireOptionalString(record, "reason", context.kind);
   requireOptionalString(record, "requestedBy", context.kind);
@@ -643,6 +696,16 @@ function readRunPayload(
   requireOptionalStringArray(record, "inputItemIds", context.kind);
   requireOptionalTimestamp(record, "completedAt", context.kind);
   requireOptionalTimestamp(record, "startedAt", context.kind);
+
+  if (context.kind === "run.completed") {
+    if ("finalMessageId" in record) {
+      requireString(record, "finalMessageId", context.kind);
+    }
+
+    if ("finalMessageText" in record) {
+      throw new Error("Runtime event run.completed payload finalMessageText is unsupported.");
+    }
+  }
 
   const admitted = omitPayloadIdentity(record);
 
@@ -662,6 +725,21 @@ function readRunPayload(
     throw new Error("Runtime event run.failed payload must include an error.");
   }
 
+  if (context.kind === "run.failed") {
+    const recoverable = record["recoverable"];
+    const error = admitted["error"] as RuntimeEventRecord;
+
+    if (typeof recoverable !== "boolean") {
+      throw new Error("Runtime event run.failed payload recoverable must be a boolean.");
+    }
+
+    if (error["retryable"] !== recoverable) {
+      throw new Error(
+        "Runtime event run.failed payload recoverable must agree with error.retryable.",
+      );
+    }
+  }
+
   return admitted;
 }
 
@@ -674,7 +752,11 @@ function readRunView(
   value: unknown,
 ): RuntimeEventRecord {
   const record = requirePayloadRecord(context.kind, value, "run");
-  requireEnumValue(record, "status", runStatuses, context.kind);
+  const status = requireEnumValue(record, "status", runStatuses, context.kind);
+
+  if (!isRunStatusAllowedForKind(context.kind, status)) {
+    throw new Error(`Runtime event ${context.kind} payload run.status is inconsistent.`);
+  }
 
   return {
     completedAt: requireNullableTimestamp(record, "completedAt", context.kind, "run.completedAt"),
@@ -682,34 +764,48 @@ function readRunView(
       record["error"] === null ? null : readRunError(context.kind, record["error"], "run.error"),
     id: context.runId ?? null,
     startedAt: requireNullableTimestamp(record, "startedAt", context.kind, "run.startedAt"),
-    status: record["status"],
+    status,
     traceId: context.traceId ?? null,
   };
 }
 
+function isRunStatusAllowedForKind(kind: RuntimeEventKind, status: string): boolean {
+  switch (kind) {
+    case "run.cancel.requested":
+    case "run.dispatched":
+    case "run.started":
+    case "run.steered":
+    case "run.waiting":
+      return status === "booting" || status === "running" || status === "waiting_input";
+    case "run.cancelled":
+      return status === "cancelled" || status === "expired";
+    case "run.completed":
+      return status === "completed";
+    case "run.failed":
+      return status === "failed";
+    case "run.queued":
+      return status === "queued";
+    default:
+      return false;
+  }
+}
+
 function readRunError(kind: RuntimeEventKind, value: unknown, label: string): RuntimeEventRecord {
   const record = requirePayloadRecord(kind, value, label);
-  const details = record["details"];
-  const recoverable = record["recoverable"];
   const retryable = record["retryable"];
 
-  if (details !== undefined && !isRuntimeEventRecord(details)) {
-    throw new Error(`Runtime event ${kind} payload ${label}.details must be an object.`);
-  }
-
-  if (recoverable !== undefined && typeof recoverable !== "boolean") {
-    throw new Error(`Runtime event ${kind} payload ${label}.recoverable must be a boolean.`);
-  }
-
-  if (retryable !== undefined && typeof retryable !== "boolean") {
+  if (typeof retryable !== "boolean") {
     throw new Error(`Runtime event ${kind} payload ${label}.retryable must be a boolean.`);
   }
 
   return {
     code: requireString(record, "code", kind),
-    details: readPrimitiveRecord(details),
+    details: readPrimitiveRecord(
+      record["details"],
+      `Runtime event ${kind} payload ${label}.details`,
+    ),
     message: requireString(record, "message", kind),
-    retryable: retryable === true || recoverable === true,
+    retryable,
   };
 }
 

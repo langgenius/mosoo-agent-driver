@@ -19,6 +19,7 @@ import type { JsonObject } from "./app-server-json";
 import {
   OpenAiAgentTaskState,
   openAiAgentTasksClosedEvent,
+  toOpenAiAgentTaskId,
   type OpenAiSubAgentActivity,
 } from "./app-server-agent-task-events";
 import {
@@ -156,10 +157,11 @@ function toOpenAiItemLifecycleEvents(
     case "imageView":
     case "sleep":
       return [];
-    // The input path owns user messages, and hook/* notifications own hook lifecycle.
-    // Their ThreadItem copies are provider echoes and must not publish duplicates.
+    // User messages and standalone function outputs are input echoes, while hook/*
+    // notifications own hook lifecycle. Their ThreadItem copies must not publish duplicates.
     case "userMessage":
     case "hookPrompt":
+    case "functionCallOutput":
       return [];
     case "subAgentActivity": {
       // App-server emits a started/completed pair for one display activity. Publish it once.
@@ -186,7 +188,7 @@ function toOpenAiItemLifecycleEvents(
             activityKind,
             agentId,
             agentPath,
-            taskId: agentId,
+            taskId: toOpenAiAgentTaskId(agentId),
             title: `Sub-agent ${activityKind}`,
           },
         },
@@ -676,7 +678,7 @@ export class OpenAiAppServerItemEventBridge {
         kind: "tool.call.updated",
         payload: {
           messageId: parentMessageId,
-          rawOutput: delta,
+          rawOutputDelta: delta,
           status: "running",
           toolCallId: publicToolCallId,
         },
@@ -776,19 +778,32 @@ export class OpenAiAppServerItemEventBridge {
     };
 
     if (this.#messages.needsSnapshot(snapshot)) {
+      const sourcePrefix = `openai.turn.final_message:${publicTurnId}:${publicItemId}`;
+      const snapshotEvents = toOpenAiMessageSnapshotEvents({
+        item: finalAssistantItem,
+        itemId,
+        messageId,
+        phase,
+        sourcePrefix,
+        text: filteredText.text,
+      });
       await this.#push(
         context,
         "driver.openai.turn.final_message",
         withOpenAiEventIds(
-          toOpenAiMessageSnapshotEvents({
-            item: finalAssistantItem,
-            itemId,
-            messageId,
-            phase,
-            sourcePrefix: `openai.turn.final_message:${publicTurnId}:${publicItemId}`,
-            text: filteredText.text,
-          }),
-          `openai.turn.final_message:${publicTurnId}:${publicItemId}`,
+          [
+            ...snapshotEvents,
+            ...(this.#messages.isEnded(messageId)
+              ? [
+                  {
+                    kind: "message.completed" as const,
+                    payload: { messageId, role: "agent" },
+                    sourceEventId: `${sourcePrefix}:completed`,
+                  },
+                ]
+              : []),
+          ],
+          sourcePrefix,
         ),
       );
       this.#messages.setText(messageId, filteredText.text);

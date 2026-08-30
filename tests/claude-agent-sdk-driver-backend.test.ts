@@ -145,7 +145,11 @@ function createHarness(
           }
         }
         return {
-          accepted: batch.map((event) => ({ seq: (seq += 1), type: event.kind })),
+          accepted: batch.map((event) => ({
+            eventId: event.sourceEventId!,
+            seq: (seq += 1),
+            type: event.kind,
+          })),
         };
       },
     },
@@ -154,9 +158,22 @@ function createHarness(
     permission: { request: async () => "allow_once" },
     ports: { skill: { materialize: async () => [] } },
   });
+  const backend = new ClaudeAgentSdkDriverBackend(payload, dependencies);
+  const handleInput = backend.handleInput.bind(backend);
+  backend.handleInput = async (inputContext, input, runId) => {
+    currentRunId ??= runId;
+
+    try {
+      await handleInput(inputContext, input, runId);
+    } finally {
+      if (currentRunId === runId) {
+        currentRunId = null;
+      }
+    }
+  };
 
   return {
-    backend: new ClaudeAgentSdkDriverBackend(payload, dependencies),
+    backend,
     context,
     events,
   };

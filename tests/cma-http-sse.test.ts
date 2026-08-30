@@ -53,7 +53,7 @@ function runFailedEvent(sessionId: string, recoverable = false) {
       recoverable,
     },
     runId: createDriverId(),
-    schemaVersion: "2026-05-26",
+    schemaVersion: "2026-08-29",
     sessionId,
     visibility: "participant",
   });
