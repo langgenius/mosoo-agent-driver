@@ -81,7 +81,7 @@ async function readResponseBody(
   const contentLength = Number(response.headers.get("content-length"));
 
   if (Number.isFinite(contentLength) && contentLength > maxResponseBytes) {
-    await response.body?.cancel().catch(() => undefined);
+    void response.body?.cancel().catch(() => undefined);
     throw responseTooLarge(maxResponseBytes);
   }
 

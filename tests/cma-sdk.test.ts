@@ -106,7 +106,12 @@ describe("CMA SDK client", () => {
     expect(fetchSignal?.aborted).toBe(true);
   });
 
-  test("bounds and cancels JSON response bodies", async () => {
+  test.each([
+    ["content-length", "cooperative"],
+    ["content-length", "stalled"],
+    ["stream", "cooperative"],
+    ["stream", "stalled"],
+  ] as const)("bounds %s JSON responses with %s cancellation", async (boundary, cancellation) => {
     let canceled = false;
     const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
@@ -115,16 +120,23 @@ describe("CMA SDK client", () => {
           new ReadableStream({
             cancel() {
               canceled = true;
+              return cancellation === "stalled" ? new Promise<void>(() => {}) : undefined;
             },
             start(controller) {
               controller.enqueue(new TextEncoder().encode('{"data":["too large"]}'));
             },
           }),
+          boundary === "content-length" ? { headers: { "content-length": "9" } } : undefined,
         ),
       maxResponseBytes: 8,
     });
 
-    await expect(client.listAgents()).rejects.toMatchObject({
+    await expect(
+      promiseWithTimeout(client.listAgents(), {
+        label: "bounded CMA SDK response",
+        timeoutMs: 250,
+      }),
+    ).rejects.toMatchObject({
       code: "CMA_SDK_RESPONSE_TOO_LARGE",
     });
     expect(canceled).toBe(true);
