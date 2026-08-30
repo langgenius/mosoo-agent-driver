@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, opendir, rename, rmdir, unlink } from "node:fs/promises";
@@ -11,6 +10,7 @@ import type { DriverResolvedSkill } from "../protocol/boot";
 import type { DriverExecutionInput } from "../protocol/execution";
 import { extractZipArchive } from "../skill-package";
 import type { SkillArchiveExtractOptions, SkillPackageEntry } from "../skill-package";
+import { readBoundedStreamBytes } from "../utils/async";
 import {
   assertDirectoryIdentity,
   closeFileHandles,
@@ -1086,7 +1086,7 @@ async function downloadSkillPackage(
   const response = await fetch(skill.downloadUrl, { signal: requestSignal });
 
   if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
+    void response.body?.cancel().catch(() => {});
     throw new Error(`Failed to download skill package for ${skill.skillId}: ${response.status}.`);
   }
   if (response.body === null) {
@@ -1099,54 +1099,20 @@ async function downloadSkillPackage(
     /^\d+$/.test(contentLength) &&
     Number(contentLength) > MAX_SKILL_COMPRESSED_BYTES
   ) {
-    await response.body.cancel().catch(() => {});
+    void response.body.cancel().catch(() => {});
     throw new Error(
       `Compressed skill package exceeds the limit (${MAX_SKILL_COMPRESSED_BYTES} bytes).`,
     );
   }
 
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  const hash = createHash("sha256");
-  let totalBytes = 0;
-  const onAbort = () => {
-    void reader.cancel(requestSignal.reason).catch(() => {});
-  };
-  requestSignal.addEventListener("abort", onAbort, { once: true });
+  const bytes = await readBoundedStreamBytes(
+    response.body,
+    MAX_SKILL_COMPRESSED_BYTES,
+    new Error(`Compressed skill package exceeds the limit (${MAX_SKILL_COMPRESSED_BYTES} bytes).`),
+    requestSignal,
+  );
 
-  try {
-    while (true) {
-      requestSignal.throwIfAborted();
-      const { done, value } = await reader.read();
-      requestSignal.throwIfAborted();
-
-      if (done) {
-        break;
-      }
-
-      totalBytes += value.byteLength;
-      if (totalBytes > MAX_SKILL_COMPRESSED_BYTES) {
-        const error = new Error(
-          `Compressed skill package exceeds the limit (${MAX_SKILL_COMPRESSED_BYTES} bytes).`,
-        );
-        await reader.cancel(error).catch(() => {});
-        throw error;
-      }
-
-      chunks.push(value);
-      hash.update(value);
-    }
-  } catch (error) {
-    await reader.cancel(error).catch(() => {});
-    throw error;
-  } finally {
-    requestSignal.removeEventListener("abort", onAbort);
-    reader.releaseLock();
-  }
-
-  const bytes = Buffer.concat(chunks, totalBytes);
-
-  if (hash.digest("hex") !== skill.blobSha256) {
+  if (createHash("sha256").update(bytes).digest("hex") !== skill.blobSha256) {
     throw new Error(`Skill blob checksum mismatch for ${skill.skillId}.`);
   }
   return bytes;

@@ -25,6 +25,7 @@ import type { DriverResolvedSkill } from "../src/protocol/boot";
 import type { DriverExecutionInput } from "../src/protocol/execution";
 import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
 import { materializeResolvedSkills } from "../src/runtimes/skill-materialization";
+import { promiseWithTimeout } from "../src/utils/async";
 import { bootPayload } from "./driver-runtime-boundary-fixtures";
 
 const textEncoder = new TextEncoder();
@@ -936,7 +937,14 @@ Check the diff.`),
     }
   });
 
-  test("cancels an oversized compressed stream before replacing the previous tree", async () => {
+  test.each([
+    ["http-error", "cooperative"],
+    ["http-error", "stalled"],
+    ["content-length", "cooperative"],
+    ["content-length", "stalled"],
+    ["stream", "cooperative"],
+    ["stream", "stalled"],
+  ] as const)("bounds %s skill downloads with %s cancellation", async (boundary, cancellation) => {
     const root = await mkdtemp(join(tmpdir(), "mosoo-skill-materialization-"));
     const logger = createTestLogger();
     const skill = createSkill(root, new Uint8Array(), {
@@ -949,19 +957,34 @@ Check the diff.`),
         new ReadableStream<Uint8Array>({
           cancel() {
             cancelled = true;
+            return cancellation === "stalled" ? new Promise<void>(() => {}) : undefined;
           },
           pull(controller) {
-            controller.enqueue(new Uint8Array(1024 * 1024));
+            if (boundary === "stream") {
+              controller.enqueue(new Uint8Array(1024 * 1024));
+            }
           },
         }),
+        boundary === "http-error"
+          ? { status: 502 }
+          : boundary === "content-length"
+            ? { headers: { "content-length": "26214401" } }
+            : undefined,
       );
     }) as unknown as typeof fetch;
     await mkdir(skill.mountPath, { recursive: true });
     await writeFile(join(skill.mountPath, "SKILL.md"), "previous contents", "utf8");
 
     try {
-      await expect(materialize(createExecution(root, skill), logger)).rejects.toThrow(
-        "Compressed skill package exceeds the limit",
+      await expect(
+        promiseWithTimeout(materialize(createExecution(root, skill), logger), {
+          label: "bounded skill download",
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow(
+        boundary === "http-error"
+          ? "Failed to download skill package"
+          : "Compressed skill package exceeds the limit",
       );
       expect(cancelled).toBe(true);
       await expect(readFile(join(skill.mountPath, "SKILL.md"), "utf8")).resolves.toBe(
