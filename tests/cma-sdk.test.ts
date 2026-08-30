@@ -429,46 +429,53 @@ describe("CMA SDK client", () => {
     expect(canceled).toBe(true);
   });
 
-  test("return interrupts a pending SSE read and waits for cleanup", async () => {
-    const cleanup = Promise.withResolvers<void>();
-    const readEntered = Promise.withResolvers<void>();
-    let fetchSignal: AbortSignal | undefined;
-    const client = new CmaSdkClient({
-      baseUrl: "https://driver.test",
-      fetch: async (_input, init) => {
-        fetchSignal = init?.signal ?? undefined;
-        return new Response(
-          new ReadableStream(
-            {
-              cancel() {
-                cleanup.resolve();
+  test.each(["settles", "stalls"] as const)(
+    "return interrupts a pending SSE read when underlying cancellation %s",
+    async (cancelMode) => {
+      const cancelEntered = Promise.withResolvers<void>();
+      const readEntered = Promise.withResolvers<void>();
+      let fetchSignal: AbortSignal | undefined;
+      const client = new CmaSdkClient({
+        baseUrl: "https://driver.test",
+        fetch: async (_input, init) => {
+          fetchSignal = init?.signal ?? undefined;
+          return new Response(
+            new ReadableStream(
+              {
+                cancel() {
+                  cancelEntered.resolve();
+                  return cancelMode === "stalls" ? new Promise<void>(() => {}) : undefined;
+                },
+                pull() {
+                  readEntered.resolve();
+                },
               },
-              pull() {
-                readEntered.resolve();
-              },
-            },
-            { highWaterMark: 0 },
-          ),
-        );
-      },
-    });
-    const iterator = client.streamSessionEvents("session-1")[Symbol.asyncIterator]();
-    const pending = iterator.next();
-    await readEntered.promise;
+              { highWaterMark: 0 },
+            ),
+          );
+        },
+      });
+      const iterator = client.streamSessionEvents("session-1")[Symbol.asyncIterator]();
+      const pending = iterator.next();
+      await readEntered.promise;
 
-    const returned = iterator.return?.();
+      const returned = iterator.return?.();
 
-    if (!returned) {
-      throw new Error("Expected the CMA stream iterator to support return().");
-    }
+      if (!returned) {
+        throw new Error("Expected the CMA stream iterator to support return().");
+      }
 
-    await expect(
-      promiseWithTimeout(pending, { label: "pending CMA stream read", timeoutMs: 100 }),
-    ).rejects.toMatchObject({ name: "AbortError" });
-    await expect(
-      promiseWithTimeout(returned, { label: "CMA stream return", timeoutMs: 100 }),
-    ).resolves.toMatchObject({ done: true });
-    await promiseWithTimeout(cleanup.promise, { label: "CMA stream cleanup", timeoutMs: 100 });
-    expect(fetchSignal?.aborted).toBe(true);
-  });
+      await expect(
+        promiseWithTimeout(pending, { label: "pending CMA stream read", timeoutMs: 100 }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      await expect(
+        promiseWithTimeout(returned, { label: "CMA stream return", timeoutMs: 100 }),
+      ).resolves.toMatchObject({ done: true });
+      await promiseWithTimeout(cancelEntered.promise, {
+        label: "CMA stream cancellation",
+        timeoutMs: 100,
+      });
+      expect(fetchSignal?.aborted).toBe(true);
+    },
+  );
 });
