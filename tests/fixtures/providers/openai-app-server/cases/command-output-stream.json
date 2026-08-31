@@ -52,7 +52,7 @@
         "parentMessageId": "<driver-id>",
         "title": "Shell"
       },
-      "sourceEventId": "openai.item.started:turn-1:cmd-1"
+      "sourceEventId": "openai.item.started:sid1_diOiKEZok2HcGrWKr19uxht3PPOLSj_ZVMcjnOYcZYo"
     },
     {
       "kind": "tool.call.updated",
@@ -63,7 +63,7 @@
         "title": "Shell",
         "toolCallId": "cmd-1"
       },
-      "sourceEventId": "openai.tool.started:turn-1:cmd-1"
+      "sourceEventId": "openai.tool.started:sid1_RWKjM-yo_eO1O7FFfDWAa7yqJPtBWMGIYPSniQQkjHs"
     },
     {
       "delivery": "best_effort",

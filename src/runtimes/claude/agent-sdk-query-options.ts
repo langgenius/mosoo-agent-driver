@@ -16,6 +16,7 @@ import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { toMcpServerKey } from "../mcp/server-key";
 import { mergeProviderOptions } from "../provider-options";
+import { toRuntimePublicId } from "../runtime-public-id";
 import { buildNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { readProcessEnvString, stringifyForDisplay } from "./agent-sdk-json";
 import { spawnClaudeCodeProcess } from "./agent-sdk-process";
@@ -68,7 +69,9 @@ function createCanUseTool(
 
       const decision = await context.ports.permission.request(
         {
-          ...(options.agentID === undefined ? {} : { agentId: options.agentID }),
+          ...(options.agentID === undefined
+            ? {}
+            : { agentId: toRuntimePublicId(options.agentID, "claude-agent") }),
           ...(options.blockedPath === undefined ? {} : { blockedPath: options.blockedPath }),
           ...(options.decisionReason === undefined
             ? {}

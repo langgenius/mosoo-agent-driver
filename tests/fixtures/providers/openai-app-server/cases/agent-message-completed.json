@@ -31,7 +31,7 @@
         "messageId": "<driver-id>",
         "role": "agent"
       },
-      "sourceEventId": "openai.item.completed:turn-1:message-1:0"
+      "sourceEventId": "openai.item.completed:sid1_BN1wwFn-vJ2yK8Ax93DBy3pMPeQlPs_fMiD3xICce38:0"
     },
     {
       "kind": "message.completed",
@@ -39,7 +39,7 @@
         "messageId": "<driver-id>",
         "role": "agent"
       },
-      "sourceEventId": "openai.item.completed:turn-1:message-1:1"
+      "sourceEventId": "openai.derived:sid1_BARJThUDVPe3fUNTSKJ0PBt0smINLtwyX9wLH2fXPTk"
     }
   ]
 }

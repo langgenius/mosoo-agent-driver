@@ -2,7 +2,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { jsonValueSchema } from "../../contract";
 import type { DriverEventInput } from "../../protocol/events";
-import type { MessageId, RunId } from "../../protocol/id";
+import type { MessageId, RunId, SessionId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { assertClaudeDurableEventFits, ClaudeAgentSdkEventWriter } from "./agent-sdk-event-writer";
 import {
@@ -36,6 +36,7 @@ import { isToolUseBlock, toToolCallId, toToolCallName, toToolResultText } from "
 import type { ClaudePermissionDenialAdvisory } from "./agent-sdk-outcomes";
 interface ClaudeMessageTranslatorOptions {
   publicToolCallId(nativeToolCallId: string): string;
+  readonly sessionId: SessionId;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
   pushTerminal(
     context: AgentDriverContext,
@@ -69,11 +70,12 @@ export class ClaudeAgentSdkMessageTranslator {
   readonly #events: ClaudeAgentSdkEventWriter;
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #permissionDenialAdvisories = new Map<string, ClaudePermissionDenialAdvisory>();
-  readonly #state = new ClaudeAgentSdkMessageState();
+  readonly #state: ClaudeAgentSdkMessageState;
 
   constructor(options: ClaudeMessageTranslatorOptions) {
     this.#options = options;
     this.#events = new ClaudeAgentSdkEventWriter({ push: options.push });
+    this.#state = new ClaudeAgentSdkMessageState(options.sessionId);
   }
 
   resetTurnMessageState(): void {

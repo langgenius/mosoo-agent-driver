@@ -1126,7 +1126,6 @@ describe("OpenAI app-server provider fixtures", () => {
         bridge,
         context,
       );
-
       expect(events()).toEqual([
         {
           delivery: "lossless",
@@ -1146,7 +1145,7 @@ describe("OpenAI app-server provider fixtures", () => {
             taskId: "agent-1",
             title: `Sub-agent ${activityKind}`,
           },
-          sourceEventId: `openai.item.completed:turn-1:activity-${activityKind}:0`,
+          sourceEventId: expect.stringMatching(/^openai\.derived:sid1_/),
         },
         {
           delivery: "lossless",
@@ -1163,7 +1162,7 @@ describe("OpenAI app-server provider fixtures", () => {
                   ]
                 : [],
           },
-          sourceEventId: `openai.item.completed:turn-1:activity-${activityKind}:1`,
+          sourceEventId: expect.stringMatching(/^openai\.derived:sid1_/),
           visibility: "participant",
         },
       ]);
@@ -1214,7 +1213,7 @@ describe("OpenAI app-server provider fixtures", () => {
         taskId: "agent-replayed",
         title: "Sub-agent interacted",
       },
-      sourceEventId: "openai.item.completed:turn-snapshot:activity-replayed:0",
+      sourceEventId: expect.stringMatching(/^openai\.derived:sid1_/),
     });
     const snapshots = events().filter((event) => event.kind === "agent.tasks.replaced");
     expect(snapshots).toMatchObject([

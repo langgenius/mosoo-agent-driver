@@ -1,14 +1,12 @@
-import { createHash } from "node:crypto";
-
 import type { SDKBackgroundTasksChangedMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
+import { toRuntimePublicId } from "../runtime-public-id";
 import {
   assertClaudeDurableEventFits,
   ClaudeDurableEventTooLargeError,
 } from "./agent-sdk-event-writer";
 
-const MAX_CLAUDE_TASK_ID_BYTES = 256;
 const MAX_CLAUDE_BACKGROUND_TASK_ENTRIES = 1_024;
 const MAX_CLAUDE_TASK_TEXT_LENGTH = 4_096;
 const MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS = 256;
@@ -43,13 +41,10 @@ function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeBackground
 }
 
 function publicTaskId(nativeTaskId: string): string | null {
-  const bytes = Buffer.byteLength(nativeTaskId, "utf8");
-  if (bytes === 0) {
+  if (nativeTaskId.length === 0) {
     return null;
   }
-  return bytes <= MAX_CLAUDE_TASK_ID_BYTES
-    ? nativeTaskId
-    : `claude-task:${createHash("sha256").update(nativeTaskId).digest("hex")}`;
+  return toRuntimePublicId(nativeTaskId, "claude-task");
 }
 
 function boundedTaskText(value: string): string | undefined {

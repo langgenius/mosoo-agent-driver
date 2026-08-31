@@ -1,7 +1,7 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import type { MessageId, RunId } from "../../protocol/id";
-import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
+import type { MessageId, RunId, SessionId } from "../../protocol/id";
+import { createRuntimeAssistantMessageId } from "../runtime-turn-transcript";
 import { isRecord, readRecord, readString } from "./agent-sdk-json";
 
 interface ClaudeAssistantFinalCandidate {
@@ -38,9 +38,7 @@ export function readClaudeSdkSessionId(value: unknown): string | null {
 export class ClaudeAgentSdkMessageState {
   readonly #activeAssistantMessageIds = new Map<RunId, MessageId>();
   readonly #activeThoughtIds = new Map<string, string>();
-  readonly #auxiliaryMessageIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #authoritativeAssistantMessageIds = new Set<MessageId>();
-  readonly #assistantMessageIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #assistantMessageOrdinals = new Map<MessageId, number>();
   readonly #assistantMessageRunIds = new Map<MessageId, RunId>();
   readonly #assistantMessageSequences = new Map<RunId, number>();
@@ -48,6 +46,7 @@ export class ClaudeAgentSdkMessageState {
   readonly #assistantWireAliases = new Map<string, string>();
   readonly #lastCompletedAssistantMessages = new Map<RunId, ClaudeAssistantFinalCandidate>();
   readonly #pendingAssistantStreamAnchors = new Map<string, ClaudeStreamMessageAnchor>();
+  readonly #sessionId: SessionId;
   readonly #streamedTextMessages = new Set<string>();
   readonly #streamingNativeMessageIds = new Map<string, ClaudeStreamMessageAnchor>();
   readonly #streamingWireUuids = new Map<string, string>();
@@ -55,13 +54,15 @@ export class ClaudeAgentSdkMessageState {
   readonly #wireAssistantMessageIds = new Map<string, MessageId>();
   readonly #wireToolCallIds = new Map<string, readonly string[]>();
 
+  constructor(sessionId: SessionId) {
+    this.#sessionId = sessionId;
+  }
+
   reset(): void {
     this.#activeAssistantMessageIds.clear();
     this.#activeThoughtIds.clear();
-    this.#auxiliaryMessageIds.reset();
     this.#assistantWireAliases.clear();
     this.#authoritativeAssistantMessageIds.clear();
-    this.#assistantMessageIds.reset();
     this.#assistantMessageOrdinals.clear();
     this.#assistantMessageRunIds.clear();
     this.#assistantMessageSequences.clear();
@@ -81,12 +82,20 @@ export class ClaudeAgentSdkMessageState {
     let messageId: MessageId;
 
     if (nativeMessageId !== null) {
-      messageId = this.#assistantMessageIds.getOrCreate(`${runId}:native:${nativeMessageId}`);
+      messageId = createRuntimeAssistantMessageId(
+        this.#sessionId,
+        "claude-assistant",
+        `${runId}:native:${nativeMessageId}`,
+      );
     } else if (active !== undefined) {
       messageId = active;
     } else {
       const ordinal = this.#nextAssistantMessageSequence(runId);
-      messageId = this.#assistantMessageIds.getOrCreate(`${runId}:sequence:${ordinal}`);
+      messageId = createRuntimeAssistantMessageId(
+        this.#sessionId,
+        "claude-assistant",
+        `${runId}:sequence:${ordinal}`,
+      );
       this.#assistantMessageOrdinals.set(messageId, ordinal);
     }
 
@@ -97,7 +106,11 @@ export class ClaudeAgentSdkMessageState {
   }
 
   auxiliaryMessageId(runId: RunId, nativeMessageId: string): MessageId {
-    return this.#auxiliaryMessageIds.getOrCreate(`${runId}:${nativeMessageId}`);
+    return createRuntimeAssistantMessageId(
+      this.#sessionId,
+      "claude-auxiliary",
+      `${runId}:${nativeMessageId}`,
+    );
   }
 
   assistantMessages(): readonly (readonly [MessageId, RunId])[] {

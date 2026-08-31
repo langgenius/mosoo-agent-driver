@@ -22,6 +22,7 @@ import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
+import { toRuntimePublicId } from "../runtime-public-id";
 import { computeRuntimeBootstrapDigest, writeSkillBootstrapArtifacts } from "../skill-bootstrap";
 import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
 import { ClaudeDurableEventTooLargeError } from "./agent-sdk-event-writer";
@@ -37,7 +38,6 @@ import {
 } from "./agent-sdk-query-options";
 import { buildClaudeRecoveryPrompt } from "./agent-sdk-recovery-context";
 import { readClaudeNativeResumeSessionId, requireClaudeNativeSessionId } from "./agent-sdk-resume";
-import { ClaudePublicToolCallIdState } from "./agent-sdk-tool-id";
 import { drainClaudeTasks } from "./agent-sdk-tasks";
 
 interface ActiveClaudeTurn {
@@ -78,7 +78,6 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #payload: DriverStartInput;
   readonly #pendingProcessTasks = new Set<Promise<void>>();
   readonly #prewarm: ClaudeAgentSdkPrewarm;
-  readonly #publicToolCallIds = new ClaudePublicToolCallIdState();
   #activeTurn: ActiveClaudeTurn | null = null;
   #nativeSessionId: string | null = null;
   #stopRequested = false;
@@ -95,11 +94,11 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       createQueryOptions: this.#dependencies.createQueryOptions,
       getNativeSessionId: () => this.#nativeSessionId,
       payload,
-      publicToolCallId: (nativeToolCallId) => this.#publicToolCallIds.publicId(nativeToolCallId),
+      publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
       startup: async (input) => this.#dependencies.startup(input),
     });
     this.#messageTranslator = new ClaudeAgentSdkMessageTranslator({
-      publicToolCallId: (nativeToolCallId) => this.#publicToolCallIds.publicId(nativeToolCallId),
+      publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
       push: async (context, reason, events) => this.#push(context, reason, events),
       pushTerminal: async (context, reason, closures, terminal) =>
         this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
@@ -107,6 +106,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         this.#recordNativeSessionId(context, sessionId),
       replaceNativeSessionId: async (context, previousSessionId, nextSessionId) =>
         this.#replaceNativeSessionId(context, previousSessionId, nextSessionId),
+      sessionId: payload.execution.run.sessionId,
     });
   }
 
@@ -170,7 +170,6 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     }
 
     this.#messageTranslator.resetTurnMessageState();
-    this.#publicToolCallIds.reset();
 
     // With no native session to resume, every query starts a fresh provider
     // session, so the bounded platform-history replay must ride the prompt of
@@ -227,7 +226,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
             permissionTasks,
             processTasks,
             publicToolCallId: (nativeToolCallId) =>
-              this.#publicToolCallIds.publicId(nativeToolCallId),
+              toRuntimePublicId(nativeToolCallId, "claude-tool"),
           });
           queryOptionsMs = Date.now() - optionsStartedAtMs;
 

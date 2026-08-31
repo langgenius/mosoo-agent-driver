@@ -51,7 +51,7 @@
         "messageId": "<driver-id>",
         "role": "agent"
       },
-      "sourceEventId": "openai.item.completed:turn-1:message-1:0"
+      "sourceEventId": "openai.item.completed:sid1_BN1wwFn-vJ2yK8Ax93DBy3pMPeQlPs_fMiD3xICce38:0"
     },
     {
       "kind": "message.completed",
@@ -59,7 +59,7 @@
         "messageId": "<driver-id>",
         "role": "agent"
       },
-      "sourceEventId": "openai.item.completed:turn-1:message-1:1"
+      "sourceEventId": "openai.derived:sid1_BARJThUDVPe3fUNTSKJ0PBt0smINLtwyX9wLH2fXPTk"
     },
     {
       "kind": "runtime.resume.updated",
@@ -73,7 +73,7 @@
       "delivery": "lossless",
       "kind": "agent.tasks.replaced",
       "payload": { "tasks": [] },
-      "sourceEventId": "openai.turn.completed.closure:turn-1:0",
+      "sourceEventId": "openai.derived:sid1_65gCZZFCtIH2m10-eUUIasKg5wmDWEVoaKGA1D26hMk",
       "visibility": "participant"
     },
     {

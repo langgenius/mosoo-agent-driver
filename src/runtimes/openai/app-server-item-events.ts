@@ -1,6 +1,7 @@
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { DriverEventInput } from "../../protocol/events";
 import { chunkJsonText } from "../provider-json";
+import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
 import { toOpenAiPlanStatus } from "./app-server-event-mapping";
 import {
   assertOpenAiDurableEventFits,
@@ -130,10 +131,20 @@ function withOpenAiEventIds(
   events: readonly DriverEventInput[],
   sourcePrefix: string,
 ): DriverEventInput[] {
-  return events.map((event, index) => ({
-    ...event,
-    sourceEventId: event.sourceEventId ?? `${sourcePrefix}:${String(index)}`,
-  }));
+  let autoIndex = 0;
+  return events.map((event) =>
+    typeof event.sourceEventId !== "string" || event.sourceEventId.length === 0
+      ? {
+          ...event,
+          sourceEventId: createRuntimeSourceEventId(
+            "openai.derived",
+            sourcePrefix,
+            autoIndex++,
+            JSON.stringify(event),
+          ),
+        }
+      : event,
+  );
 }
 
 function toOpenAiItemLifecycleEvents(
@@ -186,7 +197,7 @@ function toOpenAiItemLifecycleEvents(
                     status: activityKind === "interrupted" ? "cancelled" : "completed",
                   }),
             activityKind,
-            agentId,
+            agentId: toOpenAiAgentTaskId(agentId),
             agentPath,
             taskId: toOpenAiAgentTaskId(agentId),
             title: `Sub-agent ${activityKind}`,
@@ -494,7 +505,7 @@ export class OpenAiAppServerItemEventBridge {
     if (events.length > 0) {
       const durableEvents = withOpenAiEventIds(
         events,
-        `openai.item.completed:${publicTurnId}:${publicItemId}`,
+        createRuntimeSourceEventId("openai.item.completed", publicTurnId, publicItemId),
       );
       for (const event of durableEvents) {
         assertOpenAiDurableEventFits(event, `item completion ${publicItemId}`);
@@ -525,7 +536,7 @@ export class OpenAiAppServerItemEventBridge {
     const publicTurnId = this.#items.publicId(turnId, "turn");
     const events = withOpenAiEventIds(
       toOpenAiItemLifecycleEvents(item, publicItemId, "completed"),
-      `openai.item.completed:${publicTurnId}:${publicItemId}`,
+      createRuntimeSourceEventId("openai.item.completed", publicTurnId, publicItemId),
     );
     for (const event of events) {
       assertOpenAiDurableEventFits(event, `post-terminal sub-agent activity ${publicItemId}`);
@@ -554,7 +565,7 @@ export class OpenAiAppServerItemEventBridge {
     if (toolName === null) {
       const events = withOpenAiEventIds(
         toOpenAiItemLifecycleEvents(item, publicItemId, "started"),
-        `openai.item.started:${publicTurnId}:${publicItemId}`,
+        createRuntimeSourceEventId("openai.item.started", publicTurnId, publicItemId),
       );
 
       if (events.length > 0) {
@@ -587,14 +598,8 @@ export class OpenAiAppServerItemEventBridge {
       return;
     }
     const publicItemId = this.#items.publicId(itemId);
-    const publicTurnId = this.#items.publicId(turnId, "turn");
 
-    const event = {
-      ...this.#plans.createDeltaEvent(itemId, delta),
-      sourceEventId: `openai.plan.delta:${publicTurnId}:${publicItemId}:${String(
-        this.#plans.currentLength(itemId),
-      )}`,
-    };
+    const event = this.#plans.createDeltaEvent(itemId, delta);
     assertOpenAiDurableEventFits(event, `plan update ${publicItemId}`);
     await this.#push(context, "driver.openai.plan.delta", [event]);
     this.#plans.appendDelta(itemId, delta);
@@ -608,14 +613,13 @@ export class OpenAiAppServerItemEventBridge {
       return;
     }
 
-    const messageId = this.#messages.reasoningId(itemId);
+    const messageId = this.#messages.reasoningId(context, itemId);
     const events: DriverEventInput[] = [];
 
     if (this.#messages.isReasoningEnded(messageId)) {
       return;
     }
 
-    const currentLength = this.#messages.currentReasoningText(messageId).length;
     this.#messages.ensureReasoning(messageId, events, false);
     events.push(
       ...chunkOpenAiText(delta).map((contentDelta): DriverEventInput => ({
@@ -629,11 +633,7 @@ export class OpenAiAppServerItemEventBridge {
       })),
     );
 
-    await this.#push(
-      context,
-      "driver.openai.reasoning.summary",
-      withOpenAiEventIds(events, `openai.reasoning.delta:${messageId}:${String(currentLength)}`),
-    );
+    await this.#push(context, "driver.openai.reasoning.summary", events);
     this.#messages.ensureReasoning(messageId, [], true);
     this.#messages.appendReasoningText(messageId, delta);
   }
@@ -648,13 +648,21 @@ export class OpenAiAppServerItemEventBridge {
       typeof summaryIndex !== "number" ||
       !Number.isInteger(summaryIndex) ||
       summaryIndex < 1 ||
-      !this.#messages.beginReasoningPart(this.#messages.reasoningId(itemId), summaryIndex, false)
+      !this.#messages.beginReasoningPart(
+        this.#messages.reasoningId(context, itemId),
+        summaryIndex,
+        false,
+      )
     ) {
       return;
     }
 
     await this.onReasoningDelta(context, { ...params, delta: "\n\n" });
-    this.#messages.beginReasoningPart(this.#messages.reasoningId(itemId), summaryIndex, true);
+    this.#messages.beginReasoningPart(
+      this.#messages.reasoningId(context, itemId),
+      summaryIndex,
+      true,
+    );
   }
 
   async onToolOutput(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -778,7 +786,11 @@ export class OpenAiAppServerItemEventBridge {
     };
 
     if (this.#messages.needsSnapshot(snapshot)) {
-      const sourcePrefix = `openai.turn.final_message:${publicTurnId}:${publicItemId}`;
+      const sourcePrefix = createRuntimeSourceEventId(
+        "openai.turn.final_message",
+        publicTurnId,
+        publicItemId,
+      );
       const snapshotEvents = toOpenAiMessageSnapshotEvents({
         item: finalAssistantItem,
         itemId,
@@ -844,13 +856,9 @@ export class OpenAiAppServerItemEventBridge {
         entries: plan,
         source: "driver",
       },
-      sourceEventId: `openai.turn.plan:${this.#items.publicId(turnId, "turn")}:${String(
-        this.#plans.turnVersion(turnId),
-      )}`,
     };
     assertOpenAiDurableEventFits(event, "turn plan update");
     await this.#push(context, "driver.openai.turn.plan.updated", [event]);
-    this.#plans.advanceTurnVersion(turnId);
   }
 
   async #prepareMessageEnd(
@@ -904,7 +912,11 @@ export class OpenAiAppServerItemEventBridge {
           itemId,
           messageId,
           phase: toOpenAiMessagePhase(item),
-          sourcePrefix: `openai.item.completed:${publicTurnId}:${publicItemId}`,
+          sourcePrefix: createRuntimeSourceEventId(
+            "openai.item.completed",
+            publicTurnId,
+            publicItemId,
+          ),
           text: filteredFinalText.text,
         }),
       );
@@ -1037,9 +1049,11 @@ export class OpenAiAppServerItemEventBridge {
     const summary = Array.isArray(item["summary"])
       ? item["summary"].filter((entry): entry is string => typeof entry === "string")
       : [];
-    const messageId = this.#messages.reasoningId(itemId);
+    const messageId = this.#messages.reasoningId(context, itemId);
     const summaryText = summary.join("\n\n");
     const currentText = this.#messages.currentReasoningText(messageId);
+    // A terminal turn snapshot can be the first frame seen by a fresh Driver.
+    // Active-run Driver loss is terminal, so only a live instance can have a durable prefix to skip.
     const missingText = summaryText.startsWith(currentText)
       ? summaryText.slice(currentText.length)
       : currentText.length === 0
@@ -1062,7 +1076,7 @@ export class OpenAiAppServerItemEventBridge {
     if (missingText.length > 0) {
       this.#messages.ensureReasoning(messageId, events, false);
       events.push(
-        ...chunkOpenAiText(missingText).map((contentDelta, index): DriverEventInput => ({
+        ...chunkOpenAiText(missingText).map((contentDelta): DriverEventInput => ({
           delivery: "lossless",
           kind: "thought.delta",
           payload: {
@@ -1070,7 +1084,6 @@ export class OpenAiAppServerItemEventBridge {
             contentDelta,
             thoughtId: messageId,
           },
-          sourceEventId: `openai.reasoning.completed:${messageId}:${String(index)}`,
         })),
       );
     }
@@ -1153,7 +1166,7 @@ export class OpenAiAppServerItemEventBridge {
       kind: "tool.call.updated",
       payload: {
         ...(itemType === "collabAgentToolCall" && receiverThreadIds.length === 1
-          ? { agentId: receiverThreadIds[0] }
+          ? { agentId: toRuntimePublicId(receiverThreadIds[0]!, "openai-thread") }
           : {}),
         ...(toolResult === null ||
         toolResult.length === 0 ||
@@ -1169,7 +1182,11 @@ export class OpenAiAppServerItemEventBridge {
         status: terminalStatus,
         toolCallId: publicItemId,
       },
-      sourceEventId: `openai.item.completed:${publicTurnId}:${publicItemId}:0`,
+      sourceEventId: `${createRuntimeSourceEventId(
+        "openai.item.completed",
+        publicTurnId,
+        publicItemId,
+      )}:0`,
     });
     assertOpenAiDurableEventFits(events[0]!, `tool completion ${publicItemId}`);
     events.push({

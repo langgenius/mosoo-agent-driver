@@ -185,7 +185,7 @@ describe("OpenAI app-server agent task snapshots", () => {
     const replay = tasks(
       apply(state, { agentId: longId, agentPath: "/root/replayed", kind: "started" }),
     );
-    expect(first[0]).toMatchObject({ taskId: expect.stringMatching(/^openai-task:[\da-f]{64}$/) });
+    expect(first[0]).toMatchObject({ taskId: expect.stringMatching(/^rid1_[A-Za-z0-9_-]{43}$/) });
     expect(replay[0]).toMatchObject({ taskId: (first[0] as { taskId: string }).taskId });
     expect((first[0] as { title: string }).title).toHaveLength(4_095);
     expect(openAiAgentTasksClosedEvent()).toEqual({

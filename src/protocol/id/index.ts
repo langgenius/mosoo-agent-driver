@@ -20,6 +20,7 @@ const inputDriverIdPattern = new RegExp(DRIVER_ID_INPUT_PATTERN, "u");
 const driverIdAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const driverIdRandomLength = 16;
 const driverIdTimeLength = 10;
+const driverIdLength = driverIdTimeLength + driverIdRandomLength;
 const maxDriverIdTimeMs = 2 ** 48 - 1;
 
 let lastDriverIdTimeMs = -1;
@@ -142,6 +143,32 @@ function incrementCrockfordBase32(value: string): string {
   }
 
   return chars.join("");
+}
+
+export function createDriverIdFromBytes(bytes: Uint8Array): DriverId {
+  if (bytes.byteLength !== 16) {
+    throw new RangeError("Driver ID source must contain exactly 16 bytes.");
+  }
+
+  let value = 0n;
+  for (const byte of bytes) {
+    value = (value << 8n) | BigInt(byte);
+  }
+
+  let encoded = "";
+  for (let index = 0; index < driverIdLength; index += 1) {
+    encoded = driverIdAlphabet.charAt(Number(value & 31n)) + encoded;
+    value >>= 5n;
+  }
+  return brandDriverId(encoded);
+}
+
+export function driverIdTimeMs(id: DriverId): number {
+  let timeMs = 0;
+  for (const character of id.slice(0, driverIdTimeLength)) {
+    timeMs = timeMs * driverIdAlphabet.length + driverIdAlphabet.indexOf(character);
+  }
+  return timeMs;
 }
 
 export function createDriverId(): DriverId {

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
+import type { DriverEventInput } from "../src/protocol/events";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
-import { OpenAiPublicIdState } from "../src/runtimes/openai/app-server-event-state";
 import { parseServerNotification } from "../src/runtimes/openai/app-server-protocol-server";
 import { OpenAiTurnTracker } from "../src/runtimes/openai/app-server-turn-tracker";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
@@ -28,17 +28,156 @@ async function handleOfficialNotification(
 }
 
 describe("OpenAi app-server event bridge", () => {
-  test("keeps bounded provider identities stable and namespace distinct", () => {
-    const ids = new OpenAiPublicIdState();
+  test("keeps bounded provider identities stable across lifecycle boundaries", () => {
+    const { bridge } = createHarness();
     const nativeId = "native".repeat(100);
-    const publicItemId = ids.publicId(nativeId, "item");
-    const publicTurnId = ids.publicId(nativeId, "turn");
+    const publicItemId = bridge.mapToolCallId(nativeId);
+    const publicTurnId = bridge.publicTurnId(nativeId);
 
-    expect(ids.publicId(nativeId, "item")).toBe(publicItemId);
-    expect(ids.publicId(nativeId, "turn")).toBe(publicTurnId);
+    bridge.clearActiveTurns();
+
+    for (const candidate of [bridge, createHarness().bridge]) {
+      expect(candidate.mapToolCallId(nativeId)).toBe(publicItemId);
+      expect(candidate.publicTurnId(nativeId)).toBe(publicTurnId);
+    }
     expect(publicItemId).not.toBe(publicTurnId);
+    expect(publicItemId).toBe("rid1_KnwXRN9srTgnCleHSt-EmI8jC7h9g2foozL7GxrsP9o");
     expect(publicItemId.length).toBeLessThan(nativeId.length);
     expect(publicTurnId.length).toBeLessThan(nativeId.length);
+    expect(bridge.mapToolCallId(`rid1_${"x".repeat(43)}`)).not.toBe(`rid1_${"x".repeat(43)}`);
+    expect(bridge.mapToolCallId("\ud800".repeat(86))).not.toBe(
+      bridge.mapToolCallId("\ud801".repeat(86)),
+    );
+  });
+
+  test.each([
+    [
+      "agent message",
+      async (harness: ReturnType<typeof createHarness>, itemId: string, turnId: string) =>
+        harness.bridge.handleNotification(harness.context, "item/completed", {
+          item: { id: itemId, text: "stable reply", type: "agentMessage" },
+          threadId: "thread-1",
+          turnId,
+        }),
+    ],
+    [
+      "reasoning",
+      async (harness: ReturnType<typeof createHarness>, itemId: string, turnId: string) =>
+        harness.bridge.handleNotification(harness.context, "item/reasoning/summaryTextDelta", {
+          delta: "stable thought",
+          itemId,
+          summaryIndex: 0,
+          threadId: "thread-1",
+          turnId,
+        }),
+    ],
+    [
+      "tool",
+      async (harness: ReturnType<typeof createHarness>, itemId: string, turnId: string) =>
+        harness.bridge.handleNotification(harness.context, "item/started", {
+          item: { id: itemId, status: "inProgress", type: "commandExecution" },
+          threadId: "thread-1",
+          turnId,
+        }),
+    ],
+  ] as const)("keeps complete oversized %s replay events stable", async (_kind, replay) => {
+    const itemId = `item-${"i".repeat(300)}`;
+    const turnId = `turn-${"t".repeat(300)}`;
+    const attempts: DriverEventInput[][] = [];
+
+    for (let generation = 0; generation < 2; generation += 1) {
+      const harness = createHarness();
+      await replay(harness, itemId, turnId);
+      attempts.push(harness.events());
+    }
+
+    expect(attempts[0]?.length).toBeGreaterThan(0);
+    expect(attempts[1]).toEqual(attempts[0]);
+  });
+
+  test("keeps item messages and synthetic tool parents independent of notification order", async () => {
+    const project = async (order: readonly ("message" | "tool")[]) => {
+      const harness = createHarness();
+
+      for (const kind of order) {
+        if (kind === "message") {
+          await harness.bridge.handleNotification(harness.context, "item/completed", {
+            item: { id: "message-1", text: "reply", type: "agentMessage" },
+            threadId: "thread-1",
+            turnId: "turn-1",
+          });
+        } else {
+          await harness.bridge.handleNotification(harness.context, "item/started", {
+            item: { id: "tool-1", status: "inProgress", type: "commandExecution" },
+            threadId: "thread-1",
+            turnId: "turn-1",
+          });
+        }
+      }
+
+      const message = harness.events().find((event) => event.kind === "message.added");
+      const tool = harness
+        .events()
+        .find(
+          (event) =>
+            event.kind === "item.started" &&
+            readEventPayloadString(event, "itemType") === "tool_call",
+        );
+      return {
+        messageId: message === undefined ? null : readEventPayloadString(message, "messageId"),
+        toolParentId: tool === undefined ? null : readEventPayloadString(tool, "parentMessageId"),
+      };
+    };
+
+    const messageFirst = await project(["message", "tool"]);
+    const toolFirst = await project(["tool", "message"]);
+
+    expect(toolFirst).toEqual(messageFirst);
+    expect(toolFirst.messageId).not.toBe(toolFirst.toolParentId);
+  });
+
+  test("separates provider tuples and lone-surrogate identities", async () => {
+    const identities: Array<readonly [string | null, string | undefined, string | undefined]> = [];
+
+    for (const [turnId, itemId] of [
+      ["a", "b:c"],
+      ["a:b", "c"],
+      ["unicode", "\ud800".repeat(86)],
+      ["unicode", "\ud801".repeat(86)],
+    ]) {
+      const harness = createHarness();
+      await harness.bridge.handleNotification(harness.context, "item/completed", {
+        item: { id: itemId, text: "reply", type: "agentMessage" },
+        threadId: "thread-1",
+        turnId,
+      });
+      const started = harness.events().find((event) => event.kind === "message.started");
+      const added = harness.events().find((event) => event.kind === "message.added");
+      const toolHarness = createHarness();
+      await toolHarness.bridge.handleNotification(toolHarness.context, "item/started", {
+        item: { id: itemId, status: "inProgress", type: "commandExecution" },
+        threadId: "thread-1",
+        turnId,
+      });
+      identities.push([
+        started === undefined ? null : readEventPayloadString(started, "messageId"),
+        added?.sourceEventId,
+        toolHarness.events().find((event) => event.kind === "item.started")?.sourceEventId,
+      ]);
+    }
+
+    expect(new Set(identities.map(([messageId]) => messageId)).size).toBe(identities.length);
+    expect(new Set(identities.map(([, sourceEventId]) => sourceEventId)).size).toBe(
+      identities.length,
+    );
+    expect(new Set(identities.map(([, , sourceEventId]) => sourceEventId)).size).toBe(
+      identities.length,
+    );
+    expect(identities[0]).toEqual([
+      "10DF94GHQDTF5928TMBEZSWHQ4",
+      "openai.item.completed:sid1_U4oWh4UGZEw808sI5zy0_aOCd0-dwfUwV07Mia3XjNA:0",
+      "openai.item.started:sid1_0MMp18iqK51t_lCY7b8CZMB4CuwCFtDacjitEs2EkVE",
+    ]);
   });
 
   test("bounds terminal turn deduplication and clears it on shutdown", () => {
@@ -181,7 +320,7 @@ describe("OpenAi app-server event bridge", () => {
           taskId: "agent-1",
           title: "Sub-agent completed",
         },
-        sourceEventId: "openai.item.completed:turn-1:activity-1:0",
+        sourceEventId: "openai.derived:sid1_kECA0eVWvzfAvIr0LN7vWra6VGTB8rTQoAgf7EHr7Rg",
       },
     ]);
 
@@ -432,9 +571,57 @@ describe("OpenAi app-server event bridge", () => {
     const taskUpdate = harness.events().find((event) => event.kind === "agent.task.updated");
     const taskSnapshot = harness.events().find((event) => event.kind === "agent.tasks.replaced");
     const taskId = taskUpdate === undefined ? null : readEventPayloadString(taskUpdate, "taskId");
-    expect(taskId).toMatch(/^openai-task:[\da-f]{64}$/);
+    expect(taskId).toMatch(/^rid1_[A-Za-z0-9_-]{43}$/);
+    expect(taskUpdate === undefined ? null : readEventPayloadString(taskUpdate, "agentId")).toBe(
+      taskId,
+    );
     expect(taskSnapshot).toMatchObject({
       payload: { tasks: [{ taskId }] },
+    });
+  });
+
+  test("bounds collaboration thread identities consistently", async () => {
+    const harness = createHarness();
+    const nativeThreadId = `agent-${"a".repeat(300)}`;
+
+    await harness.bridge.handleNotification(harness.context, "item/completed", {
+      item: {
+        agentsStates: { [nativeThreadId]: { message: "done", status: "completed" } },
+        id: "collab-1",
+        model: null,
+        prompt: null,
+        reasoningEffort: null,
+        receiverThreadIds: [nativeThreadId],
+        senderThreadId: nativeThreadId,
+        status: "completed",
+        tool: "wait",
+        type: "collabAgentToolCall",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    const terminal = harness
+      .events()
+      .find(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          readEventPayloadString(event, "status") === "completed",
+      );
+    const agentId = terminal === undefined ? null : readEventPayloadString(terminal, "agentId");
+    const structuredOutput =
+      terminal?.payload !== null &&
+      typeof terminal?.payload === "object" &&
+      !Array.isArray(terminal.payload)
+        ? (terminal.payload as Record<string, unknown>)["structuredOutput"]
+        : null;
+
+    expect(agentId).toMatch(/^rid1_[A-Za-z0-9_-]{43}$/);
+    expect(JSON.stringify(structuredOutput)).not.toContain(nativeThreadId);
+    expect(structuredOutput).toMatchObject({
+      agentsStates: { [agentId!]: { message: "done", status: "completed" } },
+      receiverThreadIds: [agentId],
+      senderThreadId: agentId,
     });
   });
 
@@ -461,17 +648,49 @@ describe("OpenAi app-server event bridge", () => {
     expect(accepted.at(-1)?.events[0]?.payload).toMatchObject({
       entries: [{ content: "step two", status: "in_progress" }],
     });
-    expect(accepted.map((batch) => batch.events[0]?.sourceEventId)).toEqual([
-      "openai.plan.delta:turn-1:plan-1:0",
-      "openai.plan.delta:turn-1:plan-1:4",
-    ]);
-    expect(
-      harness.attempts
-        .filter((batch) => batch.reason === "driver.openai.plan.delta")
-        .slice(0, 2)
-        .map((batch) => batch.events[0]?.sourceEventId),
-    ).toEqual(["openai.plan.delta:turn-1:plan-1:0", "openai.plan.delta:turn-1:plan-1:0"]);
+    expect(accepted.every((batch) => batch.events[0]?.sourceEventId === undefined)).toBe(true);
     expect(JSON.stringify(accepted)).not.toContain("stepstep");
+  });
+
+  test("does not invent cross-process occurrence IDs for unsequenced provider updates", async () => {
+    const planHarness = createHarness();
+    for (const step of ["A", "B", "A"]) {
+      await planHarness.bridge.handleNotification(planHarness.context, "turn/plan/updated", {
+        explanation: null,
+        plan: [{ status: "inProgress", step }],
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+    }
+    const planEvents = planHarness.events().filter((event) => event.kind === "plan.updated");
+    expect(planEvents.map((event) => event.sourceEventId)).toEqual([
+      undefined,
+      undefined,
+      undefined,
+    ]);
+
+    const reasoningHarness = createHarness();
+    for (const delta of ["same", "same"]) {
+      await reasoningHarness.bridge.handleNotification(
+        reasoningHarness.context,
+        "item/reasoning/summaryTextDelta",
+        {
+          delta,
+          itemId: "reasoning-1",
+          summaryIndex: 0,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        },
+      );
+    }
+    const reasoningDeltas = reasoningHarness
+      .events()
+      .filter((event) => event.kind === "thought.delta");
+    expect(reasoningDeltas.map((event) => event.sourceEventId)).toEqual([undefined, undefined]);
+    expect(reasoningDeltas.map((event) => readEventPayloadString(event, "contentDelta"))).toEqual([
+      "same",
+      "same",
+    ]);
   });
 
   test("retries message start with the same identity after delivery rejection", async () => {

@@ -38,6 +38,7 @@ export function createClaudeAgentSdkHarness(
     replaceNativeSessionId: async (_context, previousSessionId, nextSessionId) => {
       nativeSessionResets.push([previousSessionId, nextSessionId]);
     },
+    sessionId: context.payload.execution.run.sessionId,
   });
 
   return {

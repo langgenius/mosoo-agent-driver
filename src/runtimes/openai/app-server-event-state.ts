@@ -2,13 +2,11 @@ import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { ProtocolError } from "../../contract";
-import { RuntimePublicIdState } from "../runtime-public-id-state";
-import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
+import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
+import { createRuntimeAssistantMessageId } from "../runtime-turn-transcript";
 import { toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
 import { readRecord } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
-
-export { RuntimePublicIdState as OpenAiPublicIdState } from "../runtime-public-id-state";
 
 export type OpenAiEventPush = (
   context: AgentDriverContext,
@@ -140,21 +138,16 @@ export class OpenAiMessageState {
   >();
   readonly #ended = new Set<MessageId>();
   readonly #itemSequences = new Map<string, number>();
-  readonly #itemByMessageId = new Map<MessageId, string>();
   readonly #itemMessageIds = new Map<string, MessageId>();
   readonly #reasoningEnded = new Set<string>();
-  readonly #reasoningIds = new RuntimeAssistantMessageIdIndex<string>();
   readonly #reasoningParts = new Map<string, Set<number>>();
   readonly #reasoningStarted = new Set<string>();
   readonly #reasoningTextById = new Map<string, string>();
   readonly #starting = new Map<MessageId, Promise<void>>();
   readonly #started = new Set<MessageId>();
   readonly #textById = new Map<MessageId, string>();
-  readonly #turnByMessageId = new Map<MessageId, string>();
-  readonly #turnMessages = new RuntimeAssistantMessageIdIndex<string>();
-  readonly #turnMessageIds = new Map<string, MessageId>();
-  readonly #turnMessageSequences = new Map<string, number>();
   readonly #turnNextItemSequences = new Map<string, number>();
+  readonly #turnParentMessageIds = new Map<string, MessageId>();
 
   appendText(messageId: MessageId, delta: string): void {
     if (delta.length === 0 || this.#ended.has(messageId)) {
@@ -263,19 +256,20 @@ export class OpenAiMessageState {
     turnId: string,
     push: OpenAiEventPush,
   ): Promise<MessageId> {
-    const existing = this.#turnMessageIds.get(turnId);
+    const existing = this.#turnParentMessageIds.get(turnId);
 
     if (existing !== undefined) {
       await this.ensureStarted(context, existing, push);
       return existing;
     }
 
-    const nextSequence = (this.#turnMessageSequences.get(turnId) ?? 0) + 1;
-    const generated = this.#turnMessages.getOrCreate(`${turnId}:${nextSequence}`);
+    const generated = createRuntimeAssistantMessageId(
+      context.payload.execution.run.sessionId,
+      "openai-message",
+      `turn:${JSON.stringify(turnId)}`,
+    );
     await this.ensureStarted(context, generated, push);
-    this.#turnMessageSequences.set(turnId, nextSequence);
-    this.#turnMessageIds.set(turnId, generated);
-    this.#turnByMessageId.set(generated, turnId);
+    this.#turnParentMessageIds.set(turnId, generated);
     return generated;
   }
 
@@ -284,31 +278,23 @@ export class OpenAiMessageState {
     input: { itemId: string; turnId: string },
     push: OpenAiEventPush,
   ): Promise<MessageId> {
-    const itemKey = `${input.turnId}:${input.itemId}`;
+    const itemKey = JSON.stringify([input.turnId, input.itemId]);
     const existing = this.#itemMessageIds.get(itemKey);
 
     if (existing !== undefined) {
-      if (!this.#ended.has(existing)) {
-        this.#turnMessageIds.set(input.turnId, existing);
-      }
       await this.ensureStarted(context, existing, push);
       return existing;
     }
 
-    const activeMessageId = this.#turnMessageIds.get(input.turnId);
-    const messageId =
-      activeMessageId !== undefined &&
-      !this.#ended.has(activeMessageId) &&
-      !this.#itemByMessageId.has(activeMessageId)
-        ? activeMessageId
-        : this.#turnMessages.getOrCreate(`item:${itemKey}`);
+    const messageId = createRuntimeAssistantMessageId(
+      context.payload.execution.run.sessionId,
+      "openai-message",
+      `item:${itemKey}`,
+    );
 
     await this.ensureStarted(context, messageId, push);
     this.#observeItem(itemKey, input.turnId);
     this.#itemMessageIds.set(itemKey, messageId);
-    this.#itemByMessageId.set(messageId, itemKey);
-    this.#turnMessageIds.set(input.turnId, messageId);
-    this.#turnByMessageId.set(messageId, input.turnId);
     return messageId;
   }
 
@@ -319,7 +305,7 @@ export class OpenAiMessageState {
     text: string;
     turnId: string;
   }): boolean {
-    const itemKey = `${input.turnId}:${input.itemId}`;
+    const itemKey = JSON.stringify([input.turnId, input.itemId]);
     const sequence = this.#observeItem(itemKey, input.turnId);
     if (!this.needsSnapshot(input)) {
       return false;
@@ -336,7 +322,7 @@ export class OpenAiMessageState {
     text: string;
     turnId: string;
   }): boolean {
-    const previous = this.#completedSnapshots.get(`${input.turnId}:${input.itemId}`);
+    const previous = this.#completedSnapshots.get(JSON.stringify([input.turnId, input.itemId]));
     return (
       previous?.messageId !== input.messageId ||
       previous.phase !== input.phase ||
@@ -425,16 +411,6 @@ export class OpenAiMessageState {
 
     this.#ended.add(messageId);
     this.#started.delete(messageId);
-    const turnId = this.#turnByMessageId.get(messageId);
-
-    if (turnId !== undefined) {
-      this.#turnByMessageId.delete(messageId);
-
-      if (this.#turnMessageIds.get(turnId) === messageId) {
-        this.#turnMessageIds.delete(turnId);
-      }
-    }
-
     return true;
   }
 
@@ -446,8 +422,12 @@ export class OpenAiMessageState {
     return this.#reasoningEnded.has(messageId);
   }
 
-  reasoningId(itemId: string): string {
-    return this.#reasoningIds.getOrCreate(itemId);
+  reasoningId(context: AgentDriverContext, itemId: string): MessageId {
+    return createRuntimeAssistantMessageId(
+      context.payload.execution.run.sessionId,
+      "openai-reasoning",
+      itemId,
+    );
   }
 
   isReasoningStarted(messageId: string): boolean {
@@ -465,28 +445,23 @@ export class OpenAiMessageState {
   }
 
   messageForTurn(turnId: string): MessageId | null {
-    return this.#turnMessageIds.get(turnId) ?? null;
+    return this.#turnParentMessageIds.get(turnId) ?? null;
   }
 
   reset(): void {
     this.#completedSnapshots.clear();
     this.#ended.clear();
     this.#itemSequences.clear();
-    this.#itemByMessageId.clear();
     this.#itemMessageIds.clear();
     this.#reasoningEnded.clear();
-    this.#reasoningIds.reset();
     this.#reasoningParts.clear();
     this.#reasoningStarted.clear();
     this.#reasoningTextById.clear();
     this.#starting.clear();
     this.#started.clear();
     this.#textById.clear();
-    this.#turnByMessageId.clear();
-    this.#turnMessages.reset();
-    this.#turnMessageIds.clear();
-    this.#turnMessageSequences.clear();
     this.#turnNextItemSequences.clear();
+    this.#turnParentMessageIds.clear();
   }
 
   #observeItem(itemKey: string, turnId: string): number {
@@ -505,7 +480,6 @@ export class OpenAiMessageState {
 
 export class OpenAiItemState {
   readonly #completed = new Set<string>();
-  readonly #ids = new RuntimePublicIdState();
 
   isCompleted(itemId: string): boolean {
     return this.#completed.has(itemId);
@@ -521,12 +495,11 @@ export class OpenAiItemState {
   }
 
   publicId(nativeId: string, namespace: "item" | "turn" = "item"): string {
-    return this.#ids.publicId(nativeId, namespace);
+    return toRuntimePublicId(nativeId, namespace === "item" ? "openai-item" : "openai-turn");
   }
 
   reset(): void {
     this.#completed.clear();
-    this.#ids.reset();
   }
 }
 
@@ -578,7 +551,11 @@ export class OpenAiToolState {
             parentMessageId: input.parentMessageId,
             title: input.toolCallName,
           },
-          sourceEventId: `openai.item.started:${input.sourceScope}:${input.publicToolCallId}`,
+          sourceEventId: createRuntimeSourceEventId(
+            "openai.item.started",
+            input.sourceScope,
+            input.publicToolCallId,
+          ),
         },
         {
           kind: "tool.call.updated",
@@ -589,7 +566,11 @@ export class OpenAiToolState {
             title: input.toolCallName,
             toolCallId: input.publicToolCallId,
           },
-          sourceEventId: `openai.tool.started:${input.sourceScope}:${input.publicToolCallId}`,
+          sourceEventId: createRuntimeSourceEventId(
+            "openai.tool.started",
+            input.sourceScope,
+            input.publicToolCallId,
+          ),
         },
       ];
       for (const event of events) {
@@ -653,11 +634,6 @@ export class OpenAiToolState {
 
 export class OpenAiPlanState {
   readonly #plans = new Map<string, { content: string; status: "completed" | "in_progress" }>();
-  readonly #turnVersions = new Map<string, number>();
-
-  currentLength(itemId: string): number {
-    return this.#plans.get(itemId)?.content.length ?? 0;
-  }
 
   appendDelta(itemId: string, delta: string): void {
     const current = this.#plans.get(itemId);
@@ -710,14 +686,5 @@ export class OpenAiPlanState {
 
   reset(): void {
     this.#plans.clear();
-    this.#turnVersions.clear();
-  }
-
-  turnVersion(turnId: string): number {
-    return this.#turnVersions.get(turnId) ?? 0;
-  }
-
-  advanceTurnVersion(turnId: string): void {
-    this.#turnVersions.set(turnId, this.turnVersion(turnId) + 1);
   }
 }

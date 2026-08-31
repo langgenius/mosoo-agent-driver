@@ -26,7 +26,7 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
         const requestSignal = signal ?? new AbortController().signal;
         permissionInputs.push(input);
         permissionSignals.push(requestSignal);
-        if (permissionInputs.length === 3) {
+        if (permissionInputs.length === 4) {
           permissionStarted.resolve();
         }
         if (input.toolKind === "item/permissions/requestApproval") {
@@ -77,6 +77,10 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
       ],
       itemId: "tool-1",
     });
+    handler.dispatch("item/commandExecution/requestApproval", "3", {
+      command: "npm test",
+      itemId: "tool-string-3",
+    });
     handler.dispatch("item/fileChange/requestApproval", 4, {
       grantRoot: "/workspace",
       itemId: "tool-2",
@@ -95,6 +99,7 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
       expect.arrayContaining([
         { id: 1, result: { currentTimeAt: expect.any(Number) } },
         { id: 3, result: { decision: "cancel" } },
+        { id: "3", result: { decision: "accept" } },
         {
           id: 5,
           result: {
@@ -119,6 +124,7 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
         command: "npm test",
         cwd: "/workspace",
       }),
+      expect.objectContaining({ command: "npm test", itemId: "tool-string-3" }),
       expect.objectContaining({ grantRoot: "/workspace", reason: "Apply changes" }),
       expect.objectContaining({
         cwd: "/workspace",
@@ -128,8 +134,15 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
     ]);
     expect(permissionInputs.map(({ title }) => title)).toEqual([
       "Approve command execution",
+      "Approve command execution",
       "Approve file changes",
       "Approve runtime permissions",
+    ]);
+    expect(permissionInputs.map(({ requestId }) => requestId)).toEqual([
+      "item/commandExecution/requestApproval:number:3",
+      "item/commandExecution/requestApproval:string:3",
+      "item/fileChange/requestApproval:number:4",
+      "item/permissions/requestApproval:number:5",
     ]);
     expect(rejections.some((response) => response.id === 3)).toBe(false);
     expect(errors).toEqual([]);
@@ -181,7 +194,7 @@ test("OpenAI server request cancellation propagates permission delivery failures
   const permissionStarted = Promise.withResolvers<void>();
   const deliveryGate = Promise.withResolvers<void>();
   const deliveryError = new PermissionEventDeliveryError(
-    "item/commandExecution/requestApproval:3",
+    "item/commandExecution/requestApproval:number:3",
     "resolved",
     new Error("event sink unavailable"),
   );

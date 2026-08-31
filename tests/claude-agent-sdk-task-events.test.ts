@@ -85,7 +85,7 @@ describe("Claude Agent SDK task snapshots", () => {
       payload: {
         tasks: [
           {
-            taskId: expect.stringMatching(/^claude-task:[a-f0-9]{64}$/),
+            taskId: expect.stringMatching(/^rid1_[A-Za-z0-9_-]{43}$/),
             title: expect.stringMatching(/^x{4095}$/),
           },
           { taskId: "empty-metadata" },

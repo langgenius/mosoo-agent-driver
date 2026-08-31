@@ -1,5 +1,6 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
+import { toRuntimePublicId } from "../runtime-public-id";
 import { isRecord, readString } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
 
@@ -102,7 +103,9 @@ export function claudePermissionDenialAdvisory(
   }
 
   return {
-    ...(message.agent_id === undefined ? {} : { agentId: message.agent_id }),
+    ...(message.agent_id === undefined
+      ? {}
+      : { agentId: toRuntimePublicId(message.agent_id, "claude-agent") }),
     ...(message.decision_reason === undefined ? {} : { decisionReason: message.decision_reason }),
     ...(message.decision_reason_type === undefined
       ? {}

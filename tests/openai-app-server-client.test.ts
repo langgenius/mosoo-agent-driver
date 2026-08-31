@@ -1229,7 +1229,7 @@ setInterval(() => {}, 1000);
         permissionAborted.resolve();
         await permissionGate.promise;
         throw new PermissionEventDeliveryError(
-          "item/commandExecution/requestApproval:41",
+          "item/commandExecution/requestApproval:number:41",
           "resolved",
           new Error("event sink unavailable"),
         );

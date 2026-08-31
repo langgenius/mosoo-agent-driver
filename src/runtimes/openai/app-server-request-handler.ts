@@ -170,7 +170,7 @@ export class OpenAiAppServerRequestHandler {
     signal: AbortSignal,
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
-    const requestId = `${method}:${String(id)}`;
+    const requestId = `${method}:${typeof id}:${String(id)}`;
 
     switch (method) {
       case "currentTime/read": {

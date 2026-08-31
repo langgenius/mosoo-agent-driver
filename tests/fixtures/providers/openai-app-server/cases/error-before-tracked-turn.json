@@ -51,7 +51,7 @@
       "delivery": "lossless",
       "kind": "agent.tasks.replaced",
       "payload": { "tasks": [] },
-      "sourceEventId": "openai.turn.failed.closure:turn-1:0",
+      "sourceEventId": "openai.derived:sid1_mw1rK-IfsZaez6IOgvoBLwbJVWO3Ou-eANcCdudVblc",
       "visibility": "participant"
     },
     {

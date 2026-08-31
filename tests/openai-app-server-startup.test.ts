@@ -479,7 +479,11 @@ process.stdin.on("data", (chunk) => {
         }
         if (
           holdTurnTiming &&
-          input.events.some((event) => event.sourceEventId === "openai.provider.turn_start:turn-1")
+          input.events.some(
+            (event) =>
+              event.kind === "runtime.timing.recorded" &&
+              event.native?.eventName === "provider.turn_start",
+          )
         ) {
           turnTimingEntered.resolve();
           await turnTimingGate.promise;
@@ -948,9 +952,10 @@ describe("OpenAI app-server startup", () => {
       );
       const started = harness.events.find((event) => event.kind === "run.started");
       const publicTurnId = timing?.native?.turnId;
-      expect(isDriverId(publicTurnId)).toBe(true);
+      expect(publicTurnId).not.toBe(nativeTurnId);
+      expect(Buffer.byteLength(publicTurnId ?? "", "utf8")).toBeLessThanOrEqual(256);
       expect(started?.native?.turnId).toBe(publicTurnId);
-      expect(timing?.sourceEventId).toBe(`openai.provider.turn_start:${publicTurnId}`);
+      expect(isDriverId(timing?.sourceEventId)).toBe(true);
       expect(
         harness.events.every((event) => Buffer.byteLength(JSON.stringify(event)) < 1_048_576),
       ).toBe(true);

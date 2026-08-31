@@ -1,17 +1,17 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
-import { createDriverId, type RunId } from "../../protocol/id";
+import { createDriverId, driverIdTimeMs, type RunId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import {
   OpenAiItemState,
   OpenAiMessageState,
   OpenAiPlanState,
-  OpenAiPublicIdState,
   OpenAiSessionUsageState,
   OpenAiToolState,
   type OpenAiTerminalOutcome,
 } from "./app-server-event-state";
+import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
 import { chunkOpenAiText, OpenAiAppServerItemEventBridge } from "./app-server-item-events";
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
@@ -141,13 +141,28 @@ function turnClosureEvents(input: {
   publicTurnId: string;
   runId?: RunId | undefined;
 }): DriverEventInput[] {
-  return input.events.map((event, index) => ({
-    ...event,
-    ...(event.runId === undefined && input.runId !== undefined ? { runId: input.runId } : {}),
-    sourceEventId:
-      event.sourceEventId ??
-      `openai.${input.eventName}.closure:${input.publicTurnId}:${String(index)}`,
-  }));
+  const sourcePrefix = createRuntimeSourceEventId(
+    `openai.${input.eventName}.closure`,
+    "turn",
+    input.publicTurnId,
+  );
+  return input.events.map((event, index) => {
+    const scopedEvent = {
+      ...event,
+      ...(event.runId === undefined && input.runId !== undefined ? { runId: input.runId } : {}),
+    };
+    return {
+      ...scopedEvent,
+      sourceEventId:
+        event.sourceEventId ??
+        createRuntimeSourceEventId(
+          "openai.derived",
+          sourcePrefix,
+          index,
+          JSON.stringify(scopedEvent),
+        ),
+    };
+  });
 }
 
 export class OpenAiAppServerEventBridge {
@@ -156,7 +171,6 @@ export class OpenAiAppServerEventBridge {
   readonly #messages = new OpenAiMessageState();
   readonly #options: OpenAiAppServerEventBridgeOptions;
   readonly #plans = new OpenAiPlanState();
-  readonly #publicTurnIds = new OpenAiPublicIdState();
   readonly #tools = new OpenAiToolState();
   readonly #turnStarts = new Map<string, Promise<void>>();
   readonly #turns = new OpenAiTurnTracker();
@@ -188,7 +202,6 @@ export class OpenAiAppServerEventBridge {
 
   clearActiveTurns(): void {
     this.#turnStarts.clear();
-    this.#publicTurnIds.reset();
     this.#turns.clearActiveTurns();
     this.#itemEvents.reset();
     this.#usage.reset();
@@ -606,7 +619,7 @@ export class OpenAiAppServerEventBridge {
 
   async publishNativeResumeRef(context: AgentDriverContext): Promise<void> {
     const threadId = this.#options.requireThreadId();
-    const publicThreadId = this.#publicTurnIds.publicId(threadId, "thread");
+    const publicThreadId = toRuntimePublicId(threadId, "openai-thread");
     await this.#push(context, "driver.openai.native_resume_ref.updated", [
       {
         kind: "runtime.resume.updated",
@@ -623,6 +636,10 @@ export class OpenAiAppServerEventBridge {
     context: AgentDriverContext,
     input: { runId?: RunId | undefined; turnId: string },
   ): Promise<void> {
+    const identityRunId = input.runId ?? context.ports.eventSink.currentRunId();
+    if (identityRunId === null) {
+      return;
+    }
     if (this.#turns.hasTurnStarted(input.turnId)) {
       return;
     }
@@ -643,7 +660,7 @@ export class OpenAiAppServerEventBridge {
           }),
           kind: "run.started",
           payload: {
-            startedAt: new Date().toISOString(),
+            startedAt: new Date(driverIdTimeMs(identityRunId)).toISOString(),
           },
         },
       ]);
@@ -828,7 +845,7 @@ export class OpenAiAppServerEventBridge {
           ...toBoundedOpenAiTelemetry({ processId }, ["processId"]),
           itemId: publicItemId,
           status: "running",
-          threadId: this.#publicTurnIds.publicId(threadId, "thread"),
+          threadId: toRuntimePublicId(threadId, "openai-thread"),
           turnId: this.publicTurnId(turnId),
         },
       },

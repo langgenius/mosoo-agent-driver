@@ -221,11 +221,12 @@ describe("Claude Agent SDK query options", () => {
     );
 
     const abortController = new AbortController();
+    const nativeAgentId = `subagent-${"a".repeat(300)}`;
     const result = options.canUseTool?.(
       "Bash",
       { command: "pwd" },
       {
-        agentID: "subagent-1",
+        agentID: nativeAgentId,
         blockedPath: "/workspace/secret",
         decisionReason: "Path is outside the allowed roots.",
         description: "Read access to /workspace/secret",
@@ -253,7 +254,6 @@ describe("Claude Agent SDK query options", () => {
     await drainClaudeTasks(permissionTasks);
     expect(permissionTasks.size).toBe(0);
     expect(permissionInput).toMatchObject({
-      agentId: "subagent-1",
       blockedPath: "/workspace/secret",
       decisionReason: "Path is outside the allowed roots.",
       description: "Read access to /workspace/secret",
@@ -265,6 +265,9 @@ describe("Claude Agent SDK query options", () => {
       requestId: "permission-request-1",
       toolCallId: "tool-1",
     });
+    const publicAgentId = (permissionInput as { agentId?: string } | null)?.agentId;
+    expect(publicAgentId).toMatch(/^rid1_[A-Za-z0-9_-]{43}$/);
+    expect(publicAgentId).not.toBe(nativeAgentId);
     expect(permissionSignal).toBe(abortController.signal);
   });
 

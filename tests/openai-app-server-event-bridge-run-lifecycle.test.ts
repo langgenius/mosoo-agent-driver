@@ -344,7 +344,7 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
-  test("rotates assistant message identity after each completed agent item", async () => {
+  test("isolates assistant items from the turn-scoped tool parent", async () => {
     const { bridge, context, events } = createHarness();
 
     const progressMessages = [
@@ -450,8 +450,10 @@ describe("OpenAi app-server event bridge", () => {
       .map((event) => readEventPayloadString(event, "parentMessageId"))
       .find((messageId): messageId is string => messageId !== null);
 
-    expect(toolParentMessageId).toBe(assistantMessages.at(-1)?.messageId);
-    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(4);
+    expect(assistantMessages.some(({ messageId }) => messageId === toolParentMessageId)).toBe(
+      false,
+    );
+    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(5);
     expect(events().filter((event) => event.kind === "run.completed")).toHaveLength(1);
   });
 
@@ -672,7 +674,6 @@ describe("OpenAi app-server event bridge", () => {
           ],
           source: "driver",
         },
-        sourceEventId: "openai.turn.plan:turn-1:0",
       },
       {
         kind: "plan.updated",
@@ -691,7 +692,6 @@ describe("OpenAi app-server event bridge", () => {
           ],
           source: "driver",
         },
-        sourceEventId: "openai.turn.plan:turn-1:1",
       },
     ]);
   });

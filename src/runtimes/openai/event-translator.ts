@@ -1,4 +1,5 @@
 import type { DriverEventInput } from "../../protocol/events";
+import { toRuntimePublicId } from "../runtime-public-id";
 import {
   isRecord,
   readArray,
@@ -95,15 +96,24 @@ export function toOpenAiCollaborationOutput(item: JsonObject): JsonObject | null
     return null;
   }
 
+  const agentsStates = readRecord(item, "agentsStates") ?? {};
+  const senderThreadId = readString(item, "senderThreadId");
+
   return {
-    agentsStates: readRecord(item, "agentsStates") ?? {},
+    agentsStates: Object.fromEntries(
+      Object.entries(agentsStates).map(([threadId, state]) => [
+        toRuntimePublicId(threadId, "openai-thread"),
+        state,
+      ]),
+    ),
     model: readString(item, "model"),
     prompt: readString(item, "prompt"),
     reasoningEffort: readString(item, "reasoningEffort"),
-    receiverThreadIds: readArray(item, "receiverThreadIds").filter(
-      (entry): entry is string => typeof entry === "string",
-    ),
-    senderThreadId: readString(item, "senderThreadId"),
+    receiverThreadIds: readArray(item, "receiverThreadIds")
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((threadId) => toRuntimePublicId(threadId, "openai-thread")),
+    senderThreadId:
+      senderThreadId === null ? null : toRuntimePublicId(senderThreadId, "openai-thread"),
     status: readString(item, "status"),
     tool: readString(item, "tool"),
   };

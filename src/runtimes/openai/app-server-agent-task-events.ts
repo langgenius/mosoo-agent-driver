@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
-
 import type { DriverEventInput } from "../../protocol/events";
+import { toRuntimePublicId } from "../runtime-public-id";
 import {
   assertOpenAiDurableEventFits,
   MAX_OPENAI_DURABLE_EVENT_BYTES,
@@ -9,7 +8,6 @@ import {
 const MAX_OPENAI_ACTIVE_AGENT_TASKS = 1_024;
 const MAX_OPENAI_CLOSED_AGENT_TASKS = 1_024;
 const MAX_OPENAI_VISIBLE_AGENT_TASKS = 256;
-const MAX_OPENAI_AGENT_TASK_ID_BYTES = 256;
 const MAX_OPENAI_AGENT_TASK_TEXT_LENGTH = 4_096;
 const OPENAI_AGENT_TASK_EVENT_ENVELOPE_RESERVE_BYTES = 1_024;
 
@@ -31,9 +29,7 @@ interface OpenAiAgentTaskUpdate {
 }
 
 export function toOpenAiAgentTaskId(nativeTaskId: string): string {
-  return Buffer.byteLength(nativeTaskId, "utf8") <= MAX_OPENAI_AGENT_TASK_ID_BYTES
-    ? nativeTaskId
-    : `openai-task:${createHash("sha256").update(nativeTaskId).digest("hex")}`;
+  return toRuntimePublicId(nativeTaskId, "openai-thread");
 }
 
 function boundedTaskText(value: string): string | undefined {

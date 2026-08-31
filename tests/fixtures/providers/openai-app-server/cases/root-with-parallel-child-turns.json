@@ -191,7 +191,7 @@
         "parentMessageId": "<driver-id-2>",
         "title": "Spawn agent"
       },
-      "sourceEventId": "openai.item.started:turn-root:agent-call-1"
+      "sourceEventId": "openai.item.started:sid1_ZbP7VMPfxU99NO5_Ssl7dpRsfsJCg5iDDTS3opi8UyQ"
     },
     {
       "kind": "tool.call.updated",
@@ -202,7 +202,7 @@
         "title": "Spawn agent",
         "toolCallId": "agent-call-1"
       },
-      "sourceEventId": "openai.tool.started:turn-root:agent-call-1"
+      "sourceEventId": "openai.tool.started:sid1_x5P0XypwtBPbQ87N6EdslwKLXsWaZ2Wsw5cgxVjLkKQ"
     },
     {
       "kind": "tool.call.updated",
@@ -223,7 +223,7 @@
         },
         "toolCallId": "agent-call-1"
       },
-      "sourceEventId": "openai.item.completed:turn-root:agent-call-1:0"
+      "sourceEventId": "openai.item.completed:sid1_C8cwMXkrQNCQEgerqw8tRi-Enh7ZKfj_DA9i9vH-rhU:0"
     },
     {
       "kind": "item.completed",
@@ -232,22 +232,27 @@
         "itemType": "tool_call",
         "status": "completed"
       },
-      "sourceEventId": "openai.item.completed:turn-root:agent-call-1:1"
+      "sourceEventId": "openai.derived:sid1_5GlNQBVpErPuMjUZcwLG6BitzcN1MSXZRXotq6VljPc"
+    },
+    {
+      "kind": "message.started",
+      "payload": { "messageId": "<driver-id-3>", "role": "agent" },
+      "sourceEventId": "openai.message.started:<driver-id-3>"
     },
     {
       "delivery": "lossless",
       "kind": "message.added",
       "payload": {
         "content": "PARENT_OK: CHILD_A + CHILD_B",
-        "messageId": "<driver-id-2>",
+        "messageId": "<driver-id-3>",
         "role": "agent"
       },
-      "sourceEventId": "openai.item.completed:turn-root:message-parent:0"
+      "sourceEventId": "openai.item.completed:sid1_FjjaUjXqCeULq2o7LJ4Ia93QFJqz2B5kI5iVqKiW9uI:0"
     },
     {
       "kind": "message.completed",
-      "payload": { "messageId": "<driver-id-2>", "role": "agent" },
-      "sourceEventId": "openai.item.completed:turn-root:message-parent:1"
+      "payload": { "messageId": "<driver-id-3>", "role": "agent" },
+      "sourceEventId": "openai.derived:sid1_hw9aor_2uReuaZl1eJIaXyugelmcCDTogRNGzqyELbQ"
     },
     {
       "kind": "runtime.resume.updated",
@@ -259,8 +264,14 @@
       "kind": "agent.tasks.replaced",
       "payload": { "tasks": [] },
       "runId": "<driver-id>",
-      "sourceEventId": "openai.turn.completed.closure:turn-root:0",
+      "sourceEventId": "openai.derived:sid1_r5WSt7u4mCiLVpw75XQhDXCCtYBUw-StSBWHAbAdolk",
       "visibility": "participant"
+    },
+    {
+      "kind": "message.completed",
+      "payload": { "messageId": "<driver-id-2>", "role": "agent" },
+      "runId": "<driver-id>",
+      "sourceEventId": "openai.derived:sid1_urrGMu3mQ34ngjJJU5uUqSjpIbhmCWsyIKYxjFeCmf4"
     },
     {
       "kind": "run.completed",
@@ -270,7 +281,7 @@
         "turnId": "turn-root"
       },
       "payload": {
-        "finalMessageId": "<driver-id-2>",
+        "finalMessageId": "<driver-id-3>",
         "stopReason": "end_turn"
       },
       "runId": "<driver-id>",

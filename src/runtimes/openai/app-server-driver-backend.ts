@@ -10,13 +10,14 @@ import {
   toDurationMs,
 } from "../../core/driver-runtime-timing";
 import { summarizePath, summarizeRuntimeCommandInput } from "../../observability/driver-debug";
-import type { RunId } from "../../protocol/id";
+import { driverIdTimeMs, type RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
+import { createRuntimeSourceEventId } from "../runtime-public-id";
 import {
   buildNativeRuntimeSystemPrompt,
   computeRuntimeBootstrapDigest,
@@ -574,7 +575,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
                 ],
                 runId,
                 sessionId: context.payload.execution.run.sessionId,
-                sourceEventId: `openai.provider.turn_start:${publicTurnId}`,
                 stage: "driver_turn",
                 startedAt: new Date(turnStartRequestedAtMs).toISOString(),
                 native: {
@@ -665,6 +665,11 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       error: protocolError,
       kind: "failed",
     });
+    const closureSourcePrefix = createRuntimeSourceEventId(
+      "openai.provider.failed.closure",
+      "run",
+      runId,
+    );
 
     await this.#eventPublisher.pushTerminal(
       context,
@@ -673,12 +678,17 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         {
           ...taskClosure,
           runId,
-          sourceEventId: `openai.provider.failed.closure:${runId}:0`,
+          sourceEventId: createRuntimeSourceEventId(
+            "openai.derived",
+            closureSourcePrefix,
+            0,
+            JSON.stringify({ ...taskClosure, runId }),
+          ),
         },
         {
           kind: "run.started",
           payload: {
-            startedAt: new Date().toISOString(),
+            startedAt: new Date(driverIdTimeMs(runId)).toISOString(),
           },
           runId,
           sourceEventId: `openai.provider.failed.started:${runId}`,
@@ -687,7 +697,13 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           ...event,
           runId,
           sourceEventId:
-            event.sourceEventId ?? `openai.provider.failed.closure:${runId}:${String(index + 1)}`,
+            event.sourceEventId ??
+            createRuntimeSourceEventId(
+              "openai.derived",
+              closureSourcePrefix,
+              index + 1,
+              JSON.stringify({ ...event, runId }),
+            ),
         })),
       ],
       {
@@ -713,6 +729,11 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     const [taskClosure, ...itemClosures] = this.#events.turnStartTerminalEvents({
       kind: "cancelled",
     });
+    const closureSourcePrefix = createRuntimeSourceEventId(
+      "openai.turn_start.cancelled.closure",
+      "run",
+      runId,
+    );
     await this.#eventPublisher.pushTerminal(
       context,
       "driver.openai.turn_start.cancelled",
@@ -720,12 +741,17 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         {
           ...taskClosure,
           runId,
-          sourceEventId: `openai.turn_start.cancelled.closure:${runId}:0`,
+          sourceEventId: createRuntimeSourceEventId(
+            "openai.derived",
+            closureSourcePrefix,
+            0,
+            JSON.stringify({ ...taskClosure, runId }),
+          ),
         },
         {
           kind: "run.started",
           payload: {
-            startedAt: new Date().toISOString(),
+            startedAt: new Date(driverIdTimeMs(runId)).toISOString(),
           },
           runId,
           sourceEventId: `openai.turn_start.cancelled.started:${runId}`,
@@ -745,7 +771,12 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           runId,
           sourceEventId:
             event.sourceEventId ??
-            `openai.turn_start.cancelled.closure:${runId}:${String(index + 1)}`,
+            createRuntimeSourceEventId(
+              "openai.derived",
+              closureSourcePrefix,
+              index + 1,
+              JSON.stringify({ ...event, runId }),
+            ),
         })),
       ],
       {

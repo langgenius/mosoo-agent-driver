@@ -1,22 +1,21 @@
-import { createDriverId } from "../protocol/id";
-import type { MessageId } from "../protocol/id";
+import { createHash } from "node:crypto";
 
-export class RuntimeAssistantMessageIdIndex<TKey extends string> {
-  readonly #messageIds = new Map<TKey, MessageId>();
+import { createDriverIdFromBytes } from "../protocol/id";
+import type { MessageId, SessionId } from "../protocol/id";
 
-  getOrCreate(key: TKey): MessageId {
-    const existing = this.#messageIds.get(key);
+type RuntimeAssistantMessageNamespace =
+  | "claude-assistant"
+  | "claude-auxiliary"
+  | "openai-message"
+  | "openai-reasoning";
 
-    if (existing !== undefined) {
-      return existing;
-    }
-
-    const messageId = createDriverId() as MessageId;
-    this.#messageIds.set(key, messageId);
-    return messageId;
-  }
-
-  reset(): void {
-    this.#messageIds.clear();
-  }
+export function createRuntimeAssistantMessageId(
+  sessionId: SessionId,
+  namespace: RuntimeAssistantMessageNamespace,
+  key: string,
+): MessageId {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(["mosoo.runtime-assistant-message-id/v1", sessionId, namespace, key]))
+    .digest();
+  return createDriverIdFromBytes(digest.subarray(0, 16)) as MessageId;
 }

@@ -13,7 +13,7 @@ import { toRuntimeEventInput } from "../src/runtime-events";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeDurableEventTooLargeError } from "../src/runtimes/claude/agent-sdk-event-writer";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
-import { ClaudePublicToolCallIdState } from "../src/runtimes/claude/agent-sdk-tool-id";
+import { toRuntimePublicId } from "../src/runtimes/runtime-public-id";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { CMA_MAX_EVENT_BYTES, encodeCmaSseRecord } from "../src/stores/cma-store";
 import { createCmaMemoryStore } from "../src/stores/memory";
@@ -46,9 +46,9 @@ function successResult(input: {
   } as unknown as SDKMessage;
 }
 
-function createCmaHarness() {
-  const runId = createDriverId() as RunId;
-  const sessionId = createDriverId() as SessionId;
+function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: SessionId } = {}) {
+  const runId = ids.runId ?? (createDriverId() as RunId);
+  const sessionId = ids.sessionId ?? (createDriverId() as SessionId);
   const events: DriverEventInput[] = [];
   const sseFrameBytes: number[] = [];
   const context = createAgentDriverContext({
@@ -78,16 +78,16 @@ function createCmaHarness() {
       sseFrameBytes.push(...records.map((record) => encodeCmaSseRecord(record).byteLength));
     }
   };
-  const toolCallIds = new ClaudePublicToolCallIdState();
   const translator = new ClaudeAgentSdkMessageTranslator({
-    publicToolCallId: (nativeToolCallId) => toolCallIds.publicId(nativeToolCallId),
+    publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
     push: async (_context, _reason, batch) => append(batch),
     pushTerminal: async (_context, _reason, closures, terminal) => append([...closures, terminal]),
     recordNativeSessionId: async () => {},
     replaceNativeSessionId: async () => {},
+    sessionId,
   });
 
-  return { context, events, runId, sseFrameBytes, translator };
+  return { context, events, runId, sessionId, sseFrameBytes, translator };
 }
 
 describe("Claude Agent SDK durable event boundaries", () => {
@@ -354,6 +354,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
         publisher.pushTerminal(pushContext, reason, closures, terminal),
       recordNativeSessionId: async () => {},
       replaceNativeSessionId: async () => {},
+      sessionId: context.payload.execution.run.sessionId,
     });
 
     let failure: ClaudeDurableEventTooLargeError | null = null;
@@ -431,6 +432,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
         publisher.pushTerminal(pushContext, reason, closures, terminal),
       recordNativeSessionId: async () => {},
       replaceNativeSessionId: async () => {},
+      sessionId: context.payload.execution.run.sessionId,
     });
 
     await expect(
@@ -466,10 +468,9 @@ describe("Claude Agent SDK durable event boundaries", () => {
 
   test("maps oversized native tool IDs and rejects oversized tool names before durable state", async () => {
     const accepted = createCmaHarness();
+    const replayed = createCmaHarness({ runId: accepted.runId, sessionId: accepted.sessionId });
     const nativeToolCallId = `tool-${"x".repeat(1_100_000)}`;
-
-    await accepted.translator.handleSdkMessage(
-      accepted.context,
+    const frames = [
       {
         message: {
           content: [{ id: nativeToolCallId, input: {}, name: "Read", type: "tool_use" }],
@@ -477,11 +478,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
         },
         type: "assistant",
         uuid: "wire-long-tool",
-      } as unknown as SDKMessage,
-      accepted.runId,
-    );
-    await accepted.translator.handleSdkMessage(
-      accepted.context,
+      },
       {
         decision_reason: "Blocked by policy",
         message: "Denied by policy",
@@ -490,11 +487,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
         tool_use_id: nativeToolCallId,
         type: "system",
         uuid: "wire-long-tool-advisory",
-      } as unknown as SDKMessage,
-      accepted.runId,
-    );
-    await accepted.translator.handleSdkMessage(
-      accepted.context,
+      },
       {
         is_error: false,
         modelUsage: {},
@@ -505,9 +498,14 @@ describe("Claude Agent SDK durable event boundaries", () => {
         type: "result",
         usage: {},
         uuid: "wire-long-tool-result",
-      } as unknown as SDKMessage,
-      accepted.runId,
-    );
+      },
+    ] as unknown as SDKMessage[];
+
+    for (const harness of [accepted, replayed]) {
+      for (const frame of frames) {
+        await harness.translator.handleSdkMessage(harness.context, frame, harness.runId);
+      }
+    }
 
     const toolEvents = accepted.events.filter(
       (event) => event.kind === "item.started" || event.kind === "tool.call.updated",
@@ -527,6 +525,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
     ).toBe(true);
     expect(JSON.stringify(accepted.events)).not.toContain(nativeToolCallId);
     expect(accepted.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
+    expect(replayed.events).toEqual(accepted.events);
 
     const rejected = createCmaHarness();
     const oversizedName = "n".repeat(1_100_000);
@@ -644,6 +643,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
       pushTerminal: async () => {},
       recordNativeSessionId: async () => {},
       replaceNativeSessionId: async () => {},
+      sessionId: context.payload.execution.run.sessionId,
     });
 
     await translator.handleSdkMessage(

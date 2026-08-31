@@ -9,6 +9,7 @@ import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
+import { createRuntimeSourceEventId } from "../src/runtimes/runtime-public-id";
 import {
   parseServerNotification,
   parseServerRequest,
@@ -663,7 +664,8 @@ describe("OpenAi app-server event bridge", () => {
         event.kind === "diagnostic.reported" &&
         readEventPayloadString(event, "message") === "OpenAI turn diff updated.",
     );
-    expect(isDriverId(publicItemId)).toBe(true);
+    expect(publicItemId).not.toBe(nativeItemId);
+    expect(Buffer.byteLength(publicItemId, "utf8")).toBeLessThanOrEqual(256);
     expect(permissionInput.toolCallId).toBe(publicItemId);
     expect(readEventPayloadString(review!, "targetItemId")).toBe(publicItemId);
     expect(progress?.payload).toMatchObject({
@@ -678,8 +680,8 @@ describe("OpenAi app-server event bridge", () => {
       status: "running",
     });
     expect(shell?.payload).not.toHaveProperty("processId");
-    expect(isDriverId(readEventPayloadString(shell!, "threadId"))).toBe(true);
-    expect(isDriverId(readEventPayloadString(shell!, "turnId"))).toBe(true);
+    expect(readEventPayloadString(shell!, "threadId")).not.toBe(nativeThreadId);
+    expect(readEventPayloadString(shell!, "turnId")).not.toBe(nativeTurnId);
     expect(readEventPayloadString(diff!, "turnId")).toBe(readEventPayloadString(shell!, "turnId"));
     expect(delivered.every((event) => Buffer.byteLength(JSON.stringify(event)) < 1_048_576)).toBe(
       true,
@@ -797,7 +799,8 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("removes OpenAI private citation markup from streamed and final assistant text", async () => {
-    const { bridge, context, events } = createHarness();
+    const { bridge, context, delivered } = createPublisherHarness();
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     const privateCitation = "\uE200cite\uE202turn7search12\uE202turn8view0\uE201";
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
@@ -841,8 +844,9 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
+    await expect(trackedTurn).resolves.toBeUndefined();
 
-    const allEvents = events();
+    const allEvents = delivered;
     const streamedText = allEvents
       .filter((event) => event.kind === "message.delta")
       .map((event) => readEventPayloadString(event, "contentDelta") ?? "")
@@ -858,6 +862,7 @@ describe("OpenAi app-server event bridge", () => {
     expect(runCompleted).toBeDefined();
     expectRunFinalReferences(allEvents, "beforeafter");
     expect(diagnostics).toHaveLength(1);
+    expect(new Set(allEvents.map((event) => event.sourceEventId)).size).toBe(allEvents.length);
   });
 
   test("flushes incomplete private markup when an item completes without a text snapshot", async () => {
@@ -1149,7 +1154,11 @@ describe("OpenAi app-server event bridge", () => {
   });
 
   test("commits a chunked snapshot once after a partial transport retry", async () => {
-    const sourcePrefix = "openai.item.completed:turn-1:message-partial:";
+    const sourcePrefix = `${createRuntimeSourceEventId(
+      "openai.item.completed",
+      "turn-1",
+      "message-partial",
+    )}:`;
     const { bridge, context, delivered, partialAttempts } = createPublisherHarness({
       partialSourcePrefix: sourcePrefix,
     });
@@ -1184,13 +1193,7 @@ describe("OpenAi app-server event bridge", () => {
       .filter((event) => event.sourceEventId?.startsWith(sourcePrefix) === true)
       .map((event) => event.sourceEventId);
     expect(new Set(deliveredSnapshotIds).size).toBe(deliveredSnapshotIds.length);
-    expect(
-      delivered.filter(
-        (event) =>
-          event.kind === "message.completed" &&
-          event.sourceEventId?.startsWith(sourcePrefix) === true,
-      ),
-    ).toHaveLength(1);
+    expect(delivered.filter((event) => event.kind === "message.completed")).toHaveLength(1);
     expectRunFinalReferences(delivered, finalText);
     expect(delivered.at(-1)?.kind).toBe("run.completed");
   });
@@ -1504,7 +1507,12 @@ describe("OpenAi app-server event bridge", () => {
 
     const reasoningEvents = delivered.filter((event) => event.kind.startsWith("thought."));
     const thoughtIds = reasoningEvents.map((event) => readEventPayloadString(event, "thoughtId"));
-    expect(thoughtIds.every((thoughtId) => thoughtId !== null && isDriverId(thoughtId))).toBe(true);
+    expect(
+      thoughtIds.every(
+        (thoughtId) =>
+          thoughtId !== null && thoughtId !== itemId && Buffer.byteLength(thoughtId, "utf8") <= 256,
+      ),
+    ).toBe(true);
     expect(new Set(thoughtIds).size).toBe(1);
     expect(
       reasoningEvents
@@ -1584,8 +1592,17 @@ describe("OpenAi app-server event bridge", () => {
         (event) =>
           readEventPayloadString(event, "toolCallId") ?? readEventPayloadString(event, "itemId"),
       );
-    expect(compactedId !== null && isDriverId(compactedId)).toBe(true);
-    expect(toolIds.every((toolId) => toolId !== null && isDriverId(toolId))).toBe(true);
+    expect(
+      compactedId !== null &&
+        compactedId !== contextItemId &&
+        Buffer.byteLength(compactedId, "utf8") <= 256,
+    ).toBe(true);
+    expect(
+      toolIds.every(
+        (toolId) =>
+          toolId !== null && toolId !== toolItemId && Buffer.byteLength(toolId, "utf8") <= 256,
+      ),
+    ).toBe(true);
     expect(new Set(toolIds).size).toBe(1);
     expect(
       delivered.some(

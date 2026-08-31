@@ -505,10 +505,12 @@ describe("Claude Agent SDK provider fixtures", () => {
 
   test("materializes authoritative result permission denials without a tool result", async () => {
     const { context, events, translator } = createHarness();
+    const nativeAgentId = `agent-${"a".repeat(300)}`;
 
     await translator.handleSdkMessage(
       context,
       {
+        agent_id: nativeAgentId,
         decision_reason: "Blocked by policy X",
         decision_reason_type: "rule",
         message: "Denied by policy X",
@@ -552,6 +554,16 @@ describe("Claude Agent SDK provider fixtures", () => {
         }),
       }),
     );
+    const denial = events().findLast(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        isRecord(event.payload) &&
+        event.payload["toolCallId"] === "tool-denied",
+    );
+    const agentId =
+      denial !== undefined && isRecord(denial.payload) ? denial.payload["agentId"] : null;
+    expect(agentId).toMatch(/^rid1_[A-Za-z0-9_-]{43}$/);
+    expect(agentId).not.toBe(nativeAgentId);
     expect(events().filter(({ kind }) => kind === "item.started")).toHaveLength(1);
     expect(events().filter(({ kind }) => kind === "item.completed")).toHaveLength(1);
   });
