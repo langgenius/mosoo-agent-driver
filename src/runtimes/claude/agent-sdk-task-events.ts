@@ -13,7 +13,7 @@ const MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS = 256;
 
 export interface ClaudeBackgroundTasksProjection {
   readonly diagnostic?: DriverEventInput;
-  readonly snapshot: DriverEventInput;
+  readonly snapshot?: DriverEventInput;
 }
 
 function taskSnapshotDiagnostic(code: string, taskCount: number): DriverEventInput {
@@ -33,10 +33,9 @@ function taskSnapshotDiagnostic(code: string, taskCount: number): DriverEventInp
   return event;
 }
 
-function rejectedTaskSnapshot(code: string, taskCount: number): ClaudeBackgroundTasksProjection {
+function rejectedTaskProjection(code: string, taskCount: number): ClaudeBackgroundTasksProjection {
   return {
     diagnostic: taskSnapshotDiagnostic(code, taskCount),
-    snapshot: claudeBackgroundTasksClosedEvent(),
   };
 }
 
@@ -67,7 +66,10 @@ export function projectClaudeBackgroundTasksSnapshot(
   message: SDKBackgroundTasksChangedMessage,
 ): ClaudeBackgroundTasksProjection {
   if (message.tasks.length > MAX_CLAUDE_BACKGROUND_TASK_ENTRIES) {
-    return rejectedTaskSnapshot("claude.background_tasks_snapshot_too_large", message.tasks.length);
+    return rejectedTaskProjection(
+      "claude.background_tasks_snapshot_too_large",
+      message.tasks.length,
+    );
   }
 
   const tasks = new Map<
@@ -92,7 +94,7 @@ export function projectClaudeBackgroundTasksSnapshot(
       ...(title === undefined ? {} : { title }),
     });
     if (tasks.size > MAX_CLAUDE_VISIBLE_BACKGROUND_TASKS) {
-      return rejectedTaskSnapshot("claude.visible_background_tasks_too_many", tasks.size);
+      return rejectedTaskProjection("claude.visible_background_tasks_too_many", tasks.size);
     }
   }
 

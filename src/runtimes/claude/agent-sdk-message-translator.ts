@@ -686,7 +686,7 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const { diagnostic, snapshot } = projectClaudeBackgroundTasksSnapshot(message);
     await this.#options.push(context, "driver.claude.tasks.replaced", [
-      snapshot,
+      ...(snapshot === undefined ? [] : [snapshot]),
       ...(diagnostic === undefined ? [] : [diagnostic]),
     ]);
   }

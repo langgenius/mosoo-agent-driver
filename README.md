@@ -225,7 +225,7 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 - `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
 - `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
 
-The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the provider-free MCP artifact test.
+The release workflow extracts the packed NPM archive to `packed/`, verifies its declarations, runs the provider-free MCP artifact test, and blocks image and package publication until the same `packed/dist/driver.mjs` passes the complete OpenAI, Claude, and OpenCode live matrix.
 
 ## License
 

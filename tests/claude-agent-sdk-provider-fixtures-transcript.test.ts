@@ -191,7 +191,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     });
   });
 
-  test("clears the prior task snapshot when the visible-task bound is exceeded", async () => {
+  test("preserves the prior task snapshot when the visible-task bound is exceeded", async () => {
     const { context, events, translator } = createHarness();
     const message = (tasks: Array<{ description: string; task_id: string; task_type: string }>) =>
       ({
@@ -221,7 +221,6 @@ describe("Claude Agent SDK provider fixtures", () => {
 
     expect(events().filter((event) => event.kind === "agent.tasks.replaced")).toMatchObject([
       { payload: { tasks: [{ taskId: "task-1" }] } },
-      { payload: { tasks: [] } },
     ]);
     expect(events().filter((event) => event.kind === "diagnostic.reported")).toMatchObject([
       { payload: { code: "claude.visible_background_tasks_too_many" } },

@@ -150,6 +150,7 @@ export async function* decodeCmaSseBytes(
       }
 
       for (const record of append(chunk.value)) {
+        signal?.throwIfAborted();
         yield record;
       }
     }
@@ -162,6 +163,7 @@ export async function* decodeCmaSseBytes(
       const record = consume(separator);
 
       if (record) {
+        signal?.throwIfAborted();
         yield record;
       }
     }
@@ -170,6 +172,7 @@ export async function* decodeCmaSseBytes(
       const record = parseSseRecord(decoder.decode(frame.subarray(0, frameLength)));
 
       if (record) {
+        signal?.throwIfAborted();
         yield record;
       }
     }

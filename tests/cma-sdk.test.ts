@@ -250,6 +250,50 @@ describe("CMA SDK client", () => {
     expect(resumed).toEqual([second]);
   });
 
+  test("does not yield buffered server-sent events after cancellation", async () => {
+    const controller = new AbortController();
+    const record = (id: string) => ({
+      command: null,
+      commandResult: null,
+      commandStatus: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      cursor: createDriverId(),
+      direction: "outbound",
+      event: {
+        message: { content: id },
+        sourceEventKind: "message.completed",
+        type: "agent.message",
+      },
+      id,
+      sessionId: "session-1",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const bytes = new TextEncoder().encode(
+      [record("event-1"), record("event-2")]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    );
+    const client = new CmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            start(stream) {
+              stream.enqueue(bytes);
+            },
+          }),
+        ),
+    });
+    const iterator = client
+      .streamSessionEvents("session-1", { signal: controller.signal })
+      [Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { id: "event-1" } });
+    const reason = new Error("stop buffered delivery");
+    controller.abort(reason);
+    await expect(iterator.next()).rejects.toBe(reason);
+  });
+
   test.each(
     ["\r\n", "\r", "\n"].flatMap((lineEnding) =>
       ["\r\n", "\r", "\n"]

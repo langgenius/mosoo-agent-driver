@@ -37,7 +37,11 @@ function projection(tasks: SDKBackgroundTasksChangedMessage["tasks"]) {
 }
 
 function snapshot(tasks: SDKBackgroundTasksChangedMessage["tasks"]) {
-  return projection(tasks).snapshot;
+  const event = projection(tasks).snapshot;
+  if (event === undefined) {
+    throw new Error("Expected a Claude task snapshot.");
+  }
+  return event;
 }
 
 describe("Claude Agent SDK task snapshots", () => {
@@ -97,37 +101,38 @@ describe("Claude Agent SDK task snapshots", () => {
     expect(maximum).toMatchObject({ kind: "agent.tasks.replaced" });
     expect((maximum.payload as { tasks: unknown[] }).tasks).toHaveLength(256);
 
-    expect(
-      projection(Array.from({ length: 257 }, (_, index) => task(`visible-${index}`))),
-    ).toMatchObject({
+    const tooManyVisible = projection(
+      Array.from({ length: 257 }, (_, index) => task(`visible-${index}`)),
+    );
+    expect(tooManyVisible).toMatchObject({
       diagnostic: {
         kind: "diagnostic.reported",
         payload: { code: "claude.visible_background_tasks_too_many" },
         visibility: "owner_debug",
       },
-      snapshot: claudeBackgroundTasksClosedEvent(),
     });
+    expect(tooManyVisible.snapshot).toBeUndefined();
     const unreadTail = task("unread-tail");
     Object.defineProperty(unreadTail, "ambient", {
       get() {
         throw new Error("Tasks after the visible limit must not be inspected.");
       },
     });
-    expect(
-      projection([
-        ...Array.from({ length: 257 }, (_, index) => task(`bounded-${index}`)),
-        unreadTail,
-      ]),
-    ).toMatchObject({
+    const unread = projection([
+      ...Array.from({ length: 257 }, (_, index) => task(`bounded-${index}`)),
+      unreadTail,
+    ]);
+    expect(unread).toMatchObject({
       diagnostic: { payload: { code: "claude.visible_background_tasks_too_many" } },
-      snapshot: claudeBackgroundTasksClosedEvent(),
     });
-    expect(
-      projection(Array.from({ length: 1_025 }, (_, index) => task(`ambient-${index}`, "x", true))),
-    ).toMatchObject({
+    expect(unread.snapshot).toBeUndefined();
+    const tooManyEntries = projection(
+      Array.from({ length: 1_025 }, (_, index) => task(`ambient-${index}`, "x", true)),
+    );
+    expect(tooManyEntries).toMatchObject({
       diagnostic: { payload: { code: "claude.background_tasks_snapshot_too_large" } },
-      snapshot: claudeBackgroundTasksClosedEvent(),
     });
+    expect(tooManyEntries.snapshot).toBeUndefined();
     expect(
       projection([
         ...Array.from({ length: 1_023 }, (_, index) => task(`ambient-${index}`, "x", true)),
@@ -155,6 +160,9 @@ describe("Claude Agent SDK task snapshots", () => {
         visibility: "participant",
       },
     });
+    if (oversizedMetadata.snapshot === undefined) {
+      throw new Error("Expected a membership-only Claude task snapshot.");
+    }
     expect(
       (oversizedMetadata.snapshot.payload as { tasks: Array<Record<string, unknown>> }).tasks,
     ).toEqual(Array.from({ length: 100 }, (_, index) => ({ taskId: `large-${index}` })));
