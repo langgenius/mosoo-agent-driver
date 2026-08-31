@@ -111,6 +111,21 @@ jobs:
           vp exec tsc --ignoreConfig --noEmit --moduleResolution Bundler --module ESNext --target ESNext "${declarations[@]}"
           bun test tests/driver-artifact-mcp.test.ts
 
+      - name: Test packed driver live matrix
+        timeout-minutes: 180
+        env:
+          AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+            echo "::error::OPENROUTER_API_KEY is required for release live artifact tests."
+            exit 1
+          fi
+
+          vp run test:live:artifact
+
       - id: image
         name: Build image
         env:

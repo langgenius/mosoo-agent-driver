@@ -37,8 +37,10 @@ interface EnvironmentPackageManagerManifest {
 }
 
 interface WorkflowStep {
+  readonly env?: Record<string, string>;
   readonly name?: string;
   readonly run?: string;
+  readonly "timeout-minutes"?: number;
   readonly uses?: string;
 }
 
@@ -235,6 +237,8 @@ describe("driver artifact contract", () => {
     expect(scripts["prepack"]).toBe("vp run build");
     expect(containerfile).toContain("COPY dist/driver.mjs /usr/local/bin/agent-driver");
     expect(scripts["test:live"]).toBe("vp run build && vp run test:live:artifact");
+    expect(scripts["test:live:artifact"]).toContain("AGENT_DRIVER_LIVE_SUITE=all");
+    expect(scripts["test:live:artifact"]).toContain("tests/driver-artifact-live.test.ts");
     expect(scripts["test:live:artifact"]).toContain("tests/driver-artifact-mcp.test.ts");
 
     for (const suite of ["anthropic", "openai", "opencode"] as const) {
@@ -246,7 +250,6 @@ describe("driver artifact contract", () => {
 
   test("keeps release publication ordered, monotonic, and verifiable", () => {
     const prWorkflow = readWorkflow("../.github/workflows/pr.yml");
-    const releaseWorkflowText = readText("../.github/workflows/release.yml");
     const releaseWorkflow = readWorkflow("../.github/workflows/release.yml");
     const verifyJob = workflowJob(releaseWorkflow, "verify");
     const buildJob = workflowJob(releaseWorkflow, "build");
@@ -254,6 +257,10 @@ describe("driver artifact contract", () => {
     const npmJob = workflowJob(releaseWorkflow, "publish-npm");
     const latestJob = workflowJob(releaseWorkflow, "publish-latest-image");
     const verifyRun = workflowStep(verifyJob, "Verify release tag").run ?? "";
+    const packStep = workflowStep(buildJob, "Pack package");
+    const mcpStep = workflowStep(buildJob, "Test packed driver");
+    const liveStep = workflowStep(buildJob, "Test packed driver live matrix");
+    const imageBuildStep = workflowStep(buildJob, "Build image");
     const imageRun = workflowStep(imageJob, "Publish versioned image").run ?? "";
     const npmRun = workflowStep(npmJob, "Publish package").run ?? "";
     const buildRun =
@@ -312,8 +319,23 @@ describe("driver artifact contract", () => {
       'skopeo copy --preserve-digests "docker://$IMAGE@$DIGEST" "docker://$IMAGE:latest"',
     ])
       expect(latestRun).toContain(marker);
-    expect(releaseWorkflowText).not.toContain("OPENROUTER_API_KEY");
-    expect(releaseWorkflowText).not.toContain("test:live:artifact");
+    expect(packStep.env).toBeUndefined();
+    expect(mcpStep.env).not.toHaveProperty("OPENROUTER_API_KEY");
+    expect(mcpStep.run).toContain("bun test tests/driver-artifact-mcp.test.ts");
+    expect(liveStep).toMatchObject({
+      env: {
+        AGENT_DRIVER_LIVE_ARTIFACT: "packed/dist/driver.mjs",
+        OPENROUTER_API_KEY: "${{ secrets.OPENROUTER_API_KEY }}",
+      },
+      "timeout-minutes": 180,
+    });
+    expect(liveStep.run).toContain('if [[ -z "${OPENROUTER_API_KEY:-}" ]]');
+    expect(liveStep.run).toContain("vp run test:live:artifact");
+    const buildSteps = buildJob.steps ?? [];
+    expect(buildSteps.indexOf(packStep)).toBeLessThan(buildSteps.indexOf(mcpStep));
+    expect(buildSteps.indexOf(mcpStep)).toBeLessThan(buildSteps.indexOf(liveStep));
+    expect(buildSteps.indexOf(liveStep)).toBeLessThan(buildSteps.indexOf(imageBuildStep));
+    expect(readText("../.github/workflows/pr.yml")).not.toContain("OPENROUTER_API_KEY");
     expect(actionUses.length).toBeGreaterThan(0);
     for (const uses of actionUses) {
       expect(uses).toMatch(/^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/);
