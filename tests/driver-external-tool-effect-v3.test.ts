@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
+import { createMcpExecuteFailedEventIdentity } from "../src/events";
 import type { DriverEventInput } from "../src/protocol/events";
 import { driverRuntimeRpcSchemas } from "../src/protocol/orpc";
 import type {
@@ -41,6 +42,29 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("durable external MCP effect protocol v3", () => {
+  test("exports the canonical failed MCP event identity", () => {
+    expect(
+      createMcpExecuteFailedEventIdentity({
+        toolCallId: "tool-canonical",
+        title: "createIssue",
+        rawOutput: "provider rejected the request",
+        rawInput: '{"issue":"A-1"}',
+        commandId: "command-canonical",
+      }),
+    ).toEqual({
+      payload: {
+        kind: "mcp",
+        rawInput: '{"issue":"A-1"}',
+        rawOutput: "provider rejected the request",
+        status: "failed",
+        title: "createIssue",
+        toolCallId: "tool-canonical",
+      },
+      sourceEventId:
+        "mcp.execute.failed:807e9e02d3b2c37d2d77db8d1ad473b0db1e1e37f98c85556227baa8873ea62a",
+    });
+  });
+
   test("exposes only the schema-first v3 wire", () => {
     const claimToken = "00000000-0000-4000-8000-000000000001";
     const result = {

@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import { AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS } from "../host-ports";
 import { createScopedWideEvent, emitWideEvent } from "../observability";
 import type { Logger } from "../observability";
 import { summarizeRuntimeCommand } from "../observability/driver-debug";
+import { createMcpExecuteFailedEventIdentity } from "../protocol/events";
 import type { DriverEventInput } from "../protocol/events";
 import { parseRunId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
@@ -189,8 +190,6 @@ export class DriverCommandDispatcher {
     );
     let joiningActiveWork = false;
     const onShutdown = () => {
-      this.#shutdownPermissionTask = this.#permissionRequests.rejectAllAndWait();
-      void this.#shutdownPermissionTask.catch(() => {});
       this.#abortActiveWork(
         socket,
         toErrorMessage(this.#shutdownSignal.reason, "driver.command_loop.stopped"),
@@ -254,7 +253,11 @@ export class DriverCommandDispatcher {
           }
         }
       });
-      if (this.#shutdownSignal.aborted || this.#runtimeState.isShuttingDown()) {
+      if (
+        this.#shutdownSignal.aborted ||
+        this.#isShuttingDown() ||
+        this.#runtimeState.isShuttingDown()
+      ) {
         this.#abortActiveWork(socket, "driver.command_loop.stopped", "shutdown");
         joiningActiveWork = true;
         await this.#joinActiveWork();
@@ -746,7 +749,12 @@ export class DriverCommandDispatcher {
         : socket.claimRunCancellation(ticket, reason);
 
     if (source !== "turn.cancel" || cancellation !== "terminal_selected") {
-      this.#permissionRequests.rejectAll();
+      if (source === "shutdown") {
+        this.#shutdownPermissionTask ??= this.#permissionRequests.rejectAllAndWait();
+        void this.#shutdownPermissionTask.catch(() => {});
+      } else {
+        this.#permissionRequests.rejectAll();
+      }
       this.#abortMcpCommands(reason);
     }
     if (cancellation === "idle") {
@@ -986,25 +994,21 @@ export class DriverCommandDispatcher {
       }
 
       const commandFailure = toCommandFailure(command, error);
-      const failedPayload = {
-        kind: "mcp",
+      const failedEvent = createMcpExecuteFailedEventIdentity({
+        commandId: command.commandId,
         rawInput: command.argumentsJson,
         rawOutput: commandFailure.message,
-        status: "failed",
         title: command.toolName,
         toolCallId: command.toolCallId,
-      } as const;
-      const failedSourceEventId = `mcp.execute.failed:${createHash("sha256")
-        .update(JSON.stringify([command.commandId, failedPayload]))
-        .digest("hex")}`;
+      });
 
       await pushLosslessEvents(socket, [
         {
           correlationId: command.commandId,
           kind: "tool.call.updated",
-          payload: failedPayload,
+          payload: failedEvent.payload,
           runId: parseRunId(command.runId),
-          sourceEventId: failedSourceEventId,
+          sourceEventId: failedEvent.sourceEventId,
         },
       ]);
 

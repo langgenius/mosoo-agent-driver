@@ -522,6 +522,50 @@ describe("driver runtime boundary", () => {
     );
   });
 
+  test("does not return while a shutdown predicate has active MCP work", async () => {
+    const execution = Promise.withResolvers<McpExternalToolExecutionResult>();
+    const entered = Promise.withResolvers<void>();
+    let shuttingDown = false;
+    const command = {
+      argumentsJson: "{}",
+      commandId: "mcp-before-predicate-shutdown",
+      kind: "mcp.execute",
+      requestId: "mcp-before-predicate-shutdown-request",
+      runId: DRIVER_TEST_IDS.runId,
+      serverId: "mcp-linear",
+      toolCallId: "tool-before-predicate-shutdown",
+      toolName: "waitForShutdown",
+    } as const;
+    const socket = new FakeDriverRuntimeIo([command], DRIVER_TEST_IDS.runId);
+    const { dispatcher, logger } = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => shuttingDown,
+      mcpExecute: async () => {
+        shuttingDown = true;
+        entered.resolve();
+        return execution.promise;
+      },
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    const run = dispatcher.run(socket, logger);
+    await entered.promise;
+    expect(await Promise.race([run.then(() => true), Bun.sleep(10).then(() => false)])).toBe(false);
+
+    execution.resolve({
+      outputText: "committed",
+      requestId: command.requestId,
+      serverId: command.serverId,
+      toolName: command.toolName,
+    });
+    await run;
+
+    expect(socket.updates.at(-1)).toMatchObject({
+      commandId: command.commandId,
+      status: "completed",
+    });
+  });
+
   test("does not report a command-loop failure when shutdown aborts an acknowledgement", async () => {
     const backend = createBackend();
     const updateEntered = Promise.withResolvers<void>();

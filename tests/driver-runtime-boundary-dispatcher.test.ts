@@ -528,9 +528,7 @@ describe("driver runtime boundary", () => {
     expect(backend.cancelledReasons).toEqual([]);
     expect(backend.handledInputs).toEqual([]);
     expect(mcpPreparations).toBe(0);
-    expect(permissions.hasPending()).toBe(true);
-
-    expect(permissions.resolve("active-permission", "reject_once")).toBe(true);
+    expect(permissions.hasPending()).toBe(false);
     await expect(permission).resolves.toBe("reject_once");
   });
 
@@ -577,8 +575,7 @@ describe("driver runtime boundary", () => {
     await dispatcher.run(socket, logger);
 
     expect(socket.updates.map(({ status }) => status)).toEqual(["accepted", "failed"]);
-    expect(permissions.hasPending()).toBeTrue();
-    expect(permissions.resolve(command.requestId, "reject_once")).toBeTrue();
+    expect(permissions.hasPending()).toBeFalse();
     await expect(pending).resolves.toBe("reject_once");
   });
 

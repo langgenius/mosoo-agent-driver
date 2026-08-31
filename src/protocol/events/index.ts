@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { timestampSchema } from "../../contract/common";
 import { parseRuntimeEventEnvelope } from "./runtime-events";
 import type { RuntimeEventEnvelope, RuntimeEventInputDraft } from "./runtime-events";
@@ -20,6 +22,38 @@ export interface DriverEventEnvelope {
   readonly event: DriverEvent;
   readonly eventId: string;
   readonly occurredAt?: string | null | undefined;
+}
+
+export interface McpExecuteFailedEventIdentityInput {
+  readonly commandId: string;
+  readonly rawInput: string;
+  readonly rawOutput: string;
+  readonly title: string;
+  readonly toolCallId: string;
+}
+
+export function createMcpExecuteFailedEventIdentity({
+  commandId,
+  rawInput,
+  rawOutput,
+  title,
+  toolCallId,
+}: McpExecuteFailedEventIdentityInput) {
+  const payload = {
+    kind: "mcp",
+    rawInput,
+    rawOutput,
+    status: "failed",
+    title,
+    toolCallId,
+  } as const;
+
+  return {
+    payload,
+    sourceEventId: `mcp.execute.failed:${createHash("sha256")
+      .update(JSON.stringify([commandId, payload]))
+      .digest("hex")}`,
+  } as const;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
