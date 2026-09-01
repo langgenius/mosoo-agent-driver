@@ -1,69 +1,33 @@
 import { describe, expect, test } from "bun:test";
 
-import { DRIVER_PROTOCOL_VERSION as DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH } from "@mosoo/agent-driver/boot";
-import { createCmaHttpHandler as createCmaHttpHandlerFromSubpath } from "@mosoo/agent-driver/cma-http";
-import { CmaSdkClient as CmaSdkClientFromSubpath } from "@mosoo/agent-driver/cma-sdk";
-import {
-  PROTOCOL_VERSION as PROTOCOL_VERSION_FROM_CONTRACT,
-  protocolVersionSchema as protocolVersionSchemaFromContract,
-  sessionSnapshotSchema as sessionSnapshotSchemaFromContract,
-} from "@mosoo/agent-driver/contract";
-import {
-  RUNTIME_EVENT_KINDS as RUNTIME_EVENT_KINDS_FROM_SUBPATH,
-  RUNTIME_EVENT_SCHEMA_VERSION as RUNTIME_EVENT_SCHEMA_VERSION_FROM_SUBPATH,
-  parseDriverEventEnvelope as parseDriverEventEnvelopeFromSubpath,
-  toRuntimeEventInput as toRuntimeEventInputFromSubpath,
-} from "@mosoo/agent-driver/events";
-import {
-  AGENT_DRIVER_PROVIDER_REGISTRY,
-  AgentDriverKernelCore,
-  CMA_DEFAULT_BETA_HEADER_VALUE,
-  CmaSdkClient,
-  CmaSdkError,
-  SUPPORTED_DRIVER_RUNTIMES,
-  createAgentDriverContext,
-  createDriverDiagnosticEvent,
-  createAgentDriverProviderCapabilities,
-  createCmaHttpHandler,
-  createCmaMemoryStore,
-  parseDriverNativeRuntimeRef,
-  pushDriverDiagnosticEvent,
-  projectCmaInboundToDriverCommand,
-  projectDriverEventToCma,
-} from "@mosoo/agent-driver";
-import {
-  parseDriverHeartbeatInput as parseDriverHeartbeatInputFromOrpcSubpath,
-  parseDriverHelloInput as parseDriverHelloInputFromOrpcSubpath,
-  parseDriverReadyInput as parseDriverReadyInputFromOrpcSubpath,
-} from "@mosoo/agent-driver/orpc";
-import type { DriverHeartbeatInput as DriverHeartbeatInputFromOrpcSubpath } from "@mosoo/agent-driver/orpc";
-import {
-  SANDBOX_MEMORY_PATH as SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH,
-  getSessionResourceBackingPath as getSessionResourceBackingPathFromSubpath,
-  getSessionResourceRootPath as getSessionResourceRootPathFromSubpath,
-  isSandboxSessionResourceBackingPath,
-  normalizeSandboxFileBrowserPath,
-} from "@mosoo/agent-driver/paths";
-import { filterOpenAiPrivateCitations } from "@mosoo/agent-driver/provider-output";
-import { isSupportedDriverRuntime as isSupportedDriverRuntimeFromSubpath } from "@mosoo/agent-driver/runtime";
+import * as agentDriver from "@mosoo/agent-driver";
+import * as boot from "@mosoo/agent-driver/boot";
+import * as cmaHttp from "@mosoo/agent-driver/cma-http";
+import * as cmaSdk from "@mosoo/agent-driver/cma-sdk";
+import * as contract from "@mosoo/agent-driver/contract";
+import * as events from "@mosoo/agent-driver/events";
+import * as orpc from "@mosoo/agent-driver/orpc";
+import * as paths from "@mosoo/agent-driver/paths";
+import * as providerOutput from "@mosoo/agent-driver/provider-output";
+import * as runtime from "@mosoo/agent-driver/runtime";
 
 describe("public API", () => {
   test("imports without starting the driver process", () => {
-    expect(AgentDriverKernelCore).toBeFunction();
-    expect(createAgentDriverContext).toBeFunction();
-    expect(createDriverDiagnosticEvent).toBeFunction();
-    expect(createAgentDriverProviderCapabilities).toBeFunction();
-    expect(createCmaHttpHandler).toBeFunction();
-    expect(createCmaMemoryStore).toBeFunction();
-    expect(CmaSdkClient).toBeFunction();
-    expect(CmaSdkError).toBeFunction();
-    expect(CMA_DEFAULT_BETA_HEADER_VALUE).toBe("managed-agents-2026-04-01");
-    expect(projectCmaInboundToDriverCommand).toBeFunction();
-    expect(projectDriverEventToCma).toBeFunction();
-    expect(pushDriverDiagnosticEvent).toBeFunction();
-    expect(parseDriverNativeRuntimeRef).toBeFunction();
-    expect(AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(3);
-    expect(SUPPORTED_DRIVER_RUNTIMES).toEqual([
+    expect(agentDriver.AgentDriverKernelCore).toBeFunction();
+    expect(agentDriver.createAgentDriverContext).toBeFunction();
+    expect(agentDriver.createDriverDiagnosticEvent).toBeFunction();
+    expect(agentDriver.createAgentDriverProviderCapabilities).toBeFunction();
+    expect(agentDriver.createCmaHttpHandler).toBeFunction();
+    expect(agentDriver.createCmaMemoryStore).toBeFunction();
+    expect(agentDriver.CmaSdkClient).toBeFunction();
+    expect(agentDriver.CmaSdkError).toBeFunction();
+    expect(agentDriver.CMA_DEFAULT_BETA_HEADER_VALUE).toBe("managed-agents-2026-04-01");
+    expect(agentDriver.projectCmaInboundToDriverCommand).toBeFunction();
+    expect(agentDriver.projectDriverEventToCma).toBeFunction();
+    expect(agentDriver.pushDriverDiagnosticEvent).toBeFunction();
+    expect(agentDriver.parseDriverNativeRuntimeRef).toBeFunction();
+    expect(agentDriver.AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(3);
+    expect(agentDriver.SUPPORTED_DRIVER_RUNTIMES).toEqual([
       "openai-runtime",
       "claude-agent-sdk",
       "acp-fallback",
@@ -71,32 +35,29 @@ describe("public API", () => {
   });
 
   test("imports public subpath entries without process side effects", () => {
-    const heartbeatReason = "ping" satisfies DriverHeartbeatInputFromOrpcSubpath["reason"];
+    const heartbeatReason = "ping" satisfies orpc.DriverHeartbeatInput["reason"];
 
-    expect(DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH).toBe(3);
-    expect(PROTOCOL_VERSION_FROM_CONTRACT).toBe(2);
-    expect(protocolVersionSchemaFromContract.parse(2)).toBe(2);
-    expect(sessionSnapshotSchemaFromContract.parse).toBeFunction();
-    expect(createCmaHttpHandlerFromSubpath).toBe(createCmaHttpHandler);
-    expect(CmaSdkClientFromSubpath).toBe(CmaSdkClient);
-    expect(parseDriverEventEnvelopeFromSubpath).toBeFunction();
-    expect(toRuntimeEventInputFromSubpath).toBeFunction();
-    expect(RUNTIME_EVENT_SCHEMA_VERSION_FROM_SUBPATH).toBe("2026-08-29");
-    expect(RUNTIME_EVENT_KINDS_FROM_SUBPATH).toContain("agent.tasks.replaced");
-    expect(heartbeatReason).toBe("ping");
-    expect(parseDriverHeartbeatInputFromOrpcSubpath({ at: "now", pid: 1, reason: "ping" })).toEqual(
-      {
-        at: "now",
-        pid: 1,
-        reason: "ping",
-      },
-    );
+    expect(boot.DRIVER_PROTOCOL_VERSION).toBe(3);
+    expect(contract.PROTOCOL_VERSION).toBe(2);
+    expect(contract.protocolVersionSchema.parse(2)).toBe(2);
+    expect(contract.sessionSnapshotSchema.parse).toBeFunction();
+    expect(cmaHttp.createCmaHttpHandler).toBe(agentDriver.createCmaHttpHandler);
+    expect(cmaSdk.CmaSdkClient).toBe(agentDriver.CmaSdkClient);
+    expect(events.parseDriverEventEnvelope).toBeFunction();
+    expect(events.toRuntimeEventInput).toBeFunction();
+    expect(events.RUNTIME_EVENT_SCHEMA_VERSION).toBe("2026-08-29");
+    expect(events.RUNTIME_EVENT_KINDS).toContain("agent.tasks.replaced");
+    expect(orpc.parseDriverHeartbeatInput({ at: "now", pid: 1, reason: heartbeatReason })).toEqual({
+      at: "now",
+      pid: 1,
+      reason: "ping",
+    });
     expect(
-      parseDriverHelloInputFromOrpcSubpath({
+      orpc.parseDriverHelloInput({
         capabilities: [],
         driverVersion: "0.1.0",
         pid: 1,
-        protocolVersion: DRIVER_PROTOCOL_VERSION_FROM_BOOT_SUBPATH,
+        protocolVersion: boot.DRIVER_PROTOCOL_VERSION,
         runtime: "openai-runtime",
         startedAt: "now",
       }),
@@ -105,7 +66,7 @@ describe("public API", () => {
       runtime: "openai-runtime",
     });
     expect(
-      parseDriverReadyInputFromOrpcSubpath({
+      orpc.parseDriverReadyInput({
         at: "now",
         driverInstanceId: "driver-1",
         pid: 1,
@@ -113,36 +74,38 @@ describe("public API", () => {
     ).toMatchObject({
       driverInstanceId: "driver-1",
     });
-    expect(isSupportedDriverRuntimeFromSubpath("openai-runtime")).toBe(true);
-    expect(SANDBOX_MEMORY_PATH_FROM_PATHS_SUBPATH).toBe("/workspace/memory");
-    expect(getSessionResourceRootPathFromSubpath("session-1")).toBe(
+    expect(runtime.isSupportedDriverRuntime("openai-runtime")).toBe(true);
+    expect(paths.SANDBOX_MEMORY_PATH).toBe("/workspace/memory");
+    expect(paths.getSessionResourceRootPath("session-1")).toBe(
       "/workspace/se/session-1/session-files",
     );
-    expect(getSessionResourceBackingPathFromSubpath("session-1")).toBe(
+    expect(paths.getSessionResourceBackingPath("session-1")).toBe(
       "/workspace/.mosoo/session-files/session-1",
     );
     expect(
-      isSandboxSessionResourceBackingPath("/workspace/.mosoo/session-files/session-1/nested.txt"),
+      paths.isSandboxSessionResourceBackingPath(
+        "/workspace/.mosoo/session-files/session-1/nested.txt",
+      ),
     ).toBe(true);
     expect(
-      isSandboxSessionResourceBackingPath(
+      paths.isSandboxSessionResourceBackingPath(
         "/workspace/.mosoo/session-files-other/session-1/nested.txt",
       ),
     ).toBe(false);
     expect(
-      isSandboxSessionResourceBackingPath(
+      paths.isSandboxSessionResourceBackingPath(
         "/workspace/se/session-1/public/.mosoo-session-files-session-1",
       ),
     ).toBe(false);
     expect(() =>
-      normalizeSandboxFileBrowserPath("/workspace/.mosoo/session-files/session-1/nested.txt"),
+      paths.normalizeSandboxFileBrowserPath("/workspace/.mosoo/session-files/session-1/nested.txt"),
     ).toThrow("Session resource backing is not visible");
     expect(
-      normalizeSandboxFileBrowserPath(
+      paths.normalizeSandboxFileBrowserPath(
         "/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt",
       ),
     ).toBe("/workspace/se/session-1/.mosoo-session-files-session-2/nested.txt");
-    expect(filterOpenAiPrivateCitations("plain text")).toEqual({
+    expect(providerOutput.filterOpenAiPrivateCitations("plain text")).toEqual({
       privateCitationCount: 0,
       text: "plain text",
     });

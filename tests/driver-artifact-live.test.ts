@@ -13,6 +13,7 @@ import {
   type DriverArtifactBootPayload,
   type DriverArtifactTestEvent,
 } from "./driver-artifact-test-controller";
+import { messageText } from "./driver-event-test-helpers";
 
 const LIVE_START_TIMEOUT_MS = 120_000;
 const LIVE_TURN_TIMEOUT_MS = 180_000;
@@ -380,44 +381,6 @@ function payloadRecord(event: DriverArtifactTestEvent): Record<string, unknown> 
     !Array.isArray(event.payload)
     ? (event.payload as Record<string, unknown>)
     : {};
-}
-
-function messageText(events: readonly DriverArtifactTestEvent[], messageId: string): string {
-  let text = "";
-
-  for (const event of events) {
-    const payload = payloadRecord(event);
-    if (payload["messageId"] !== messageId) {
-      continue;
-    }
-
-    if (event.kind === "message.delta" && typeof payload["contentDelta"] === "string") {
-      text += payload["contentDelta"];
-      continue;
-    }
-
-    if (event.kind !== "message.added") {
-      continue;
-    }
-
-    const content = payload["content"];
-    text =
-      typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content
-              .flatMap((block) => {
-                const value =
-                  typeof block === "object" && block !== null && !Array.isArray(block)
-                    ? (block as Record<string, unknown>)["text"]
-                    : null;
-                return typeof value === "string" ? [value] : [];
-              })
-              .join("")
-          : text;
-  }
-
-  return text;
 }
 
 function eventText(events: readonly DriverArtifactTestEvent[]): string {

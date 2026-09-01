@@ -27,29 +27,8 @@ export type {
   CmaUserMessageEvent,
   CmaUserToolConfirmationEvent,
 } from "./projections/cma";
-export {
-  CMA_DEFAULT_BETA_HEADER_NAME,
-  CMA_DEFAULT_BETA_HEADER_VALUE,
-  createCmaHttpHandler,
-} from "./surfaces/cma-http";
-export type {
-  CmaHttpAuthorizationContext,
-  CmaHttpAuthorizer,
-  CmaHttpBetaHeaderRequirement,
-  CmaHttpDriverCommandDispatcher,
-  CmaHttpDriverCommandDispatchInput,
-  CmaHttpHandler,
-  CmaHttpHandlerOptions,
-} from "./surfaces/cma-http";
-export { CmaSdkClient, CmaSdkError } from "./surfaces/cma-sdk";
-export type {
-  CmaSdkBetaHeader,
-  CmaSdkClientOptions,
-  CmaSdkFetch,
-  CmaSdkRequestOptions,
-  CmaSdkStreamOptions,
-  CmaSessionEventDispatchRecord,
-} from "./surfaces/cma-sdk";
+export * from "./surfaces/cma-http";
+export * from "./surfaces/cma-sdk";
 export { createCmaMemoryStore } from "./stores/memory";
 export type { CmaMemoryStoreIdFactory, CmaMemoryStoreOptions } from "./stores/memory";
 export {
@@ -98,23 +77,7 @@ export type {
   AgentDriverContextPortOverrides,
 } from "./core/agent-driver-backend";
 export { createAgentDriverContext } from "./core/agent-driver-backend";
-export {
-  isSupportedDriverRuntime,
-  isSupportedDriverRuntimeTransport,
-  SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS,
-  SUPPORTED_DRIVER_RUNTIMES,
-  SUPPORTED_DRIVER_RUNTIME_TRANSPORTS,
-} from "./protocol/runtime";
-export type {
-  DriverNativeRuntimeRef,
-  DriverNativeRuntimeRefKind,
-  DriverRuntime,
-  DriverRuntimeTransport,
-} from "./protocol/runtime";
-export {
-  getExpectedDriverNativeRuntimeRefKind,
-  parseDriverNativeRuntimeRef,
-} from "./protocol/runtime";
+export * from "./protocol/runtime";
 export { parseDriverEventEnvelope } from "./protocol/events";
 export type { DriverEvent, DriverEventEnvelope, DriverEventInput } from "./protocol/events";
 export type {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
+import { ACTIVE_INPUT_SETTLE_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { McpExternalToolExecutionResult, RuntimeCommand } from "../src/runtime-command";
@@ -69,7 +69,7 @@ describe("driver runtime boundary", () => {
           ? 20
           : timeout === DRIVER_EVENT_DELIVERY_TIMEOUT_MS
             ? 100
-            : timeout === ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS
+            : timeout === ACTIVE_INPUT_SETTLE_GRACE_MS
               ? 200
               : timeout,
         ...arguments_,

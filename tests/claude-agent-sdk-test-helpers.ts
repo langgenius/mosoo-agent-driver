@@ -1,13 +1,15 @@
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
-import { isRecord } from "../src/runtimes/claude/agent-sdk-json";
 import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 export { isRecord } from "../src/runtimes/claude/agent-sdk-json";
+export { messageText } from "./driver-event-test-helpers";
 
 export function createClaudeAgentSdkHarness(
   publicToolCallId: (nativeToolCallId: string) => string = (id) => id,
@@ -40,42 +42,21 @@ export function createClaudeAgentSdkHarness(
     },
     sessionId: context.payload.execution.run.sessionId,
   });
+  const handleMessages = async (
+    messages: readonly SDKMessage[],
+    runId: RunId = "run-1" as RunId,
+  ): Promise<void> => {
+    for (const message of messages) {
+      await translator.handleSdkMessage(context, message, runId);
+    }
+  };
 
   return {
     context,
     events: () => driverEvents,
+    handleMessages,
     nativeSessionIds,
     nativeSessionResets,
     translator,
   };
-}
-
-export function messageText(events: readonly DriverEventInput[], messageId: unknown): string {
-  let text = "";
-
-  for (const event of events) {
-    if (!isRecord(event.payload) || event.payload["messageId"] !== messageId) {
-      continue;
-    }
-
-    if (event.kind === "message.added") {
-      const content = event.payload["content"];
-      text = Array.isArray(content)
-        ? content
-            .flatMap((block) =>
-              isRecord(block) && typeof block["text"] === "string" ? [block["text"]] : [],
-            )
-            .join("")
-        : typeof content === "string"
-          ? content
-          : "";
-    } else if (
-      event.kind === "message.delta" &&
-      typeof event.payload["contentDelta"] === "string"
-    ) {
-      text += event.payload["contentDelta"];
-    }
-  }
-
-  return text;
 }

@@ -138,13 +138,11 @@ function normalizeCallToolResult(
   result: CallToolResult,
   command: McpExecuteCommand,
 ): McpExternalToolExecutionResult {
-  const textContent = result.content.flatMap((block) =>
-    block.type === "text" ? [block.text] : [],
-  );
+  const content = result.content[0];
   const plainText =
     result.content.length === 1 &&
-    result.content[0]?.type === "text" &&
-    Object.keys(result.content[0]).every((key) => key === "type" || key === "text");
+    content?.type === "text" &&
+    Object.keys(content).every((key) => key === "type" || key === "text");
   const hasRichContent = !plainText || result.structuredContent !== undefined;
 
   const outputText = hasRichContent
@@ -159,11 +157,7 @@ function normalizeCallToolResult(
         null,
         2,
       )
-    : textContent.length > 0
-      ? textContent.join("\n\n")
-      : result.isError === true
-        ? `MCP tool ${command.toolName} reported an error without textual details.`
-        : "";
+    : content.text;
 
   return {
     ...(result.isError === undefined ? {} : { isError: result.isError }),

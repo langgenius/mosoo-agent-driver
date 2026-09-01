@@ -4,7 +4,12 @@ import { jsonValueSchema } from "../../contract";
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId, RunId, SessionId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { assertClaudeDurableEventFits, ClaudeAgentSdkEventWriter } from "./agent-sdk-event-writer";
+import { DriverCompletedTerminalSupersededError } from "../driver-event-publisher";
+import {
+  assertClaudeDurableEventFits,
+  ClaudeAgentSdkEventWriter,
+  type ClaudeTerminalOutcome,
+} from "./agent-sdk-event-writer";
 import {
   isRecord,
   readNumber,
@@ -58,11 +63,15 @@ function exhaustSdkMessage(value: never): unknown {
   return value;
 }
 
+export type { ClaudeTerminalOutcome } from "./agent-sdk-event-writer";
+
 export class ClaudeTerminalWriteError extends Error {
   override readonly name = "ClaudeTerminalWriteError";
+  readonly terminalKind: ClaudeTerminalOutcome["kind"];
 
-  constructor(cause: unknown) {
+  constructor(cause: unknown, terminalKind: ClaudeTerminalOutcome["kind"]) {
     super("Claude terminal delivery failed.", { cause });
+    this.terminalKind = terminalKind;
   }
 }
 
@@ -71,6 +80,7 @@ export class ClaudeAgentSdkMessageTranslator {
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #permissionDenialAdvisories = new Map<string, ClaudePermissionDenialAdvisory>();
   readonly #state: ClaudeAgentSdkMessageState;
+  #turnClosureCommitted = false;
 
   constructor(options: ClaudeMessageTranslatorOptions) {
     this.#options = options;
@@ -82,6 +92,7 @@ export class ClaudeAgentSdkMessageTranslator {
     this.#state.reset();
     this.#events.resetTurnState();
     this.#permissionDenialAdvisories.clear();
+    this.#turnClosureCommitted = false;
   }
 
   async #cancelOpenTurn(context: AgentDriverContext): Promise<void> {
@@ -107,19 +118,36 @@ export class ClaudeAgentSdkMessageTranslator {
     terminal: DriverEventInput,
     reason: string,
   ): Promise<void> {
-    const closure = this.#events.prepareTurnClosure(toolStatus);
-    await this.#options.pushTerminal(
-      context,
-      reason,
-      [...closure.events, claudeBackgroundTasksClosedEvent()],
-      terminal,
-    );
-    closure.commit();
+    const closure = this.#turnClosureCommitted ? null : this.#events.prepareTurnClosure(toolStatus);
+    const commit = () => {
+      if (closure === null) {
+        return;
+      }
+      closure.commit();
+      this.#turnClosureCommitted = true;
+      this.#state.clearThoughtIds();
+      for (const [messageId, runId] of this.#state.assistantMessages()) {
+        this.#state.completeAssistantMessage(runId, messageId, toolStatus === "completed");
+      }
+    };
 
-    this.#state.clearThoughtIds();
-    for (const [messageId, runId] of this.#state.assistantMessages()) {
-      this.#state.completeAssistantMessage(runId, messageId, toolStatus === "completed");
+    try {
+      await this.#options.pushTerminal(
+        context,
+        reason,
+        closure === null ? [] : [...closure.events, claudeBackgroundTasksClosedEvent()],
+        terminal,
+      );
+    } catch (error) {
+      if (
+        terminal.kind === "run.completed" &&
+        error instanceof DriverCompletedTerminalSupersededError
+      ) {
+        commit();
+      }
+      throw error;
     }
+    commit();
   }
 
   async cancelTurn(context: AgentDriverContext, runId: RunId, reason: string): Promise<void> {
@@ -158,7 +186,7 @@ export class ClaudeAgentSdkMessageTranslator {
     context: AgentDriverContext,
     message: SDKMessage,
     runId: RunId,
-  ): Promise<boolean> {
+  ): Promise<ClaudeTerminalOutcome | null> {
     const sessionId = readClaudeSdkSessionId(message);
 
     if (sessionId !== null && message.type !== "conversation_reset") {
@@ -168,37 +196,36 @@ export class ClaudeAgentSdkMessageTranslator {
     switch (message.type) {
       case "assistant": {
         await this.#handleAssistantMessage(context, message, runId);
-        return false;
+        return null;
       }
       case "auth_status":
       case "rate_limit_event":
       case "tool_progress":
       case "tool_use_summary": {
         await this.#events.pushDiagnostic(context, message);
-        return false;
+        return null;
       }
       case "conversation_reset": {
         await this.#handleConversationReset(context, message);
-        return false;
+        return null;
       }
       case "result": {
-        await this.#handleResultMessage(context, message, runId);
-        return true;
+        return this.#handleResultMessage(context, message, runId);
       }
       case "stream_event": {
         await this.#handleStreamEvent(context, message, runId);
-        return false;
+        return null;
       }
       case "system": {
         await this.#handleSystemMessage(context, message, runId);
-        return false;
+        return null;
       }
       case "user": {
         await this.#handleUserMessage(context, message, runId);
-        return false;
+        return null;
       }
       case "prompt_suggestion": {
-        return false;
+        return null;
       }
       default: {
         const unexpected = exhaustSdkMessage(message);
@@ -207,7 +234,7 @@ export class ClaudeAgentSdkMessageTranslator {
           "driver.claude.message.unknown",
           isRecord(unexpected) ? unexpected : { value: String(unexpected) },
         );
-        return false;
+        return null;
       }
     }
   }
@@ -771,7 +798,7 @@ export class ClaudeAgentSdkMessageTranslator {
     context: AgentDriverContext,
     message: Extract<SDKMessage, { type: "result" }>,
     runId: RunId,
-  ): Promise<void> {
+  ): Promise<ClaudeTerminalOutcome> {
     const successful = isClaudeResultSuccessful(message);
     const cancelled = isClaudeResultCancelled(message);
 
@@ -816,23 +843,23 @@ export class ClaudeAgentSdkMessageTranslator {
     );
     const finishResult = async (
       toolStatus: "cancelled" | "completed" | "failed",
-      terminal: DriverEventInput,
+      terminal: ClaudeTerminalOutcome,
       reason: string,
-    ): Promise<void> => {
+    ): Promise<ClaudeTerminalOutcome> => {
       try {
         await this.finishTurnWithTerminal(context, toolStatus, terminal, reason);
       } catch (error) {
-        throw new ClaudeTerminalWriteError(error);
+        throw new ClaudeTerminalWriteError(error, terminal.kind);
       }
+      return terminal;
     };
 
     if (cancelled) {
-      await finishResult(
+      return finishResult(
         "cancelled",
         this.#events.runCancelled(runId, message.terminal_reason ?? "provider.aborted"),
         "driver.claude.turn.cancelled",
       );
-      return;
     }
 
     if (message.subtype === "success" && successful) {
@@ -843,7 +870,7 @@ export class ClaudeAgentSdkMessageTranslator {
           : jsonValueSchema.safeParse(message.structured_output);
 
       if (structuredOutput !== undefined && !structuredOutput.success) {
-        await finishResult(
+        return finishResult(
           "failed",
           this.#events.runError(
             runId,
@@ -853,7 +880,6 @@ export class ClaudeAgentSdkMessageTranslator {
           ),
           "driver.claude.turn.failed",
         );
-        return;
       }
 
       const completedTerminal = this.#events.runFinished(runId, null, structuredOutput?.data);
@@ -863,7 +889,7 @@ export class ClaudeAgentSdkMessageTranslator {
           MAX_CLAUDE_STRUCTURED_TERMINAL_BYTES;
 
       if (structuredOutputTooLarge) {
-        await finishResult(
+        return finishResult(
           "failed",
           this.#events.runError(
             runId,
@@ -873,7 +899,6 @@ export class ClaudeAgentSdkMessageTranslator {
           ),
           "driver.claude.turn.failed",
         );
-        return;
       }
 
       if (
@@ -897,15 +922,14 @@ export class ClaudeAgentSdkMessageTranslator {
           ? null
           : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
 
-      await finishResult(
+      return finishResult(
         "completed",
         this.#events.runFinished(runId, finalMessage, structuredOutput?.data),
         "driver.claude.turn.completed",
       );
-      return;
     }
 
-    await finishResult(
+    return finishResult(
       "failed",
       this.#events.runError(
         runId,

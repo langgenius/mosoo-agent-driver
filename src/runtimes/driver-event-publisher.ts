@@ -27,6 +27,7 @@ import {
 interface TerminalSettlement {
   readonly acceptedSourceEventIds: Set<string>;
   readonly activeRunId: RunId;
+  readonly cancellationSignal: AbortSignal | null;
   readonly events: readonly DriverEventInput[];
   readonly key: string;
   signal: AbortSignal;
@@ -87,6 +88,13 @@ class QueuedPushDeliveryError extends Error {
     this.deliveryCause = cause;
     this.name = "QueuedPushDeliveryError";
     this.retainedSourceEventIds = retainedSourceEventIds;
+  }
+}
+
+export class DriverCompletedTerminalSupersededError extends Error {
+  constructor(reason: unknown) {
+    super("Driver completed terminal was superseded by cancellation.", { cause: reason });
+    this.name = "DriverCompletedTerminalSupersededError";
   }
 }
 
@@ -179,6 +187,7 @@ export class DriverEventPublisher {
     events: readonly DriverEventInput[],
     terminalSettlement?: TerminalSettlement,
     sessionScoped = false,
+    deliverySignal = terminalSettlement?.signal,
   ): Promise<void> {
     if (events.length === 0) {
       this.#requestPendingDrain(context, reason);
@@ -231,12 +240,7 @@ export class DriverEventPublisher {
       this.#pendingTerminalKey !== null &&
       terminalDriverEventRetryKey(events, activeRunId) === this.#pendingTerminalKey
     ) {
-      const retry = this.#createPendingRetry(
-        context,
-        reason,
-        undefined,
-        terminalSettlement?.signal,
-      );
+      const retry = this.#createPendingRetry(context, reason, undefined, deliverySignal);
       this.#enqueue(retry);
       return retry.promise;
     }
@@ -261,7 +265,7 @@ export class DriverEventPublisher {
     const entry =
       adoption.events.length === 0
         ? null
-        : this.#admit(context, reason, adoption.events, activeRunId, terminalSettlement?.signal);
+        : this.#admit(context, reason, adoption.events, activeRunId, deliverySignal);
 
     if (entry === null && adoption.sourceEventIds.length === 0) {
       this.#requestPendingDrain(context, reason);
@@ -299,7 +303,7 @@ export class DriverEventPublisher {
         context,
         reason,
         adoption.sourceEventIds,
-        terminalSettlement?.signal,
+        deliverySignal,
       );
       this.#enqueue(retry);
       deliveries.push(Promise.race([acknowledged, retry.promise.then(() => acknowledged)]));
@@ -379,6 +383,7 @@ export class DriverEventPublisher {
     reason: string,
     closures: readonly DriverEventInput[],
     terminal: DriverEventInput,
+    cancellationSignal?: AbortSignal,
   ): Promise<void> {
     if (!isRunTerminalDriverEvent(terminal)) {
       throw new Error("Driver terminal push requires a run terminal event.");
@@ -386,6 +391,9 @@ export class DriverEventPublisher {
 
     if (!isLosslessDriverEvent(terminal)) {
       throw new Error("Driver terminal push requires lossless events.");
+    }
+    if (cancellationSignal !== undefined && terminal.kind !== "run.completed") {
+      throw new Error("Only a completed driver terminal can lose to cancellation.");
     }
 
     for (const closure of closures) {
@@ -440,6 +448,8 @@ export class DriverEventPublisher {
 
       this.#terminalSettlement = null;
     }
+
+    cancellationSignal?.throwIfAborted();
 
     const retryCandidates = [
       ...(this.#inFlightEvents ?? this.#pendingEvents),
@@ -511,6 +521,7 @@ export class DriverEventPublisher {
           .filter((sourceEventId) => this.#acceptedInFlightSourceEventIds.has(sourceEventId)),
       ),
       activeRunId,
+      cancellationSignal: cancellationSignal ?? null,
       events,
       key,
       nextIndex: 0,
@@ -534,6 +545,13 @@ export class DriverEventPublisher {
       (error: unknown) => {
         if (settlement.task === task) {
           settlement.task = null;
+        }
+        if (
+          settlement.cancellationSignal?.aborted === true &&
+          settlement.nextIndex === settlement.events.length - 1
+        ) {
+          this.#abandonCancelledTerminalSettlement(settlement);
+          throw new DriverCompletedTerminalSupersededError(settlement.cancellationSignal.reason);
         }
 
         throw error;
@@ -565,6 +583,10 @@ export class DriverEventPublisher {
       const event = settlement.events[settlement.nextIndex]!;
       const deliveryReason = terminal ? reason : `${reason}.items`;
       const retryReason = `${deliveryReason}.retry`;
+      const deliverySignal =
+        terminal && settlement.cancellationSignal !== null
+          ? AbortSignal.any([settlement.signal, settlement.cancellationSignal])
+          : settlement.signal;
       let delivery: Promise<void>;
 
       try {
@@ -575,12 +597,12 @@ export class DriverEventPublisher {
             );
         delivery =
           retained === undefined
-            ? this.#submit(context, deliveryReason, [event], settlement)
+            ? this.#submit(context, deliveryReason, [event], settlement, false, deliverySignal)
             : this.#retryPending(
                 context,
                 retryReason,
                 [retained.event.sourceEventId!],
-                settlement.signal,
+                deliverySignal,
               );
       } catch (error) {
         this.#requestPendingDrain(context, deliveryReason);
@@ -601,7 +623,7 @@ export class DriverEventPublisher {
           context,
           retryReason,
           error.retainedSourceEventIds,
-          settlement.signal,
+          deliverySignal,
         );
       }
     }
@@ -1037,5 +1059,44 @@ export class DriverEventPublisher {
     ) {
       settlement.nextIndex += 1;
     }
+  }
+
+  #abandonCancelledTerminalSettlement(settlement: TerminalSettlement): void {
+    if (this.#terminalSettlement !== settlement) {
+      return;
+    }
+    if (
+      settlement.task !== null ||
+      settlement.nextIndex !== settlement.events.length - 1 ||
+      settlement.acceptedSourceEventIds.size > 0
+    ) {
+      throw new Error("Cannot abandon a selected driver run terminal.");
+    }
+
+    const sourceEventId = settlement.events.at(-1)!.sourceEventId!;
+    if (
+      this.#inFlightEvents?.some(({ event }) => event.sourceEventId === sourceEventId) === true ||
+      this.#queue.some((entry) =>
+        entry.events.some(({ event }) => event.sourceEventId === sourceEventId),
+      )
+    ) {
+      throw new Error("Cannot abandon an in-flight driver terminal batch.");
+    }
+
+    const pending = this.#pendingEvents.filter(
+      ({ event }) => event.sourceEventId !== sourceEventId,
+    );
+    if (pending.some(({ terminalLane }) => terminalLane)) {
+      throw new Error("Cannot abandon a driver terminal while another terminal is pending.");
+    }
+
+    this.#eventSettlements
+      .get(sourceEventId)
+      ?.reject(
+        settlement.cancellationSignal?.reason ?? new Error("Driver terminal was cancelled."),
+      );
+    this.#eventSettlements.delete(sourceEventId);
+    this.#setPending(pending, null);
+    this.#terminalSettlement = null;
   }
 }

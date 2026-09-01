@@ -51,10 +51,6 @@ export interface ClientRequestParams {
   "turn/start": TurnStartParams;
 }
 
-export type ServerNotificationParams = {
-  [Method in ServerNotificationMethod]: JsonObject;
-};
-
 export interface ParsedServerNotification {
   emittedAtMs?: number;
   method: ServerNotificationMethod;

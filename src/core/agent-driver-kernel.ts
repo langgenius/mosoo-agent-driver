@@ -141,8 +141,9 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
   claimRunCancellation(
     ticket: DriverRunTicket,
     reason: string,
+    source?: Parameters<DriverRuntimeIo["claimRunCancellation"]>[2],
   ): "already_claimed" | "claimed" | "terminal_selected" {
-    return this.#terminalState.claimCancellation(ticket, reason);
+    return this.#terminalState.claimCancellation(ticket, reason, source);
   }
 
   async cancel(reason: string): Promise<void> {
@@ -905,22 +906,14 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
     this.#commands.close({ discard: true });
 
     try {
-      let permissionFailure: { error: unknown } | null = null;
+      const [permissionResult] = await Promise.allSettled([permissionCancellation]);
+      const [backendResult] = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
 
-      try {
-        await permissionCancellation;
-      } catch (error) {
-        permissionFailure = { error };
+      if (permissionResult.status === "rejected") {
+        throw permissionResult.reason;
       }
-
-      const backendShutdown = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
-      const failure = backendShutdown.find((result) => result.status === "rejected");
-
-      if (permissionFailure !== null) {
-        throw permissionFailure.error;
-      }
-      if (failure?.status === "rejected") {
-        throw failure.reason;
+      if (backendResult.status === "rejected") {
+        throw backendResult.reason;
       }
 
       await this.#completeShutdown();

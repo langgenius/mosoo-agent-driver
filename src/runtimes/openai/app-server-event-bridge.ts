@@ -12,11 +12,12 @@ import {
   type OpenAiTerminalOutcome,
 } from "./app-server-event-state";
 import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
+import { DriverCompletedTerminalSupersededError } from "../driver-event-publisher";
 import { chunkOpenAiText, OpenAiAppServerItemEventBridge } from "./app-server-item-events";
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
-import { OpenAiTurnTracker } from "./app-server-turn-tracker";
-import type { ServerNotificationMethod, ServerNotificationParams } from "./app-server-protocol";
+import { OpenAiTurnTracker, type OpenAiTurnAdmission } from "./app-server-turn-tracker";
+import type { ServerNotificationMethod } from "./app-server-protocol";
 
 interface OpenAiAppServerEventBridgeOptions {
   beforeInterruptedTurn?(context: AgentDriverContext, turnId: string): Promise<void>;
@@ -31,6 +32,7 @@ interface OpenAiAppServerEventBridgeOptions {
     reason: string,
     closures: readonly DriverEventInput[],
     terminal: DriverEventInput,
+    cancellationSignal?: AbortSignal,
   ): Promise<void>;
   requireThreadId(): string;
 }
@@ -91,22 +93,36 @@ function toBoundedOpenAiTelemetry(payload: JsonObject, fields: readonly string[]
   return summary;
 }
 
-function toOpenAiWarningEvents(
-  method: "guardianWarning" | "warning",
+function toOpenAiUserFacingEvents(
+  method:
+    | "guardianWarning"
+    | "modelProvider/authRecoveryCompleted"
+    | "modelProvider/authRecoveryStarted"
+    | "warning",
   message: string,
+  details: JsonObject = {},
 ): DriverEventInput[] {
   const chunks = chunkOpenAiText(message);
+  const warning = method === "guardianWarning" || method === "warning";
 
   return chunks.map((content, index) => ({
-    delivery: "lossless",
+    delivery: warning ? "lossless" : "best_effort",
     kind: "message.added",
     payload: {
+      ...details,
       ...(chunks.length === 1 ? {} : { chunkCount: chunks.length, chunkIndex: index }),
       content,
-      level: "warning",
+      level: warning ? "warning" : "info",
       messageId: createDriverId(),
       role: "agent",
-      subtype: method === "guardianWarning" ? "guardian_warning" : "warning",
+      subtype:
+        method === "guardianWarning"
+          ? "guardian_warning"
+          : method === "warning"
+            ? "warning"
+            : method === "modelProvider/authRecoveryStarted"
+              ? "model_provider_auth_recovery_started"
+              : "model_provider_auth_recovery_completed",
     },
   }));
 }
@@ -192,6 +208,47 @@ export class OpenAiAppServerEventBridge {
     return this.#turns.activeTurnIds();
   }
 
+  beginTurnAdmission(runId: RunId, signal?: AbortSignal): OpenAiTurnAdmission {
+    return this.#turns.admitRootTurn(runId, signal);
+  }
+
+  bindTurnAdmission(admission: OpenAiTurnAdmission, turnId: string): void {
+    this.#turns.bindRootTurn(admission, turnId);
+  }
+
+  armTurnAdmission(admission: OpenAiTurnAdmission): void {
+    this.#turns.armRootTurn(admission);
+  }
+
+  claimTurnAdmission(
+    admission: OpenAiTurnAdmission,
+    turnId: string,
+    runId: RunId,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.#turns.claimRootTurn(admission, turnId, runId, signal);
+  }
+
+  releaseTurnAdmission(admission: OpenAiTurnAdmission): void {
+    this.#turns.releaseRootTurn(admission);
+  }
+
+  releaseTurnAdmissionSelection(admission: OpenAiTurnAdmission): void {
+    this.#turns.releaseRootTurnSelection(admission);
+  }
+
+  admittedTurnId(admission: OpenAiTurnAdmission): string | null {
+    return this.#turns.admittedTurnId(admission);
+  }
+
+  hasTerminalTurn(turnId: string): boolean {
+    return this.#turns.hasTerminal(turnId);
+  }
+
+  hasAdmittedTerminalTurn(): boolean {
+    return this.#turns.hasAdmittedTerminalTurn();
+  }
+
   mapToolCallId(toolCallId: string): string {
     return this.#items.publicId(toolCallId);
   }
@@ -224,7 +281,11 @@ export class OpenAiAppServerEventBridge {
       return;
     }
     const publicTurnId = this.publicTurnId(turnId);
-    const [taskClosure, ...itemClosures] = this.#itemEvents.terminalEvents({ kind: "cancelled" });
+    const completionClosuresCommitted = this.#turns.completionClosuresCommitted(turnId);
+    const cancelledClosures = completionClosuresCommitted
+      ? []
+      : this.#itemEvents.terminalEvents({ kind: "cancelled" });
+    const [taskClosure, ...itemClosures] = cancelledClosures;
 
     try {
       await this.#options.pushTerminal(
@@ -233,7 +294,7 @@ export class OpenAiAppServerEventBridge {
         turnClosureEvents({
           eventName: "turn.cancelled",
           events: [
-            taskClosure,
+            ...(taskClosure === undefined ? [] : [taskClosure]),
             {
               ...turnEventFields({ eventName: "turn.cancel.requested", publicTurnId, runId }),
               kind: "run.cancel.requested",
@@ -332,20 +393,20 @@ export class OpenAiAppServerEventBridge {
     return this.#itemEvents.terminalEvents(outcome);
   }
 
-  async trackTurn(turnId: string, runId: RunId): Promise<void> {
-    return this.#turns.track(turnId, runId);
+  async trackTurn(turnId: string, runId: RunId, signal?: AbortSignal): Promise<void> {
+    return this.#turns.track(turnId, runId, signal);
   }
 
-  async handleNotification<M extends ServerNotificationMethod>(
+  async handleNotification(
     context: AgentDriverContext,
-    method: M,
-    params: ServerNotificationParams[M],
+    method: ServerNotificationMethod,
+    params: JsonObject,
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
     const turnId =
       readNonEmptyString(payload, "turnId") ??
       readNonEmptyString(readRecord(payload, "turn"), "id");
-    const notificationMethod: ServerNotificationMethod = method;
+    const notificationMethod = method;
 
     // Native Codex subagents own child threads and turns. Their direct message
     // and lifecycle frames are provider-internal activity, not authoritative
@@ -358,7 +419,6 @@ export class OpenAiAppServerEventBridge {
     ) {
       return;
     }
-
     const item = readRecord(payload, "item");
     const postTerminalSubAgentActivity =
       notificationMethod === "item/completed" &&
@@ -371,6 +431,12 @@ export class OpenAiAppServerEventBridge {
       }
       return;
     }
+    if (
+      turnId !== null &&
+      (!(await this.#turns.awaitRootTurnAdmission(turnId)) || !this.#turns.acceptsRootTurn(turnId))
+    ) {
+      return;
+    }
 
     switch (notificationMethod) {
       case "configWarning": {
@@ -380,6 +446,22 @@ export class OpenAiAppServerEventBridge {
       case "warning":
       case "guardianWarning": {
         await this.#onWarning(context, payload, notificationMethod);
+        return;
+      }
+      case "modelProvider/authRecoveryStarted":
+      case "modelProvider/authRecoveryCompleted": {
+        const message = readString(payload, "message");
+        if (message !== null) {
+          await this.#push(
+            context,
+            "driver.openai.model_provider.auth_recovery",
+            toOpenAiUserFacingEvents(
+              notificationMethod,
+              message,
+              toBoundedOpenAiTelemetry(payload, ["provider"]),
+            ),
+          );
+        }
         return;
       }
       case "remoteControl/status/changed": {
@@ -640,7 +722,7 @@ export class OpenAiAppServerEventBridge {
     if (identityRunId === null) {
       return;
     }
-    if (this.#turns.hasTurnStarted(input.turnId)) {
+    if (this.#turns.hasTurnStarted(input.turnId) || this.#turns.hasTerminal(input.turnId)) {
       return;
     }
 
@@ -918,7 +1000,7 @@ export class OpenAiAppServerEventBridge {
       threadIdPresent: readString(params, "threadId") !== null,
     });
 
-    await this.#push(context, `driver.openai.${method}`, toOpenAiWarningEvents(method, message));
+    await this.#push(context, `driver.openai.${method}`, toOpenAiUserFacingEvents(method, message));
   }
 
   async #onWorldWritableWarning(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -1004,7 +1086,13 @@ export class OpenAiAppServerEventBridge {
       throw new Error("OpenAi turn/completed requires a terminal turn status.");
     }
 
-    const runId = this.#turns.activeRunId(turnId) ?? undefined;
+    const pendingTurn = this.#turns.pendingTurnContext(turnId);
+    if (pendingTurn !== null && !this.#turns.hasTurnStarted(turnId)) {
+      throw new Error("OpenAi turn/completed arrived before its turn/started notification.");
+    }
+    const runId = this.#turns.activeRunId(turnId) ?? pendingTurn?.runId;
+    const cancellationSignal =
+      this.#turns.cancellationSignal(turnId) ?? pendingTurn?.cancellationSignal ?? null;
 
     await this.publishRunStarted(context, { runId, turnId });
     await this.#itemEvents.onTurnItems(context, params, turnId);
@@ -1118,10 +1206,23 @@ export class OpenAiAppServerEventBridge {
             stopReason: "end_turn",
           },
         },
+        cancellationSignal ?? undefined,
       );
       this.#finishSettlement(turnId, { kind: "completed" });
     } catch (pushError) {
       this.#turns.cancelSettlement(turnId);
+      if (
+        status === "completed" &&
+        cancellationSignal?.aborted === true &&
+        (pushError === cancellationSignal.reason ||
+          (pushError instanceof DriverCompletedTerminalSupersededError &&
+            pushError.cause === cancellationSignal.reason))
+      ) {
+        if (pushError instanceof DriverCompletedTerminalSupersededError) {
+          this.#turns.markCompletionClosuresCommitted(turnId);
+        }
+        return;
+      }
       throw pushError;
     }
   }
@@ -1165,7 +1266,7 @@ export class OpenAiAppServerEventBridge {
       return;
     }
 
-    const runId = this.#turns.activeRunId(turnId) ?? undefined;
+    const runId = this.#turns.activeRunId(turnId) ?? this.#turns.pendingTurnContext(turnId)?.runId;
 
     await this.publishRunStarted(context, { runId, turnId });
   }

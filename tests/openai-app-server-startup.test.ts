@@ -27,7 +27,7 @@ const initializeResultJson = JSON.stringify({
   codexHome: "/tmp/openai-home",
   platformFamily: "unix",
   platformOs: "linux",
-  userAgent: "test-app-server/0.151.0",
+  userAgent: "test-app-server/0.152.0",
 });
 
 function eventPayloadStatus(event: DriverEventInput): unknown {
@@ -42,6 +42,7 @@ interface CancellationHarnessOptions {
   readonly backgroundTerminalCleanFailure?: "error" | "timeout";
   readonly duplicateRequestPhase?: "active_turn" | "turn_start";
   readonly emitInterruptedTurnOnStart?: boolean;
+  readonly terminalNotificationBeforeTurnStartResponse?: boolean;
   readonly emitToolCompletionOnTurnStart?: boolean;
   readonly environmentVariables?: Readonly<Record<string, string>>;
   readonly failCancellationRequest?: boolean;
@@ -137,6 +138,22 @@ const sendInterrupted = (turnId) => process.stdout.write(JSON.stringify({
     },
   },
 }) + "\\n");
+const sendTurnStarted = (turnId) => process.stdout.write(JSON.stringify({
+  method: "turn/started",
+  params: {
+    threadId: "fresh-thread",
+    turn: {
+      completedAt: null,
+      durationMs: null,
+      error: null,
+      id: turnId,
+      items: [],
+      itemsView: "notLoaded",
+      startedAt: Date.now(),
+      status: "inProgress",
+    },
+  },
+}) + "\\n");
 const toolItem = {
     aggregatedOutput: "done",
     command: "printf done",
@@ -225,7 +242,7 @@ const thread = {
   status: { type: "idle" },
   path: null,
   cwd: ${JSON.stringify(directory)},
-  cliVersion: "0.151.0",
+  cliVersion: "0.152.0",
   source: "appServer",
   canAcceptDirectInput: true,
   threadSource: null,
@@ -284,6 +301,9 @@ process.stdin.on("data", (chunk) => {
       ["terminal_response", "terminal_then_malformed"].includes(
         toolStartFollowup,
       ) ||
+      (request.method === "turn/start" &&
+        turnNumber === 1 &&
+        ${JSON.stringify(cancellationOptions.terminalNotificationBeforeTurnStartResponse ?? false)}) ||
       ((launchNumber > 1 || turnNumber > 1) &&
         !${JSON.stringify(cancellationOptions.emitToolCompletionOnTurnStart ?? false)});
     const holdTurnStart =
@@ -341,6 +361,14 @@ process.stdin.on("data", (chunk) => {
       if (request.method === "turn/start" && duplicateRequestPhase === "turn_start") {
         sendDuplicateRequest(turnId);
         return;
+      }
+      if (
+        request.method === "turn/start" &&
+        turnNumber === 1 &&
+        ${JSON.stringify(cancellationOptions.terminalNotificationBeforeTurnStartResponse ?? false)}
+      ) {
+        sendTurnStarted(turnId);
+        sendToolLifecycle(turnId, true);
       }
       if (request.method === "turn/start" && response !== null && toolStartFollowup === "malformed") {
         process.stdout.write(JSON.stringify(response) + "\\n" + toolStartMessage(turnId) + "not-json\\n");
@@ -560,10 +588,10 @@ process.stdin.on("data", (chunk) => {
   const trackedBackend: AgentDriverBackend = {
     runtime: backend.runtime,
     cancelActiveTurn: (backendContext, reason) => backend.cancelActiveTurn(backendContext, reason),
-    handleInput: async (backendContext, input, runId) => {
+    handleInput: async (backendContext, input, runId, signal) => {
       activeRunId = runId;
       try {
-        await backend.handleInput(backendContext, input, runId);
+        await backend.handleInput(backendContext, input, runId, signal);
       } finally {
         if (activeRunId === runId) {
           activeRunId = null;
@@ -1114,7 +1142,7 @@ describe("OpenAI app-server startup", () => {
     },
   );
 
-  test("closes items emitted before a pending turn start response is cancelled", async () => {
+  test("does not project items before their pending turn response identifies the run", async () => {
     const harness = await createCancellationHarness({
       emitToolCompletionOnTurnStart: true,
       holdTurnStartAfterItems: true,
@@ -1131,18 +1159,21 @@ describe("OpenAI app-server startup", () => {
       await expect(
         settlePromiseWithTimeout(
           (async () => {
-            while (
-              !harness.events.some(
-                (event) =>
-                  event.kind === "tool.call.updated" && eventPayloadStatus(event) === "running",
-              )
-            ) {
+            while (!(await Bun.file(harness.turnStartHeldMarker).exists())) {
               await Bun.sleep(1);
             }
           })(),
-          { label: "pre-response tool start", timeoutMs: 250 },
+          { label: "held turn start", timeoutMs: 250 },
         ),
       ).resolves.toMatchObject({ status: "completed" });
+      await Bun.sleep(10);
+      expect(
+        harness.events.filter((event) =>
+          ["item.started", "message.started", "run.started", "tool.call.updated"].includes(
+            event.kind,
+          ),
+        ),
+      ).toEqual([]);
 
       await harness.backend.cancelActiveTurn(harness.context, "test.cancel");
       await expect(input).rejects.toThrow("test.cancel");
@@ -1151,15 +1182,9 @@ describe("OpenAI app-server startup", () => {
           .filter((event) => event.runId === DRIVER_TEST_IDS.runId)
           .map((event) => [event.kind, eventPayloadStatus(event)]),
       ).toEqual([
-        ["message.started", undefined],
-        ["item.started", undefined],
-        ["tool.call.updated", "running"],
         ["agent.tasks.replaced", undefined],
         ["run.started", undefined],
         ["run.cancel.requested", undefined],
-        ["message.cancelled", undefined],
-        ["tool.call.updated", "cancelled"],
-        ["item.completed", "cancelled"],
         ["run.cancelled", undefined],
       ]);
     } finally {
@@ -1189,8 +1214,11 @@ describe("OpenAI app-server startup", () => {
   ] as const)(
     "closes a durably started tool before a same-burst %s",
     async (_label, toolStartFollowup, closureStatus, terminalKind) => {
+      const responseIdentifiesTurn =
+        toolStartFollowup === "terminal_response" ||
+        toolStartFollowup === "terminal_then_malformed";
       const harness = await createCancellationHarness({
-        holdMessageStart: true,
+        holdMessageStart: responseIdentifiesTurn || toolStartFollowup === "malformed",
         ...(toolStartFollowup === "error_response" || toolStartFollowup === "error_then_malformed"
           ? { turnStartErrorMessage: "turn start rejected" }
           : {}),
@@ -1205,14 +1233,15 @@ describe("OpenAI app-server startup", () => {
           DRIVER_TEST_IDS.runId,
         );
         void input.catch(() => {});
-        await harness.messageStartEntered;
-        expect(
-          harness.events.some((event) =>
-            ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
-          ),
-        ).toBe(false);
-
-        harness.releaseMessageStart();
+        if (responseIdentifiesTurn || toolStartFollowup === "malformed") {
+          await harness.messageStartEntered;
+          expect(
+            harness.events.some((event) =>
+              ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
+            ),
+          ).toBe(false);
+          harness.releaseMessageStart();
+        }
         if (
           toolStartFollowup !== "terminal_response" &&
           toolStartFollowup !== "terminal_then_malformed"
@@ -1224,22 +1253,25 @@ describe("OpenAI app-server startup", () => {
           await expect(input).resolves.toBeUndefined();
         }
 
-        expect(
-          harness.events
-            .filter((event) =>
-              [
-                "item.completed",
-                "item.started",
-                "message.completed",
-                "message.failed",
-                "message.started",
-                "run.completed",
-                "run.failed",
-                "tool.call.updated",
-              ].includes(event.kind),
-            )
-            .map((event) => [event.kind, eventPayloadStatus(event)]),
-        ).toEqual([
+        const projectedLifecycle = harness.events
+          .filter((event) =>
+            [
+              "item.completed",
+              "item.started",
+              "message.completed",
+              "message.failed",
+              "message.started",
+              "run.completed",
+              "run.failed",
+              "tool.call.updated",
+            ].includes(event.kind),
+          )
+          .map((event) => [event.kind, eventPayloadStatus(event)]);
+        if (!responseIdentifiesTurn && toolStartFollowup !== "malformed") {
+          expect(projectedLifecycle).toEqual([["run.failed", undefined]]);
+          return;
+        }
+        expect(projectedLifecycle).toEqual([
           ["message.started", undefined],
           ["item.started", undefined],
           ["tool.call.updated", "running"],
@@ -1264,7 +1296,7 @@ describe("OpenAI app-server startup", () => {
     10_000,
   );
 
-  test("does not carry failed turn-start item state into the next turn", async () => {
+  test("does not project an unadmitted failed-turn item into the next turn", async () => {
     const harness = await createCancellationHarness({
       toolStartFollowup: "error_then_success",
       turnStartErrorMessage: "turn start rejected",
@@ -1285,12 +1317,12 @@ describe("OpenAI app-server startup", () => {
 
       expect(
         harness.events.filter((event) => event.kind === "item.completed").map(eventPayloadStatus),
-      ).toEqual(["failed"]);
+      ).toEqual([]);
       expect(
         harness.events
           .filter((event) => event.kind === "tool.call.updated")
           .map(eventPayloadStatus),
-      ).toEqual(["running", "failed"]);
+      ).toEqual([]);
       expect(
         harness.events
           .filter((event) => ["run.completed", "run.failed"].includes(event.kind))
@@ -1461,6 +1493,87 @@ describe("OpenAI app-server startup", () => {
       expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
     } finally {
       await harness.releaseTurnStartResponse();
+      await kernel.stop("test complete").catch(() => {});
+    }
+  });
+
+  test("dispatcher cancellation replaces an unselected completed terminal", async () => {
+    const harness = await createCancellationHarness({
+      terminalNotificationBeforeTurnStartResponse: true,
+    });
+    const kernel = new AgentDriverKernelCore({
+      backendFactory: (payload) => new OpenAiAppServerDriverBackend(payload),
+      hostPorts: { skill: { materialize: async () => [] } },
+      logger: harness.logger,
+    });
+    const terminalEntered = Promise.withResolvers<void>();
+    const releaseTerminal = Promise.withResolvers<void>();
+    const cancellationClaimed =
+      Promise.withResolvers<ReturnType<AgentDriverKernelCore["claimRunCancellation"]>>();
+    const registerRunTerminalBarrier = kernel.registerRunTerminalBarrier.bind(kernel);
+    kernel.registerRunTerminalBarrier = (barrier) =>
+      registerRunTerminalBarrier((events) => {
+        const pending = barrier(events);
+        if (!events.some(({ kind }) => kind === "run.completed")) {
+          return pending;
+        }
+        return Promise.resolve(pending).then(async () => {
+          terminalEntered.resolve();
+          await releaseTerminal.promise;
+        });
+      });
+    const claimRunCancellation = kernel.claimRunCancellation.bind(kernel);
+    kernel.claimRunCancellation = (ticket, reason) => {
+      const result = claimRunCancellation(ticket, reason);
+      cancellationClaimed.resolve(result);
+      return result;
+    };
+    const events: DriverEventInput[] = [];
+    const cancelled = (async () => {
+      for await (const event of kernel.events()) {
+        events.push(event);
+        if (event.kind === "run.cancelled") {
+          return;
+        }
+      }
+    })();
+
+    try {
+      await kernel.start(harness.payload);
+      const input = kernel.dispatch({
+        commandId: "completed-terminal-race-input",
+        input: { text: "finish" },
+        kind: "input.start",
+        requestId: "completed-terminal-race-request",
+        runId: DRIVER_TEST_IDS.runId,
+      });
+      await terminalEntered.promise;
+      const cancellation = kernel.cancel("test.cancel");
+      expect(await cancellationClaimed.promise).toBe("claimed");
+      releaseTerminal.resolve();
+      await Promise.all([input, cancellation, cancelled]);
+
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(
+        events
+          .filter(
+            ({ kind, payload }) =>
+              kind === "tool.call.updated" &&
+              typeof payload === "object" &&
+              payload !== null &&
+              "status" in payload &&
+              (payload.status === "completed" || payload.status === "cancelled"),
+          )
+          .map(({ payload }) => (payload as { status: string }).status),
+      ).toEqual(["completed"]);
+      expect(events.filter(({ kind }) => kind === "agent.tasks.replaced")).toHaveLength(1);
+    } finally {
+      releaseTerminal.resolve();
       await kernel.stop("test complete").catch(() => {});
     }
   });
@@ -1680,6 +1793,7 @@ describe("OpenAI app-server startup", () => {
     const harness = await createCancellationHarness({
       holdCancellationRequest: true,
     });
+    let stopped = false;
 
     try {
       await harness.backend.start(harness.context, new AbortController().signal);
@@ -1702,6 +1816,21 @@ describe("OpenAI app-server startup", () => {
 
       const cancellation = harness.backend.cancelActiveTurn(harness.context, "test.cancel");
       void cancellation.catch(() => {});
+      const stop = harness.backend.stop(
+        harness.context,
+        "test complete",
+        new AbortController().signal,
+      );
+      void stop.catch(() => {});
+      let stopSettled = false;
+      void stop.then(
+        () => {
+          stopSettled = true;
+        },
+        () => {
+          stopSettled = true;
+        },
+      );
       await harness.cancellationRequestEntered;
       const firstPid = await readFirstLaunchPid(harness.processLog);
       expect(() => process.kill(firstPid, 0)).toThrow();
@@ -1712,8 +1841,13 @@ describe("OpenAI app-server startup", () => {
         }),
       ).resolves.toMatchObject({ status: "completed" });
 
+      await Bun.sleep(10);
+      expect(stopSettled).toBe(false);
+
       harness.releaseCancellationRequest();
       await expect(input).rejects.toThrow("test.cancel");
+      await stop;
+      stopped = true;
       await expect(
         settlePromiseWithTimeout(
           (async () => {
@@ -1726,7 +1860,11 @@ describe("OpenAI app-server startup", () => {
       ).resolves.toMatchObject({ status: "completed" });
     } finally {
       harness.releaseCancellationRequest();
-      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      if (!stopped) {
+        await harness.backend
+          .stop(harness.context, "test complete", new AbortController().signal)
+          .catch(() => {});
+      }
     }
   });
 
@@ -1947,11 +2085,7 @@ describe("OpenAI app-server startup", () => {
           terminalGate.resolve();
         }
         await expect(input).rejects.toThrow("test cancellation");
-        if (failureMode === "late terminal delivery") {
-          await expect(cancellation).resolves.toBeUndefined();
-        } else {
-          await expect(cancellation).rejects.toThrow("test cancellation");
-        }
+        await expect(cancellation).rejects.toThrow("test cancellation");
         await expect(
           settlePromiseWithTimeout(
             (async () => {

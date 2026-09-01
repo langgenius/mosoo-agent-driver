@@ -46,8 +46,11 @@ describe("DriverTerminalStateMachine", () => {
     const ticket = state.beginRun(DRIVER_TEST_IDS.runId);
 
     expect(state.claimCancellation(ticket, "cancel first")).toBe("claimed");
-    expect(state.claimCancellation(ticket, "again")).toBe("already_claimed");
+    expect(ticket.signal.reason).toMatchObject({ resumeAllowed: true });
+    expect(state.claimCancellation(ticket, "stop now", "shutdown")).toBe("already_claimed");
     expect(ticket.signal.reason).toBeInstanceOf(DriverTurnCancelledError);
+    expect(ticket.signal.reason).toMatchObject({ resumeAllowed: false });
+    expect(ticket.signal.reason.resumeSignal.aborted).toBe(true);
     expect(state.selectRunTerminal(ticket, terminal("completed"))).toBe("cancelled");
   });
 

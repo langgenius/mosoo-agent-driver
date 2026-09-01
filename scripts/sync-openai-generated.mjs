@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   cpSync,
@@ -30,26 +30,13 @@ const schemaSources = new Map([
 ]);
 
 function run(command, args) {
-  const result = spawnSync(command, args, { cwd: root, encoding: "utf8" });
-  if (result.status !== 0) {
-    throw new Error(
-      [result.stdout, result.stderr, `${command} exited with ${String(result.status)}.`]
-        .filter(Boolean)
-        .join("\n"),
-    );
-  }
+  execFileSync(command, args, { cwd: root, stdio: "inherit" });
 }
 
 function listFiles(directory, extension) {
-  return readdirSync(directory, { withFileTypes: true })
-    .flatMap((entry) => {
-      const path = resolve(directory, entry.name);
-      return entry.isDirectory()
-        ? listFiles(path, extension)
-        : path.endsWith(extension)
-          ? [path]
-          : [];
-    })
+  return readdirSync(directory, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(extension))
+    .map((entry) => resolve(entry.parentPath, entry.name))
     .sort();
 }
 

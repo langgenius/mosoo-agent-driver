@@ -203,7 +203,7 @@ function createThreadFixture(id = "thread-1") {
     agentNickname: null,
     agentRole: null,
     canAcceptDirectInput: true,
-    cliVersion: "0.151.0",
+    cliVersion: "0.152.0",
     createdAt: 1_700_000_000,
     cwd: "/workspace",
     ephemeral: false,
@@ -480,7 +480,7 @@ describe("OpenAI app-server provider fixtures", () => {
         codexHome: "/tmp/openai-home",
         platformFamily: "unix",
         platformOs: "linux",
-        userAgent: "test-app-server/0.151.0",
+        userAgent: "test-app-server/0.152.0",
       };
       delete response[missing];
 
@@ -493,7 +493,7 @@ describe("OpenAI app-server provider fixtures", () => {
       codexHome: "/tmp/openai-home",
       platformFamily: "unix",
       platformOs: "linux",
-      userAgent: "test-app-server/0.151.0",
+      userAgent: "test-app-server/0.152.0",
     };
 
     expect(CLIENT_RESULT_SCHEMAS.initialize.parse(response)).toEqual(response);

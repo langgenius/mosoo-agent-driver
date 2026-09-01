@@ -18,10 +18,12 @@ import {
   parseDriverLogBatchInput,
   parseDriverNextCommandInput,
   parseDriverReadyInput,
+  type DriverEventReceipt,
   type DriverLogEntry,
 } from "../src/protocol/orpc";
 import type {
   DriverCapability,
+  DriverCommandUpdate,
   McpExecuteCommandResult,
   McpExternalToolEffectState,
   RuntimeCommand,
@@ -45,13 +47,6 @@ export function expectedDriverCapabilities(runtime: string): readonly DriverCapa
     permissionRequestStatus: "supported",
     provider,
   });
-}
-
-export interface DriverArtifactTestCommandUpdate {
-  readonly commandId: string;
-  readonly error?: unknown;
-  readonly result?: unknown;
-  readonly status: string;
 }
 
 export type DriverArtifactTestCommand = RuntimeCommand;
@@ -323,15 +318,10 @@ function readSameUserLinuxIdentity(pid: number): LinuxProcessIdentity | null {
 export class DriverArtifactTestController {
   readonly #bootPayload: DriverArtifactBootPayload;
   readonly #commands: DriverArtifactTestCommand[] = [];
-  readonly #commandUpdates: DriverArtifactTestCommandUpdate[] = [];
+  readonly #commandUpdates: DriverCommandUpdate[] = [];
   readonly #eventIngressGates = new Set<EventIngressGateState>();
   readonly #eventIngressObservers = new Set<(event: DriverArtifactTestEvent) => void>();
-  readonly #eventReceipts = new Map<
-    string,
-    {
-      readonly receipt: { readonly eventId: string; readonly seq: number; readonly type: string };
-    }
-  >();
+  readonly #eventReceipts = new Map<string, DriverEventReceipt>();
   readonly #events: DriverArtifactTestEvent[] = [];
   readonly #externalToolEffects = new Map<string, ArtifactExternalToolEffect>();
   readonly #expectedCapabilities: readonly DriverCapability[] | undefined;
@@ -437,7 +427,7 @@ export class DriverArtifactTestController {
     return this.#events;
   }
 
-  get commandUpdates(): readonly DriverArtifactTestCommandUpdate[] {
+  get commandUpdates(): readonly DriverCommandUpdate[] {
     return this.#commandUpdates;
   }
 
@@ -662,7 +652,7 @@ export class DriverArtifactTestController {
     commandId: string,
     timeoutMs: number,
     fromIndex = 0,
-  ): Promise<DriverArtifactTestCommandUpdate> {
+  ): Promise<DriverCommandUpdate> {
     return this.#waitFor(
       () =>
         this.#commandUpdates
@@ -677,11 +667,11 @@ export class DriverArtifactTestController {
   }
 
   async waitForCommandUpdate(
-    predicate: (update: DriverArtifactTestCommandUpdate) => boolean,
+    predicate: (update: DriverCommandUpdate) => boolean,
     fromIndex: number,
     timeoutMs: number,
     label: string,
-  ): Promise<DriverArtifactTestCommandUpdate> {
+  ): Promise<DriverCommandUpdate> {
     return this.#waitFor(
       () => this.#commandUpdates.slice(fromIndex).find(predicate),
       label,
@@ -965,10 +955,10 @@ export class DriverArtifactTestController {
           const existing = this.#eventReceipts.get(envelope.eventId);
 
           if (existing !== undefined) {
-            if (existing.receipt.type !== envelope.event.kind) {
+            if (existing.type !== envelope.event.kind) {
               throw new Error(`Driver reused event ID ${envelope.eventId} with a changed type.`);
             }
-            return existing.receipt;
+            return existing;
           }
 
           const { event } = envelope;
@@ -1020,7 +1010,7 @@ export class DriverArtifactTestController {
             seq: this.#nextEventSeq,
             type: envelope.event.kind,
           };
-          this.#eventReceipts.set(envelope.eventId, { receipt });
+          this.#eventReceipts.set(envelope.eventId, receipt);
           return receipt;
         });
         await Promise.all(ingressWaits);
@@ -1033,23 +1023,9 @@ export class DriverArtifactTestController {
         return { ok: true };
       }
       case "/driver/commandUpdate": {
-        const update = parseDriverCommandUpdateInput(input);
-        this.#assertDriverInstanceId(update.driverInstanceId);
-        this.#commandUpdates.push(
-          update.status === "failed"
-            ? {
-                commandId: update.commandId,
-                error: update.error,
-                status: update.status,
-              }
-            : update.status === "completed"
-              ? {
-                  commandId: update.commandId,
-                  ...(update.result === undefined ? {} : { result: update.result }),
-                  status: update.status,
-                }
-              : { commandId: update.commandId, status: update.status },
-        );
+        const { driverInstanceId, ...update } = parseDriverCommandUpdateInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
+        this.#commandUpdates.push(update);
         return { ok: true };
       }
       case "/driver/observeExternalToolEffect": {

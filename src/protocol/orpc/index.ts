@@ -240,29 +240,26 @@ const driverFailureInputSchema = z.strictObject({
   runId: nonEmptyStringSchema,
 });
 
-const driverCommandUpdateIdentitySchema = {
+const driverCommandIdentitySchema = {
   commandId: nonEmptyStringSchema,
   driverInstanceId: nonEmptyStringSchema,
 } as const;
 const driverCommandUpdateInputSchema = z.discriminatedUnion("status", [
-  z.strictObject({ ...driverCommandUpdateIdentitySchema, status: z.literal("accepted") }),
-  z.strictObject({ ...driverCommandUpdateIdentitySchema, status: z.literal("cancelled") }),
+  z.strictObject({ ...driverCommandIdentitySchema, status: z.literal("accepted") }),
+  z.strictObject({ ...driverCommandIdentitySchema, status: z.literal("cancelled") }),
   z.strictObject({
-    ...driverCommandUpdateIdentitySchema,
+    ...driverCommandIdentitySchema,
     result: runtimeCommandResultSchema.optional(),
     status: z.literal("completed"),
   }),
   z.strictObject({
-    ...driverCommandUpdateIdentitySchema,
+    ...driverCommandIdentitySchema,
     error: durableRunErrorSchema,
     status: z.literal("failed"),
   }),
 ]);
 
-const driverExternalToolEffectObserveInputSchema = z.strictObject({
-  commandId: nonEmptyStringSchema,
-  driverInstanceId: nonEmptyStringSchema,
-});
+const driverExternalToolEffectObserveInputSchema = z.strictObject(driverCommandIdentitySchema);
 
 const driverExternalToolEffectIntentSchema = z.strictObject({
   effectId: nonEmptyStringSchema,
@@ -295,9 +292,8 @@ const driverExternalToolEffectStateSchema = z.discriminatedUnion("kind", [
 ]);
 
 const driverExternalToolEffectClaimInputSchema = z.strictObject({
+  ...driverCommandIdentitySchema,
   claimToken: lowercaseUuidV4Schema,
-  commandId: nonEmptyStringSchema,
-  driverInstanceId: nonEmptyStringSchema,
 });
 
 const driverExternalToolEffectClaimOutputSchema = z.discriminatedUnion("kind", [
@@ -324,9 +320,8 @@ const driverExternalToolEffectSettlementSchema = z
   );
 
 const driverExternalToolEffectSettleInputSchema = z.strictObject({
+  ...driverCommandIdentitySchema,
   claimToken: lowercaseUuidV4Schema,
-  commandId: nonEmptyStringSchema,
-  driverInstanceId: nonEmptyStringSchema,
   effectId: nonEmptyStringSchema,
   settlement: driverExternalToolEffectSettlementSchema,
 });
@@ -336,13 +331,11 @@ const driverEventBatchInputSchema = z.strictObject({
   events: z.array(parsedSchema(parseDriverEventEnvelope)).max(driverRpcBatchMaxSize),
 });
 
-const driverEventReceiptSchema = z
-  .strictObject({
-    eventId: nonEmptyStringSchema,
-    seq: nonNegativeSafeIntegerSchema("Driver event receipt seq"),
-    type: z.enum(RUNTIME_EVENT_KINDS),
-  })
-  .transform(omitUndefined);
+const driverEventReceiptSchema = z.strictObject({
+  eventId: nonEmptyStringSchema,
+  seq: nonNegativeSafeIntegerSchema("Driver event receipt seq"),
+  type: z.enum(RUNTIME_EVENT_KINDS),
+});
 
 const driverEventBatchOutputSchema = z.strictObject({
   accepted: z.array(driverEventReceiptSchema),

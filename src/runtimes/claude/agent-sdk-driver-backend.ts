@@ -21,7 +21,10 @@ import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
-import { DriverEventPublisher } from "../driver-event-publisher";
+import {
+  DriverCompletedTerminalSupersededError,
+  DriverEventPublisher,
+} from "../driver-event-publisher";
 import { toRuntimePublicId } from "../runtime-public-id";
 import { computeRuntimeBootstrapDigest, writeSkillBootstrapArtifacts } from "../skill-bootstrap";
 import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
@@ -30,6 +33,7 @@ import { ClaudeAgentSdkPrewarm } from "./agent-sdk-prewarm";
 import {
   ClaudeAgentSdkMessageTranslator,
   ClaudeTerminalWriteError,
+  type ClaudeTerminalOutcome,
 } from "./agent-sdk-message-translator";
 import {
   CLAUDE_CODE_EXECUTABLE_ENV,
@@ -42,13 +46,14 @@ import { drainClaudeTasks } from "./agent-sdk-tasks";
 
 interface ActiveClaudeTurn {
   abortController: AbortController;
-  cancelTask: Promise<void> | null;
   cancelReason: string | null;
   permissionTasks: Set<Promise<unknown>>;
   processTasks: Set<Promise<void>>;
   query: Query | null;
   queryCloseTask: Promise<void> | null;
   runId: RunId;
+  runSignal: AbortSignal | null;
+  readonly settled: ReturnType<typeof Promise.withResolvers<void>>;
   state: "running" | "finalizing" | "cancelled";
 }
 
@@ -64,10 +69,17 @@ const DEFAULT_DEPENDENCIES: ClaudeAgentSdkDriverBackendDependencies = {
   startup,
 };
 
-const CLAUDE_INTERRUPT_TIMEOUT_MS = 1_500;
+const CLAUDE_QUERY_RETURN_TIMEOUT_MS = 2_500;
 
 function isTurnCancelled(turn: ActiveClaudeTurn): boolean {
-  return turn.state === "cancelled";
+  return turn.state === "cancelled" || turn.runSignal?.aborted === true;
+}
+
+function turnCancellationReason(turn: ActiveClaudeTurn): string {
+  return (
+    turn.cancelReason ??
+    toErrorMessage(turn.runSignal?.reason, "Claude Agent SDK turn was cancelled.")
+  );
 }
 
 export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
@@ -100,8 +112,16 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     this.#messageTranslator = new ClaudeAgentSdkMessageTranslator({
       publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
       push: async (context, reason, events) => this.#push(context, reason, events),
-      pushTerminal: async (context, reason, closures, terminal) =>
-        this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
+      pushTerminal: async (context, reason, closures, terminal) => {
+        const activeTurn = this.#activeTurn;
+        await this.#eventPublisher.pushTerminal(
+          context,
+          reason,
+          closures,
+          terminal,
+          terminal.kind === "run.completed" ? (activeTurn?.runSignal ?? undefined) : undefined,
+        );
+      },
       recordNativeSessionId: async (context, sessionId) =>
         this.#recordNativeSessionId(context, sessionId),
       replaceNativeSessionId: async (context, previousSessionId, nextSessionId) =>
@@ -160,6 +180,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     context: AgentDriverContext,
     input: RuntimeCommandInput,
     runId: RunId,
+    signal?: AbortSignal,
   ): Promise<void> {
     if (this.#activeTurn) {
       throw new Error("Claude Agent SDK already has an active turn.");
@@ -181,20 +202,27 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     const { abortController, permissionTasks, processTasks, warmQuery } = this.#prewarm.take();
     const activeTurn: ActiveClaudeTurn = {
       abortController,
-      cancelTask: null,
       cancelReason: null,
       permissionTasks,
       processTasks,
       query: null,
       queryCloseTask: null,
       runId,
+      runSignal: signal ?? null,
+      settled: Promise.withResolvers<void>(),
       state: "running",
     };
     this.#activeTurn = activeTurn;
+    const turnSignal =
+      activeTurn.runSignal === null
+        ? activeTurn.abortController.signal
+        : AbortSignal.any([activeTurn.abortController.signal, activeTurn.runSignal]);
 
     let queryStartedAtMs = Date.now();
     let queryOptionsMs = 0;
     let runStarted = false;
+
+    let terminalOutcome: ClaudeTerminalOutcome | null = null;
 
     try {
       await this.#push(context, "driver.claude.turn.started", [
@@ -218,16 +246,19 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           activeQuery = warmQuery.query(promptText);
         } else {
           const optionsStartedAtMs = Date.now();
-          const queryOptions = await this.#dependencies.createQueryOptions({
-            abortController,
-            context,
-            nativeSessionId: this.#nativeSessionId,
-            payload: this.#payload,
-            permissionTasks,
-            processTasks,
-            publicToolCallId: (nativeToolCallId) =>
-              toRuntimePublicId(nativeToolCallId, "claude-tool"),
-          });
+          const queryOptions = await raceWithAbort(
+            this.#dependencies.createQueryOptions({
+              abortController,
+              context,
+              nativeSessionId: this.#nativeSessionId,
+              payload: this.#payload,
+              permissionTasks,
+              processTasks,
+              publicToolCallId: (nativeToolCallId) =>
+                toRuntimePublicId(nativeToolCallId, "claude-tool"),
+            }),
+            turnSignal,
+          );
           queryOptionsMs = Date.now() - optionsStartedAtMs;
 
           if (isTurnCancelled(activeTurn)) {
@@ -242,7 +273,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
         activeTurn.query = activeQuery;
         if (isTurnCancelled(activeTurn)) {
-          await this.#closeQuery(context, activeTurn, activeTurn.cancelReason ?? "turn.cancelled");
+          await this.#closeQuery(context, activeTurn, turnCancellationReason(activeTurn));
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
         }
       } catch (error) {
@@ -284,11 +315,15 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         nativeSessionIdPresent: Boolean(this.#nativeSessionId),
       });
 
-      let completed = false;
       let firstProviderEventPublished = false;
       const providerStartedAtMs = Date.now();
+      for (;;) {
+        const next = await raceWithAbort(activeQuery.next(), turnSignal);
+        if (next.done) {
+          break;
+        }
+        const message = next.value;
 
-      for await (const message of activeQuery) {
         if (isTurnCancelled(activeTurn)) {
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
         }
@@ -326,17 +361,17 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           await this.#closeQuery(context, activeTurn, "provider.result");
         }
 
-        completed = await this.#messageTranslator.handleSdkMessage(context, message, runId);
-        if (completed) {
+        terminalOutcome = await this.#messageTranslator.handleSdkMessage(context, message, runId);
+        if (terminalOutcome !== null) {
           break;
         }
       }
 
-      if (isTurnCancelled(activeTurn)) {
+      if (terminalOutcome === null && isTurnCancelled(activeTurn)) {
         throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
       }
 
-      if (!completed) {
+      if (terminalOutcome === null) {
         throw new Error("Claude Agent SDK query ended before a result frame.");
       }
     } catch (error) {
@@ -344,14 +379,22 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         throw error;
       }
 
+      if (error instanceof ClaudeTerminalWriteError) {
+        const replaceableCompletion =
+          error.terminalKind === "run.completed" &&
+          (error.cause === activeTurn.runSignal?.reason ||
+            (error.cause instanceof DriverCompletedTerminalSupersededError &&
+              error.cause.cause === activeTurn.runSignal?.reason));
+        if (!replaceableCompletion) {
+          throw error.cause;
+        }
+      }
+
       if (isTurnCancelled(activeTurn)) {
-        await this.#closeQuery(context, activeTurn, activeTurn.cancelReason ?? "turn.cancelled");
-        await this.#messageTranslator.cancelTurn(
-          context,
-          runId,
-          activeTurn.cancelReason ?? "turn.cancelled",
-        );
-        throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
+        const cancellationReason = turnCancellationReason(activeTurn);
+        await this.#closeQuery(context, activeTurn, cancellationReason);
+        await this.#messageTranslator.cancelTurn(context, runId, cancellationReason);
+        throw new DriverTurnCancelledError(cancellationReason);
       }
 
       activeTurn.state = "finalizing";
@@ -377,7 +420,17 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         if (this.#activeTurn === activeTurn) {
           this.#activeTurn = null;
         }
+        activeTurn.settled.resolve();
       }
+    }
+
+    if (terminalOutcome.kind === "run.cancelled") {
+      throw new DriverTurnCancelledError(
+        terminalOutcome.payload.reason ?? "Claude Agent SDK turn was cancelled by the provider.",
+      );
+    }
+    if (terminalOutcome.kind === "run.failed") {
+      throw new Error(terminalOutcome.payload.error.message);
     }
   }
 
@@ -388,13 +441,9 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       return;
     }
 
-    if (activeTurn.cancelTask !== null) {
-      await activeTurn.cancelTask;
-      return;
-    }
-
     if (activeTurn.state === "finalizing") {
-      await this.#closeQuery(context, activeTurn, reason);
+      activeTurn.abortController.abort(reason);
+      void this.#closeQuery(context, activeTurn, reason).catch(() => {});
       return;
     }
 
@@ -404,33 +453,8 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     activeTurn.state = "cancelled";
     activeTurn.cancelReason = reason;
-
-    activeTurn.cancelTask = (async () => {
-      try {
-        if (activeTurn.query !== null) {
-          const interrupted = await settlePromiseWithTimeout(
-            Promise.resolve().then(() => activeTurn.query?.interrupt()),
-            {
-              label: "Claude Agent SDK turn interrupt",
-              timeoutMs: CLAUDE_INTERRUPT_TIMEOUT_MS,
-            },
-          );
-
-          if (interrupted.status !== "completed") {
-            context.logger.debug("driver.claude.turn.interrupt_failed", {
-              message: toErrorMessage(interrupted.error, "Claude turn interrupt failed"),
-              reason,
-              runId: activeTurn.runId,
-            });
-          }
-        }
-      } finally {
-        activeTurn.abortController.abort(reason);
-        await this.#closeQuery(context, activeTurn, reason);
-      }
-    })();
-
-    await activeTurn.cancelTask;
+    activeTurn.abortController.abort(reason);
+    void this.#closeQuery(context, activeTurn, reason).catch(() => {});
   }
 
   stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void> {
@@ -455,17 +479,27 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const activeTurn = this.#activeTurn;
     const prewarmStop = this.#prewarm.stop(context, reason, signal);
+    const activeCleanup =
+      activeTurn === null
+        ? Promise.resolve()
+        : raceWithAbort(
+            (async () => {
+              await this.cancelActiveTurn(context, reason);
+              const [closeResult] = await Promise.allSettled([
+                this.#closeQuery(context, activeTurn, reason),
+                activeTurn.settled.promise,
+              ]);
+              if (closeResult.status === "rejected") {
+                throw closeResult.reason;
+              }
+            })(),
+            signal,
+          );
     const [activeResult, prewarmResult, pendingResult] = await Promise.allSettled([
-      this.cancelActiveTurn(context, reason),
+      activeCleanup,
       prewarmStop,
-      drainClaudeTasks(this.#pendingProcessTasks),
+      raceWithAbort(drainClaudeTasks(this.#pendingProcessTasks), signal),
     ]);
-    if (activeTurn !== null) {
-      this.#retainProcessTasks(activeTurn);
-      if (activeResult.status === "rejected" && this.#activeTurn === activeTurn) {
-        this.#activeTurn = null;
-      }
-    }
 
     if (activeResult.status === "rejected") {
       throw activeResult.reason;
@@ -545,19 +579,38 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     if (turn.queryCloseTask === null) {
       const query = turn.query;
-      turn.queryCloseTask = Promise.resolve()
-        .then(() => query?.return())
-        .then(
-          () => {},
-          (error) => {
+      turn.queryCloseTask = (async () => {
+        if (query !== null) {
+          try {
+            query.close();
+          } catch (error) {
+            turn.abortController.abort(reason);
             context.logger.debug("driver.claude.turn.close_failed", {
               message: toErrorMessage(error, "query close failed"),
               reason,
               runId: turn.runId,
             });
-          },
-        )
-        .then(() => drainClaudeTasks(turn.permissionTasks, turn.processTasks));
+          }
+
+          const returned = await settlePromiseWithTimeout(
+            Promise.resolve().then(() => query.return()),
+            {
+              label: "Claude Agent SDK query return",
+              timeoutMs: CLAUDE_QUERY_RETURN_TIMEOUT_MS,
+            },
+          );
+          if (returned.status !== "completed") {
+            turn.abortController.abort(reason);
+            context.logger.debug("driver.claude.turn.return_failed", {
+              message: toErrorMessage(returned.error, "query return failed"),
+              reason,
+              runId: turn.runId,
+            });
+          }
+        }
+
+        await drainClaudeTasks(turn.permissionTasks, turn.processTasks);
+      })();
     }
 
     await turn.queryCloseTask;

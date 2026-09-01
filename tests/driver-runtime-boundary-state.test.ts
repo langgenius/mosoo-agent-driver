@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { ACTIVE_INPUT_SETTLE_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { createTimingEvent } from "../src/core/driver-runtime-timing";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
@@ -12,6 +13,7 @@ import {
   FakeDriverRuntimeIo,
   createBackend,
   createDispatcher,
+  settleBackendInput,
   waitForUpdate,
 } from "./driver-runtime-boundary-fixtures";
 
@@ -455,29 +457,18 @@ describe("driver runtime boundary", () => {
     },
   );
 
-  test("lets a queued input wait for the previous turn command to settle", async () => {
+  test("rejects overlapping input without blocking a following stop", async () => {
     const firstInputStarted = Promise.withResolvers<void>();
-    const firstInputCanFinish = Promise.withResolvers<void>();
     const backend = createBackend();
     let handledInputCount = 0;
-    backend.handleInput = async (context, _input, runId) => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       handledInputCount += 1;
       backend.handledInputs.push(context.payload.execution.session);
-
-      if (handledInputCount === 1) {
-        firstInputStarted.resolve();
-        await firstInputCanFinish.promise;
-      }
-      await context.ports.eventSink.pushEvents({
-        events: [
-          {
-            kind: "run.completed",
-            payload: { status: "completed" },
-            runId,
-            sourceEventId: `queued-input.completed:${runId}`,
-          },
-        ],
+      firstInputStarted.resolve();
+      await new Promise<void>((resolve) => {
+        signal!.addEventListener("abort", () => resolve(), { once: true });
       });
+      await settleBackendInput(context, runId, signal);
     };
     const runtimeState = new DriverRuntimeStateMachine("ready");
     const socket = new FakeDriverRuntimeIo([
@@ -499,66 +490,60 @@ describe("driver runtime boundary", () => {
         requestId: "request-2",
         runId: DRIVER_TEST_IDS.secondRunId,
       },
+      {
+        commandId: "stop-after-overlap",
+        kind: "session.stop",
+        reason: "test.stop-after-overlap",
+      },
     ]);
     const { commandReads, dispatcher, logger } = createDispatcher({
       backend,
       isShuttingDown: () => socket.isDrained(),
       runtimeState,
     });
-    const runTask = dispatcher.run(socket, logger);
+    const nativeSetTimeout = globalThis.setTimeout;
+    let activeInputTimeouts = 0;
+    globalThis.setTimeout = ((
+      callback: (...arguments_: unknown[]) => void,
+      timeout?: number,
+      ...arguments_: unknown[]
+    ) => {
+      if (timeout === ACTIVE_INPUT_SETTLE_GRACE_MS) {
+        activeInputTimeouts += 1;
+      }
+      return nativeSetTimeout(callback, timeout, ...arguments_);
+    }) as typeof setTimeout;
 
-    await firstInputStarted.promise;
-    await waitForUpdate(
-      socket,
-      (update) => update.commandId === "input-1" && update.status === "accepted",
-    );
-    firstInputCanFinish.resolve();
-    await runTask;
-    await waitForUpdate(
-      socket,
-      (update) =>
-        update.commandId === "input-2" &&
-        update.status === "completed" &&
-        runtimeState.status() === "ready",
-    );
+    try {
+      const runTask = dispatcher.run(socket, logger);
+      await firstInputStarted.promise;
+      await runTask;
+    } finally {
+      globalThis.setTimeout = nativeSetTimeout;
+    }
 
-    expect(handledInputCount).toBe(2);
-    expect(runtimeState.status()).toBe("ready");
-    expect(commandReads.count).toBe(2);
+    expect(handledInputCount).toBe(1);
+    expect(activeInputTimeouts).toBe(1);
+    expect(runtimeState.status()).toBe("stopped");
+    expect(commandReads.count).toBe(3);
     expect(socket.failedRuns).toEqual([]);
+    expect(backend.cancelledReasons).toEqual(["test.stop-after-overlap"]);
     expect(socket.updates).toEqual(
       expect.arrayContaining([
-        {
-          commandId: "input-1",
-          status: "accepted",
-        },
-        {
-          commandId: "input-2",
-          status: "accepted",
-        },
-        {
-          commandId: "input-1",
-          result: {
-            requestId: "request-1",
-          },
-          status: "completed",
-        },
-        {
-          commandId: "input-2",
-          result: {
-            requestId: "request-2",
-          },
-          status: "completed",
-        },
+        { commandId: "input-1", status: "accepted" },
+        { commandId: "input-1", status: "cancelled" },
+        { commandId: "stop-after-overlap", status: "accepted" },
+        { commandId: "stop-after-overlap", status: "completed" },
+        expect.objectContaining({ commandId: "input-2", status: "failed" }),
       ]),
     );
     expect(
       socket.updates.findIndex(
-        (update) => update.commandId === "input-1" && update.status === "completed",
+        (update) => update.commandId === "input-2" && update.status === "failed",
       ),
     ).toBeLessThan(
       socket.updates.findIndex(
-        (update) => update.commandId === "input-2" && update.status === "completed",
+        (update) => update.commandId === "stop-after-overlap" && update.status === "accepted",
       ),
     );
   });

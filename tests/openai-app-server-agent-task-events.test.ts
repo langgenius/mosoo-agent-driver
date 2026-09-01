@@ -19,6 +19,14 @@ function apply(state: OpenAiAgentTaskState, activity: OpenAiSubAgentActivity) {
   return update.events;
 }
 
+function activity(
+  agentId: string,
+  kind: OpenAiSubAgentActivity["kind"],
+  agentPath = `/root/${agentId}`,
+): OpenAiSubAgentActivity {
+  return { agentId, agentPath, kind };
+}
+
 function tasks(events: readonly DriverEventInput[]) {
   const snapshot = events.find((event) => event.kind === "agent.tasks.replaced");
 
@@ -32,10 +40,6 @@ function tasks(events: readonly DriverEventInput[]) {
 describe("OpenAI app-server agent task snapshots", () => {
   test("projects interleaved completion-only activity as full active-set replacements", () => {
     const state = new OpenAiAgentTaskState();
-    const activity = (
-      agentId: string,
-      kind: OpenAiSubAgentActivity["kind"],
-    ): OpenAiSubAgentActivity => ({ agentId, agentPath: `/root/${agentId}`, kind });
 
     expect(tasks(apply(state, activity("agent-1", "started")))).toEqual([
       { taskId: "agent-1", taskType: "openai_subagent", title: "/root/agent-1" },
@@ -64,11 +68,8 @@ describe("OpenAI app-server agent task snapshots", () => {
     let events: DriverEventInput[] = [];
 
     for (let index = 0; index < 256; index += 1) {
-      events = apply(state, {
-        agentId: `agent-${String(index)}`,
-        agentPath: `${privateMarker}-${String(index)}`,
-        kind: "started",
-      });
+      const agentId = `agent-${String(index)}`;
+      events = apply(state, activity(agentId, "started", `${privateMarker}-${String(index)}`));
     }
 
     expect(events).toContainEqual(
@@ -87,18 +88,10 @@ describe("OpenAI app-server agent task snapshots", () => {
     const state = new OpenAiAgentTaskState();
 
     for (let index = 0; index < 256; index += 1) {
-      apply(state, {
-        agentId: `agent-${String(index)}`,
-        agentPath: `/root/agent-${String(index)}`,
-        kind: "started",
-      });
+      apply(state, activity(`agent-${String(index)}`, "started"));
     }
 
-    const overflow = apply(state, {
-      agentId: "agent-256",
-      agentPath: "/root/agent-256",
-      kind: "started",
-    });
+    const overflow = apply(state, activity("agent-256", "started"));
     expect(overflow).toEqual([
       expect.objectContaining({
         kind: "diagnostic.reported",
@@ -106,13 +99,7 @@ describe("OpenAI app-server agent task snapshots", () => {
       }),
     ]);
 
-    const recovered = tasks(
-      apply(state, {
-        agentId: "agent-0",
-        agentPath: "/root/agent-0",
-        kind: "completed",
-      }),
-    );
+    const recovered = tasks(apply(state, activity("agent-0", "completed")));
     expect(recovered).toHaveLength(256);
     expect(recovered).not.toContainEqual(expect.objectContaining({ taskId: "agent-0" }));
     expect(recovered).toContainEqual(expect.objectContaining({ taskId: "agent-256" }));
@@ -122,69 +109,37 @@ describe("OpenAI app-server agent task snapshots", () => {
     const state = new OpenAiAgentTaskState();
 
     for (let index = 0; index < 1_024; index += 1) {
-      apply(state, {
-        agentId: `agent-${String(index)}`,
-        agentPath: `/root/agent-${String(index)}`,
-        kind: "started",
-      });
+      apply(state, activity(`agent-${String(index)}`, "started"));
     }
 
-    expect(() =>
-      state.prepare({ agentId: "agent-1024", agentPath: "/root/overflow", kind: "started" }),
-    ).toThrow("exceeds 1024");
+    expect(() => state.prepare(activity("agent-1024", "started", "/root/overflow"))).toThrow(
+      "exceeds 1024",
+    );
   });
 
   test("bounds completed replay protection without letting late starts revive", () => {
     const state = new OpenAiAgentTaskState();
 
     for (let index = 0; index < 1_024; index += 1) {
-      apply(state, {
-        agentId: `closed-${String(index)}`,
-        agentPath: `/root/closed-${String(index)}`,
-        kind: "completed",
-      });
+      apply(state, activity(`closed-${String(index)}`, "completed"));
     }
     for (let index = 0; index < 1_024; index += 1) {
-      expect(
-        tasks(
-          apply(state, {
-            agentId: `closed-${String(index)}`,
-            agentPath: `/root/closed-${String(index)}`,
-            kind: "started",
-          }),
-        ),
-      ).toEqual([]);
+      expect(tasks(apply(state, activity(`closed-${String(index)}`, "started")))).toEqual([]);
     }
 
-    expect(() =>
-      state.prepare({
-        agentId: "closed-1024",
-        agentPath: "/root/closed-1024",
-        kind: "completed",
-      }),
-    ).toThrow("closed sub-agent count exceeds 1024");
-    expect(
-      tasks(
-        apply(state, {
-          agentId: "closed-0",
-          agentPath: "/root/closed-0",
-          kind: "started",
-        }),
-      ),
-    ).toEqual([]);
+    expect(() => state.prepare(activity("closed-1024", "completed"))).toThrow(
+      "closed sub-agent count exceeds 1024",
+    );
+    expect(tasks(apply(state, activity("closed-0", "started")))).toEqual([]);
   });
 
   test("uses deterministic bounded IDs and an authoritative empty terminal snapshot", () => {
     const state = new OpenAiAgentTaskState();
     const longId = "agent".repeat(100);
-    const first = tasks(
-      apply(state, { agentId: longId, agentPath: `${"a".repeat(4_095)}😀`, kind: "started" }),
-    );
+    const first = tasks(apply(state, activity(longId, "started", `${"a".repeat(4_095)}😀`)));
 
     state.reset();
-    const replay = tasks(
-      apply(state, { agentId: longId, agentPath: "/root/replayed", kind: "started" }),
-    );
+    const replay = tasks(apply(state, activity(longId, "started", "/root/replayed")));
     expect(first[0]).toMatchObject({ taskId: expect.stringMatching(/^rid1_[A-Za-z0-9_-]{43}$/) });
     expect(replay[0]).toMatchObject({ taskId: (first[0] as { taskId: string }).taskId });
     expect((first[0] as { title: string }).title).toHaveLength(4_095);

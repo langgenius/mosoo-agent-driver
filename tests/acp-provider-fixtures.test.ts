@@ -15,13 +15,7 @@ interface AcpProviderFixtureCase {
     | { readonly stopReason: StopReason; readonly usage: unknown }
     | undefined;
   readonly expectedEvents: readonly unknown[];
-  readonly failPrompt?:
-    | {
-        readonly code: string;
-        readonly message: string;
-        readonly recoverable?: boolean | undefined;
-      }
-    | undefined;
+  readonly failPrompt?: Parameters<AcpAssistantTranscriptState["failPrompt"]>[0] | undefined;
   readonly permissionRequest?: { readonly params: unknown; readonly requestId: string } | undefined;
   readonly sessionReady?:
     | {
@@ -62,15 +56,7 @@ function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   }
 
   if (fixture.failPrompt !== undefined) {
-    events.push(
-      ...state.failPrompt({
-        code: fixture.failPrompt.code,
-        message: fixture.failPrompt.message,
-        ...(fixture.failPrompt.recoverable === undefined
-          ? {}
-          : { recoverable: fixture.failPrompt.recoverable }),
-      }),
-    );
+    events.push(...state.failPrompt(fixture.failPrompt));
   }
 
   if (fixture.completePrompt !== undefined) {

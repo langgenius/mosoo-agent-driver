@@ -74,19 +74,11 @@ const DRIVER_RPC_TIMEOUT_MS = 10_000;
 const MAX_WEBSOCKET_CLOSE_REASON_BYTES = 123;
 
 function toWebSocketCloseReason(reason: string): string {
-  let bytes = 0;
-  let result = "";
-
-  for (const character of reason) {
-    const characterBytes = Buffer.byteLength(character, "utf8");
-    if (bytes + characterBytes > MAX_WEBSOCKET_CLOSE_REASON_BYTES) {
-      break;
-    }
-    bytes += characterBytes;
-    result += character;
-  }
-
-  return result;
+  const { read } = new TextEncoder().encodeInto(
+    reason,
+    new Uint8Array(MAX_WEBSOCKET_CLOSE_REASON_BYTES),
+  );
+  return reason.slice(0, read);
 }
 
 export class DriverInstanceSocket {
@@ -184,8 +176,9 @@ export class DriverInstanceSocket {
   claimRunCancellation(
     ticket: DriverRunTicket,
     reason: string,
+    source?: Parameters<DriverRuntimeIo["claimRunCancellation"]>[2],
   ): "already_claimed" | "claimed" | "terminal_selected" {
-    return this.#terminalState.claimCancellation(ticket, reason);
+    return this.#terminalState.claimCancellation(ticket, reason, source);
   }
 
   releaseRun(ticket: DriverRunTicket, reason: "command_acked" | "driver_failing"): void {
@@ -735,30 +728,9 @@ export class DriverInstanceSocket {
 
   #enqueueDelivery<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const predecessor = this.#deliveryTail;
-    const slot = Promise.withResolvers<void>();
-    this.#deliveryTail = predecessor.then(
-      () => slot.promise,
-      () => slot.promise,
-    );
-
-    return (async () => {
-      let acquired = false;
-
-      try {
-        await raceWithAbort(predecessor, signal);
-        acquired = true;
-        return await operation();
-      } finally {
-        if (acquired) {
-          slot.resolve();
-        } else {
-          void predecessor.then(
-            () => slot.resolve(),
-            () => slot.resolve(),
-          );
-        }
-      }
-    })();
+    const task = raceWithAbort(predecessor, signal).then(operation);
+    this.#deliveryTail = Promise.allSettled([predecessor, task]).then(() => {});
+    return task;
   }
 
   #requireClient(): DriverRuntimeClient {

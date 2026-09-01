@@ -35,7 +35,6 @@ import type {
   ThreadStartParams,
   ThreadStartResponse,
   TurnStatus,
-  TurnStartParams,
 } from "./app-server-protocol";
 
 /**
@@ -50,14 +49,6 @@ import type {
  */
 function resolveApprovalPolicy(payload: DriverStartInput): ApprovalPolicy {
   return isDriverFullAccess(payload) ? "never" : "untrusted";
-}
-
-interface OpenAiTurnStartInput {
-  readonly approvalPolicy: ApprovalPolicy;
-  readonly cwd: string;
-  readonly model: string;
-  readonly text: string;
-  readonly threadId: string;
 }
 
 interface OpenAiPhaseMeasure {
@@ -143,26 +134,11 @@ function toRecoveryItems(
   }));
 }
 
-function createTurnParams(input: OpenAiTurnStartInput): TurnStartParams {
-  return {
-    approvalPolicy: input.approvalPolicy,
-    cwd: input.cwd,
-    input: [
-      {
-        text: input.text,
-        text_elements: [],
-        type: "text",
-      },
-    ],
-    model: input.model,
-    threadId: input.threadId,
-  };
-}
-
 export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "openai-runtime";
   readonly #payload: DriverStartInput;
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#threadId);
+  #activeCancellationTask: Promise<void> | null = null;
   #client: OpenAiAppServerClient | null = null;
   #clientStartupCancellation: AbortController | null = null;
   #clientStopRequested = false;
@@ -171,6 +147,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   #pendingTurnStartCancellationReason: string | null = null;
   #pendingTurnStartServerRequests: Promise<void> | null = null;
   #pendingTurnStartUpdates: Promise<void> | null = null;
+  #pendingCancellationSettlement: Promise<void> | null = null;
   #restartThreadId: string | null = null;
   #stopping = false;
   #threadId: string | null = null;
@@ -194,8 +171,8 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     push: async (context, reason, events) => this.#eventPublisher.push(context, reason, events),
     pushSession: async (context, reason, events) =>
       this.#eventPublisher.pushSession(context, reason, events),
-    pushTerminal: async (context, reason, closures, terminal) =>
-      this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
+    pushTerminal: async (context, reason, closures, terminal, cancellationSignal) =>
+      this.#eventPublisher.pushTerminal(context, reason, closures, terminal, cancellationSignal),
     requireThreadId: () => this.#requireThreadId(),
   });
 
@@ -300,6 +277,10 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
         try {
           if (await this.#events.failActiveTurns(context, error)) {
+            return;
+          }
+          if (this.#events.hasAdmittedTerminalTurn()) {
+            context.lifecycle.fail(boundedError);
             return;
           }
           if (await this.#failTurnStart(context, error)) {
@@ -519,6 +500,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     context: AgentDriverContext,
     input: RuntimeCommandInput,
     runId: RunId,
+    signal?: AbortSignal,
   ): Promise<void> {
     this.#turnStartInFlight = true;
     this.#turnStartRunId = runId;
@@ -529,6 +511,9 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     this.#pendingTurnStartUpdates = null;
 
     let completion: Promise<void>;
+    let turnAdmission: ReturnType<OpenAiAppServerEventBridge["beginTurnAdmission"]> | null =
+      this.#events.beginTurnAdmission(runId, signal);
+    const admission = turnAdmission;
 
     try {
       await this.#ensureClient(context);
@@ -545,82 +530,159 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       });
 
       const turnStartRequestedAtMs = Date.now();
+      this.#events.armTurnAdmission(admission);
       const accepted = await client.requestAtWireBarrier(
         "turn/start",
-        createTurnParams({
+        {
           approvalPolicy: resolveApprovalPolicy(this.#payload),
           cwd: this.#payload.execution.session.cwd,
+          input: [
+            {
+              text: input.text,
+              text_elements: [],
+              type: "text",
+            },
+          ],
           model: this.#payload.execution.model,
-          text: input.text,
           threadId,
-        }),
+        },
         {
           accept: async (turnResult) => {
             const turnId = turnResult.turn.id;
-            const publicTurnId = this.#events.publicTurnId(turnId);
-            const turnCompletion = this.#events.trackTurn(turnId, runId);
+            const terminalObserved = this.#events.hasTerminalTurn(turnId);
+            const turnCompletion = this.#events.claimTurnAdmission(
+              admission,
+              turnId,
+              runId,
+              signal,
+            );
+            turnAdmission = null;
             void turnCompletion.catch(() => {});
             this.#claimTurnStartResponse();
 
-            const turnStartedAtMs = Date.now();
-            await this.#eventPublisher.push(context, "driver.openai.provider.turn_start", [
-              createTimingEvent({
-                completedAt: new Date(turnStartedAtMs).toISOString(),
-                path: "unknown",
-                phases: [
-                  createTimingPhase(
-                    "provider.turn_start",
-                    toDurationMs(turnStartRequestedAtMs, turnStartedAtMs),
-                  ),
-                ],
-                runId,
-                sessionId: context.payload.execution.run.sessionId,
-                stage: "driver_turn",
-                startedAt: new Date(turnStartRequestedAtMs).toISOString(),
-                native: {
-                  eventName: "provider.turn_start",
-                  provider: "openai",
-                  turnId: publicTurnId,
-                },
-              }),
-            ]);
+            if (!terminalObserved) {
+              const publicTurnId = this.#events.publicTurnId(turnId);
+              const turnStartedAtMs = Date.now();
+              await this.#eventPublisher.push(context, "driver.openai.provider.turn_start", [
+                createTimingEvent({
+                  completedAt: new Date(turnStartedAtMs).toISOString(),
+                  path: "unknown",
+                  phases: [
+                    createTimingPhase(
+                      "provider.turn_start",
+                      toDurationMs(turnStartRequestedAtMs, turnStartedAtMs),
+                    ),
+                  ],
+                  runId,
+                  sessionId: context.payload.execution.run.sessionId,
+                  stage: "driver_turn",
+                  startedAt: new Date(turnStartRequestedAtMs).toISOString(),
+                  native: {
+                    eventName: "provider.turn_start",
+                    provider: "openai",
+                    turnId: publicTurnId,
+                  },
+                }),
+              ]);
 
-            await this.#events.publishRunStarted(context, { runId, turnId });
+              await this.#events.publishRunStarted(context, { runId, turnId });
 
-            if (isTerminalTurn(turnResult.turn.status)) {
-              await this.#events.handleNotification(context, "turn/completed", {
-                threadId,
-                turn: turnResult.turn,
-              });
+              if (isTerminalTurn(turnResult.turn.status)) {
+                await this.#events.handleNotification(context, "turn/completed", {
+                  threadId,
+                  turn: turnResult.turn,
+                });
+              }
             }
 
             return { completion: turnCompletion };
+          },
+          received: (turnResult) => {
+            this.#events.bindTurnAdmission(admission, turnResult.turn.id);
           },
           reject: async (error) => {
             this.#claimTurnStartResponse();
             await this.#publishTurnStartFailure(context, runId, error);
           },
+          released: () => {
+            this.#events.releaseTurnAdmissionSelection(admission);
+          },
         },
       );
       completion = accepted.completion;
     } catch (error) {
-      const publishCancellation = this.#pendingTurnStartCancellationEvent;
-      const pendingCancellationReason = this.#pendingTurnStartCancellationReason;
+      const signalCancellation =
+        signal?.aborted === true && signal.reason instanceof DriverTurnCancelledError
+          ? signal.reason
+          : null;
+      const pendingCancellationReason =
+        this.#pendingTurnStartCancellationReason ?? signalCancellation?.message ?? null;
+      const publishCancellation =
+        this.#pendingTurnStartCancellationReason === null
+          ? (signalCancellation?.resumeAllowed ?? false)
+          : this.#pendingTurnStartCancellationEvent;
       const failure = error instanceof Error ? error : new Error("OpenAI turn start failed.");
 
       if (pendingCancellationReason !== null) {
-        await this.#finishPendingTurnStartCancellation(
-          context,
-          runId,
-          pendingCancellationReason,
-          publishCancellation,
-        );
+        await this.#finishPendingTurnStartCancellation();
+        const admittedTurnId =
+          turnAdmission === null ? null : this.#events.admittedTurnId(turnAdmission);
+
+        try {
+          if (turnAdmission !== null && admittedTurnId !== null) {
+            const turnCompletion = this.#events.claimTurnAdmission(
+              turnAdmission,
+              admittedTurnId,
+              runId,
+              signal,
+            );
+            turnAdmission = null;
+            void turnCompletion.catch(() => {});
+            if (publishCancellation) {
+              await this.#events.cancelTurn(context, admittedTurnId, pendingCancellationReason);
+            } else {
+              this.#events.rejectTurn(
+                admittedTurnId,
+                new DriverTurnCancelledError(pendingCancellationReason),
+              );
+            }
+          } else if (publishCancellation) {
+            await this.#publishTurnStartCancellation(context, runId, pendingCancellationReason);
+          }
+        } catch (cancellationError) {
+          throw new DriverTurnCancellationCleanupError(
+            `OpenAI pending turn cancellation settlement failed: ${
+              cancellationError instanceof Error
+                ? cancellationError.message
+                : "unknown cancellation error"
+            }`,
+            cancellationError,
+          );
+        }
         this.#events.releaseTurnState();
         this.#turnStartInFlight = false;
         this.#turnStartRunId = null;
         this.#pendingTurnStartCancellationEvent = false;
         this.#pendingTurnStartCancellationReason = null;
         throw new DriverTurnCancelledError(pendingCancellationReason);
+      }
+
+      const admittedTurnId =
+        turnAdmission === null ? null : this.#events.admittedTurnId(turnAdmission);
+      if (
+        turnAdmission !== null &&
+        admittedTurnId !== null &&
+        this.#events.hasTerminalTurn(admittedTurnId)
+      ) {
+        const terminalCompletion = this.#events.claimTurnAdmission(
+          turnAdmission,
+          admittedTurnId,
+          runId,
+          signal,
+        );
+        turnAdmission = null;
+        this.#claimTurnStartResponse();
+        return await terminalCompletion;
       }
 
       try {
@@ -630,6 +692,10 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         this.#turnStartRunId = null;
       }
       throw new Error(toOpenAiProtocolError({ message: failure.message }).message);
+    } finally {
+      if (turnAdmission !== null) {
+        this.#events.releaseTurnAdmission(turnAdmission);
+      }
     }
 
     await completion;
@@ -791,18 +857,23 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     );
   }
 
-  async #finishPendingTurnStartCancellation(
-    context: AgentDriverContext,
-    runId: RunId,
-    reason: string,
-    publish: boolean,
-  ): Promise<void> {
+  async #finishPendingTurnStartCancellation(): Promise<void> {
     try {
-      await this.#waitPendingTurnStartCleanup();
-      await this.#waitPendingTurnStartServerRequests();
-      await this.#waitPendingTurnStartUpdates();
-      if (publish) {
-        await this.#publishTurnStartCancellation(context, runId, reason);
+      let pending = this.#pendingTurnStartCleanup;
+      this.#pendingTurnStartCleanup = null;
+      if (pending !== null) {
+        await pending;
+      }
+      pending = this.#pendingTurnStartServerRequests;
+      this.#pendingTurnStartServerRequests = null;
+      if (pending !== null) {
+        await pending;
+      }
+
+      pending = this.#pendingTurnStartUpdates;
+      this.#pendingTurnStartUpdates = null;
+      if (pending !== null) {
+        await pending;
       }
     } catch (error) {
       throw new DriverTurnCancellationCleanupError(
@@ -814,45 +885,39 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     }
   }
 
-  async #waitPendingTurnStartServerRequests(): Promise<void> {
-    const pending = this.#pendingTurnStartServerRequests;
-    this.#pendingTurnStartServerRequests = null;
-    if (pending !== null) {
-      await pending;
-    }
+  cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void> {
+    return this.#startCancellation(context, reason, true);
   }
 
-  async #waitPendingTurnStartCleanup(): Promise<void> {
-    const pending = this.#pendingTurnStartCleanup;
-    this.#pendingTurnStartCleanup = null;
-    if (pending !== null) {
-      await pending;
+  #startCancellation(
+    context: AgentDriverContext,
+    reason: string,
+    publishTurnStartCancellation: boolean,
+  ): Promise<void> {
+    if (this.#activeCancellationTask !== null) {
+      return this.#activeCancellationTask;
     }
-  }
 
-  async #waitPendingTurnStartUpdates(): Promise<void> {
-    const pending = this.#pendingTurnStartUpdates;
-    this.#pendingTurnStartUpdates = null;
-    if (pending !== null) {
-      await pending;
-    }
-  }
+    const task = this.#cancelActiveTurn(context, reason, publishTurnStartCancellation)
+      .catch((error: unknown) => {
+        if (error instanceof DriverTurnCancellationCleanupError) {
+          throw error;
+        }
 
-  async cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void> {
-    try {
-      await this.#cancelActiveTurn(context, reason, true);
-    } catch (error) {
-      if (error instanceof DriverTurnCancellationCleanupError) {
-        throw error;
-      }
-
-      throw new DriverTurnCancellationCleanupError(
-        `OpenAI cancelled turn cleanup failed: ${
-          error instanceof Error ? error.message : "unknown cleanup error"
-        }`,
-        error,
-      );
-    }
+        throw new DriverTurnCancellationCleanupError(
+          `OpenAI cancelled turn cleanup failed: ${
+            error instanceof Error ? error.message : "unknown cleanup error"
+          }`,
+          error,
+        );
+      })
+      .finally(() => {
+        if (this.#activeCancellationTask === task) {
+          this.#activeCancellationTask = null;
+        }
+      });
+    this.#activeCancellationTask = task;
+    return task;
   }
 
   async #cancelActiveTurn(
@@ -943,7 +1008,8 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       activeTurnIds.map((turnId) =>
         this.#events.cancelTurn(context, turnId, reason, () => updatesDrained),
       ),
-    ).catch((error: unknown) => {
+    ).then(() => undefined);
+    const cancellationSettlementTask = cancellationEvents.catch((error: unknown) => {
       const cleanupError = new DriverTurnCancellationCleanupError(
         `OpenAI cancellation event delivery failed: ${
           error instanceof Error ? error.message : "unknown delivery error"
@@ -953,8 +1019,9 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       this.#events.rejectActiveTurns(cleanupError);
       throw cleanupError;
     });
-    void cancellationEvents.catch(() => {});
-    const cancellationSettlement = await settlePromiseWithTimeout(cancellationEvents, {
+    this.#pendingCancellationSettlement = cancellationSettlementTask;
+    void cancellationSettlementTask.catch(() => {});
+    const cancellationSettlement = await settlePromiseWithTimeout(cancellationSettlementTask, {
       label: "OpenAI turn cancellation event delivery",
       timeoutMs: OPENAI_TURN_CANCEL_EVENT_TIMEOUT_MS,
     });
@@ -1019,8 +1086,20 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
     try {
       signal.throwIfAborted();
-      if (!this.#clientStopRequested) {
-        await raceWithAbort(this.#cancelActiveTurn(context, reason, false), signal);
+      if (this.#activeCancellationTask !== null) {
+        await this.#activeCancellationTask;
+      } else if (!this.#clientStopRequested) {
+        await this.#startCancellation(context, reason, false);
+      }
+      const cancellationSettlement = this.#pendingCancellationSettlement;
+      if (cancellationSettlement !== null) {
+        try {
+          await cancellationSettlement;
+        } finally {
+          if (this.#pendingCancellationSettlement === cancellationSettlement) {
+            this.#pendingCancellationSettlement = null;
+          }
+        }
       }
     } finally {
       this.#events.rejectActiveTurns(new DriverTurnCancelledError(reason));

@@ -97,31 +97,33 @@ function textFieldAtJsonSize<Value>(targetBytes: number, create: (text: string) 
 }
 
 describe("Driver RPC wire v3", () => {
+  const rpc = driverRuntimeRpcSchemas.driver;
+
+  test("omits explicit undefined capability details", () => {
+    const parsed = rpc.hello.input.parse(
+      helloInput({
+        capabilities: [{ details: undefined, id: "input_start", status: "supported", version: 1 }],
+      }),
+    );
+
+    expect(Object.hasOwn(parsed.capabilities[0]!, "details")).toBeFalse();
+  });
+
   test.each([2, 4] as const)("rejects protocol version %d", (protocolVersion) => {
-    expect(
-      driverRuntimeRpcSchemas.driver.hello.input.safeParse(helloInput({ protocolVersion })).success,
-    ).toBeFalse();
+    expect(rpc.hello.input.safeParse(helloInput({ protocolVersion })).success).toBeFalse();
   });
 
   test.each(invalidPositiveSafeIntegers)(
     "rejects %p at every positive safe-integer field",
     (value) => {
+      expect(rpc.hello.input.safeParse(helloInput({ pid: value })).success).toBeFalse();
+      expect(rpc.heartbeat.input.safeParse(heartbeatInput(value)).success).toBeFalse();
+      expect(rpc.ready.input.safeParse(readyInput(value)).success).toBe(false);
       expect(
-        driverRuntimeRpcSchemas.driver.hello.input.safeParse(helloInput({ pid: value })).success,
+        rpc.hello.output.safeParse(helloOutput({ eventBatchMaxSize: value })).success,
       ).toBeFalse();
       expect(
-        driverRuntimeRpcSchemas.driver.heartbeat.input.safeParse(heartbeatInput(value)).success,
-      ).toBeFalse();
-      expect(driverRuntimeRpcSchemas.driver.ready.input.safeParse(readyInput(value)).success).toBe(
-        false,
-      );
-      expect(
-        driverRuntimeRpcSchemas.driver.hello.output.safeParse(
-          helloOutput({ eventBatchMaxSize: value }),
-        ).success,
-      ).toBeFalse();
-      expect(
-        driverRuntimeRpcSchemas.driver.claimExternalToolEffect.output.safeParse({
+        rpc.claimExternalToolEffect.output.safeParse({
           attempt: value,
           effectId: "effect-1",
           idempotencyKey: "idempotency-1",
@@ -135,10 +137,7 @@ describe("Driver RPC wire v3", () => {
     [64, true],
     [65, false],
   ] as const)("validates wire-safe event batch limit %d", (eventBatchMaxSize, accepted) => {
-    expect(
-      driverRuntimeRpcSchemas.driver.hello.output.safeParse(helloOutput({ eventBatchMaxSize }))
-        .success,
-    ).toBe(accepted);
+    expect(rpc.hello.output.safeParse(helloOutput({ eventBatchMaxSize })).success).toBe(accepted);
   });
 
   test.each([
@@ -151,7 +150,7 @@ describe("Driver RPC wire v3", () => {
     Number.MAX_SAFE_INTEGER + 1,
   ] as const)("rejects invalid heartbeat interval %p", (heartbeatIntervalMs) => {
     expect(
-      driverRuntimeRpcSchemas.driver.hello.output.safeParse({
+      rpc.hello.output.safeParse({
         ...helloOutput(),
         heartbeatIntervalMs,
       }).success,
@@ -162,45 +161,31 @@ describe("Driver RPC wire v3", () => {
     "rejects %p at every non-negative safe-integer field",
     (value) => {
       expect(
-        driverRuntimeRpcSchemas.driver.hello.output.safeParse(
-          helloOutput({ commandLeaseMs: value }),
-        ).success,
+        rpc.hello.output.safeParse(helloOutput({ commandLeaseMs: value })).success,
       ).toBeFalse();
       expect(
-        driverRuntimeRpcSchemas.driver.heartbeat.output.safeParse({
+        rpc.heartbeat.output.safeParse({
           heartbeatCount: value,
           ok: true,
         }).success,
       ).toBeFalse();
-      expect(driverRuntimeRpcSchemas.driver.pushLogs.input.safeParse(logBatch(value)).success).toBe(
-        false,
-      );
-      expect(
-        driverRuntimeRpcSchemas.driver.pushEvents.output.safeParse(eventBatchOutput(value)).success,
-      ).toBeFalse();
+      expect(rpc.pushLogs.input.safeParse(logBatch(value)).success).toBe(false);
+      expect(rpc.pushEvents.output.safeParse(eventBatchOutput(value)).success).toBeFalse();
     },
   );
 
   test("accepts zero at every non-negative safe-integer field", () => {
-    expect(driverRuntimeRpcSchemas.driver.hello.output.safeParse(helloOutput()).success).toBeTrue();
-    expect(
-      driverRuntimeRpcSchemas.driver.heartbeat.output.safeParse({ heartbeatCount: 0, ok: true })
-        .success,
-    ).toBeTrue();
-    expect(driverRuntimeRpcSchemas.driver.pushLogs.input.safeParse(logBatch(0)).success).toBeTrue();
-    expect(
-      driverRuntimeRpcSchemas.driver.pushEvents.output.safeParse(eventBatchOutput(0)).success,
-    ).toBeTrue();
+    expect(rpc.hello.output.safeParse(helloOutput()).success).toBeTrue();
+    expect(rpc.heartbeat.output.safeParse({ heartbeatCount: 0, ok: true }).success).toBeTrue();
+    expect(rpc.pushLogs.input.safeParse(logBatch(0)).success).toBeTrue();
+    expect(rpc.pushEvents.output.safeParse(eventBatchOutput(0)).success).toBeTrue();
   });
 
   test.each([
     ["event", "events", { event: diagnosticEvent(), eventId: "source-1" }],
     ["log", "logs", logBatch(0).logs[0]],
   ] as const)("bounds %s batches at 64 entries", (_label, field, entry) => {
-    const schema =
-      field === "events"
-        ? driverRuntimeRpcSchemas.driver.pushEvents.input
-        : driverRuntimeRpcSchemas.driver.pushLogs.input;
+    const schema = field === "events" ? rpc.pushEvents.input : rpc.pushLogs.input;
     const input = (length: number) => ({
       driverInstanceId: "driver-1",
       [field]: Array.from({ length }, () => entry),
@@ -213,38 +198,36 @@ describe("Driver RPC wire v3", () => {
   test.each([
     [
       "failure message",
-      driverRuntimeRpcSchemas.driver.failRun.input,
+      rpc.failRun.input,
       {
         driverInstanceId: "driver-1",
         error: { code: "failed", details: {}, message: "", retryable: false },
         runId: "run-1",
       },
     ],
-    ["receipt type", driverRuntimeRpcSchemas.driver.pushEvents.output, eventBatchOutput(0, "")],
+    ["receipt type", rpc.pushEvents.output, eventBatchOutput(0, "")],
   ] as const)("rejects an empty %s", (_label, schema, input) => {
     expect(schema.safeParse(input).success).toBeFalse();
   });
 
   test("rejects an unknown receipt event type", () => {
     expect(
-      driverRuntimeRpcSchemas.driver.pushEvents.output.safeParse(
-        eventBatchOutput(0, "future.event"),
-      ).success,
+      rpc.pushEvents.output.safeParse(eventBatchOutput(0, "future.event")).success,
     ).toBeFalse();
   });
 
   test.each([
-    [driverRuntimeRpcSchemas.driver.completeRun.input, { driverInstanceId: "driver-1" }],
-    [driverRuntimeRpcSchemas.driver.completeRun.input, { driverInstanceId: "driver-1", runId: "" }],
+    [rpc.completeRun.input, { driverInstanceId: "driver-1" }],
+    [rpc.completeRun.input, { driverInstanceId: "driver-1", runId: "" }],
     [
-      driverRuntimeRpcSchemas.driver.failRun.input,
+      rpc.failRun.input,
       {
         driverInstanceId: "driver-1",
         error: { code: "failed", details: {}, message: "failed", retryable: false },
       },
     ],
     [
-      driverRuntimeRpcSchemas.driver.failRun.input,
+      rpc.failRun.input,
       {
         driverInstanceId: "driver-1",
         error: { code: "failed", details: {}, message: "failed", retryable: false },
@@ -260,19 +243,13 @@ describe("Driver RPC wire v3", () => {
     ["empty", { accepted: [{ eventId: "", seq: 0, type: "message.delta" }] }],
     ["non-string", { accepted: [{ eventId: 1, seq: 0, type: "message.delta" }] }],
   ] as const)("rejects %s receipt eventId", (_label, input) => {
-    expect(driverRuntimeRpcSchemas.driver.pushEvents.output.safeParse(input).success).toBeFalse();
+    expect(rpc.pushEvents.output.safeParse(input).success).toBeFalse();
   });
 
   test("rejects empty handshake identity fields", () => {
-    expect(
-      driverRuntimeRpcSchemas.driver.hello.input.safeParse(helloInput({ startedAt: "" })).success,
-    ).toBeFalse();
-    expect(
-      driverRuntimeRpcSchemas.driver.heartbeat.input.safeParse(heartbeatInput(1, "")).success,
-    ).toBeFalse();
-    expect(driverRuntimeRpcSchemas.driver.hello.output.safeParse(helloOutput({}, "")).success).toBe(
-      false,
-    );
+    expect(rpc.hello.input.safeParse(helloInput({ startedAt: "" })).success).toBeFalse();
+    expect(rpc.heartbeat.input.safeParse(heartbeatInput(1, "")).success).toBeFalse();
+    expect(rpc.hello.output.safeParse(helloOutput({}, "")).success).toBe(false);
   });
 
   test("bounds run and mutually exclusive command terminal payloads", () => {
@@ -289,8 +266,8 @@ describe("Driver RPC wire v3", () => {
         toolName: "tool-1",
       }),
     );
-    const commandUpdate = driverRuntimeRpcSchemas.driver.commandUpdate.input;
-    const failRun = driverRuntimeRpcSchemas.driver.failRun.input;
+    const commandUpdate = rpc.commandUpdate.input;
+    const failRun = rpc.failRun.input;
 
     expect(failRun.safeParse({ driverInstanceId: "driver-1", error, runId: "run-1" }).success).toBe(
       true,
@@ -350,7 +327,7 @@ describe("Driver RPC wire v3", () => {
     "rejects database-only command status %s on Driver updates",
     (status) => {
       expect(
-        driverRuntimeRpcSchemas.driver.commandUpdate.input.safeParse({
+        rpc.commandUpdate.input.safeParse({
           commandId: "command-1",
           driverInstanceId: "driver-1",
           status,
@@ -360,7 +337,7 @@ describe("Driver RPC wire v3", () => {
   );
 
   test("enforces command update payloads by terminal status", () => {
-    const schema = driverRuntimeRpcSchemas.driver.commandUpdate.input;
+    const schema = rpc.commandUpdate.input;
     const identity = { commandId: "command-1", driverInstanceId: "driver-1" };
     const error = { code: "failed", details: {}, message: "failed", retryable: false };
     const result = { requestId: "request-1" };
@@ -393,12 +370,10 @@ describe("Driver RPC wire v3", () => {
     const capability = { id: "text_stream", status: "supported", version: 1 };
 
     expect(
-      driverRuntimeRpcSchemas.driver.hello.input.safeParse(
-        helloInput({ capabilities: [capability, capability] }),
-      ).success,
+      rpc.hello.input.safeParse(helloInput({ capabilities: [capability, capability] })).success,
     ).toBeFalse();
     expect(
-      driverRuntimeRpcSchemas.driver.hello.output.safeParse({
+      rpc.hello.output.safeParse({
         ...helloOutput(),
         acceptedCapabilities: [capability, capability],
       }).success,
@@ -415,43 +390,34 @@ describe("Driver RPC wire v3", () => {
     };
     const cases = [
       [
-        driverRuntimeRpcSchemas.driver.observeExternalToolEffect.input,
+        rpc.observeExternalToolEffect.input,
         { commandId: "command-1", driverInstanceId: "driver-1" },
       ],
+      [rpc.observeExternalToolEffect.output, { effectId: "effect-1", kind: "intent" }],
       [
-        driverRuntimeRpcSchemas.driver.observeExternalToolEffect.output,
-        { effectId: "effect-1", kind: "intent" },
-      ],
-      [
-        driverRuntimeRpcSchemas.driver.claimExternalToolEffect.input,
+        rpc.claimExternalToolEffect.input,
         {
           claimToken: "00000000-0000-4000-8000-000000000001",
           commandId: "command-1",
           driverInstanceId: "driver-1",
         },
       ],
-      [driverRuntimeRpcSchemas.driver.claimExternalToolEffect.output, claim],
+      [rpc.claimExternalToolEffect.output, claim],
       [
-        driverRuntimeRpcSchemas.driver.commandUpdate.input,
+        rpc.commandUpdate.input,
         { commandId: "command-1", driverInstanceId: "driver-1", status: "accepted" },
       ],
-      [driverRuntimeRpcSchemas.driver.commandUpdate.output, { ok: true }],
+      [rpc.commandUpdate.output, { ok: true }],
+      [rpc.completeRun.input, { driverInstanceId: "driver-1", runId: "run-1" }],
+      [rpc.completeRun.output, { ok: true }],
+      [rpc.failRun.input, { driverInstanceId: "driver-1", error: failure, runId: "run-1" }],
+      [rpc.failRun.output, { ok: true }],
+      [rpc.heartbeat.input, heartbeatInput(1)],
+      [rpc.heartbeat.output, { heartbeatCount: 0, ok: true }],
+      [rpc.hello.input, helloInput()],
+      [rpc.hello.output, helloOutput()],
       [
-        driverRuntimeRpcSchemas.driver.completeRun.input,
-        { driverInstanceId: "driver-1", runId: "run-1" },
-      ],
-      [driverRuntimeRpcSchemas.driver.completeRun.output, { ok: true }],
-      [
-        driverRuntimeRpcSchemas.driver.failRun.input,
-        { driverInstanceId: "driver-1", error: failure, runId: "run-1" },
-      ],
-      [driverRuntimeRpcSchemas.driver.failRun.output, { ok: true }],
-      [driverRuntimeRpcSchemas.driver.heartbeat.input, heartbeatInput(1)],
-      [driverRuntimeRpcSchemas.driver.heartbeat.output, { heartbeatCount: 0, ok: true }],
-      [driverRuntimeRpcSchemas.driver.hello.input, helloInput()],
-      [driverRuntimeRpcSchemas.driver.hello.output, helloOutput()],
-      [
-        driverRuntimeRpcSchemas.driver.settleExternalToolEffect.input,
+        rpc.settleExternalToolEffect.input,
         {
           claimToken: "00000000-0000-4000-8000-000000000001",
           commandId: "command-1",
@@ -460,22 +426,19 @@ describe("Driver RPC wire v3", () => {
           settlement: { kind: "unknown" },
         },
       ],
+      [rpc.settleExternalToolEffect.output, { effectId: "effect-1", kind: "unknown" }],
       [
-        driverRuntimeRpcSchemas.driver.settleExternalToolEffect.output,
-        { effectId: "effect-1", kind: "unknown" },
-      ],
-      [
-        driverRuntimeRpcSchemas.driver.pushEvents.input,
+        rpc.pushEvents.input,
         {
           driverInstanceId: "driver-1",
           events: [{ event: diagnosticEvent(), eventId: "source-1" }],
         },
       ],
-      [driverRuntimeRpcSchemas.driver.pushEvents.output, eventBatchOutput(0)],
-      [driverRuntimeRpcSchemas.driver.pushLogs.input, logBatch(0)],
-      [driverRuntimeRpcSchemas.driver.pushLogs.output, { ok: true }],
-      [driverRuntimeRpcSchemas.driver.ready.input, readyInput(1)],
-      [driverRuntimeRpcSchemas.driver.ready.output, { ok: true }],
+      [rpc.pushEvents.output, eventBatchOutput(0)],
+      [rpc.pushLogs.input, logBatch(0)],
+      [rpc.pushLogs.output, { ok: true }],
+      [rpc.ready.input, readyInput(1)],
+      [rpc.ready.output, { ok: true }],
       [driverRuntimeRpcSchemas.driverInstance.nextCommand.input, { driverInstanceId: "driver-1" }],
       [driverRuntimeRpcSchemas.driverInstance.nextCommand.output, { command: null }],
     ] as const;
@@ -489,14 +452,14 @@ describe("Driver RPC wire v3", () => {
     const event = diagnosticEvent({ future: { nested: true }, message: "ok" });
     const nestedCases = [
       [
-        driverRuntimeRpcSchemas.driver.hello.input,
+        rpc.hello.input,
         helloInput({
           capabilities: [{ future: true, id: "text_stream", status: "supported", version: 1 }],
         }),
       ],
-      [driverRuntimeRpcSchemas.driver.hello.output, helloOutput({ future: true })],
+      [rpc.hello.output, helloOutput({ future: true })],
       [
-        driverRuntimeRpcSchemas.driver.failRun.input,
+        rpc.failRun.input,
         {
           driverInstanceId: "driver-1",
           error: { code: "failed", details: {}, future: true, message: "failed", retryable: false },
@@ -504,7 +467,7 @@ describe("Driver RPC wire v3", () => {
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.commandUpdate.input,
+        rpc.commandUpdate.input,
         {
           commandId: "command-1",
           driverInstanceId: "driver-1",
@@ -513,7 +476,7 @@ describe("Driver RPC wire v3", () => {
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.settleExternalToolEffect.input,
+        rpc.settleExternalToolEffect.input,
         {
           claimToken: "00000000-0000-4000-8000-000000000001",
           commandId: "command-1",
@@ -523,18 +486,18 @@ describe("Driver RPC wire v3", () => {
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushLogs.input,
+        rpc.pushLogs.input,
         { driverInstanceId: "driver-1", logs: [{ ...logBatch(0).logs[0], future: true }] },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushLogs.input,
+        rpc.pushLogs.input,
         {
           driverInstanceId: "driver-1",
           logs: [{ ...logBatch(0).logs[0], context: { future: true } }],
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushLogs.input,
+        rpc.pushLogs.input,
         {
           driverInstanceId: "driver-1",
           logs: [
@@ -543,18 +506,18 @@ describe("Driver RPC wire v3", () => {
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushEvents.input,
+        rpc.pushEvents.input,
         { driverInstanceId: "driver-1", events: [{ event, eventId: "source-1", future: true }] },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushEvents.input,
+        rpc.pushEvents.input,
         {
           driverInstanceId: "driver-1",
           events: [{ event: { ...event, future: true }, eventId: "source-1" }],
         },
       ],
       [
-        driverRuntimeRpcSchemas.driver.pushEvents.input,
+        rpc.pushEvents.input,
         {
           driverInstanceId: "driver-1",
           events: [
@@ -565,10 +528,7 @@ describe("Driver RPC wire v3", () => {
           ],
         },
       ],
-      [
-        driverRuntimeRpcSchemas.driver.pushEvents.output,
-        { accepted: [{ ...eventBatchOutput(0).accepted[0], future: true }] },
-      ],
+      [rpc.pushEvents.output, { accepted: [{ ...eventBatchOutput(0).accepted[0], future: true }] }],
     ] as const;
 
     for (const [schema, value] of nestedCases) {
@@ -576,7 +536,7 @@ describe("Driver RPC wire v3", () => {
     }
 
     expect(
-      driverRuntimeRpcSchemas.driver.pushEvents.input.safeParse({
+      rpc.pushEvents.input.safeParse({
         driverInstanceId: "driver-1",
         events: [{ event, eventId: "source-1" }],
       }).success,
@@ -585,7 +545,7 @@ describe("Driver RPC wire v3", () => {
 
   test("preserves empty log and tracing strings", () => {
     expect(
-      driverRuntimeRpcSchemas.driver.pushLogs.input.safeParse({
+      rpc.pushLogs.input.safeParse({
         driverInstanceId: "driver-1",
         logs: [
           {
@@ -603,7 +563,7 @@ describe("Driver RPC wire v3", () => {
 
   test("rejects the previous runtime event schema", () => {
     expect(
-      driverRuntimeRpcSchemas.driver.pushEvents.input.safeParse({
+      rpc.pushEvents.input.safeParse({
         driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
         events: [
           {

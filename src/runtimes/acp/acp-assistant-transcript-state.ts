@@ -141,7 +141,11 @@ export class AcpAssistantTranscriptState {
     };
   }
 
-  completePrompt(stopReason: StopReason, usage: unknown): DriverEventInput[] {
+  completePrompt(
+    stopReason: StopReason,
+    usage: unknown,
+    requestedBy: "provider" | "user" = "user",
+  ): DriverEventInput[] {
     const events: DriverEventInput[] = [];
     const runId = this.#requireRunId();
     const terminalError =
@@ -204,7 +208,7 @@ export class AcpAssistantTranscriptState {
       events.push({
         kind: "run.cancelled",
         payload: {
-          requestedBy: "user",
+          requestedBy,
           stopReason: "cancelled",
         },
         runId,

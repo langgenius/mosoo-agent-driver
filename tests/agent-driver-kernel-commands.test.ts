@@ -1,12 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
+import { ACTIVE_INPUT_SETTLE_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import type {
   AgentDriverContext,
   AgentDriverContextPortOverrides,
 } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../src/core/driver-runtime-io";
 import type { DriverEventInput } from "../src/protocol/events";
 import {
   RUNTIME_COMMAND_MAX_UTF8_BYTES,
@@ -798,16 +797,21 @@ describe("AgentDriverKernelCore", () => {
       .catch(() => {});
     await inputEntered.promise;
     const nativeSetTimeout = globalThis.setTimeout;
+    let activeInputTimeouts = 0;
     const acceleratedSetTimeout = (
       callback: (...args: unknown[]) => void,
       timeout?: number,
       ...args: unknown[]
-    ) =>
-      nativeSetTimeout(
+    ) => {
+      if (timeout === ACTIVE_INPUT_SETTLE_GRACE_MS) {
+        activeInputTimeouts += 1;
+      }
+      return nativeSetTimeout(
         callback,
-        timeout === ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS ? 10 : timeout,
+        timeout === ACTIVE_INPUT_SETTLE_GRACE_MS ? 10 : timeout,
         ...args,
       );
+    };
     globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
     try {
@@ -817,6 +821,7 @@ describe("AgentDriverKernelCore", () => {
       expect(first[0]?.status).toBe("rejected");
       expect(second[0]?.status).toBe("rejected");
       expect(inputSettled).toBe(false);
+      expect(activeInputTimeouts).toBe(1);
     } finally {
       globalThis.setTimeout = nativeSetTimeout;
       releaseInput.resolve();

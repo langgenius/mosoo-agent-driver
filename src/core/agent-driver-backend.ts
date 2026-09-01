@@ -1,11 +1,8 @@
 import type {
   AgentDriverCommandSource,
   AgentDriverEventSink,
-  AgentDriverFilePort,
   AgentDriverHostPorts,
-  AgentDriverMcpPort,
   AgentDriverPermissionPort,
-  AgentDriverSkillPort,
 } from "../host-ports";
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
@@ -27,14 +24,7 @@ export interface AgentDriverLifecycle {
   fail(error: Error): void;
 }
 
-export type AgentDriverContextPortOverrides = Partial<{
-  commandSource: AgentDriverCommandSource;
-  eventSink: AgentDriverEventSink;
-  file: AgentDriverFilePort;
-  mcp: AgentDriverMcpPort;
-  permission: AgentDriverPermissionPort;
-  skill: AgentDriverSkillPort;
-}>;
+export type AgentDriverContextPortOverrides = Partial<AgentDriverHostPorts>;
 
 export interface AgentDriverContextInput {
   commandSource?: AgentDriverCommandSource;

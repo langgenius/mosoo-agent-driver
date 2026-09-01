@@ -667,7 +667,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
     await expect(translator.handleSdkMessage(context, messageStop, runId)).rejects.toThrow(
       "thought delivery failed",
     );
-    await expect(translator.handleSdkMessage(context, messageStop, runId)).resolves.toBe(false);
+    await expect(translator.handleSdkMessage(context, messageStop, runId)).resolves.toBeNull();
     expect(reasons.filter((reason) => reason === "driver.claude.thought.completed")).toHaveLength(
       2,
     );
@@ -696,7 +696,7 @@ describe("Claude Agent SDK durable event boundaries", () => {
     await expect(translator.handleSdkMessage(context, fallback, runId)).rejects.toThrow(
       "tool retraction failed",
     );
-    await expect(translator.handleSdkMessage(context, fallback, runId)).resolves.toBe(false);
+    await expect(translator.handleSdkMessage(context, fallback, runId)).resolves.toBeNull();
     expect(
       replayedEvents.filter(
         (event) => event.kind === "message.cancelled" && payload(event)["reason"] === "superseded",

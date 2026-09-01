@@ -2,7 +2,7 @@
 
 This directory contains the transitive closure of the OpenAI app-server types imported by the driver.
 
-They correspond to OpenAI app-server runtime version `0.151.0`, which is also pinned by the CLI dependency and container image.
+They correspond to OpenAI app-server runtime version `0.152.0`, which is also pinned by the CLI dependency and container image.
 
 Runtime validation and the complete supported server method sets come from the adjacent JSON Schemas.
 

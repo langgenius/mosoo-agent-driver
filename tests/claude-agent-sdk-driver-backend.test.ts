@@ -7,7 +7,10 @@ import type {
   WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 
-import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
+import {
+  DriverRuntimeStateMachine,
+  DriverTurnCancelledError,
+} from "../src/core/driver-runtime-state";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
@@ -15,7 +18,13 @@ import type { DriverStartInput } from "../src/protocol/start";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "../src/runtimes/claude/agent-sdk-driver-backend";
 import { registerClaudeTaskRetry } from "../src/runtimes/claude/agent-sdk-tasks";
-import { bootPayload, DRIVER_TEST_IDS } from "./driver-runtime-boundary-fixtures";
+import { settlePromiseWithTimeout } from "../src/utils/async";
+import {
+  bootPayload,
+  createDispatcher,
+  DRIVER_TEST_IDS,
+  FakeDriverRuntimeIo,
+} from "./driver-runtime-boundary-fixtures";
 
 const PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 const previousPrewarm = process.env[PREWARM_ENV];
@@ -68,6 +77,13 @@ function errorResultMessage(): SDKMessage {
     usage: { input_tokens: 1, output_tokens: 1 },
     uuid: "result-1",
   } as unknown as SDKMessage;
+}
+
+function cancelledResultMessage(): SDKMessage {
+  return {
+    ...errorResultMessage(),
+    terminal_reason: "aborted_tools",
+  } as SDKMessage;
 }
 
 function fakeQuery(
@@ -160,11 +176,11 @@ function createHarness(
   });
   const backend = new ClaudeAgentSdkDriverBackend(payload, dependencies);
   const handleInput = backend.handleInput.bind(backend);
-  backend.handleInput = async (inputContext, input, runId) => {
+  backend.handleInput = async (inputContext, input, runId, signal) => {
     currentRunId ??= runId;
 
     try {
-      await handleInput(inputContext, input, runId);
+      await handleInput(inputContext, input, runId, signal);
     } finally {
       if (currentRunId === runId) {
         currentRunId = null;
@@ -785,12 +801,15 @@ describe("Claude Agent SDK driver backend", () => {
       );
       await optionsRequested.promise;
 
+      let stopping: Promise<void> | null = null;
       if (action === "cancel") {
         await harness.backend.cancelActiveTurn(harness.context, "test.cancel");
       } else {
-        await harness.backend.stop(harness.context, "test.stop", new AbortController().signal);
+        stopping = harness.backend.stop(harness.context, "test.stop", new AbortController().signal);
       }
-      options.resolve({});
+      if (stopping !== null) {
+        await stopping;
+      }
 
       await expect(handling).rejects.toBeInstanceOf(DriverTurnCancelledError);
       expect(queryCalls).toBe(0);
@@ -918,6 +937,106 @@ describe("Claude Agent SDK driver backend", () => {
       ),
     ).toBe(false);
   });
+
+  test("bounds a stuck dequeued-result return after cancellation is claimed", async () => {
+    delete process.env[PREWARM_ENV];
+    const releaseReturn = Promise.withResolvers<void>();
+    const returnStarted = Promise.withResolvers<void>();
+    let closeCalls = 0;
+    let innerReturnCalls = 0;
+    let outerReturnCalls = 0;
+    let turnSignal: AbortSignal | undefined;
+    const message = resultMessage();
+    let innerMessagePending = true;
+    const inner = {
+      async next() {
+        if (innerMessagePending) {
+          innerMessagePending = false;
+          return { done: false as const, value: message };
+        }
+        return { done: true as const, value: undefined };
+      },
+      async return() {
+        innerReturnCalls += 1;
+        await releaseReturn.promise;
+        return { done: true as const, value: undefined };
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+    let outerMessagePending = true;
+    const query = {
+      close() {
+        closeCalls += 1;
+      },
+      async interrupt() {},
+      async next() {
+        if (outerMessagePending) {
+          outerMessagePending = false;
+          return { done: false as const, value: message };
+        }
+        return { done: true as const, value: undefined };
+      },
+      async return() {
+        outerReturnCalls += 1;
+        returnStarted.resolve();
+        await releaseReturn.promise;
+        return { done: true as const, value: undefined };
+      },
+      [Symbol.asyncIterator]() {
+        return inner;
+      },
+    } as unknown as Query;
+    const harness = createHarness({
+      createQueryOptions: async ({ abortController }) => {
+        turnSignal = abortController.signal;
+        return {};
+      },
+      query: () => query,
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+    const runCancellation = new AbortController();
+
+    try {
+      const handling = harness.backend.handleInput(
+        harness.context,
+        { text: "finish" },
+        DRIVER_TEST_IDS.runId,
+        runCancellation.signal,
+      );
+      await returnStarted.promise;
+      runCancellation.abort(new DriverTurnCancelledError("test.cancel"));
+
+      expect(
+        await settlePromiseWithTimeout(
+          harness.backend.cancelActiveTurn(harness.context, "test.cancel"),
+          { label: "dequeued Claude cancellation", timeoutMs: 50 },
+        ),
+      ).toMatchObject({ status: "completed" });
+      expect(turnSignal?.aborted).toBe(true);
+      expect(
+        await settlePromiseWithTimeout(handling, {
+          label: "stuck Claude query return",
+          timeoutMs: 3_000,
+        }),
+      ).toMatchObject({ error: expect.any(DriverTurnCancelledError), status: "failed" });
+
+      expect(closeCalls).toBe(1);
+      expect(outerReturnCalls).toBe(1);
+      expect(innerReturnCalls).toBe(0);
+      expect(
+        harness.events.filter((event) =>
+          ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
+        ),
+      ).toMatchObject([{ kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId }]);
+    } finally {
+      releaseReturn.resolve();
+      await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    }
+  }, 6_000);
 
   test("awaits query and process cleanup before publishing a completed terminal", async () => {
     delete process.env[PREWARM_ENV];
@@ -1101,9 +1220,7 @@ describe("Claude Agent SDK driver backend", () => {
     delete process.env[PREWARM_ENV];
     const closed = Promise.withResolvers<void>();
     const cleanupStarted = Promise.withResolvers<void>();
-    const interrupted = Promise.withResolvers<void>();
     const releaseCleanup = Promise.withResolvers<void>();
-    const releaseInterrupt = Promise.withResolvers<void>();
     const releasePermissionDelivery = Promise.withResolvers<void>();
     const queryCreated = Promise.withResolvers<void>();
     const started = Promise.withResolvers<void>();
@@ -1136,10 +1253,7 @@ describe("Claude Agent SDK driver backend", () => {
               closes += 1;
               closed.resolve();
             },
-            async () => {
-              interrupted.resolve();
-              await releaseInterrupt.promise;
-            },
+            async () => undefined,
             async () => {
               cleanupStarted.resolve();
               await releaseCleanup.promise;
@@ -1171,18 +1285,15 @@ describe("Claude Agent SDK driver backend", () => {
     await queryCreated.promise;
 
     const cancellation = harness.backend.cancelActiveTurn(harness.context, "test.cancel");
-    await interrupted.promise;
-    expect(turnSignal?.aborted).toBe(false);
-    expect(closes).toBe(0);
-    releaseInterrupt.resolve();
+    await cancellation;
     await cleanupStarted.promise;
     expect(turnSignal?.aborted).toBe(true);
+    expect(closes).toBe(1);
     expect(harness.events.some((event) => event.kind === "run.cancelled")).toBe(false);
     releaseCleanup.resolve();
     await nextEventLoopTurn();
     expect(harness.events.some((event) => event.kind === "run.cancelled")).toBe(false);
     releasePermissionDelivery.resolve();
-    await cancellation;
     await expect(handling).rejects.toBeInstanceOf(DriverTurnCancelledError);
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
 
@@ -1195,15 +1306,84 @@ describe("Claude Agent SDK driver backend", () => {
     expect(terminalOrder).toEqual(["permission.resolved", "run.cancelled"]);
   });
 
-  test("stop joins an in-flight cancellation and propagates its cleanup failure", async () => {
+  test("stop waits for the cancelled terminal acknowledgement", async () => {
+    delete process.env[PREWARM_ENV];
+    const closed = Promise.withResolvers<void>();
+    const releaseTerminal = Promise.withResolvers<void>();
+    const terminalEntered = Promise.withResolvers<void>();
+    const queryCreated = Promise.withResolvers<void>();
+    const harness = createHarness(
+      {
+        createQueryOptions: async () => ({}),
+        query: () => {
+          queryCreated.resolve();
+          return fakeQuery(
+            (async function* () {
+              await closed.promise;
+              yield* [] as SDKMessage[];
+            })(),
+            () => closed.resolve(),
+          );
+        },
+        startup: async () => {
+          throw new Error("prewarm is disabled");
+        },
+      },
+      async (events) => {
+        if (events.some(({ kind }) => kind === "run.cancelled")) {
+          terminalEntered.resolve();
+          await releaseTerminal.promise;
+        }
+      },
+    );
+    const handling = harness.backend.handleInput(
+      harness.context,
+      { text: "wait" },
+      DRIVER_TEST_IDS.runId,
+    );
+    void handling.catch(() => {});
+    await queryCreated.promise;
+    let stopSettled = false;
+    const stopping = harness.backend.stop(
+      harness.context,
+      "test.stop",
+      new AbortController().signal,
+    );
+    void stopping.then(
+      () => {
+        stopSettled = true;
+      },
+      () => {
+        stopSettled = true;
+      },
+    );
+
+    try {
+      await terminalEntered.promise;
+      await nextEventLoopTurn();
+      expect(stopSettled).toBe(false);
+      releaseTerminal.resolve();
+      await expect(Promise.all([stopping, handling])).rejects.toBeInstanceOf(
+        DriverTurnCancelledError,
+      );
+      expect(
+        harness.events.filter(({ kind }) =>
+          ["run.cancelled", "run.completed", "run.failed"].includes(kind),
+        ),
+      ).toMatchObject([{ kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId }]);
+    } finally {
+      releaseTerminal.resolve();
+      await Promise.allSettled([stopping, handling]);
+    }
+  });
+
+  test("stop owns in-flight cancellation cleanup and propagates its failure", async () => {
     delete process.env[PREWARM_ENV];
     const closed = Promise.withResolvers<void>();
     const cleanupError = new Error("provider process cleanup failed");
     const cleanupStarted = Promise.withResolvers<void>();
-    const interrupted = Promise.withResolvers<void>();
     const processExit = Promise.withResolvers<void>();
     const queryCreated = Promise.withResolvers<void>();
-    const releaseInterrupt = Promise.withResolvers<void>();
     let cancellationSettled = false;
     let stopSettled = false;
     const harness = createHarness({
@@ -1219,10 +1399,7 @@ describe("Claude Agent SDK driver backend", () => {
             yield* [] as SDKMessage[];
           })(),
           () => closed.resolve(),
-          async () => {
-            interrupted.resolve();
-            await releaseInterrupt.promise;
-          },
+          async () => undefined,
           async () => cleanupStarted.resolve(),
         );
       },
@@ -1246,7 +1423,7 @@ describe("Claude Agent SDK driver backend", () => {
         cancellationSettled = true;
       },
     );
-    await interrupted.promise;
+    await cleanupStarted.promise;
 
     const stopping = harness.backend.stop(
       harness.context,
@@ -1262,19 +1439,13 @@ describe("Claude Agent SDK driver backend", () => {
       },
     );
     await nextEventLoopTurn();
-    expect(cancellationSettled).toBe(false);
-    expect(stopSettled).toBe(false);
-
-    releaseInterrupt.resolve();
-    await cleanupStarted.promise;
-    await nextEventLoopTurn();
-    expect(cancellationSettled).toBe(false);
+    expect(cancellationSettled).toBe(true);
     expect(stopSettled).toBe(false);
 
     const settled = Promise.allSettled([cancellation, stopping, handling]);
     processExit.reject(cleanupError);
     expect(await settled).toEqual([
-      { reason: cleanupError, status: "rejected" },
+      { status: "fulfilled", value: undefined },
       { reason: cleanupError, status: "rejected" },
       { reason: cleanupError, status: "rejected" },
     ]);
@@ -1324,6 +1495,236 @@ describe("Claude Agent SDK driver backend", () => {
         ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
       ),
     ).toMatchObject([{ kind: "run.completed", runId: DRIVER_TEST_IDS.runId }]);
+  });
+
+  test.each(["query cleanup", "terminal selection"] as const)(
+    "honors a socket cancellation claimed during %s",
+    async (window) => {
+      delete process.env[PREWARM_ENV];
+      const windowEntered = Promise.withResolvers<void>();
+      const releaseWindow = Promise.withResolvers<void>();
+      const cancellationClaimed = Promise.withResolvers<void>();
+      const order: string[] = [];
+      const backend = new ClaudeAgentSdkDriverBackend(
+        {
+          ...bootPayload,
+          runtime: "claude-agent-sdk",
+          runtimeTransport: "claude-agent-sdk",
+        } as DriverStartInput,
+        {
+          createQueryOptions: async () => ({}),
+          query: () =>
+            fakeQuery(
+              [resultMessage()],
+              () => {},
+              async () => undefined,
+              async () => {
+                if (window === "query cleanup") {
+                  windowEntered.resolve();
+                  await releaseWindow.promise;
+                }
+                order.push("cleanup");
+              },
+            ),
+        },
+      );
+      const socket = new FakeDriverRuntimeIo([
+        {
+          commandId: "result-cleanup-input",
+          input: { text: "finish" },
+          kind: "input.start",
+          requestId: "result-cleanup-request",
+          runId: DRIVER_TEST_IDS.runId,
+        },
+        {
+          commandId: "result-cleanup-cancel",
+          kind: "turn.cancel",
+          reason: "test.cancel",
+          runId: DRIVER_TEST_IDS.runId,
+        },
+      ]);
+      const nextCommand = socket.nextCommand.bind(socket);
+      socket.nextCommand = async (signal) => {
+        const command = await nextCommand(signal);
+        if (command?.kind === "turn.cancel") {
+          await windowEntered.promise;
+        }
+        return command;
+      };
+      const registerRunTerminalBarrier = socket.registerRunTerminalBarrier.bind(socket);
+      socket.registerRunTerminalBarrier = (barrier) =>
+        registerRunTerminalBarrier((events) => {
+          const pending = barrier(events);
+          if (
+            window !== "terminal selection" ||
+            !events.some(({ kind }) => kind === "run.completed")
+          ) {
+            return pending;
+          }
+          return Promise.resolve(pending).then(async () => {
+            windowEntered.resolve();
+            await releaseWindow.promise;
+          });
+        });
+      const claimRunCancellation = socket.claimRunCancellation.bind(socket);
+      socket.claimRunCancellation = (ticket, reason) => {
+        const claim = claimRunCancellation(ticket, reason);
+        cancellationClaimed.resolve();
+        return claim;
+      };
+      const pushEvents = socket.pushEvents.bind(socket);
+      socket.pushEvents = async (input) => {
+        const result = await pushEvents(input);
+        const terminal = input.events.find(({ kind }) =>
+          ["run.cancelled", "run.completed", "run.failed"].includes(kind),
+        );
+        if (terminal !== undefined) {
+          order.push(terminal.kind);
+        }
+        return result;
+      };
+      const runtimeState = new DriverRuntimeStateMachine("ready");
+      const { dispatcher, logger, shutdownCalls } = createDispatcher({
+        backend,
+        isShuttingDown: () => socket.isDrained(),
+        runtimeState,
+      });
+
+      const running = dispatcher.run(socket, logger);
+      await windowEntered.promise;
+      await cancellationClaimed.promise;
+      const claimedSnapshot = socket.runSnapshot(DRIVER_TEST_IDS.runId);
+      releaseWindow.resolve();
+      await running;
+
+      expect(claimedSnapshot).toMatchObject({
+        cancellation: { reason: "test.cancel" },
+        terminal: null,
+      });
+      expect(order).toEqual(["cleanup", "run.cancelled"]);
+      expect(socket.updates).toEqual([
+        { commandId: "result-cleanup-input", status: "accepted" },
+        { commandId: "result-cleanup-cancel", status: "accepted" },
+        { commandId: "result-cleanup-input", status: "cancelled" },
+        { commandId: "result-cleanup-cancel", status: "completed" },
+      ]);
+      expect(socket.failedRuns).toEqual([]);
+      expect(shutdownCalls).toEqual([]);
+      expect(runtimeState.status()).toBe("ready");
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(({ kind }) => kind === "message.completed" || kind === "message.cancelled")
+          .map(({ kind }) => kind),
+      ).toEqual(["message.completed"]);
+      expect(events.filter(({ kind }) => kind === "agent.tasks.replaced")).toHaveLength(1);
+    },
+  );
+
+  test("settles a provider-aborted result as cancellation without failing the runtime", async () => {
+    delete process.env[PREWARM_ENV];
+    const backend = new ClaudeAgentSdkDriverBackend(
+      {
+        ...bootPayload,
+        runtime: "claude-agent-sdk",
+        runtimeTransport: "claude-agent-sdk",
+      } as DriverStartInput,
+      {
+        createQueryOptions: async () => ({}),
+        query: () => fakeQuery([cancelledResultMessage()]),
+      },
+    );
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "provider-cancelled-input",
+        input: { text: "cancel" },
+        kind: "input.start",
+        requestId: "provider-cancelled-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    let cancellationClaims = 0;
+    const claimRunCancellation = socket.claimRunCancellation.bind(socket);
+    socket.claimRunCancellation = (ticket, reason) => {
+      cancellationClaims += 1;
+      return claimRunCancellation(ticket, reason);
+    };
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const { dispatcher, logger } = createDispatcher({
+      backend,
+      isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
+      runtimeState,
+    });
+
+    await dispatcher.run(socket, logger);
+
+    expect(
+      socket.pushedEvents
+        .flatMap(({ events }) => events)
+        .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+        .map(({ kind }) => kind),
+    ).toEqual(["run.cancelled"]);
+    expect(socket.updates).toEqual([
+      { commandId: "provider-cancelled-input", status: "accepted" },
+      { commandId: "provider-cancelled-input", status: "cancelled" },
+    ]);
+    expect(socket.failedRuns).toEqual([]);
+    expect(cancellationClaims).toBe(0);
+    expect(runtimeState.status()).toBe("ready");
+  });
+
+  test("keeps a provider failure authoritative when cancellation is claimed during cleanup", async () => {
+    delete process.env[PREWARM_ENV];
+    const cleanupEntered = Promise.withResolvers<void>();
+    const releaseCleanup = Promise.withResolvers<void>();
+    const payload = {
+      ...bootPayload,
+      runtime: "claude-agent-sdk",
+      runtimeTransport: "claude-agent-sdk",
+    } as DriverStartInput;
+    const backend = new ClaudeAgentSdkDriverBackend(payload, {
+      createQueryOptions: async () => ({}),
+      query: () =>
+        fakeQuery(
+          [errorResultMessage()],
+          () => {},
+          async () => undefined,
+          async () => {
+            cleanupEntered.resolve();
+            await releaseCleanup.promise;
+          },
+        ),
+    });
+    const socket = new FakeDriverRuntimeIo([]);
+    const ticket = socket.beginRun(DRIVER_TEST_IDS.runId);
+    const context = createAgentDriverContext({
+      eventSink: socket,
+      logger: createDisabledLogger(),
+      payload,
+      permission: { request: async () => "reject_once" },
+    });
+
+    const handling = backend.handleInput(
+      context,
+      { text: "fail" },
+      DRIVER_TEST_IDS.runId,
+      ticket.signal,
+    );
+    await cleanupEntered.promise;
+    expect(socket.claimRunCancellation(ticket, "test.cancel")).toBe("claimed");
+    releaseCleanup.resolve();
+
+    await expect(handling).rejects.toThrow("failed");
+    expect(socket.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toMatchObject({
+      phase: "acked",
+      value: { status: "failed" },
+    });
+    expect(
+      socket.pushedEvents
+        .flatMap(({ events }) => events)
+        .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+        .map(({ kind }) => kind),
+    ).toEqual(["run.failed"]);
   });
 
   test.each([

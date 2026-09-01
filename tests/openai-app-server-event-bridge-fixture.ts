@@ -6,6 +6,7 @@ import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
+import { DriverCompletedTerminalSupersededError } from "../src/runtimes/driver-event-publisher";
 import { DRIVER_TEST_IDS, driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
 
 interface EventBatch {
@@ -44,6 +45,7 @@ export function createOpenAiBridgeHarness(
     failNativeResumePublish?: boolean;
     failReasonOnce?: string;
     failTerminalOnce?: boolean;
+    holdCompletedTerminalOnce?: boolean;
     holdFailedTerminalOnce?: boolean;
     holdReason?: string;
   } = {},
@@ -51,11 +53,13 @@ export function createOpenAiBridgeHarness(
   const batches: EventBatch[] = [];
   const attempts: EventBatch[] = [];
   const terminalAttempts: Array<{
+    cancellationSignal: AbortSignal | null;
     closures: readonly DriverEventInput[];
     terminal: DriverEventInput;
   }> = [];
   let failedReason = false;
   let failedTerminal = false;
+  let heldCompletedTerminal = false;
   const heldPush = Promise.withResolvers<void>();
   const releasePush = Promise.withResolvers<void>();
   const terminalHeld = Promise.withResolvers<void>();
@@ -92,8 +96,25 @@ export function createOpenAiBridgeHarness(
   const bridge = new OpenAiAppServerEventBridge({
     push,
     pushSession: push,
-    pushTerminal: async (pushContext, reason, closures, terminal) => {
-      terminalAttempts.push({ closures, terminal });
+    pushTerminal: async (pushContext, reason, closures, terminal, cancellationSignal) => {
+      terminalAttempts.push({ cancellationSignal: cancellationSignal ?? null, closures, terminal });
+      if (
+        !heldCompletedTerminal &&
+        options.holdCompletedTerminalOnce === true &&
+        terminal.kind === "run.completed"
+      ) {
+        heldCompletedTerminal = true;
+        for (const closure of closures) {
+          await push(pushContext, `${reason}.items`, [closure]);
+        }
+        terminalHeld.resolve();
+        await releaseTerminal.promise;
+        if (cancellationSignal?.aborted === true) {
+          throw new DriverCompletedTerminalSupersededError(cancellationSignal.reason);
+        }
+        await push(pushContext, reason, [terminal]);
+        return;
+      }
       if (!failedTerminal && options.failTerminalOnce === true) {
         failedTerminal = true;
         if (options.holdFailedTerminalOnce === true) {

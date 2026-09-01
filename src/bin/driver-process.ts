@@ -332,23 +332,15 @@ export class DriverProcess {
     this.#heartbeatLoop.stop(this.#logger, reason);
 
     try {
-      let permissionFailure: { error: unknown } | null = null;
-
-      try {
-        await permissionCancellation;
-      } catch (error) {
-        permissionFailure = { error };
-      }
-
-      const backendShutdown = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
+      const [permissionResult] = await Promise.allSettled([permissionCancellation]);
+      const [backendResult] = await Promise.allSettled([this.#backendLifecycle?.shutdown(reason)]);
       socket.abortPendingRequests(reason);
-      const failure = backendShutdown.find((result) => result.status === "rejected");
 
-      if (permissionFailure !== null) {
-        throw permissionFailure.error;
+      if (permissionResult.status === "rejected") {
+        throw permissionResult.reason;
       }
-      if (failure?.status === "rejected") {
-        throw failure.reason;
+      if (backendResult.status === "rejected") {
+        throw backendResult.reason;
       }
 
       if (this.#runtimeState.status() === "stopping") {

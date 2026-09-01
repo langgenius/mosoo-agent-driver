@@ -56,8 +56,9 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
   claimRunCancellation(
     ticket: DriverRunTicket,
     reason: string,
+    source?: Parameters<DriverRuntimeIo["claimRunCancellation"]>[2],
   ): ReturnType<DriverRuntimeIo["claimRunCancellation"]> {
-    return this.#terminalState.claimCancellation(ticket, reason);
+    return this.#terminalState.claimCancellation(ticket, reason, source);
   }
 
   currentRunId(): ReturnType<DriverRuntimeIo["currentRunId"]> {
@@ -184,6 +185,7 @@ export class FakeDriverRuntimeIo implements DriverRuntimeIo {
         await pending;
       }
     }
+    input.signal?.throwIfAborted();
     this.pushedEvents.push({ ...input, events });
     const ticket = this.#activeRunTicket;
     const terminalEvent = events.find(

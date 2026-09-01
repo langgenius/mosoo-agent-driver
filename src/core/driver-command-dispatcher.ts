@@ -43,6 +43,7 @@ import {
 import type { DriverRuntimeStateMachine } from "./driver-runtime-state";
 import { isDriverTurnCancelledError } from "./driver-runtime-state";
 import type { DriverInputOutcome, DriverRunTicket } from "./driver-terminal-state";
+import type { DriverTurnCancellationSource } from "./driver-turn-cancelled-error";
 
 interface DriverCommandDispatcherOptions {
   backend: AgentDriverBackend;
@@ -59,7 +60,9 @@ interface DriverCommandDispatcherOptions {
 
 const COMMAND_POLL_INTERVAL_MS = 250;
 export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
-const ACTIVE_INPUT_SETTLE_GRACE_MS = ACTIVE_TURN_CANCEL_GRACE_MS + DRIVER_EVENT_DELIVERY_TIMEOUT_MS;
+// Fault-containment ceiling, not a normal cancellation SLA: an admitted turn can
+// legitimately cross several independent durable-delivery and cleanup epochs.
+export const ACTIVE_INPUT_SETTLE_GRACE_MS = DRIVER_EVENT_DELIVERY_TIMEOUT_MS * 9;
 const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
 export const ACTIVE_MCP_COMMIT_GRACE_MS = AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS + 30_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
@@ -158,6 +161,7 @@ export class DriverCommandDispatcher {
   readonly #shutdownSignal: AbortSignal;
   readonly #shutdown: (socket: DriverRuntimeIo, reason: string) => Promise<void>;
   readonly #commandDelivery: DriverCommandDelivery;
+  #activeWorkFenceFailure: { error: unknown } | null = null;
   #activeWorkFailure: { error: unknown } | null = null;
   #activeRunTicket: DriverRunTicket | null = null;
   readonly #activeMcpAdmissions = new Set<ActiveMcpAdmission>();
@@ -165,6 +169,7 @@ export class DriverCommandDispatcher {
   readonly #mcpRunFailures = new Map<RunId, { error: unknown }>();
   readonly #terminalRunFences = new Set<RunId>();
   #activeRunGeneration = 0;
+  #activeRunSettleTask: Promise<void> | null = null;
   #activeRunTask: Promise<void> | null = null;
   #shutdownCompleted = false;
   #shutdownPermissionTask: Promise<void> | null = null;
@@ -550,9 +555,6 @@ export class DriverCommandDispatcher {
       if (command.kind === "mcp.execute" && replay === null && !mcpAdmissionGranted) {
         throw new Error(`Run ${command.runId} is already publishing its terminal event.`);
       }
-      if (replay === null && command.kind === "input.start" && this.#activeRunTask !== null) {
-        await settleInput(this.#activeRunTask);
-      }
       this.#assertCommandRunOwnership(socket, command, replayMode);
     } catch (error) {
       await this.#commandDelivery.reject(runtimeContext, command, {
@@ -632,6 +634,7 @@ export class DriverCommandDispatcher {
           .finally(() => {
             if (this.#activeRunTask === activeRunTask) {
               this.#activeRunTask = null;
+              this.#activeRunSettleTask = null;
               this.#activeRunTicket = null;
             }
           });
@@ -740,13 +743,13 @@ export class DriverCommandDispatcher {
   #abortActiveWork(
     socket: DriverRuntimeIo,
     reason: string,
-    source: "session.stop" | "shutdown" | "turn.cancel",
+    source: DriverTurnCancellationSource,
   ): "already_claimed" | "claimed" | "idle" | "terminal_selected" {
     const ticket = this.#activeRunTicket;
     const cancellation =
       ticket === null || socket.runSnapshot(ticket.runId) === null
         ? "idle"
-        : socket.claimRunCancellation(ticket, reason);
+        : socket.claimRunCancellation(ticket, reason, source);
 
     if (source !== "turn.cancel" || cancellation !== "terminal_selected") {
       if (source === "shutdown") {
@@ -767,7 +770,7 @@ export class DriverCommandDispatcher {
     runtimeContext: AgentDriverContext,
     socket: DriverRuntimeIo,
     reason: string,
-    source: "session.stop" | "shutdown" | "turn.cancel",
+    source: DriverTurnCancellationSource,
     permissionCancellation?: Promise<void>,
   ): Promise<void> {
     const cancellation = this.#abortActiveWork(socket, reason, source);
@@ -814,10 +817,14 @@ export class DriverCommandDispatcher {
         permissionFailure = { error };
       }
     }
+    if (this.#activeWorkFenceFailure !== null) {
+      throw this.#activeWorkFenceFailure.error;
+    }
     const tasks: Promise<unknown>[] = [];
 
-    if (this.#activeRunTask !== null) {
-      tasks.push(settleInput(this.#activeRunTask));
+    const activeRunSettleTask = this.#settleActiveRun();
+    if (activeRunSettleTask !== null) {
+      tasks.push(activeRunSettleTask);
     }
 
     if (this.#activeMcpCommands.size > 0) {
@@ -839,8 +846,22 @@ export class DriverCommandDispatcher {
       throw permissionFailure.error;
     }
     if (failure?.status === "rejected") {
-      throw failure.reason;
+      this.#activeWorkFenceFailure ??= { error: failure.reason };
+      throw this.#activeWorkFenceFailure.error;
     }
+  }
+
+  #settleActiveRun(): Promise<void> | null {
+    if (this.#activeRunTask === null) {
+      return null;
+    }
+
+    return (this.#activeRunSettleTask ??= settleInput(this.#activeRunTask).catch(
+      (error: unknown) => {
+        this.#activeWorkFenceFailure ??= { error };
+        throw this.#activeWorkFenceFailure.error;
+      },
+    ));
   }
 
   #startMcpCommand(

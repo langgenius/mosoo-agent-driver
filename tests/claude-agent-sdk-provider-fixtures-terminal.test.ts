@@ -85,7 +85,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // Real SDK wire shape: every envelope (each stream chunk and the complete
     // assistant replay) carries a distinct uuid; only the API message id inside
     // message_start / assistant.message is stable across the whole message.
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -151,9 +151,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const startedEvents = events().filter((event) => event.kind === "message.started");
     const completedEvents = events().filter((event) => event.kind === "message.completed");
@@ -182,7 +180,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("scopes interleaved subagent stream chunks away from the main message", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -231,9 +229,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const textByMessageId = new Map<string, string>();
 
@@ -254,7 +250,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("does not promote a replayed stream-only message stop to canonical final", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -287,9 +283,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const liveText = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {
@@ -310,7 +304,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("materializes a result-only native resume completion", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: { type: "message_stop" },
@@ -327,9 +321,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const translated = events();
     const started = translated.filter((event) => event.kind === "message.started");
@@ -416,7 +408,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("retracts a superseded refusal before publishing its replacement", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         message: {
@@ -452,9 +444,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const snapshots = events().flatMap((event) => {
       if (event.kind !== "message.added" || !isRecord(event.payload)) {
@@ -494,7 +484,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("applies refusal fallback retractions idempotently to messages and tool results", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const fallback = {
       content: "Retrying with fallback model.",
       direction: "retry",
@@ -573,9 +563,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const retractedMessages = events().filter(
       (event) =>
@@ -620,7 +608,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("keeps assistant envelopes distinct when they share an API message id", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         message: { content: [{ text: "first", type: "text" }], id: "shared-native" },
@@ -649,9 +637,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const snapshots = events().flatMap((event) => {
       if (event.kind !== "message.added" || !isRecord(event.payload)) {
@@ -704,7 +690,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("does not let a late older assistant completion replace the final message", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -738,9 +724,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -753,7 +737,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed when a newer assistant is still incomplete at result success", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         message: {
@@ -780,9 +764,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -795,7 +777,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed when an older full frame arrives after a newer incomplete message", async () => {
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -822,9 +804,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -841,7 +821,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // scope comes from the burst anchor: parallel tool blocks of one message
     // are told apart by content-block index, and a message_stop boundary
     // separates one message's thought stream from the next.
-    const { context, events, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const stream = (uuid: string, event: Record<string, unknown>) =>
       ({ event, type: "stream_event", uuid }) as unknown as SDKMessage;
     const messages = [
@@ -899,9 +879,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       }),
     ];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
+    await handleMessages(messages);
 
     const toolArguments = events().flatMap((event) => {
       if (event.kind !== "tool.call.updated" || !isRecord(event.payload)) {
@@ -942,11 +920,9 @@ describe("Claude Agent SDK provider fixtures", () => {
     const fixture = readClaudeProviderFixtureCase(
       `./fixtures/providers/claude-agent-sdk/cases/${name}.json`,
     );
-    const { context, events, nativeSessionIds, translator } = createHarness();
+    const { events, handleMessages, nativeSessionIds } = createHarness();
 
-    for (const message of fixture.messages) {
-      await translator.handleSdkMessage(context, message as SDKMessage, fixture.runId);
-    }
+    await handleMessages(fixture.messages as SDKMessage[], fixture.runId);
 
     expect(nativeSessionIds).toEqual(fixture.expectedNativeSessionIds);
     expect(normalizeClaudeEvents(events())).toEqual(fixture.expectedEvents);

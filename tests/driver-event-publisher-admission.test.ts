@@ -10,7 +10,10 @@ import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import type { RunId } from "../src/protocol/id";
 import type { DriverEventBatchOutput } from "../src/protocol/orpc";
-import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import {
+  DriverCompletedTerminalSupersededError,
+  DriverEventPublisher,
+} from "../src/runtimes/driver-event-publisher";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
 
@@ -714,6 +717,164 @@ describe("DriverEventPublisher", () => {
     ]);
     expect(new Set(attempts.slice(0, 3).map(([event]) => event?.sourceEventId)).size).toBe(1);
     expect(kinds([accepted])).toEqual([["message.completed", "run.completed"]]);
+  });
+
+  test("lets cancellation replace only the unselected completed terminal", async () => {
+    const closureEntered = Promise.withResolvers<void>();
+    const releaseClosure = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    let closureAttempts = 0;
+    let seq = 0;
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+
+        if (events[0]?.kind === "message.completed" && ++closureAttempts <= 2) {
+          if (closureAttempts === 1) {
+            closureEntered.resolve();
+            await releaseClosure.promise;
+          }
+          throw new Error(`closure outcome unknown ${closureAttempts}`);
+        }
+
+        return acceptEvents(events, () => (seq += 1));
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const cancellation = new Error("cancellation won");
+    const controller = new AbortController();
+    const closure = createEvent("message.completed");
+    const completed = createRunTerminal("run.completed");
+    const first = publisher.pushTerminal(
+      context,
+      "terminal",
+      [closure],
+      completed,
+      controller.signal,
+    );
+
+    await closureEntered.promise;
+    controller.abort(cancellation);
+    releaseClosure.resolve();
+    await expect(first).rejects.toThrow("closure outcome unknown 2");
+    await expect(
+      publisher.pushTerminal(context, "terminal.retry", [closure], completed, controller.signal),
+    ).rejects.toBeInstanceOf(DriverCompletedTerminalSupersededError);
+    await publisher.pushTerminal(
+      context,
+      "terminal.cancelled",
+      [],
+      createRunTerminal("run.cancelled"),
+    );
+
+    expect(kinds(attempts)).toEqual([
+      ["message.completed"],
+      ["message.completed"],
+      ["message.completed"],
+      ["run.cancelled"],
+    ]);
+    expect(new Set(attempts.slice(0, 3).map(([event]) => event?.sourceEventId)).size).toBe(1);
+  });
+
+  test("does not start a completed settlement after cancellation was claimed", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const cancellation = new Error("cancellation already won");
+    const controller = new AbortController();
+    controller.abort(cancellation);
+
+    expect(() =>
+      publisher.pushTerminal(
+        context,
+        "completed",
+        [createEvent("message.completed")],
+        createRunTerminal("run.completed"),
+        controller.signal,
+      ),
+    ).toThrow(cancellation);
+    await publisher.pushTerminal(context, "cancelled", [], createRunTerminal("run.cancelled"));
+
+    expect(kinds(attempts)).toEqual([["run.cancelled"]]);
+  });
+
+  test("aborts an in-flight unselected completed terminal", async () => {
+    const terminalEntered = Promise.withResolvers<void>();
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events, signal) => {
+        attempts.push(events);
+        if (events[0]?.kind === "run.completed") {
+          terminalEntered.resolve();
+          await new Promise<void>((_resolve, reject) =>
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true }),
+          );
+        }
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const cancellation = new Error("cancellation won during delivery");
+    const controller = new AbortController();
+    const completed = publisher.pushTerminal(
+      context,
+      "completed",
+      [createEvent("message.completed")],
+      createRunTerminal("run.completed"),
+      controller.signal,
+    );
+
+    await terminalEntered.promise;
+    controller.abort(cancellation);
+    const error = await completed.catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(DriverCompletedTerminalSupersededError);
+    expect((error as Error).cause).toBe(cancellation);
+    await publisher.pushTerminal(context, "cancelled", [], createRunTerminal("run.cancelled"));
+
+    expect(kinds(attempts)).toEqual([["message.completed"], ["run.completed"], ["run.cancelled"]]);
+  });
+
+  test("releases a failed unselected completion when cancellation arrives later", async () => {
+    const attempts: DriverEventInput[][] = [];
+    const context = createContext({
+      pushEvents: async (events) => {
+        attempts.push(events);
+        if (events[0]?.kind === "run.completed") {
+          throw new Error("completion outcome unknown");
+        }
+        return acceptEvents(events);
+      },
+    });
+    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
+    const controller = new AbortController();
+
+    await expect(
+      publisher.pushTerminal(
+        context,
+        "completed",
+        [],
+        createRunTerminal("run.completed"),
+        controller.signal,
+      ),
+    ).rejects.toThrow("completion outcome unknown");
+    controller.abort(new Error("cancellation won"));
+    await expect(
+      publisher.pushTerminal(
+        context,
+        "completed.retry",
+        [],
+        createRunTerminal("run.completed"),
+        controller.signal,
+      ),
+    ).rejects.toBeInstanceOf(DriverCompletedTerminalSupersededError);
+    await publisher.pushTerminal(context, "cancelled", [], createRunTerminal("run.cancelled"));
+
+    expect(kinds(attempts)).toEqual([["run.completed"], ["run.completed"], ["run.cancelled"]]);
   });
 
   test("joins one in-flight terminal operation and rejects a different occurrence", async () => {

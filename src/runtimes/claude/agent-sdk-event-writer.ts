@@ -42,6 +42,20 @@ interface ClaudeAgentSdkEventWriterOptions {
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
 }
 
+export type ClaudeTerminalOutcome =
+  | (DriverEventInput & {
+      readonly kind: "run.cancelled";
+      readonly payload: { readonly [key: string]: unknown; readonly reason: string };
+    })
+  | (DriverEventInput & { readonly kind: "run.completed" })
+  | (DriverEventInput & {
+      readonly kind: "run.failed";
+      readonly payload: {
+        readonly [key: string]: unknown;
+        readonly error: { readonly [key: string]: unknown; readonly message: string };
+      };
+    });
+
 export interface ClaudeToolStartEvent {
   context: AgentDriverContext;
   parentMessageId?: string;
@@ -302,8 +316,8 @@ export class ClaudeAgentSdkEventWriter {
     message: string,
     retryable: boolean,
     details?: JsonObject,
-  ): DriverEventInput {
-    const event: DriverEventInput = {
+  ): Extract<ClaudeTerminalOutcome, { kind: "run.failed" }> {
+    const event: Extract<ClaudeTerminalOutcome, { kind: "run.failed" }> = {
       kind: "run.failed",
       payload: {
         error: {
@@ -345,7 +359,7 @@ export class ClaudeAgentSdkEventWriter {
     runId: RunId,
     finalMessage: { readonly id: MessageId } | null,
     structuredOutput?: JsonValue,
-  ): DriverEventInput {
+  ): Extract<ClaudeTerminalOutcome, { kind: "run.completed" }> {
     return {
       runId,
       kind: "run.completed",
@@ -357,8 +371,11 @@ export class ClaudeAgentSdkEventWriter {
     };
   }
 
-  runCancelled(runId: RunId, reason: string): DriverEventInput {
-    const event: DriverEventInput = {
+  runCancelled(
+    runId: RunId,
+    reason: string,
+  ): Extract<ClaudeTerminalOutcome, { kind: "run.cancelled" }> {
+    const event: Extract<ClaudeTerminalOutcome, { kind: "run.cancelled" }> = {
       kind: "run.cancelled",
       payload: { reason, stopReason: "cancelled" },
       runId,

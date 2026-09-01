@@ -37,7 +37,6 @@ import type {
   ClientRequestResult,
   RequestId,
   ServerNotificationMethod,
-  ServerNotificationParams,
 } from "./app-server-protocol";
 import {
   CLIENT_RESULT_SCHEMAS,
@@ -55,8 +54,10 @@ interface PendingJsonRpcRequest {
   accept: ((value: unknown) => Promise<unknown>) | null;
   method: string;
   parse(value: unknown): unknown;
+  receiveAtWire: ((value: unknown) => void) | null;
   reject(error: Error): void;
   rejectAtBarrier: ((error: Error) => Promise<void>) | null;
+  releaseAtWire: (() => void) | null;
   responseQueued: boolean;
   resolve(value: unknown): void;
 }
@@ -73,10 +74,7 @@ interface OpenAiAppServerClientStartResult {
 type OpenAiRuntimeHomeState = Awaited<ReturnType<typeof createOpenAiRuntimeHome>>;
 
 interface OpenAiClientContext extends AgentDriverContext {
-  handleNotification<M extends ServerNotificationMethod>(
-    method: M,
-    params: ServerNotificationParams[M],
-  ): Promise<void>;
+  handleNotification(method: ServerNotificationMethod, params: JsonObject): Promise<void>;
   handleProtocolError(error: Error): Promise<void>;
   mapToolCallId(toolCallId: string): string;
 }
@@ -568,7 +566,9 @@ export class OpenAiAppServerClient {
     params: ClientRequestParams[M],
     handlers: {
       accept(result: ClientRequestResult[M]): Promise<R>;
+      received(result: ClientRequestResult[M]): void;
       reject(error: Error): Promise<void>;
+      released(): void;
     },
     signal?: AbortSignal,
   ): Promise<R> {
@@ -579,7 +579,12 @@ export class OpenAiAppServerClient {
     method: string,
     params: unknown,
     parseResult: (value: unknown) => T,
-    handlers: { accept(result: T): Promise<R>; reject(error: Error): Promise<void> } | null,
+    handlers: {
+      accept(result: T): Promise<R>;
+      received(result: T): void;
+      reject(error: Error): Promise<void>;
+      released(): void;
+    } | null,
     signal?: AbortSignal,
   ): Promise<R> {
     signal?.throwIfAborted();
@@ -587,15 +592,18 @@ export class OpenAiAppServerClient {
     this.#nextId += 1;
 
     const response = Promise.withResolvers<R>();
-    this.#pendingRequests.set(id, {
+    const pending: PendingJsonRpcRequest = {
       accept: handlers === null ? null : async (value: unknown) => handlers.accept(value as T),
       method,
       parse: parseResult,
+      receiveAtWire: handlers === null ? null : (value: unknown) => handlers.received(value as T),
       reject: response.reject,
       rejectAtBarrier: handlers?.reject ?? null,
+      releaseAtWire: handlers?.released ?? null,
       responseQueued: false,
       resolve: response.resolve,
-    });
+    };
+    this.#pendingRequests.set(id, pending);
 
     try {
       this.#send({
@@ -604,6 +612,7 @@ export class OpenAiAppServerClient {
         ...(params === undefined ? {} : { params }),
       });
     } catch (error) {
+      this.#releaseWireBarrier(pending);
       this.#pendingRequests.delete(id);
       throw error;
     }
@@ -620,11 +629,13 @@ export class OpenAiAppServerClient {
       }
 
       if (result.status === "timed_out") {
+        this.#releaseWireBarrier(pending);
         await this.#failProtocol(result.error);
       }
 
       throw result.error;
     } finally {
+      this.#releaseWireBarrier(pending);
       this.#pendingRequests.delete(id);
     }
   }
@@ -937,6 +948,7 @@ export class OpenAiAppServerClient {
       return this.#protocolFailureCommit ?? Promise.resolve();
     }
 
+    this.#releasePendingWireBarriers();
     this.#fatalError = error;
     this.#process?.stdout.pause();
     const barrier = this.#serverMessageQueue;
@@ -1055,6 +1067,19 @@ export class OpenAiAppServerClient {
       return;
     }
     pending.responseQueued = true;
+    if ("error" in parsed.data) {
+      this.#releaseWireBarrier(pending);
+    } else {
+      try {
+        this.#receiveWireResult(pending, pending.parse(parsed.data.result));
+      } catch (error) {
+        const failure =
+          error instanceof Error ? error : new Error("OpenAi app-server result parse failed.");
+        this.#releaseWireBarrier(pending);
+        void this.#failProtocol(failure);
+        return;
+      }
+    }
     this.#serverMessageQueue = this.#processResponse(
       this.#serverMessageQueue,
       id,
@@ -1076,6 +1101,9 @@ export class OpenAiAppServerClient {
   ): Promise<void> {
     await previousMessage;
 
+    if (this.#stopRequested) {
+      return;
+    }
     if (this.#pendingRequests.get(id) !== pending) {
       return;
     }
@@ -1229,9 +1257,37 @@ export class OpenAiAppServerClient {
 
   #rejectPending(error: Error): void {
     for (const pending of this.#pendingRequests.values()) {
+      this.#releaseWireBarrier(pending);
       pending.reject(error);
     }
 
     this.#pendingRequests.clear();
+  }
+
+  #receiveWireResult(pending: PendingJsonRpcRequest, result: unknown): void {
+    const receive = pending.receiveAtWire;
+    const release = pending.releaseAtWire;
+    pending.receiveAtWire = null;
+    pending.releaseAtWire = null;
+
+    try {
+      receive?.(result);
+    } catch (error) {
+      release?.();
+      throw error;
+    }
+  }
+
+  #releaseWireBarrier(pending: PendingJsonRpcRequest): void {
+    const release = pending.releaseAtWire;
+    pending.receiveAtWire = null;
+    pending.releaseAtWire = null;
+    release?.();
+  }
+
+  #releasePendingWireBarriers(): void {
+    for (const pending of this.#pendingRequests.values()) {
+      this.#releaseWireBarrier(pending);
+    }
   }
 }

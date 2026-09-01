@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import {
   createOpenAiBridgeHarness as createHarness,
@@ -64,6 +65,58 @@ describe("OpenAi app-server event bridge", () => {
     });
     await bridge.cancelTurn(context, "turn-1", "test.cancel.retry");
     expect(events()).toHaveLength(terminalEventCount);
+  });
+
+  test("lets core cancellation replace a pre-response unselected completed turn", async () => {
+    const { bridge, context, events, releaseTerminal, terminalAttempts, terminalHeld } =
+      createHarness({ holdCompletedTerminalOnce: true });
+    const controller = new AbortController();
+    const admission = bridge.beginTurnAdmission(DRIVER_TEST_IDS.runId, controller.signal);
+    bridge.armTurnAdmission(admission);
+    const started = bridge.handleNotification(context, "turn/started", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "inProgress" },
+    });
+    bridge.bindTurnAdmission(admission, "turn-1");
+    await started;
+    await bridge.handleNotification(context, "item/agentMessage/delta", {
+      delta: "done",
+      itemId: "message-1",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+    const completion = bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+
+    await terminalHeld;
+    controller.abort(new DriverTurnCancelledError("test.cancel"));
+    releaseTerminal();
+    await completion;
+    const trackedTurn = bridge.claimTurnAdmission(
+      admission,
+      "turn-1",
+      DRIVER_TEST_IDS.runId,
+      controller.signal,
+    );
+    void trackedTurn.catch(() => {});
+    await bridge.cancelTurn(context, "turn-1", "test.cancel");
+
+    await expect(trackedTurn).rejects.toThrow("test.cancel");
+    expect(terminalAttempts.map(({ terminal }) => terminal.kind)).toEqual([
+      "run.completed",
+      "run.cancelled",
+    ]);
+    expect(terminalAttempts[0]?.cancellationSignal).toBe(controller.signal);
+    expect(
+      events().filter((event) =>
+        ["run.cancel.requested", "run.cancelled", "run.completed"].includes(event.kind),
+      ),
+    ).toMatchObject([{ kind: "run.cancel.requested" }, { kind: "run.cancelled" }]);
+    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(1);
+    expect(events().filter((event) => event.kind === "message.cancelled")).toHaveLength(0);
+    expect(events().filter((event) => event.kind === "agent.tasks.replaced")).toHaveLength(1);
   });
 
   test("does not duplicate streamed reasoning in the completed snapshot", async () => {

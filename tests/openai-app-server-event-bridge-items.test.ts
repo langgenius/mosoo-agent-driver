@@ -244,6 +244,28 @@ describe("OpenAi app-server event bridge", () => {
     await expect(Promise.all([first, duplicate])).resolves.toEqual([undefined, undefined]);
   });
 
+  test("keeps one exact root-turn admission until its matching response claims it", async () => {
+    const tracker = new OpenAiTurnTracker();
+    const controller = new AbortController();
+    const admission = tracker.admitRootTurn(DRIVER_TEST_IDS.runId, controller.signal);
+
+    expect(() => tracker.admitRootTurn(DRIVER_TEST_IDS.secondRunId)).toThrow("already pending");
+    tracker.armRootTurn(admission);
+    tracker.bindRootTurn(admission, "turn-1");
+    expect(() =>
+      tracker.claimRootTurn(admission, "turn-mismatch", DRIVER_TEST_IDS.runId, controller.signal),
+    ).toThrow("was not bound");
+
+    tracker.releaseRootTurn(admission);
+    const next = tracker.admitRootTurn(DRIVER_TEST_IDS.secondRunId);
+    tracker.releaseRootTurn(admission);
+    tracker.armRootTurn(next);
+    tracker.bindRootTurn(next, "turn-2");
+    const tracked = tracker.claimRootTurn(next, "turn-2", DRIVER_TEST_IDS.secondRunId);
+    tracker.settle("turn-2", { kind: "completed" });
+    await expect(tracked).resolves.toBeUndefined();
+  });
+
   test("closes visible message, tool, and run state when a turn is cancelled", async () => {
     const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
@@ -1085,6 +1107,36 @@ describe("OpenAi app-server event bridge", () => {
       },
     });
     expect(JSON.stringify(events())).not.toContain("y\\n");
+  });
+
+  test.each([
+    ["modelProvider/authRecoveryStarted", "Refreshing Amazon Bedrock credentials.", "started"],
+    ["modelProvider/authRecoveryCompleted", "Amazon Bedrock credentials refreshed.", "completed"],
+  ] as const)("publishes %s independently", async (method, message, status) => {
+    const { bridge, context, events } = createHarness();
+
+    await handleOfficialNotification(bridge, context, method, {
+      message,
+      provider: "Amazon Bedrock",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    const published = events();
+    expect(published).toMatchObject([
+      {
+        delivery: "best_effort",
+        kind: "message.added",
+        payload: {
+          content: message,
+          level: "info",
+          provider: "Amazon Bedrock",
+          subtype: `model_provider_auth_recovery_${status}`,
+        },
+      },
+    ]);
+    expect(published[0]?.payload).not.toHaveProperty("threadId");
+    expect(published[0]?.payload).not.toHaveProperty("turnId");
   });
 
   test("publishes model, MCP server, and user-facing warning notifications", async () => {

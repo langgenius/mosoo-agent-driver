@@ -5,6 +5,7 @@ import { PermissionEventDeliveryError } from "../src/core/driver-permission-brok
 import type { DriverPermissionRequest } from "../src/host-ports";
 import { createDisabledLogger } from "../src/observability";
 import { OpenAiAppServerRequestHandler } from "../src/runtimes/openai/app-server-request-handler";
+import { parseServerRequest } from "../src/runtimes/openai/app-server-protocol";
 import { driverStartInput } from "./driver-boot-payload-fixture";
 
 test("OpenAI server request callbacks handle, reject, and cancel explicitly", async () => {
@@ -59,6 +60,26 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
     handler.dispatch("attestation/generate", 2, {});
     handler.dispatch("applyPatchApproval", 6, {});
     handler.dispatch("execCommandApproval", 7, {});
+    const openAiFormRequest = parseServerRequest({
+      id: 8,
+      method: "mcpServer/elicitation/request",
+      params: {
+        _meta: { "example/request": "template-picker" },
+        message: "Choose a template",
+        mode: "openaiForm",
+        requestedSchema: {
+          properties: { template: { type: "string", "x-openai-preview": {} } },
+          type: "object",
+        },
+        serverName: "codex_apps",
+        threadId: "thread-1",
+        turnId: null,
+      },
+    });
+    if (openAiFormRequest === null) {
+      throw new Error("Codex 0.152 openaiForm elicitation did not match the generated schema.");
+    }
+    handler.dispatch(openAiFormRequest.method, openAiFormRequest.id, openAiFormRequest.params);
     handler.dispatch("item/commandExecution/requestApproval", 3, {
       additionalPermissions: {
         fileSystem: { write: ["/secrets"] },
@@ -113,6 +134,10 @@ test("OpenAI server request callbacks handle, reject, and cancel explicitly", as
       { id: 2, message: "Unsupported OpenAi app-server request: attestation/generate." },
       { id: 6, message: "Unsupported OpenAi app-server request: applyPatchApproval." },
       { id: 7, message: "Unsupported OpenAi app-server request: execCommandApproval." },
+      {
+        id: 8,
+        message: "Unsupported OpenAi app-server request: mcpServer/elicitation/request.",
+      },
     ]);
     expect(permissionSignals.filter((signal) => signal.aborted)).toHaveLength(1);
     expect(permissionInputs.map(({ rawInput }) => JSON.parse(rawInput ?? "null"))).toEqual([

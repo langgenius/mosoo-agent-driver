@@ -26,7 +26,7 @@ const initializeResult = {
   codexHome: "/tmp/openai-home",
   platformFamily: "unix",
   platformOs: "linux",
-  userAgent: "test-app-server/0.151.0",
+  userAgent: "test-app-server/0.152.0",
 } as const;
 const initializeResultJson = JSON.stringify(initializeResult);
 const nativeResumeResultJson = JSON.stringify({
@@ -52,7 +52,7 @@ const nativeResumeResultJson = JSON.stringify({
     agentNickname: null,
     agentRole: null,
     canAcceptDirectInput: true,
-    cliVersion: "0.151.0",
+    cliVersion: "0.152.0",
     createdAt: 1,
     cwd: "/workspace",
     ephemeral: false,

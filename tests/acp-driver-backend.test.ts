@@ -9,7 +9,9 @@ import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
+import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
+import { DriverTerminalStateMachine } from "../src/core/driver-terminal-state";
 import { createDisabledLogger } from "../src/observability";
 import type { AgentDriverFilePort, AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
@@ -24,6 +26,7 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { waitForAcpTestCondition } from "./acp-test-helpers";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
+import { createDispatcher, FakeDriverRuntimeIo } from "./driver-runtime-boundary-fixtures";
 
 const FAKE_AGENT = String.raw`
 const { appendFileSync, existsSync } = require("node:fs");
@@ -308,6 +311,10 @@ const handle = (message) => {
           });
         }
         return;
+      }
+      if (message.params.prompt[0]?.text === "provider-cancel") {
+        result = { stopReason: "cancelled" };
+        break;
       }
       if (message.params.prompt[0]?.text === "hang") {
         pendingPromptId = message.id;
@@ -1558,9 +1565,15 @@ describe("ACP driver backend lifecycle", () => {
           "ACP session/prompt request",
         );
 
-        await expect(
-          harness.backend.cancelActiveTurn(harness.context, "test cancellation"),
-        ).resolves.toBeUndefined();
+        const gate = harness.blockNext("run.cancel.requested");
+        const cancellation = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
+        await gate.entered;
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/cancel"),
+          "ACP session/cancel request",
+        );
+        gate.release();
+        await expect(cancellation).resolves.toBeUndefined();
         await waitForAcpTestCondition(
           async () => (await harness.methods()).includes("session/resume"),
           "ACP session/resume request",
@@ -1831,6 +1844,96 @@ describe("ACP driver backend lifecycle", () => {
       expect(turn.events.completePrompt("end_turn", null)).toEqual(rejectedSettlement);
     } finally {
       turn.events.clear();
+      await harness.destroy();
+    }
+  });
+
+  test("cancels an unresponsive provider only after the request event is durable", async () => {
+    const harness = await createHarness();
+    const state = new DriverTerminalStateMachine();
+    const ticket = state.beginRun(DRIVER_TEST_IDS.runId as RunId);
+    const promptRequested = Promise.withResolvers<void>();
+    const cancellationPushEntered = Promise.withResolvers<void>();
+    const releaseCancellationPush = Promise.withResolvers<void>();
+    const barrierEntered = Promise.withResolvers<void>();
+    let resumeAllowedAtBarrier: boolean | null = null;
+    const events: DriverEventInput[] = [];
+    const turn = new AcpTurnController(
+      async (_context, _reason, pushed) => {
+        if (pushed.some(({ kind }) => kind === "run.cancel.requested")) {
+          cancellationPushEntered.resolve();
+          await releaseCancellationPush.promise;
+        }
+        events.push(...pushed);
+      },
+      async (_context, _providerPromptAdmitted, resumeSignal) => {
+        resumeAllowedAtBarrier = !resumeSignal.aborted;
+        barrierEntered.resolve();
+      },
+    );
+    const clientRequests = new AcpClientRequestHandler({
+      allowedRoots: [process.cwd()],
+      cwd: process.cwd(),
+      env: {},
+      isCancelling: () => turn.isCancelling(),
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents: turn.events,
+    });
+    const connection = {
+      notify: () => new Promise<never>(() => {}),
+      request: async () => {
+        promptRequested.resolve();
+        return new Promise<never>(() => {});
+      },
+    } as unknown as ClientContext;
+
+    try {
+      const input = turn.handleInput(
+        harness.context,
+        { text: "cancel me" },
+        DRIVER_TEST_IDS.runId as RunId,
+        connection,
+        "native-session-1",
+        clientRequests,
+        ticket.signal,
+      );
+      void input.catch(() => {});
+      await promptRequested.promise;
+      expect(state.claimCancellation(ticket, "test cancellation", "turn.cancel")).toBe("claimed");
+      const cancel = turn.cancel(
+        harness.context,
+        "test cancellation",
+        connection,
+        "native-session-1",
+      );
+
+      await cancellationPushEntered.promise;
+      await expect(cancel).resolves.toBeUndefined();
+      expect(
+        await settlePromiseWithTimeout(barrierEntered.promise, {
+          label: "ACP cancellation request acknowledgement",
+          timeoutMs: 25,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+      expect(state.claimCancellation(ticket, "test shutdown", "shutdown")).toBe("already_claimed");
+      releaseCancellationPush.resolve();
+      await expect(input).rejects.toThrow("cancelled");
+      await barrierEntered.promise;
+      expect(resumeAllowedAtBarrier).toBe(false);
+
+      const eventKinds = events.map(({ kind }) => kind);
+      expect(eventKinds.indexOf("run.cancel.requested")).toBeLessThan(
+        eventKinds.indexOf("run.cancelled"),
+      );
+      expect(
+        eventKinds.filter(
+          (kind) => kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+        ),
+      ).toEqual(["run.cancelled"]);
+    } finally {
+      releaseCancellationPush.resolve();
       await harness.destroy();
     }
   });
@@ -2251,7 +2354,15 @@ describe("ACP driver backend lifecycle", () => {
 
       releasePermission.resolve();
       await expect(input).rejects.toThrow("cancelled");
-      expect(harness.events).toContainEqual(expect.objectContaining({ kind: "run.cancelled" }));
+      expect(harness.events).toContainEqual(
+        expect.objectContaining({
+          kind: "run.cancelled",
+          payload: expect.objectContaining({ requestedBy: "provider" }),
+        }),
+      );
+      expect(harness.events).not.toContainEqual(
+        expect.objectContaining({ kind: "run.cancel.requested" }),
+      );
       expect(harness.events).not.toContainEqual(expect.objectContaining({ kind: "run.failed" }));
     } finally {
       releasePermission.resolve();
@@ -2282,6 +2393,361 @@ describe("ACP driver backend lifecycle", () => {
             (kind) => kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
           ),
       ).toEqual(["run.completed"]);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("lets a cancellation request use the durable event delivery budget", async () => {
+    const harness = await createHarness();
+    const gateEntered = Promise.withResolvers<void>();
+    const releaseGate = Promise.withResolvers<void>();
+    let gateOpen = false;
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-durable-cancel-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-durable-cancel-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-durable-cancel-command",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const pushEvents = socket.pushEvents.bind(socket);
+    socket.pushEvents = async (input) => {
+      if (!gateOpen && input.events.some(({ kind }) => kind === "run.cancel.requested")) {
+        gateOpen = true;
+        gateEntered.resolve();
+        await releaseGate.promise;
+      }
+      return pushEvents(input);
+    };
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const { dispatcher, logger, shutdownCalls } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
+      runtimeState,
+    });
+
+    try {
+      const running = dispatcher.run(socket, logger);
+      await gateEntered.promise;
+      await Bun.sleep(2_100);
+      releaseGate.resolve();
+      await running;
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(runtimeState.status()).toBe("ready");
+      expect(shutdownCalls).toEqual([]);
+    } finally {
+      releaseGate.resolve();
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("honors dispatcher cancellation before the completed terminal is selected", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const windowEntered = Promise.withResolvers<void>();
+    const releaseWindow = Promise.withResolvers<void>();
+    const cancellationClaimed = Promise.withResolvers<void>();
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-terminal-race-input",
+        input: { text: "complete" },
+        kind: "input.start",
+        requestId: "acp-terminal-race-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-terminal-race-cancel",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "turn.cancel") {
+        await windowEntered.promise;
+      }
+      return command;
+    };
+    const registerRunTerminalBarrier = socket.registerRunTerminalBarrier.bind(socket);
+    socket.registerRunTerminalBarrier = (barrier) =>
+      registerRunTerminalBarrier((events) => {
+        const pending = barrier(events);
+        if (!events.some(({ kind }) => kind === "run.completed")) {
+          return pending;
+        }
+        return Promise.resolve(pending).then(async () => {
+          windowEntered.resolve();
+          await releaseWindow.promise;
+        });
+      });
+    const claimRunCancellation = socket.claimRunCancellation.bind(socket);
+    socket.claimRunCancellation = (ticket, reason) => {
+      const result = claimRunCancellation(ticket, reason);
+      cancellationClaimed.resolve();
+      return result;
+    };
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const { dispatcher, logger, shutdownCalls } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
+      runtimeState,
+    });
+
+    try {
+      const running = dispatcher.run(socket, logger);
+      await windowEntered.promise;
+      await cancellationClaimed.promise;
+      releaseWindow.resolve();
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "ACP session/resume request",
+      );
+      await Bun.sleep(2_100);
+      await writeFile(harness.resumeGatePath, "resume");
+      await running;
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(
+            ({ kind }) =>
+              kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+          )
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(
+        events
+          .filter(({ kind }) => kind === "message.completed" || kind === "message.cancelled")
+          .map(({ kind }) => kind),
+      ).toEqual(["message.completed"]);
+      expect(socket.updates).toEqual([
+        { commandId: "acp-terminal-race-input", status: "accepted" },
+        { commandId: "acp-terminal-race-cancel", status: "accepted" },
+        { commandId: "acp-terminal-race-input", status: "cancelled" },
+        { commandId: "acp-terminal-race-cancel", status: "completed" },
+      ]);
+      expect(socket.failedRuns).toEqual([]);
+      expect(shutdownCalls).toEqual([]);
+      expect(runtimeState.status()).toBe("ready");
+    } finally {
+      releaseWindow.resolve();
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("interrupts a provider-cancelled resume when session stop arrives", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-provider-cancel-input",
+        input: { text: "provider-cancel" },
+        kind: "input.start",
+        requestId: "acp-provider-cancel-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-provider-cancel-stop",
+        kind: "session.stop",
+        reason: "test.stop",
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "session.stop") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/resume"),
+          "blocked ACP session/resume request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => runtimeState.isShuttingDown(),
+      runtimeState,
+      shutdown: async (_runtimeIo, reason) =>
+        harness.backend.stop(harness.context, reason, new AbortController().signal),
+    });
+    const running = dispatcher.run(socket, logger);
+
+    try {
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "blocked ACP session/resume request",
+      );
+      expect(
+        await settlePromiseWithTimeout(running, {
+          label: "provider-cancelled ACP session stop",
+          timeoutMs: 1_500,
+        }),
+      ).toMatchObject({ status: "completed" });
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      const eventKinds = events.map(({ kind }) => kind);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(eventKinds.filter((kind) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(eventKinds.indexOf("run.cancel.requested")).toBeLessThan(
+        eventKinds.indexOf("run.cancelled"),
+      );
+      expect(events.filter(({ kind }) => kind === "session.resumed")).toHaveLength(0);
+      expect(runtimeState.status()).toBe("stopped");
+    } finally {
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await running.catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("interrupts a turn-cancel resume when shutdown upgrades the claim", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const shutdown = new AbortController();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-cancel-upgrade-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-cancel-upgrade-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-cancel-upgrade-command",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "turn.cancel") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => shutdown.signal.aborted,
+      runtimeState,
+      shutdownSignal: shutdown.signal,
+    });
+    const running = dispatcher.run(socket, logger);
+
+    try {
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "blocked ACP session/resume after turn cancellation",
+      );
+      shutdown.abort(new Error("test shutdown"));
+      expect(
+        await settlePromiseWithTimeout(running, {
+          label: "upgraded ACP turn cancellation",
+          timeoutMs: 1_500,
+        }),
+      ).toMatchObject({ status: "completed" });
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "session.resumed")).toHaveLength(0);
+    } finally {
+      shutdown.abort(new Error("test cleanup"));
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await running.catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("stops an active session without resuming its cancelled provider", async () => {
+    const harness = await createHarness();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-stop-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-stop-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-stop-session",
+        kind: "session.stop",
+        reason: "test.stop",
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "session.stop") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => runtimeState.isShuttingDown(),
+      runtimeState,
+      shutdown: async (_runtimeIo, reason) =>
+        harness.backend.stop(harness.context, reason, new AbortController().signal),
+    });
+
+    try {
+      await dispatcher.run(socket, logger);
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(
+            ({ kind }) =>
+              kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+          )
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(await harness.methods()).not.toContain("session/resume");
+      expect(socket.updates).toContainEqual({
+        commandId: "acp-stop-input",
+        status: "cancelled",
+      });
+      expect(socket.updates).toContainEqual({
+        commandId: "acp-stop-session",
+        status: "completed",
+      });
+      expect(socket.completedRunReasons).toEqual(["completed"]);
+      expect(runtimeState.status()).toBe("stopped");
     } finally {
       await harness.destroy();
     }

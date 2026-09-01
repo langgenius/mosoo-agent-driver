@@ -11,9 +11,7 @@ import {
 } from "./driver-artifact-test-controller";
 import {
   driverRuntimeRpcSchemas,
-  parseDriverCommandUpdateInput,
   parseDriverFailureInput,
-  parseDriverHelloInput,
   parseDriverLogBatchInput,
 } from "../src/protocol/orpc";
 
@@ -160,7 +158,6 @@ describe("driver artifact test controller", () => {
     const diagnostics = controller.diagnostics();
     expect(diagnostics).toContain('"message": "transport exploded: [redacted]"');
     expect(diagnostics).toContain('"stage": "session/new"');
-    expect(diagnostics).not.toContain(secret);
     expect(diagnostics).not.toContain(JSON.stringify(secret).slice(1, -1));
     await controller.dispose();
   });
@@ -255,96 +252,7 @@ describe("driver artifact test controller", () => {
     expect(disposeError.message).not.toContain(secret);
   });
 
-  test("validates structured RPC inputs with the production parsers", () => {
-    const hello = parseDriverHelloInput({
-      capabilities: [{ details: undefined, id: "input_start", status: "supported", version: 1 }],
-      driverVersion: "test",
-      pid: 1,
-      protocolVersion: DRIVER_PROTOCOL_VERSION,
-      runtime: "acp-fallback",
-      startedAt: "now",
-    });
-    expect(Object.hasOwn(hello.capabilities[0]!, "details")).toBeFalse();
-    expect(() =>
-      parseDriverHelloInput({
-        capabilities: [],
-        driverVersion: "test",
-        ignored: true,
-        pid: 1,
-        protocolVersion: DRIVER_PROTOCOL_VERSION,
-        runtime: "acp-fallback",
-        startedAt: "now",
-      }),
-    ).toThrow("ignored");
-    expect(() =>
-      parseDriverHelloInput({
-        capabilities: [],
-        driverVersion: "test",
-        pid: 0,
-        protocolVersion: DRIVER_PROTOCOL_VERSION,
-        runtime: "acp-fallback",
-        startedAt: "now",
-      }),
-    ).toThrow("pid must be a positive safe integer");
-    expect(() =>
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        status: "invented",
-      }),
-    ).toThrow("accepted' | 'cancelled' | 'completed' | 'failed");
-    const completed = parseDriverCommandUpdateInput({
-      commandId: "command-1",
-      driverInstanceId: "driver-1",
-      result: {
-        isError: true,
-        outputText: "failed",
-        requestId: "request-1",
-        serverId: "server-1",
-        toolName: "tool-1",
-      },
-      status: "completed",
-    });
-    expect(completed.status === "completed" ? completed.result : undefined).toMatchObject({
-      isError: true,
-    });
-    expect(() =>
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        result: { outputText: "partial", requestId: "request-1" },
-        status: "completed",
-      }),
-    ).toThrow();
-    expect(() =>
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        result: { isError: true, requestId: "request-1" },
-        status: "completed",
-      }),
-    ).toThrow();
-    expect(() =>
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        result: { outputText: undefined, requestId: "request-1" },
-        status: "completed",
-      }),
-    ).toThrow();
-    expect(() =>
-      parseDriverHelloInput({
-        capabilities: [
-          { id: "input_start", status: "supported", version: 1 },
-          { id: "input_start", status: "unsupported", version: 1 },
-        ],
-        driverVersion: "test",
-        pid: 1,
-        protocolVersion: DRIVER_PROTOCOL_VERSION,
-        runtime: "acp-fallback",
-        startedAt: "now",
-      }),
-    ).toThrow("capabilities must not contain duplicate ids");
+  test("validates structured RPC input edge cases", () => {
     expect(() =>
       parseDriverFailureInput({
         driverInstanceId: "driver-1",

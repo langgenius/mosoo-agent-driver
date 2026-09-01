@@ -1,40 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
+import environmentPackageManagers from "../environment-package-managers.json" with { type: "json" };
+import packageJson from "../package.json" with { type: "json" };
 import { AGENT_DRIVER_VERSION } from "../src/core/version";
 import viteConfig from "../vite.config";
-
-interface DriverPackageExportTarget {
-  readonly default?: string;
-  readonly types?: string;
-}
-
-interface DriverPackageJson {
-  readonly bin?: Record<string, string>;
-  readonly bugs?: { readonly url?: string };
-  readonly dependencies?: Record<string, string>;
-  readonly devDependencies?: Record<string, string>;
-  readonly description?: string;
-  readonly engines?: Record<string, string>;
-  readonly exports?: Record<string, DriverPackageExportTarget>;
-  readonly files?: readonly string[];
-  readonly homepage?: string;
-  readonly license?: string;
-  readonly name?: string;
-  readonly packageManager?: string;
-  readonly private?: boolean;
-  readonly publishConfig?: Record<string, string>;
-  readonly repository?: { readonly type?: string; readonly url?: string };
-  readonly scripts?: Record<string, string>;
-  readonly types?: string;
-  readonly type?: string;
-  readonly version?: string;
-}
-
-interface EnvironmentPackageManagerManifest {
-  readonly managers?: readonly string[];
-  readonly schemaVersion?: number;
-}
 
 interface WorkflowStep {
   readonly env?: Record<string, string>;
@@ -75,16 +45,6 @@ function readText(path: string): string {
   return readFileSync(new URL(path, import.meta.url), "utf8");
 }
 
-function readDriverPackageJson(): DriverPackageJson {
-  return JSON.parse(readText("../package.json")) as DriverPackageJson;
-}
-
-function readEnvironmentPackageManagerManifest(): EnvironmentPackageManagerManifest {
-  return JSON.parse(
-    readText("../environment-package-managers.json"),
-  ) as EnvironmentPackageManagerManifest;
-}
-
 function readWorkflow(path: string): Workflow {
   return Bun.YAML.parse(readText(path)) as Workflow;
 }
@@ -116,8 +76,6 @@ function workflowStep(job: WorkflowJob, name: string): WorkflowStep {
 
 describe("driver artifact contract", () => {
   test("uses the public mosoo package identity", () => {
-    const packageJson = readDriverPackageJson();
-
     expect(packageJson.name).toBe("@mosoo/agent-driver");
     expect(packageJson.private).toBe(false);
     expect(packageJson.version).toBe(AGENT_DRIVER_VERSION);
@@ -129,7 +87,7 @@ describe("driver artifact contract", () => {
       type: "git",
       url: "git+https://github.com/langgenius/mosoo-agent-driver.git",
     });
-    expect(packageJson.bugs?.url).toBe("https://github.com/langgenius/mosoo-agent-driver/issues");
+    expect(packageJson.bugs.url).toBe("https://github.com/langgenius/mosoo-agent-driver/issues");
     expect(packageJson.homepage).toBe("https://github.com/langgenius/mosoo-agent-driver");
     expect(packageJson.publishConfig).toEqual({
       access: "public",
@@ -143,13 +101,9 @@ describe("driver artifact contract", () => {
   });
 
   test("keeps public package entries separate from process internals", () => {
-    const packageJson = readDriverPackageJson();
-
     expect(packageJson.type).toBe("module");
-    expect(Object.keys(packageJson.exports ?? {}).toSorted()).toEqual(
-      [...PUBLIC_EXPORTS].toSorted(),
-    );
-    expect(packageJson.exports?.["."]).toEqual({
+    expect(Object.keys(packageJson.exports).toSorted()).toEqual([...PUBLIC_EXPORTS].toSorted());
+    expect(packageJson.exports["."]).toEqual({
       default: "./src/index.ts",
       types: "./dist/types/index.d.ts",
     });
@@ -157,8 +111,7 @@ describe("driver artifact contract", () => {
   });
 
   test("builds declarations for exactly the public package entries", () => {
-    const packageJson = readDriverPackageJson();
-    const targets = Object.values(packageJson.exports ?? {});
+    const targets = Object.values(packageJson.exports);
     const sources = [
       ...new Bun.Glob("src/*.ts").scanSync({
         cwd: new URL("../", import.meta.url).pathname,
@@ -173,16 +126,15 @@ describe("driver artifact contract", () => {
       outDir: "dist/types",
       platform: "neutral",
     });
-    expect(targets.map(({ default: source }) => source?.slice(2)).toSorted()).toEqual(sources);
+    expect(targets.map(({ default: source }) => source.slice(2)).toSorted()).toEqual(sources);
     for (const { default: source, types } of targets) {
       expect(source).toMatch(/^\.\/src\/.+\.ts$/);
-      expect(types).toBe(source?.replace("./src/", "./dist/types/").replace(/\.ts$/, ".d.ts"));
+      expect(types).toBe(source.replace("./src/", "./dist/types/").replace(/\.ts$/, ".d.ts"));
       expect(source).not.toContain("/generated");
     }
   });
 
   test("uses package.json as the runtime version source", () => {
-    const packageJson = readDriverPackageJson();
     const runtimeVersionSources = [
       "../src/bin/driver-process.ts",
       "../src/runtimes/acp/acp-driver-backend.ts",
@@ -199,13 +151,12 @@ describe("driver artifact contract", () => {
   });
 
   test("pins container runtimes to package dependency versions", () => {
-    const packageJson = readDriverPackageJson();
     const containerfile = readText("../Containerfile");
     const versions = {
-      BUN_VERSION: packageJson.packageManager?.replace("bun@", ""),
-      CLAUDE_AGENT_SDK_VERSION: packageJson.dependencies?.["@anthropic-ai/claude-agent-sdk"],
-      OPENAI_RUNTIME_VERSION: packageJson.devDependencies?.["@openai/codex"],
-      OPENCODE_VERSION: packageJson.devDependencies?.["opencode-ai"],
+      BUN_VERSION: packageJson.packageManager.replace("bun@", ""),
+      CLAUDE_AGENT_SDK_VERSION: packageJson.dependencies["@anthropic-ai/claude-agent-sdk"],
+      OPENAI_RUNTIME_VERSION: packageJson.devDependencies["@openai/codex"],
+      OPENCODE_VERSION: packageJson.devDependencies["opencode-ai"],
     };
 
     expect(readContainerArguments()).toMatchObject(versions);
@@ -229,7 +180,7 @@ describe("driver artifact contract", () => {
   });
 
   test("builds and tests the packed process artifact", () => {
-    const scripts = readDriverPackageJson().scripts ?? {};
+    const scripts = packageJson.scripts;
     const containerfile = readText("../Containerfile");
 
     expect(scripts["build"]).toContain("src/bin/driver.ts");
@@ -263,8 +214,6 @@ describe("driver artifact contract", () => {
     const imageBuildStep = workflowStep(buildJob, "Build image");
     const imageRun = workflowStep(imageJob, "Publish versioned image").run ?? "";
     const npmRun = workflowStep(npmJob, "Publish package").run ?? "";
-    const buildRun =
-      buildJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
     const latestRun =
       latestJob.steps?.flatMap(({ run }) => (run === undefined ? [] : [run])).join("\n") ?? "";
     const actionUses = [prWorkflow, releaseWorkflow].flatMap((workflow) =>
@@ -292,23 +241,22 @@ describe("driver artifact contract", () => {
       'git merge-base --is-ancestor "${GITHUB_SHA}" origin/main',
     ])
       expect(verifyRun).toContain(marker);
-    for (const marker of [
-      "npm pack --ignore-scripts",
-      "declarations=(packed/dist/types/**/*.d.ts)",
-      "bun test tests/driver-artifact-mcp.test.ts",
-      "buildah build",
+    expect(packStep.run).toContain("npm pack --ignore-scripts");
+    expect(mcpStep.run).toContain("declarations=(packed/dist/types/**/*.d.ts)");
+    expect(imageBuildStep.run).toContain("buildah build");
+    expect(workflowStep(buildJob, "Test image environment").run).toContain(
       "podman run --pull=never --rm",
-    ])
-      expect(buildRun).toContain(marker);
+    );
     for (const marker of [
-      "remote_digest=",
+      "skopeo inspect --format '{{.Digest}}' \"docker://$IMAGE:$VERSION\"",
       'if [[ "$remote_digest" != "$EXPECTED_DIGEST" ]]',
       "skopeo copy --preserve-digests",
       "gh attestation verify",
     ])
       expect(imageRun).toContain(marker);
     for (const marker of [
-      "remote_integrity=",
+      'npm view "$package_name@$VERSION" dist.integrity',
+      'if [[ "$remote_integrity" != "$local_integrity" ]]',
       'npm view "$package_name@>$VERSION"',
       'npm publish "$tarball" --ignore-scripts --provenance',
     ])
@@ -343,17 +291,14 @@ describe("driver artifact contract", () => {
   });
 
   test("declares writable Environment package managers", () => {
-    const manifest = readEnvironmentPackageManagerManifest();
-
-    expect(manifest).toEqual({
+    expect(environmentPackageManagers).toEqual({
       managers: ["npm", "pip"],
       schemaVersion: 1,
     });
   });
 
   test("keeps the standalone package independent of Mosoo workspace packages", () => {
-    const packageJson = readDriverPackageJson();
-    const deps = Object.keys(packageJson.dependencies ?? {});
+    const deps = Object.keys(packageJson.dependencies);
 
     expect(deps.filter((dependency) => dependency.startsWith("@mosoo/"))).toEqual([]);
   });

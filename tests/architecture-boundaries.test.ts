@@ -1,84 +1,55 @@
 import { describe, expect, test } from "bun:test";
-import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
-const packageManifest = resolve(repositoryRoot, "package.json");
-const sourceRoot = resolve(repositoryRoot, "src");
-const transpiler = new Bun.Transpiler({ loader: "ts" });
-
-interface SourceGraph {
-  readonly dependencies: ReadonlyMap<string, ReadonlySet<string>>;
-  readonly files: readonly string[];
-}
-
-function admitSourceDependency(
-  importer: string,
-  specifier: string,
-  target: string,
-  files: ReadonlySet<string>,
-): string | undefined {
-  if (target === packageManifest) {
-    return undefined;
-  }
-  if (!target.startsWith(`${sourceRoot}${sep}`)) {
-    throw new Error(
-      `Source import resolves outside the source root: ${sourcePath(importer)} -> ${specifier}.`,
-    );
-  }
-  if (target.endsWith(".json")) {
-    return undefined;
-  }
-  if (!files.has(target)) {
-    throw new Error(`Source import resolved to an unsupported file: ${sourcePath(target)}.`);
-  }
-
-  return target;
-}
+type SourceGraph = ReadonlyMap<string, ReadonlySet<string>>;
 
 async function createSourceGraph(): Promise<SourceGraph> {
-  const files = (
-    await Array.fromAsync(
-      new Bun.Glob("src/**/*.ts").scan({ absolute: true, cwd: repositoryRoot, onlyFiles: true }),
-    )
-  ).toSorted();
-  const fileSet = new Set(files);
-  const dependencies = new Map<string, ReadonlySet<string>>();
+  const entrypoints = await Array.fromAsync(
+    new Bun.Glob("src/**/*.ts").scan({ absolute: true, cwd: repositoryRoot, onlyFiles: true }),
+  );
+  const metafile = (
+    await Bun.build({
+      allowUnresolved: [],
+      entrypoints,
+      metafile: true,
+      packages: "external",
+      root: repositoryRoot,
+      treeShaking: false,
+    })
+  ).metafile!;
+  const inputs = new Set(Object.keys(metafile.inputs));
+  const sourceFiles = new Set(
+    [...inputs].filter((path) => path.startsWith("src/") && path.endsWith(".ts")),
+  );
+  const unsupportedInput = [...inputs].find(
+    (path) =>
+      !sourceFiles.has(path) &&
+      path !== "package.json" &&
+      !(path.startsWith("src/") && path.endsWith(".json")),
+  );
+  if (unsupportedInput !== undefined) {
+    throw new Error(`Source import resolved to an unsupported file: ${unsupportedInput}.`);
+  }
 
-  await Promise.all(
-    files.map(async (file) => {
-      const source = (await Bun.file(file).text()).replace(/^#![^\n]*\n/, "");
-      const resolved = new Set<string>();
-
-      for (const dependency of transpiler.scanImports(source)) {
-        if (dependency.kind !== "import-statement") {
-          throw new Error(`Runtime module loaders are unsupported: ${sourcePath(file)}.`);
-        }
-        if (!dependency.path.startsWith(".")) {
-          continue;
-        }
-
-        const target = Bun.resolveSync(dependency.path, dirname(file));
-        const sourceDependency = admitSourceDependency(file, dependency.path, target, fileSet);
-        if (sourceDependency !== undefined) {
-          resolved.add(sourceDependency);
-        }
+  return new Map(
+    [...sourceFiles].map((file) => {
+      const imports = metafile.inputs[file]!.imports;
+      if (imports.some((dependency) => dependency.kind !== "import-statement")) {
+        throw new Error(`Runtime module loaders are unsupported: ${file}.`);
       }
-
-      dependencies.set(file, resolved);
+      return [
+        file,
+        new Set(
+          imports.map((dependency) => dependency.path).filter((path) => sourceFiles.has(path)),
+        ),
+      ];
     }),
   );
-
-  return { dependencies, files };
-}
-
-function sourcePath(path: string): string {
-  return relative(repositoryRoot, path).split(sep).join("/");
 }
 
 function isWithin(path: string, directory: string): boolean {
-  const root = resolve(sourceRoot, directory);
-  return path === root || path.startsWith(`${root}${sep}`);
+  return path.startsWith(`src/${directory}/`);
 }
 
 function isProviderRuntime(path: string): boolean {
@@ -87,16 +58,17 @@ function isProviderRuntime(path: string): boolean {
   );
 }
 
-function reachableDependencies(graph: SourceGraph, file: string): ReadonlySet<string> {
-  const reachable = new Set<string>();
-  const pending = [...(graph.dependencies.get(file) ?? [])];
-
-  for (const dependency of pending) {
+function reachableDependencies(
+  graph: SourceGraph,
+  file: string,
+  reachable = new Set<string>(),
+): ReadonlySet<string> {
+  for (const dependency of graph.get(file) ?? []) {
     if (reachable.has(dependency)) {
       continue;
     }
     reachable.add(dependency);
-    pending.push(...(graph.dependencies.get(dependency) ?? []));
+    reachableDependencies(graph, dependency, reachable);
   }
 
   return reachable;
@@ -105,7 +77,7 @@ function reachableDependencies(graph: SourceGraph, file: string): ReadonlySet<st
 function boundaryViolations(graph: SourceGraph): string[] {
   const violations: string[] = [];
 
-  for (const file of graph.files) {
+  for (const file of graph.keys()) {
     for (const dependency of reachableDependencies(graph, file)) {
       const forbidden =
         (isWithin(file, "contract") &&
@@ -127,7 +99,7 @@ function boundaryViolations(graph: SourceGraph): string[] {
           ));
 
       if (forbidden) {
-        violations.push(`${sourcePath(file)} -> ${sourcePath(dependency)}`);
+        violations.push(`${file} -> ${dependency}`);
       }
     }
   }
@@ -136,7 +108,7 @@ function boundaryViolations(graph: SourceGraph): string[] {
 }
 
 function compositionViolations(graph: SourceGraph): string[] {
-  return graph.files
+  return [...graph.keys()]
     .filter((file) => !isWithin(file, "bin"))
     .filter((file) => {
       const dependencies = [...reachableDependencies(graph, file)];
@@ -146,21 +118,20 @@ function compositionViolations(graph: SourceGraph): string[] {
         dependencies.some((dependency) => isWithin(dependency, "infrastructure"))
       );
     })
-    .map(sourcePath)
     .toSorted();
 }
 
 function sourceDirectory(path: string): string {
-  const parts = relative(sourceRoot, path).split(sep);
+  const parts = path.slice("src/".length).split("/");
   return parts.length === 1 ? "(entrypoints)" : parts[0]!;
 }
 
 function bidirectionalDirectories(graph: SourceGraph): string[] {
   const edges = new Set<string>();
 
-  for (const file of graph.files) {
+  for (const file of graph.keys()) {
     const source = sourceDirectory(file);
-    for (const dependency of graph.dependencies.get(file) ?? []) {
+    for (const dependency of graph.get(file) ?? []) {
       const target = sourceDirectory(dependency);
       if (source !== target) {
         edges.add(`${source}\0${target}`);
@@ -181,68 +152,43 @@ function bidirectionalDirectories(graph: SourceGraph): string[] {
 const graph = await createSourceGraph();
 
 describe("source architecture", () => {
-  test("allows only source JSON leaves and the root package manifest outside the TS graph", () => {
-    const importer = resolve(sourceRoot, "runtime.ts");
-    const files = new Set([importer]);
-
-    expect(
-      admitSourceDependency(importer, "../package.json", packageManifest, files),
-    ).toBeUndefined();
-    expect(
-      admitSourceDependency(importer, "./schema.json", resolve(sourceRoot, "schema.json"), files),
-    ).toBeUndefined();
-    expect(() =>
-      admitSourceDependency(importer, "./README.md", resolve(sourceRoot, "README.md"), files),
-    ).toThrow("unsupported file");
-    expect(() =>
-      admitSourceDependency(
-        importer,
-        "../schema.json",
-        resolve(repositoryRoot, "schema.json"),
-        files,
-      ),
-    ).toThrow("outside the source root");
-  });
-
   test("keeps transitive contract, protocol, core, and provider dependencies inward", () => {
     expect(boundaryViolations(graph)).toEqual([]);
 
-    const core = resolve(sourceRoot, "core/audit.ts");
-    const wrapper = resolve(sourceRoot, "audit/wrapper.ts");
-    const provider = resolve(sourceRoot, "runtimes/openai/audit.ts");
+    const core = "src/core/audit.ts";
+    const wrapper = "src/audit/wrapper.ts";
+    const provider = "src/runtimes/openai/audit.ts";
 
     expect(
-      boundaryViolations({
-        dependencies: new Map([
+      boundaryViolations(
+        new Map([
           [core, new Set([wrapper])],
           [wrapper, new Set([provider])],
           [provider, new Set()],
         ]),
-        files: [core, wrapper, provider],
-      }),
+      ),
     ).toEqual(["src/core/audit.ts -> src/runtimes/openai/audit.ts"]);
   });
 
   test("keeps bin as the only transitive full runtime composition root", () => {
     expect(compositionViolations(graph)).toEqual([]);
 
-    const root = resolve(sourceRoot, "composition-audit.ts");
-    const wrapper = resolve(sourceRoot, "audit/wrapper.ts");
-    const core = resolve(sourceRoot, "core/audit.ts");
-    const provider = resolve(sourceRoot, "runtimes/openai/audit.ts");
-    const infrastructure = resolve(sourceRoot, "infrastructure/audit.ts");
+    const root = "src/composition-audit.ts";
+    const wrapper = "src/audit/wrapper.ts";
+    const core = "src/core/audit.ts";
+    const provider = "src/runtimes/openai/audit.ts";
+    const infrastructure = "src/infrastructure/audit.ts";
 
     expect(
-      compositionViolations({
-        dependencies: new Map([
+      compositionViolations(
+        new Map([
           [root, new Set([wrapper])],
           [wrapper, new Set([core, provider, infrastructure])],
           [core, new Set()],
           [provider, new Set()],
           [infrastructure, new Set()],
         ]),
-        files: [root, wrapper, core, provider, infrastructure],
-      }),
+      ),
     ).toEqual(["src/audit/wrapper.ts", "src/composition-audit.ts"]);
   });
 

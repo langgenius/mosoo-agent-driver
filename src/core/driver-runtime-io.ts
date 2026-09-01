@@ -1,3 +1,4 @@
+import type { AgentDriverEventSink } from "../host-ports";
 import type { DriverEventInput } from "../protocol/events";
 import { createDriverId } from "../protocol/id";
 import type { RunId } from "../protocol/id";
@@ -8,19 +9,14 @@ import type {
   DriverHeartbeatInput,
   DriverHeartbeatOutput,
 } from "../protocol/orpc";
-import type {
-  DriverCommandUpdate,
-  McpExternalToolEffectClaim,
-  McpExternalToolEffectSettlement,
-  McpExternalToolEffectState,
-  RuntimeCommand,
-} from "../runtime-command";
+import type { DriverCommandUpdate, RuntimeCommand } from "../runtime-command";
 import type {
   DriverInputOutcome,
   DriverInputSettlement,
   DriverRunSnapshot,
   DriverRunTicket,
 } from "./driver-terminal-state";
+import type { DriverTurnCancellationSource } from "./driver-turn-cancelled-error";
 
 export interface DriverRuntimeEventPort {
   currentRunId(): RunId | null;
@@ -170,31 +166,19 @@ export interface DriverRuntimeCommandPort {
 }
 
 /** API-owned durable effect ledger used only for external MCP calls. */
-export interface DriverRuntimeExternalToolEffectPort {
-  claimExternalToolEffect(
-    input: { claimToken: string; commandId: string },
-    signal: AbortSignal,
-  ): Promise<McpExternalToolEffectClaim>;
-  observeExternalToolEffect(
-    input: { commandId: string },
-    signal: AbortSignal,
-  ): Promise<McpExternalToolEffectState>;
-  settleExternalToolEffect(
-    input: {
-      claimToken: string;
-      commandId: string;
-      effectId: string;
-      settlement: McpExternalToolEffectSettlement;
-    },
-    signal: AbortSignal,
-  ): Promise<McpExternalToolEffectState>;
-}
+export type DriverRuntimeExternalToolEffectPort = Required<
+  Pick<
+    AgentDriverEventSink,
+    "claimExternalToolEffect" | "observeExternalToolEffect" | "settleExternalToolEffect"
+  >
+>;
 
 export interface DriverRuntimeRunPort {
   beginRun(runId: RunId): DriverRunTicket;
   claimRunCancellation(
     ticket: DriverRunTicket,
     reason: string,
+    source?: DriverTurnCancellationSource,
   ): "already_claimed" | "claimed" | "terminal_selected";
   completeRun(signal?: AbortSignal): Promise<void>;
   failRun(error: DriverFailureInput["error"], signal?: AbortSignal): Promise<void>;

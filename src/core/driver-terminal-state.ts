@@ -4,7 +4,10 @@ import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 import type { DriverEventReceipt } from "../protocol/orpc";
 import type { RunError } from "../runtime-command";
-import { DriverTurnCancelledError } from "./driver-turn-cancelled-error";
+import {
+  DriverTurnCancelledError,
+  type DriverTurnCancellationSource,
+} from "./driver-turn-cancelled-error";
 
 export type DriverRunTerminalStatus = "cancelled" | "completed" | "failed";
 
@@ -115,17 +118,24 @@ export class DriverTerminalStateMachine {
   claimCancellation(
     ticket: DriverRunTicket,
     reason: string,
+    source: DriverTurnCancellationSource = "turn.cancel",
   ): "already_claimed" | "claimed" | "terminal_selected" {
     const active = this.#requireRun(ticket);
     if (active.terminal !== null) {
       return "terminal_selected";
     }
     if (active.cancellationClaim !== null) {
+      if (
+        source !== "turn.cancel" &&
+        active.cancellation.signal.reason instanceof DriverTurnCancelledError
+      ) {
+        active.cancellation.signal.reason.preventResume();
+      }
       return "already_claimed";
     }
 
     active.cancellationClaim = { reason };
-    active.cancellation.abort(new DriverTurnCancelledError(reason));
+    active.cancellation.abort(new DriverTurnCancelledError(reason, source));
     return "claimed";
   }
 

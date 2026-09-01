@@ -96,10 +96,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#runtimeBootstrapText = buildRuntimeBootstrapText(payload.execution);
     this.#turnController = new AcpTurnController(
       (context, reason, events) => this.#push(context, reason, events),
-      (context, providerPromptAdmitted) =>
-        this.#settleCancelledTurn(context, providerPromptAdmitted),
-      (context, reason, closures, terminal) =>
-        this.#eventPublisher.pushTerminal(context, reason, closures, terminal),
+      (context, providerPromptAdmitted, resumeSignal) =>
+        this.#settleCancelledTurn(context, providerPromptAdmitted, resumeSignal),
+      (context, reason, closures, terminal, cancellationSignal) =>
+        this.#eventPublisher.pushTerminal(context, reason, closures, terminal, cancellationSignal),
     );
     this.#clientRequests = new AcpClientRequestHandler({
       allowedRoots: payload.execution.session.additionalDirectories,
@@ -503,9 +503,13 @@ export class AcpDriverBackend implements AgentDriverBackend {
   async #settleCancelledTurn(
     context: AgentDriverContext,
     providerPromptAdmitted: boolean,
+    resumeSignal: AbortSignal,
   ): Promise<void> {
     if (this.#stopRequested) {
       await this.#joinStop();
+      return;
+    }
+    if (resumeSignal.aborted) {
       return;
     }
     if (!providerPromptAdmitted) {
@@ -528,15 +532,20 @@ export class AcpDriverBackend implements AgentDriverBackend {
       await this.#joinStop();
       return;
     }
-
+    if (resumeSignal.aborted) {
+      return;
+    }
     try {
       await this.#connect(
         context,
-        AbortSignal.timeout(this.#remainingStopMs(deadline)),
+        AbortSignal.any([AbortSignal.timeout(this.#remainingStopMs(deadline)), resumeSignal]),
         false,
         sessionId,
       );
     } catch (error) {
+      if (resumeSignal.aborted) {
+        return;
+      }
       if (!this.#stopRequested) {
         throw error;
       }
