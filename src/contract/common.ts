@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 export const protocolVersionSchema = z.literal(PROTOCOL_VERSION);
 export const timestampSchema = z.iso.datetime({ offset: true });
 export const revisionSchema = z.number().int().nonnegative().safe();

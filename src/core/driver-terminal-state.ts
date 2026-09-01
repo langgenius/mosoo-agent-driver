@@ -143,6 +143,13 @@ export class DriverTerminalStateMachine {
     return this.#activeRun?.runId ?? null;
   }
 
+  rememberOwnedRunId(runId: RunId): void {
+    if (this.#activeRun !== null && this.#activeRun.runId !== runId) {
+      throw new Error("Driver handshake run conflicts with the active run.");
+    }
+    this.#lastOwnedRunId = runId;
+  }
+
   selectRunTerminal(
     ticket: DriverRunTicket,
     terminal: DriverRunTerminalIdentity,

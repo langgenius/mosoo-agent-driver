@@ -86,7 +86,7 @@ export interface ClaudeToolArgumentsEvent {
 export interface ClaudeToolResultEvent {
   agentId?: string;
   authoritative?: boolean;
-  content: string;
+  content?: string;
   context: AgentDriverContext;
   decisionReason?: string;
   decisionReasonType?: string;
@@ -686,7 +686,7 @@ export class ClaudeAgentSdkEventWriter {
         kind: "tool.call.updated",
         payload: {
           ...(agentId === undefined ? {} : { agentId }),
-          content,
+          ...(content === undefined ? {} : { content }),
           ...(decisionReason === undefined ? {} : { decisionReason }),
           ...(decisionReasonType === undefined ? {} : { decisionReasonType }),
           ...(messageId === undefined ? {} : { messageId }),

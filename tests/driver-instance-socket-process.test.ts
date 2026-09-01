@@ -4,6 +4,7 @@ import { DriverProcess } from "../src/bin/driver-process";
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
+import type { DriverBootPayload } from "../src/protocol/boot";
 import type { RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
@@ -59,6 +60,7 @@ class RpcWebSocket extends OpenWebSocket {
   static eventBatchMaxSize = 2;
   static heartbeatFails = false;
   static heartbeatIntervalMs = 1_000;
+  static helloRunId: string | null = null;
   static lostResponsePath: string | null = null;
   static pathObserver: ((path: string) => void) | null = null;
   static receiptOverride: Partial<{ eventId: string; seq: number; type: string }> | null = null;
@@ -135,7 +137,7 @@ class RpcWebSocket extends OpenWebSocket {
           eventBatchMaxSize: RpcWebSocket.eventBatchMaxSize,
           organizationPath: "/workspace",
         },
-        runId: null,
+        runId: RpcWebSocket.helloRunId,
       };
     } else if (path === "/driver/pushEvents") {
       const events = (
@@ -206,6 +208,7 @@ afterEach(() => {
   RpcWebSocket.eventBatchMaxSize = 2;
   RpcWebSocket.heartbeatFails = false;
   RpcWebSocket.heartbeatIntervalMs = 1_000;
+  RpcWebSocket.helloRunId = null;
   RpcWebSocket.lostResponsePath = null;
   RpcWebSocket.pathObserver = null;
   RpcWebSocket.receiptOverride = null;
@@ -449,6 +452,32 @@ describe("DriverProcess lifecycle", () => {
     expect(failRunSocketState).toBe(1);
     expect(socket.readyState).toBe(3);
     expect(paths.filter((path) => path === "/driver/failRun")).toHaveLength(2);
+  });
+
+  test("reports startup failure to the run adopted during hello", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.helloRunId = DRIVER_TEST_IDS.secondRunId;
+    const prewarmPayload = {
+      ...driverBootPayload,
+      execution: {
+        ...driverBootPayload.execution,
+        configRevision: {
+          ...driverBootPayload.execution.configRevision,
+          runId: null,
+        },
+      },
+    } satisfies DriverBootPayload;
+
+    await expect(
+      new DriverProcess(prewarmPayload, () => {
+        throw new Error("backend factory failed");
+      }).run(),
+    ).rejects.toThrow("backend factory failed");
+
+    const failure = (PendingWebSocket.instances[0] as RpcWebSocket).requests.find(
+      ({ path }) => path === "/driver/failRun",
+    );
+    expect(failure?.input).toMatchObject({ runId: DRIVER_TEST_IDS.secondRunId });
   });
 
   test("fails the exact second run when its provider exits before a run event", async () => {

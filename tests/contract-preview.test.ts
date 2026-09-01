@@ -47,7 +47,7 @@ function session(id = createDriverId()): Session {
 
 function snapshot(sessionValue = session()): SessionSnapshot {
   return validateSessionSnapshot({
-    protocolVersion: 2,
+    protocolVersion: 3,
     revision: 0,
     capturedAt: time,
     session: sessionValue,
@@ -178,7 +178,7 @@ describe("contract closed core", () => {
       maxSnapshotBytes: 1,
     });
     const result = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       implementation: { name: "coordinator", version: "1" },
       capabilities: {},
       limits,
@@ -192,7 +192,7 @@ describe("contract closed core", () => {
 
   test("reserves the complete JSON-RPC envelope in frame limits", () => {
     const result = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       implementation: { name: "coordinator", version: "1" },
       capabilities: {},
       limits: protocolLimits({ maxCommandBytes: 4_095, maxFrameBytes: 4_096 }),
@@ -225,7 +225,7 @@ describe("contract closed core", () => {
       capabilities: {},
       implementation: { name: "coordinator", version: "1" },
       limits: protocolLimits({ maxFrameBytes, maxSnapshotBytes }),
-      protocolVersion: 2,
+      protocolVersion: 3,
     });
 
     expect(initializeResultSchema.safeParse(result(maxFrameBytes - envelopeBytes)).success).toBe(

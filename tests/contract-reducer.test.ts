@@ -41,7 +41,7 @@ function session(id = createDriverId()): Session {
 
 function snapshot(sessionValue = session()): SessionSnapshot {
   return validateSessionSnapshot({
-    protocolVersion: 2,
+    protocolVersion: 3,
     revision: 0,
     capturedAt: time,
     session: sessionValue,
@@ -619,7 +619,7 @@ describe("contract authority reducer", () => {
     };
     const nextRun = activeRun();
     const value = validateSessionSnapshot({
-      protocolVersion: 2,
+      protocolVersion: 3,
       revision: 2,
       capturedAt: time,
       session: sessionValue,
@@ -648,7 +648,7 @@ describe("contract authority reducer", () => {
       endedAt: time,
     };
     const current = validateSessionSnapshot({
-      protocolVersion: 2,
+      protocolVersion: 3,
       revision: 1,
       capturedAt: time,
       session: sessionValue,

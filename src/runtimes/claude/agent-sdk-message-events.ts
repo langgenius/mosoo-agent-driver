@@ -63,6 +63,7 @@ function sumModelUsage(modelUsage: unknown, key: string): number | null {
 export function aggregateClaudeModelUsage(modelUsage: unknown): JsonObject | null {
   const inputTokens = sumModelUsage(modelUsage, "inputTokens");
   const outputTokens = sumModelUsage(modelUsage, "outputTokens");
+  const thinkingTokens = sumModelUsage(modelUsage, "thinkingTokens");
   const cacheReadTokens = sumModelUsage(modelUsage, "cacheReadInputTokens");
   const cacheCreationTokens = sumModelUsage(modelUsage, "cacheCreationInputTokens");
   const usage: JsonObject = {
@@ -70,6 +71,7 @@ export function aggregateClaudeModelUsage(modelUsage: unknown): JsonObject | nul
     ...(cacheReadTokens === null ? {} : { cache_read_input_tokens: cacheReadTokens }),
     ...(inputTokens === null ? {} : { input_tokens: inputTokens }),
     ...(outputTokens === null ? {} : { output_tokens: outputTokens }),
+    ...(thinkingTokens === null ? {} : { thinking_tokens: thinkingTokens }),
   };
 
   return Object.keys(usage).length === 0 ? null : usage;
@@ -81,6 +83,7 @@ export function toClaudeUsageUpdatedEvents(
 ): DriverEventInput[] {
   const inputTokens = toTokenCount(usage?.["input_tokens"]);
   const outputTokens = toTokenCount(usage?.["output_tokens"]);
+  const thoughtTokens = toTokenCount(usage?.["thinking_tokens"]);
   const cacheReadTokens = toTokenCount(usage?.["cache_read_input_tokens"]);
   const cacheCreationTokens = toTokenCount(usage?.["cache_creation_input_tokens"]);
   const totalTokens = sumTokenCounts(inputTokens, outputTokens);
@@ -89,6 +92,7 @@ export function toClaudeUsageUpdatedEvents(
   if (
     inputTokens === null &&
     outputTokens === null &&
+    thoughtTokens === null &&
     cacheReadTokens === null &&
     cacheCreationTokens === null &&
     cost === null
@@ -108,7 +112,7 @@ export function toClaudeUsageUpdatedEvents(
         outputTokens,
         size: null,
         source: "session_update",
-        thoughtTokens: null,
+        thoughtTokens,
         totalTokens,
         usageContract: "anthropic_bucketed",
         used: null,

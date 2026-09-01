@@ -41,7 +41,7 @@ function session(id = createDriverId()): Session {
 
 function snapshot(sessionValue = session()): SessionSnapshot {
   return validateSessionSnapshot({
-    protocolVersion: 2,
+    protocolVersion: 3,
     revision: 0,
     capturedAt: time,
     session: sessionValue,

@@ -1889,8 +1889,9 @@ describe("Claude Agent SDK driver backend", () => {
     expect(harness.events.filter(({ kind }) => kind === "run.completed")).toHaveLength(2);
   });
 
-  test("requires one result frame and ignores provider frames after it", async () => {
+  test("requires one result frame and drains informational frames before its terminal", async () => {
     delete process.env[PREWARM_ENV];
+    let closedAfterTail = false;
     let queryIndex = 0;
     let lateFrameRead = false;
     const harness = createHarness({
@@ -1907,13 +1908,27 @@ describe("Claude Agent SDK driver backend", () => {
             yield resultMessage();
             lateFrameRead = true;
             yield {
-              message: { content: [{ text: "late", type: "text" }] },
-              parent_tool_use_id: null,
+              output_file: "/tmp/report.pdf",
+              resource_links: [
+                {
+                  mimeType: "application/pdf",
+                  name: "report.pdf",
+                  uri: "file:///workspace/report.pdf",
+                },
+              ],
               session_id: "native-session-1",
-              type: "assistant",
-              uuid: "late-assistant",
+              status: "completed",
+              subtype: "task_notification",
+              summary: "done",
+              task_id: "task-resource",
+              tool_use_id: "tool-resource",
+              type: "system",
+              uuid: "post-result-resource",
             } as unknown as SDKMessage;
           })(),
+          () => {
+            closedAfterTail = lateFrameRead;
+          },
         );
       },
       startup: async () => {
@@ -1933,17 +1948,136 @@ describe("Claude Agent SDK driver backend", () => {
     );
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
 
-    expect(lateFrameRead).toBe(false);
+    const resourceEventIndex = harness.events.findIndex(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        isRecord(event.payload) &&
+        isRecord(event.payload["structuredOutput"]),
+    );
+    const terminalEventIndex = harness.events.findIndex(
+      (event) => event.kind === "run.completed" && event.runId === DRIVER_TEST_IDS.secondRunId,
+    );
+    expect(lateFrameRead).toBe(true);
+    expect(closedAfterTail).toBe(true);
+    expect(resourceEventIndex).toBeGreaterThanOrEqual(0);
+    expect(harness.events[resourceEventIndex]).toMatchObject({
+      kind: "tool.call.updated",
+      payload: {
+        status: "completed",
+        structuredOutput: {
+          resourceLinks: [
+            {
+              mimeType: "application/pdf",
+              name: "report.pdf",
+              uri: "file:///workspace/report.pdf",
+            },
+          ],
+        },
+        toolCallId: "tool-resource",
+      },
+    });
+    expect(terminalEventIndex).toBeGreaterThan(resourceEventIndex);
+  });
+
+  test("fails closed on turn content after a result frame", async () => {
+    delete process.env[PREWARM_ENV];
+    const harness = createHarness({
+      createQueryOptions: async () => ({}),
+      query: () =>
+        fakeQuery([
+          resultMessage(),
+          {
+            message: { content: [{ text: "late", type: "text" }] },
+            parent_tool_use_id: null,
+            session_id: "native-session-1",
+            type: "assistant",
+            uuid: "late-assistant",
+          } as unknown as SDKMessage,
+        ]),
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+
+    await expect(
+      harness.backend.handleInput(harness.context, { text: "terminal" }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("turn content after its result frame");
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+
+    expect(harness.events.some((event) => event.kind === "run.completed")).toBe(false);
+    expect(harness.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
     expect(
       harness.events.some(
         (event) =>
           event.kind === "message.delta" &&
-          typeof event.payload === "object" &&
-          event.payload !== null &&
-          "contentDelta" in event.payload &&
-          event.payload.contentDelta === "late",
+          isRecord(event.payload) &&
+          event.payload["contentDelta"] === "late",
       ),
     ).toBe(false);
+  });
+
+  test("keeps result bookkeeping causal across a post-result conversation reset", async () => {
+    delete process.env[PREWARM_ENV];
+    const harness = createHarness({
+      createQueryOptions: async () => ({}),
+      query: () =>
+        fakeQuery([
+          {
+            message: {
+              content: [
+                {
+                  id: "tool-before-reset",
+                  input: {},
+                  name: "Bash",
+                  type: "tool_use",
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            session_id: "native-session-1",
+            type: "assistant",
+            uuid: "assistant-before-reset",
+          },
+          resultMessage("native-session-1"),
+          {
+            new_conversation_id: "native-session-2",
+            session_id: "native-session-1",
+            type: "conversation_reset",
+            uuid: "post-result-reset",
+          },
+        ] as unknown as SDKMessage[]),
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+
+    await harness.backend.handleInput(harness.context, { text: "terminal" }, DRIVER_TEST_IDS.runId);
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+
+    const resetIndex = harness.events.findIndex(
+      (event) =>
+        event.kind === "runtime.resume.updated" &&
+        isRecord(event.payload) &&
+        event.payload["resumePointer"] === "native-session-2",
+    );
+    const terminalIndex = harness.events.findIndex((event) => event.kind === "run.completed");
+    expect(resetIndex).toBeGreaterThanOrEqual(0);
+    expect(terminalIndex).toBeGreaterThan(resetIndex);
+    expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+    expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
+    expect(
+      harness.events.flatMap((event) => {
+        if (
+          event.kind !== "tool.call.updated" ||
+          !isRecord(event.payload) ||
+          event.payload["toolCallId"] !== "tool-before-reset" ||
+          !["cancelled", "completed", "failed"].includes(String(event.payload["status"]))
+        ) {
+          return [];
+        }
+        return [event.payload["status"]];
+      }),
+    ).toEqual(["completed"]);
   });
 
   function recoveryPayload(

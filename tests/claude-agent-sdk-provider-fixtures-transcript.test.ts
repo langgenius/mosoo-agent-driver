@@ -46,7 +46,24 @@ describe("Claude Agent SDK provider fixtures", () => {
         uuid: "task-updated-1",
       },
       {
+        elapsed_time_seconds: 5,
+        heartbeat: true,
+        parent_tool_use_id: null,
+        session_id: "native-session-1",
+        tool_name: "Agent",
+        tool_use_id: "tool-1",
+        type: "tool_progress",
+        uuid: "tool-heartbeat-1",
+      },
+      {
         output_file: "/tmp/private-task-output",
+        resource_links: [
+          {
+            mimeType: "application/pdf",
+            name: "report.pdf",
+            uri: "file:///workspace/report.pdf",
+          },
+        ],
         session_id: "native-session-1",
         status: "completed",
         subtype: "task_notification",
@@ -110,6 +127,24 @@ describe("Claude Agent SDK provider fixtures", () => {
     });
     expect(JSON.stringify(taskEvents)).not.toContain("private");
     expect(events().filter((event) => event.kind === "diagnostic.reported")).toHaveLength(4);
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "tool.call.updated",
+        payload: expect.objectContaining({
+          status: "completed",
+          structuredOutput: {
+            resourceLinks: [
+              {
+                mimeType: "application/pdf",
+                name: "report.pdf",
+                uri: "file:///workspace/report.pdf",
+              },
+            ],
+          },
+          toolCallId: "tool-1",
+        }),
+      }),
+    );
   });
 
   test("closes visible tasks before the run terminal and resets them between turns", async () => {
@@ -469,6 +504,13 @@ describe("Claude Agent SDK provider fixtures", () => {
           },
         ],
         tool_use_result: {
+          resourceLinks: [
+            {
+              mimeType: "application/pdf",
+              name: "report.pdf",
+              uri: "file:///workspace/report.pdf",
+            },
+          ],
           usage: { output_tokens_details: { thinking_tokens: 3 } },
         },
         type: "user",
@@ -485,6 +527,13 @@ describe("Claude Agent SDK provider fixtures", () => {
           nonExecutionKind: "interrupted",
           status: "cancelled",
           structuredOutput: {
+            resourceLinks: [
+              {
+                mimeType: "application/pdf",
+                name: "report.pdf",
+                uri: "file:///workspace/report.pdf",
+              },
+            ],
             usage: { output_tokens_details: { thinking_tokens: 3 } },
           },
           toolCallId: "tool-1",

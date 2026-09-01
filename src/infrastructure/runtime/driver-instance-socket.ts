@@ -18,6 +18,7 @@ import {
 } from "../../core/driver-terminal-state";
 import type { DriverBootPayload } from "../../protocol/boot";
 import type { DriverEventEnvelope, DriverEventInput } from "../../protocol/events";
+import { parseRunId } from "../../protocol/id";
 import type { RunId } from "../../protocol/id";
 import { driverRuntimeRpcSchemas } from "../../protocol/orpc";
 import type {
@@ -321,6 +322,9 @@ export class DriverInstanceSocket {
       throw new Error("Driver socket connection changed during hello.");
     }
 
+    if (result.runId !== null) {
+      this.#terminalState.rememberOwnedRunId(parseRunId(result.runId));
+    }
     this.#eventBatchMaxSize = result.runConfig.eventBatchMaxSize;
     return result;
   }

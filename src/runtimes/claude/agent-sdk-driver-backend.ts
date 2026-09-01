@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
 import { query, startup } from "@anthropic-ai/claude-agent-sdk";
-import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
@@ -33,6 +33,7 @@ import { ClaudeAgentSdkPrewarm } from "./agent-sdk-prewarm";
 import {
   ClaudeAgentSdkMessageTranslator,
   ClaudeTerminalWriteError,
+  type ClaudePreparedResult,
   type ClaudeTerminalOutcome,
 } from "./agent-sdk-message-translator";
 import {
@@ -222,6 +223,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     let queryOptionsMs = 0;
     let runStarted = false;
 
+    let preparedResult: ClaudePreparedResult | null = null;
     let terminalOutcome: ClaudeTerminalOutcome | null = null;
 
     try {
@@ -318,11 +320,24 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       let firstProviderEventPublished = false;
       const providerStartedAtMs = Date.now();
       for (;;) {
-        const next = await raceWithAbort(activeQuery.next(), turnSignal);
-        if (next.done) {
+        let iteration: IteratorResult<SDKMessage>;
+        try {
+          iteration = await raceWithAbort(activeQuery.next(), turnSignal);
+        } catch (error) {
+          if (
+            preparedResult !== null &&
+            activeTurn.state === "finalizing" &&
+            !isTurnCancelled(activeTurn) &&
+            activeTurn.abortController.signal.aborted
+          ) {
+            break;
+          }
+          throw error;
+        }
+        if (iteration.done) {
           break;
         }
-        const message = next.value;
+        const message = iteration.value;
 
         if (isTurnCancelled(activeTurn)) {
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
@@ -356,24 +371,43 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
         }
 
+        if (preparedResult !== null) {
+          if (message.type === "result") {
+            throw new Error("Claude Agent SDK emitted multiple result frames.");
+          }
+          if (
+            message.type === "assistant" ||
+            message.type === "stream_event" ||
+            message.type === "user"
+          ) {
+            throw new Error("Claude Agent SDK emitted turn content after its result frame.");
+          }
+          await this.#messageTranslator.handleSdkMessage(context, message, runId, true);
+          continue;
+        }
+
         if (message.type === "result") {
           activeTurn.state = "finalizing";
-          await this.#closeQuery(context, activeTurn, "provider.result");
+          preparedResult = await this.#messageTranslator.prepareResult(context, message, runId);
+          continue;
         }
 
-        terminalOutcome = await this.#messageTranslator.handleSdkMessage(context, message, runId);
-        if (terminalOutcome !== null) {
-          break;
-        }
+        await this.#messageTranslator.handleSdkMessage(context, message, runId);
       }
 
-      if (terminalOutcome === null && isTurnCancelled(activeTurn)) {
+      if (preparedResult === null && isTurnCancelled(activeTurn)) {
         throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
       }
 
-      if (terminalOutcome === null) {
+      if (preparedResult === null) {
         throw new Error("Claude Agent SDK query ended before a result frame.");
       }
+
+      await this.#closeQuery(context, activeTurn, "provider.result");
+      terminalOutcome = await this.#messageTranslator.publishPreparedResult(
+        context,
+        preparedResult,
+      );
     } catch (error) {
       if (!runStarted) {
         throw error;

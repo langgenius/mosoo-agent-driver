@@ -64,6 +64,9 @@ export const ACTIVE_TURN_CANCEL_GRACE_MS = 2_000;
 // legitimately cross several independent durable-delivery and cleanup epochs.
 export const ACTIVE_INPUT_SETTLE_GRACE_MS = DRIVER_EVENT_DELIVERY_TIMEOUT_MS * 9;
 const EXTERNAL_TOOL_EFFECT_FENCE_TIMEOUT_MS = 2_000;
+// The remote disposer can spend three independent two-second epochs terminating,
+// retrying, and closing before this end-to-end fault-containment ceiling applies.
+const MCP_PREPARED_DISPOSE_TIMEOUT_MS = 7_000;
 export const ACTIVE_MCP_COMMIT_GRACE_MS = AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS + 30_000;
 const MAX_ACTIVE_MCP_COMMANDS = 32;
 
@@ -1121,7 +1124,13 @@ export class DriverCommandDispatcher {
       );
       return this.#resolveExternalToolEffectState(command, settled, effectId);
     } finally {
-      await Promise.resolve(prepared[Symbol.asyncDispose]()).catch((error: unknown) => {
+      await promiseWithTimeout(
+        Promise.try(() => prepared[Symbol.asyncDispose]()),
+        {
+          label: "Prepared MCP command cleanup",
+          timeoutMs: MCP_PREPARED_DISPOSE_TIMEOUT_MS,
+        },
+      ).catch((error: unknown) => {
         runtimeContext.logger.warn("driver.runtime.mcp.cleanup.failed", {
           commandId: command.commandId,
           message: toErrorMessage(error, "MCP cleanup failed."),

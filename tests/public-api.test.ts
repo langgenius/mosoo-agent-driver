@@ -38,8 +38,9 @@ describe("public API", () => {
     const heartbeatReason = "ping" satisfies orpc.DriverHeartbeatInput["reason"];
 
     expect(boot.DRIVER_PROTOCOL_VERSION).toBe(3);
-    expect(contract.PROTOCOL_VERSION).toBe(2);
-    expect(contract.protocolVersionSchema.parse(2)).toBe(2);
+    expect(contract.PROTOCOL_VERSION).toBe(3);
+    expect(contract.protocolVersionSchema.parse(3)).toBe(3);
+    expect(contract.protocolVersionSchema.safeParse(2).success).toBe(false);
     expect(contract.sessionSnapshotSchema.parse).toBeFunction();
     expect(cmaHttp.createCmaHttpHandler).toBe(agentDriver.createCmaHttpHandler);
     expect(cmaSdk.CmaSdkClient).toBe(agentDriver.CmaSdkClient);

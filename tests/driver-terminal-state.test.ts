@@ -222,4 +222,15 @@ describe("DriverTerminalStateMachine", () => {
 
     expect(state.terminalRunId(DRIVER_TEST_IDS.runId)).toBe(DRIVER_TEST_IDS.secondRunId);
   });
+
+  test("remembers a handshake run without activating it", () => {
+    const state = new DriverTerminalStateMachine();
+
+    state.rememberOwnedRunId(DRIVER_TEST_IDS.secondRunId);
+
+    expect(state.currentRunId()).toBeNull();
+    expect(state.terminalRunId(DRIVER_TEST_IDS.runId)).toBe(DRIVER_TEST_IDS.secondRunId);
+    state.beginRun(DRIVER_TEST_IDS.secondRunId);
+    expect(() => state.rememberOwnedRunId(DRIVER_TEST_IDS.runId)).toThrow("active run");
+  });
 });

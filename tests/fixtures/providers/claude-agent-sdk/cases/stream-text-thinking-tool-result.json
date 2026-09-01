@@ -88,6 +88,7 @@
           "inputTokens": 3,
           "maxOutputTokens": 64000,
           "outputTokens": 5,
+          "thinkingTokens": 2,
           "webSearchRequests": 0
         }
       },
@@ -203,7 +204,7 @@
         "outputTokens": 5,
         "size": null,
         "source": "session_update",
-        "thoughtTokens": null,
+        "thoughtTokens": 2,
         "totalTokens": 8,
         "usageContract": "anthropic_bucketed",
         "used": null

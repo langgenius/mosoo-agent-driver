@@ -644,6 +644,7 @@ describe("durable external MCP effect protocol v3", () => {
 
   test("rechecks exact run ownership after preparation and before claim", async () => {
     const input = command("run-changed-before-claim");
+    const shutdown = new AbortController();
     let currentRunId = DRIVER_TEST_IDS.runId;
     let claims = 0;
     let executions = 0;
@@ -659,7 +660,7 @@ describe("durable external MCP effect protocol v3", () => {
     };
     const runtime = createDispatcher({
       backend: createBackend(),
-      isShuttingDown: () => socket.isDrained(),
+      isShuttingDown: () => shutdown.signal.aborted,
       mcpPrepare: async () => {
         currentRunId = DRIVER_TEST_IDS.secondRunId;
         return {
@@ -671,10 +672,13 @@ describe("durable external MCP effect protocol v3", () => {
         };
       },
       runtimeState: new DriverRuntimeStateMachine("ready"),
+      shutdownSignal: shutdown.signal,
     });
 
-    await runtime.dispatcher.run(socket, runtime.logger);
+    const run = runtime.dispatcher.run(socket, runtime.logger);
     await waitForUpdate(socket, (update) => update.status === "failed");
+    shutdown.abort(new Error("test complete"));
+    await run;
 
     expect(claims).toBe(0);
     expect(executions).toBe(0);
@@ -1170,4 +1174,72 @@ describe("durable external MCP effect protocol v3", () => {
     });
     expect(runtime.shutdownCalls).toEqual([]);
   });
+
+  test("waits for MCP cleanup beyond one internal cleanup epoch", async () => {
+    const input = command("cleanup-multiple-epochs");
+    const socket = new FakeDriverRuntimeIo([input], DRIVER_TEST_IDS.runId);
+    let disposed = false;
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      mcpPrepare: async () => ({
+        async execute() {
+          return {
+            outputText: "durable result",
+            requestId: input.requestId,
+            serverId: input.serverId,
+            toolName: input.toolName,
+          };
+        },
+        async [Symbol.asyncDispose]() {
+          await Bun.sleep(2_250);
+          disposed = true;
+        },
+      }),
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    await runtime.dispatcher.run(socket, runtime.logger);
+
+    expect(disposed).toBe(true);
+    expect(socket.updates.at(-1)).toMatchObject({
+      commandId: input.commandId,
+      status: "completed",
+    });
+  });
+
+  test("bounds a permanently stalled MCP cleanup", async () => {
+    const input = command("cleanup-stalled");
+    const socket = new FakeDriverRuntimeIo([input], DRIVER_TEST_IDS.runId);
+    let disposeCalls = 0;
+    const runtime = createDispatcher({
+      backend: createBackend(),
+      isShuttingDown: () => socket.isDrained(),
+      mcpPrepare: async () => ({
+        async execute() {
+          return {
+            outputText: "durable result",
+            requestId: input.requestId,
+            serverId: input.serverId,
+            toolName: input.toolName,
+          };
+        },
+        async [Symbol.asyncDispose]() {
+          disposeCalls += 1;
+          await new Promise(() => {});
+        },
+      }),
+      runtimeState: new DriverRuntimeStateMachine("ready"),
+    });
+
+    await runtime.dispatcher.run(socket, runtime.logger);
+    await waitForUpdate(socket, (update) => update.status === "completed");
+
+    expect(disposeCalls).toBe(1);
+    expect(socket.updates.at(-1)).toMatchObject({
+      commandId: input.commandId,
+      status: "completed",
+    });
+    expect(runtime.shutdownCalls).toEqual([]);
+  }, 10_000);
 });
