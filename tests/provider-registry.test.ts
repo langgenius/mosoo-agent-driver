@@ -6,7 +6,6 @@ import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
   createAgentDriverProviderCapabilities,
-  createAgentDriverProviderRegistry,
 } from "../src/runtimes/provider-registry";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 
@@ -79,39 +78,18 @@ describe("provider registry", () => {
         { id: "input_start", status: "supported", version: 1 },
         { id: "permission_request", status: "unsupported", version: 1 },
         { id: "session_stop", status: "supported", version: 1 },
-        { id: "thinking_stream", status: "unsupported", version: 1 },
+        { id: "thinking_stream", status: "supported", version: 1 },
       ]),
     );
   });
 
-  test("declares provider host port requirements", () => {
-    expect(
-      AGENT_DRIVER_PROVIDER_REGISTRY.list().map((provider) => ({
-        id: provider.id,
-        requiredHostPorts: provider.requiredHostPorts,
-      })),
-    ).toEqual([
-      {
-        id: "openai-app-server",
-        requiredHostPorts: ["event_sink", "permission", "mcp", "skill"],
-      },
-      {
-        id: "claude-agent-sdk",
-        requiredHostPorts: ["event_sink", "permission", "mcp", "skill"],
-      },
-      {
-        id: "acp-fallback",
-        requiredHostPorts: ["event_sink", "permission", "mcp", "skill", "file", "host_integration"],
-      },
-    ]);
-  });
-
   test("fails fast when no provider owns the transport", () => {
-    const registry = createAgentDriverProviderRegistry([]);
-
-    expect(() => registry.createBackend(startInputFor("openai-app-server"))).toThrow(
-      "Unsupported runtime transport: openai-app-server.",
-    );
+    expect(() =>
+      AGENT_DRIVER_PROVIDER_REGISTRY.createBackend({
+        ...startInputFor("openai-app-server"),
+        runtimeTransport: "unknown" as DriverRuntimeTransport,
+      }),
+    ).toThrow("Unsupported runtime transport: unknown.");
   });
 
   test("fails fast when the start input runtime does not match the provider transport", () => {
@@ -194,16 +172,4 @@ describe("provider registry", () => {
       ).toBe(input.runtime);
     },
   );
-
-  test("rejects duplicate provider transports", () => {
-    const [provider] = AGENT_DRIVER_PROVIDER_REGISTRY.list();
-
-    if (!provider) {
-      throw new Error("Expected provider fixture.");
-    }
-
-    expect(() => createAgentDriverProviderRegistry([provider, provider])).toThrow(
-      "Runtime transport openai-app-server is already registered by provider openai-app-server.",
-    );
-  });
 });

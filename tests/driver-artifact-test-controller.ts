@@ -9,15 +9,25 @@ import {
   parseDriverCommandUpdateInput,
   parseDriverCompletionInput,
   parseDriverEventBatchInput,
+  parseDriverExternalToolEffectClaimInput,
+  parseDriverExternalToolEffectObserveInput,
+  parseDriverExternalToolEffectSettleInput,
   parseDriverFailureInput,
   parseDriverHeartbeatInput,
   parseDriverHelloInput,
   parseDriverLogBatchInput,
   parseDriverNextCommandInput,
   parseDriverReadyInput,
+  type DriverEventReceipt,
   type DriverLogEntry,
 } from "../src/protocol/orpc";
-import type { DriverCapability } from "../src/runtime-command";
+import type {
+  DriverCapability,
+  DriverCommandUpdate,
+  McpExecuteCommandResult,
+  McpExternalToolEffectState,
+  RuntimeCommand,
+} from "../src/runtime-command";
 import { PROCESS_TREE_OWNER_ENV } from "../src/runtimes/child-process";
 import {
   AGENT_DRIVER_PROVIDER_REGISTRY,
@@ -39,18 +49,7 @@ export function expectedDriverCapabilities(runtime: string): readonly DriverCapa
   });
 }
 
-export interface DriverArtifactTestCommandUpdate {
-  readonly commandId: string;
-  readonly error?: unknown;
-  readonly result?: unknown;
-  readonly status: string;
-}
-
-export interface DriverArtifactTestCommand {
-  readonly commandId: string;
-  readonly kind: string;
-  readonly [key: string]: unknown;
-}
+export type DriverArtifactTestCommand = RuntimeCommand;
 
 export interface DriverArtifactEventIngressGate {
   readonly entered: Promise<DriverArtifactTestEvent>;
@@ -92,6 +91,7 @@ interface DriverExit {
 
 interface DriverRunTerminal {
   readonly error?: unknown;
+  readonly runId: string;
   readonly status: "completed" | "failed";
 }
 
@@ -101,6 +101,30 @@ interface EventIngressGateState {
   readonly predicate: (event: DriverArtifactTestEvent) => boolean;
   readonly release: () => void;
   readonly released: Promise<void>;
+}
+
+type ArtifactExternalToolEffect =
+  | { readonly effectId: string; readonly kind: "intent" }
+  | {
+      readonly attempt: number;
+      readonly claimToken: string;
+      readonly effectId: string;
+      readonly idempotencyKey: string;
+      readonly kind: "claimed";
+    }
+  | {
+      readonly effectId: string;
+      readonly kind: "succeeded";
+      readonly result: McpExecuteCommandResult;
+    }
+  | { readonly effectId: string; readonly kind: "unknown" };
+
+function toExternalToolEffectState(effect: ArtifactExternalToolEffect): McpExternalToolEffectState {
+  if (effect.kind === "claimed") {
+    const { claimToken: _, ...state } = effect;
+    return state;
+  }
+  return structuredClone(effect);
 }
 
 interface RpcRequest {
@@ -294,10 +318,12 @@ function readSameUserLinuxIdentity(pid: number): LinuxProcessIdentity | null {
 export class DriverArtifactTestController {
   readonly #bootPayload: DriverArtifactBootPayload;
   readonly #commands: DriverArtifactTestCommand[] = [];
-  readonly #commandUpdates: DriverArtifactTestCommandUpdate[] = [];
+  readonly #commandUpdates: DriverCommandUpdate[] = [];
   readonly #eventIngressGates = new Set<EventIngressGateState>();
   readonly #eventIngressObservers = new Set<(event: DriverArtifactTestEvent) => void>();
+  readonly #eventReceipts = new Map<string, DriverEventReceipt>();
   readonly #events: DriverArtifactTestEvent[] = [];
+  readonly #externalToolEffects = new Map<string, ArtifactExternalToolEffect>();
   readonly #expectedCapabilities: readonly DriverCapability[] | undefined;
   readonly #forbiddenSecrets: readonly string[];
   readonly #heartbeatIntervalMs: number;
@@ -401,7 +427,7 @@ export class DriverArtifactTestController {
     return this.#events;
   }
 
-  get commandUpdates(): readonly DriverArtifactTestCommandUpdate[] {
+  get commandUpdates(): readonly DriverCommandUpdate[] {
     return this.#commandUpdates;
   }
 
@@ -626,7 +652,7 @@ export class DriverArtifactTestController {
     commandId: string,
     timeoutMs: number,
     fromIndex = 0,
-  ): Promise<DriverArtifactTestCommandUpdate> {
+  ): Promise<DriverCommandUpdate> {
     return this.#waitFor(
       () =>
         this.#commandUpdates
@@ -641,11 +667,11 @@ export class DriverArtifactTestController {
   }
 
   async waitForCommandUpdate(
-    predicate: (update: DriverArtifactTestCommandUpdate) => boolean,
+    predicate: (update: DriverCommandUpdate) => boolean,
     fromIndex: number,
     timeoutMs: number,
     label: string,
-  ): Promise<DriverArtifactTestCommandUpdate> {
+  ): Promise<DriverCommandUpdate> {
     return this.#waitFor(
       () => this.#commandUpdates.slice(fromIndex).find(predicate),
       label,
@@ -896,7 +922,7 @@ export class DriverArtifactTestController {
           runConfig: {
             commandLeaseMs: 300_000,
             envPolicy: "strict",
-            eventBatchMaxSize: 256,
+            eventBatchMaxSize: 64,
             organizationPath: this.#organizationPath,
           },
           runId: null,
@@ -926,6 +952,15 @@ export class DriverArtifactTestController {
 
         const ingressWaits = new Set<Promise<void>>();
         const accepted = batch.events.map((envelope) => {
+          const existing = this.#eventReceipts.get(envelope.eventId);
+
+          if (existing !== undefined) {
+            if (existing.type !== envelope.event.kind) {
+              throw new Error(`Driver reused event ID ${envelope.eventId} with a changed type.`);
+            }
+            return existing;
+          }
+
           const { event } = envelope;
           if (event.driverInstanceId !== this.#bootPayload.driverInstanceId) {
             throw new Error(
@@ -970,11 +1005,13 @@ export class DriverArtifactTestController {
             this.#terminalRunIds.add(event.runId);
           }
           this.#nextEventSeq += 1;
-          return {
+          const receipt = {
             eventId: envelope.eventId,
             seq: this.#nextEventSeq,
             type: envelope.event.kind,
           };
+          this.#eventReceipts.set(envelope.eventId, receipt);
+          return receipt;
         });
         await Promise.all(ingressWaits);
         return { accepted };
@@ -986,23 +1023,90 @@ export class DriverArtifactTestController {
         return { ok: true };
       }
       case "/driver/commandUpdate": {
-        const update = parseDriverCommandUpdateInput(input);
-        this.#assertDriverInstanceId(update.driverInstanceId);
-        this.#commandUpdates.push({
-          commandId: update.commandId,
-          ...(update.error === undefined ? {} : { error: update.error }),
-          ...(update.result === undefined ? {} : { result: update.result }),
-          status: update.status,
-        });
+        const { driverInstanceId, ...update } = parseDriverCommandUpdateInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
+        this.#commandUpdates.push(update);
         return { ok: true };
+      }
+      case "/driver/observeExternalToolEffect": {
+        const { commandId, driverInstanceId } = parseDriverExternalToolEffectObserveInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
+        const effect =
+          this.#externalToolEffects.get(commandId) ??
+          ({ effectId: `artifact-test-effect-${commandId}`, kind: "intent" } as const);
+        this.#externalToolEffects.set(commandId, effect);
+        return toExternalToolEffectState(effect);
+      }
+      case "/driver/claimExternalToolEffect": {
+        const { claimToken, commandId, driverInstanceId } =
+          parseDriverExternalToolEffectClaimInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
+        const effectId = `artifact-test-effect-${commandId}`;
+        const effect =
+          this.#externalToolEffects.get(commandId) ?? ({ effectId, kind: "intent" } as const);
+
+        if (effect.kind === "succeeded" || effect.kind === "unknown") {
+          return toExternalToolEffectState(effect);
+        }
+        if (effect.kind === "claimed") {
+          if (effect.claimToken === claimToken) {
+            return toExternalToolEffectState(effect);
+          }
+          const unknown = { effectId, kind: "unknown" } as const;
+          this.#externalToolEffects.set(commandId, unknown);
+          return unknown;
+        }
+
+        const claimed = {
+          attempt: 1,
+          claimToken,
+          effectId,
+          idempotencyKey: effectId,
+          kind: "claimed",
+        } as const;
+        this.#externalToolEffects.set(commandId, claimed);
+        return toExternalToolEffectState(claimed);
+      }
+      case "/driver/settleExternalToolEffect": {
+        const { claimToken, commandId, driverInstanceId, effectId, settlement } =
+          parseDriverExternalToolEffectSettleInput(input);
+        this.#assertDriverInstanceId(driverInstanceId);
+        const current =
+          this.#externalToolEffects.get(commandId) ?? ({ effectId, kind: "intent" } as const);
+
+        if (current.effectId !== effectId) {
+          throw new Error(`External tool effect ${commandId} used a mismatched effect ID.`);
+        }
+        if (current.kind === "succeeded" || current.kind === "unknown") {
+          return toExternalToolEffectState(current);
+        }
+        if (current.kind === "intent") {
+          this.#externalToolEffects.set(commandId, current);
+          return current;
+        }
+        if (current.claimToken !== claimToken) {
+          const unknown = { effectId, kind: "unknown" } as const;
+          this.#externalToolEffects.set(commandId, unknown);
+          return unknown;
+        }
+
+        const terminal: ArtifactExternalToolEffect =
+          settlement.kind === "succeeded"
+            ? { effectId, kind: "succeeded", result: structuredClone(settlement.result) }
+            : { effectId, kind: "unknown" };
+        this.#externalToolEffects.set(commandId, terminal);
+        return toExternalToolEffectState(terminal);
       }
       case "/driver/completeRun": {
         const completion = parseDriverCompletionInput(input);
         this.#assertDriverInstanceId(completion.driverInstanceId);
+        if (!this.#knownRunIds.has(completion.runId)) {
+          throw new Error(`Driver completed unknown run ${completion.runId}.`);
+        }
         if (this.#runTerminals.length > 0) {
           throw new Error("Driver emitted more than one control-plane run terminal.");
         }
-        const terminal = { status: "completed" } as const;
+        const terminal = { runId: completion.runId, status: "completed" } as const;
         this.#runTerminals.push(terminal);
         for (const observer of this.#runTerminalIngressObservers) {
           observer(terminal);
@@ -1012,10 +1116,13 @@ export class DriverArtifactTestController {
       case "/driver/failRun": {
         const failure = parseDriverFailureInput(input);
         this.#assertDriverInstanceId(failure.driverInstanceId);
+        if (!this.#knownRunIds.has(failure.runId)) {
+          throw new Error(`Driver failed unknown run ${failure.runId}.`);
+        }
         if (this.#runTerminals.length > 0) {
           throw new Error("Driver emitted more than one control-plane run terminal.");
         }
-        const terminal = { error: failure.error, status: "failed" } as const;
+        const terminal = { error: failure.error, runId: failure.runId, status: "failed" } as const;
         this.#runTerminals.push(terminal);
         for (const observer of this.#runTerminalIngressObservers) {
           observer(terminal);
@@ -1088,7 +1195,9 @@ export class DriverArtifactTestController {
 
   #throwProtocolError(label: string): void {
     if (this.#protocolError !== null) {
-      throw new Error(`Driver protocol failed while waiting for ${label}: ${this.#protocolError}.`);
+      throw new Error(
+        `Driver protocol failed while waiting for ${label}: ${this.#protocolError}.\n${this.diagnostics()}`,
+      );
     }
   }
 
@@ -1120,7 +1229,7 @@ export class DriverArtifactTestController {
   waitForRunTerminal(
     timeoutMs: number,
     fromIndex = 0,
-  ): Promise<{ error?: unknown; status: "completed" | "failed" }> {
+  ): Promise<{ error?: unknown; runId: string; status: "completed" | "failed" }> {
     return this.#waitFor(
       () => this.#runTerminals.slice(fromIndex).at(-1),
       "control-plane run terminal",

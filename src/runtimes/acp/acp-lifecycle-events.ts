@@ -2,22 +2,21 @@ import type { InitializeResponse } from "@agentclientprotocol/sdk";
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
-import { isRecord, readNumber, readRecord, readString } from "./acp-types";
-import type { JsonObject } from "./acp-types";
 import {
-  toCapabilityEvents,
-  toConfigEvents,
-  toModeEvents,
-  toModelEvents,
-} from "./acp-session-update-events";
-
-// OpenCode's ACP usage reports fresh input tokens with cache read/write as
-// separate buckets (Anthropic-style), not an input total that includes them.
-const ACP_USAGE_CONTRACT = "anthropic_bucketed";
+  ACP_USAGE_CONTRACT,
+  assertBoundedLosslessEvents,
+  isRecord,
+  readNumber,
+  readRecord,
+  readString,
+} from "./acp-types";
+import type { JsonObject } from "./acp-types";
+import { toConfigEvents, toModeEvents } from "./acp-session-update-events";
 
 export function toInitializeEvents(result: InitializeResponse): DriverEventInput[] {
   const events: DriverEventInput[] = [
     {
+      delivery: "best_effort",
       kind: "runtime.capabilities.updated",
       payload: {
         capabilities: result.agentCapabilities ?? {},
@@ -29,6 +28,7 @@ export function toInitializeEvents(result: InitializeResponse): DriverEventInput
 
   if (result.authMethods !== undefined && result.authMethods.length > 0) {
     events.push({
+      delivery: "best_effort",
       kind: "auth.methods.updated",
       payload: {
         methods: result.authMethods,
@@ -45,7 +45,7 @@ export function toPromptStartEvents(input: {
   runId: RunId;
   text: string;
 }): DriverEventInput[] {
-  return [
+  return assertBoundedLosslessEvents([
     {
       actor: "user",
       kind: "message.added",
@@ -80,7 +80,7 @@ export function toPromptStartEvents(input: {
       },
       runId: input.runId,
     },
-  ];
+  ]);
 }
 
 export function toSessionReadyEvents(input: {
@@ -88,7 +88,7 @@ export function toSessionReadyEvents(input: {
   nativeSessionId: string;
   setup: JsonObject;
 }): DriverEventInput[] {
-  return [
+  return assertBoundedLosslessEvents([
     {
       kind: input.mode === "created" ? "session.created" : "session.resumed",
       payload:
@@ -109,28 +109,28 @@ export function toSessionReadyEvents(input: {
       },
       visibility: "owner_debug",
     },
-    ...toModeEvents(input.setup),
-    ...toModelEvents(input.setup),
+    ...toModeEvents(readRecord(input.setup, "modes")),
     ...toConfigEvents(input.setup),
-    ...toCapabilityEvents(input.setup),
-  ];
+  ]);
 }
 
 export function toAuthEvent(input: {
   methodId: string;
   status: "authenticated" | "failed";
 }): DriverEventInput {
-  return {
-    kind: "auth.session.updated",
-    payload: {
-      methodId: input.methodId,
-      status: input.status,
+  return assertBoundedLosslessEvents([
+    {
+      kind: "auth.session.updated",
+      payload: {
+        methodId: input.methodId,
+        status: input.status,
+      },
+      visibility: "owner_debug",
     },
-    visibility: "owner_debug",
-  };
+  ])[0]!;
 }
 
-export function shouldIgnoreReplay(params: unknown): boolean {
+export function isTurnScopedSessionUpdate(params: unknown): boolean {
   const record = isRecord(params) ? params : {};
   const update = readRecord(record, "update");
 
@@ -171,12 +171,14 @@ export function normalizePromptUsage(raw: unknown): JsonObject | null {
     return null;
   }
 
+  // Prompt usage is emitted in the same lossless batch as every open-item
+  // closure. Keep only the bounded canonical counters; ACP extension metadata
+  // is arbitrary JSON and cannot safely participate in that atomic batch.
   return {
     ...(cachedReadTokens === null ? {} : { cachedReadTokens }),
     ...(cachedWriteTokens === null ? {} : { cachedWriteTokens }),
     ...(inputTokens === null ? {} : { inputTokens }),
     ...(outputTokens === null ? {} : { outputTokens }),
-    raw,
     source: "prompt_response",
     ...(thoughtTokens === null ? {} : { thoughtTokens }),
     ...(totalTokens === null ? {} : { totalTokens }),

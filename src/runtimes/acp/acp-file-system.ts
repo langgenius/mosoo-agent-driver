@@ -1,7 +1,11 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { lstat, open, rename, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import { DRIVER_EVENT_DELIVERY_TIMEOUT_MS } from "../../core/driver-runtime-io";
 import { isRecord, raceWithAbort, readNonEmptyString, readNumber } from "./acp-types";
 import { AcpPathScope } from "./acp-path-scope";
 
@@ -12,6 +16,7 @@ interface AcpFileSystemOptions {
 }
 
 const MAX_ACP_FILE_BYTES = 8 * 1_024 * 1_024;
+const FILE_CHUNK_BYTES = 64 * 1_024;
 
 export class AcpFileSystem {
   readonly #pathScope: AcpPathScope;
@@ -29,19 +34,25 @@ export class AcpFileSystem {
       throw new Error("ACP fs/read_text_file requires a path.");
     }
 
-    const path = await this.#pathScope.resolveExisting(requestedPath, "ACP file path");
-    const file = await stat(path);
-    signal?.throwIfAborted();
+    const path = await this.#pathScope.openFile(requestedPath, "ACP file path");
+    let raw: string;
 
-    if (!file.isFile()) {
-      throw new Error("ACP fs/read_text_file requires a regular file.");
+    try {
+      const metadata = await path.file.stat();
+      signal?.throwIfAborted();
+
+      if (!metadata.isFile()) {
+        throw new Error("ACP fs/read_text_file requires a regular file.");
+      }
+
+      if (metadata.size > MAX_ACP_FILE_BYTES) {
+        throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
+      }
+
+      raw = await readBoundedText(path.file, signal);
+    } finally {
+      await path.file.close();
     }
-
-    if (file.size > MAX_ACP_FILE_BYTES) {
-      throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
-    }
-
-    const raw = await readFile(path, { encoding: "utf8", signal });
     const line = readNumber(record, "line");
     const limit = readNumber(record, "limit");
 
@@ -62,6 +73,7 @@ export class AcpFileSystem {
     context: AgentDriverContext,
     params: unknown,
     signal?: AbortSignal,
+    onCommitted?: () => void,
   ): Promise<Record<string, never>> {
     signal?.throwIfAborted();
     const record = isRecord(params) ? params : {};
@@ -76,19 +88,117 @@ export class AcpFileSystem {
       throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
     }
 
-    const path = await this.#pathScope.resolveWritable(requestedPath, "ACP file path");
-    await mkdir(dirname(path), { recursive: true });
-    signal?.throwIfAborted();
-    await writeFile(path, content, { encoding: "utf8", signal });
+    const path = await this.#pathScope.openWritable(requestedPath, "ACP file path");
+    const temporaryPath = join(path.directory.procPath, `.${randomUUID()}.tmp`);
+    const destinationPath = join(path.directory.procPath, path.name);
+    let temporaryCreated = false;
+    let committed = false;
+    let changedPath: string;
+
+    try {
+      const mode = await readExistingMode(destinationPath);
+      const temporary = await open(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      temporaryCreated = true;
+
+      try {
+        const bytes = Buffer.from(content, "utf8");
+        let offset = 0;
+
+        while (offset < bytes.length) {
+          signal?.throwIfAborted();
+          const { bytesWritten } = await temporary.write(
+            bytes,
+            offset,
+            Math.min(FILE_CHUNK_BYTES, bytes.length - offset),
+            offset,
+          );
+
+          if (bytesWritten === 0) {
+            throw new Error("ACP fs/write_text_file could not make write progress.");
+          }
+          offset += bytesWritten;
+        }
+
+        await temporary.chmod(mode);
+        signal?.throwIfAborted();
+        await temporary.sync();
+        signal?.throwIfAborted();
+        await rename(temporaryPath, destinationPath);
+        committed = true;
+        onCommitted?.();
+        await path.directory.file.sync();
+      } finally {
+        await temporary.close();
+      }
+
+      changedPath = join(await this.#pathScope.identify(path.directory), path.name);
+    } finally {
+      try {
+        if (temporaryCreated && !committed) {
+          await rm(temporaryPath, { force: true });
+        }
+      } finally {
+        await path.directory.file.close();
+      }
+    }
+
+    const reportSignal = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
     await raceWithAbort(
-      context.ports.file.reportChanged({
-        change: "upsert",
-        path,
-        reason: "acp.fs",
-      }),
-      signal,
+      context.ports.file.reportChanged(
+        {
+          change: "upsert",
+          path: changedPath,
+          reason: "acp.fs",
+        },
+        reportSignal,
+      ),
+      reportSignal,
     );
 
     return {};
+  }
+}
+
+async function readExistingMode(path: string): Promise<number> {
+  try {
+    const metadata = await lstat(path);
+    return metadata.isFile() ? metadata.mode & 0o7777 : 0o600;
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return 0o600;
+    }
+    throw error;
+  }
+}
+
+async function readBoundedText(file: FileHandle, signal?: AbortSignal): Promise<string> {
+  const decoder = new TextDecoder();
+  const chunk = Buffer.allocUnsafe(FILE_CHUNK_BYTES);
+  const content: string[] = [];
+  let offset = 0;
+
+  for (;;) {
+    signal?.throwIfAborted();
+    const remaining = MAX_ACP_FILE_BYTES + 1 - offset;
+
+    if (remaining <= 0) {
+      throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
+    }
+
+    const { bytesRead } = await file.read(chunk, 0, Math.min(chunk.length, remaining), offset);
+    if (bytesRead === 0) {
+      content.push(decoder.decode());
+      return content.join("");
+    }
+
+    offset += bytesRead;
+    if (offset > MAX_ACP_FILE_BYTES) {
+      throw new Error(`ACP file exceeds ${MAX_ACP_FILE_BYTES} bytes.`);
+    }
+    content.push(decoder.decode(chunk.subarray(0, bytesRead), { stream: true }));
   }
 }

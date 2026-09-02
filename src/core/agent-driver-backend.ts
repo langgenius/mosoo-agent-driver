@@ -1,12 +1,8 @@
 import type {
   AgentDriverCommandSource,
   AgentDriverEventSink,
-  AgentDriverFilePort,
-  AgentDriverHostIntegrationPort,
   AgentDriverHostPorts,
-  AgentDriverMcpPort,
   AgentDriverPermissionPort,
-  AgentDriverSkillPort,
 } from "../host-ports";
 import type { Logger } from "../observability";
 import type { DriverEventInput } from "../protocol/events";
@@ -28,15 +24,7 @@ export interface AgentDriverLifecycle {
   fail(error: Error): void;
 }
 
-export type AgentDriverContextPortOverrides = Partial<{
-  commandSource: AgentDriverCommandSource;
-  eventSink: AgentDriverEventSink;
-  file: AgentDriverFilePort;
-  hostIntegration: AgentDriverHostIntegrationPort;
-  mcp: AgentDriverMcpPort;
-  permission: AgentDriverPermissionPort;
-  skill: AgentDriverSkillPort;
-}>;
+export type AgentDriverContextPortOverrides = Partial<AgentDriverHostPorts>;
 
 export interface AgentDriverContextInput {
   commandSource?: AgentDriverCommandSource;
@@ -65,18 +53,18 @@ function toAgentDriverEventSink(
     return eventSink;
   }
 
-  const currentRunId = eventSink.currentRunId?.bind(eventSink);
-
   return {
     claimExternalToolEffect: async () => {
       throw new Error("Driver external tool effect ledger is not configured.");
     },
     commandUpdate: async () => {},
-    completeExternalToolEffect: async () => {
+    observeExternalToolEffect: async () => {
       throw new Error("Driver external tool effect ledger is not configured.");
     },
-    ...(currentRunId === undefined ? {} : { currentRunId }),
-    markExternalToolEffectUnknown: async () => {},
+    currentRunId: eventSink.currentRunId.bind(eventSink),
+    settleExternalToolEffect: async () => {
+      throw new Error("Driver external tool effect ledger is not configured.");
+    },
     pushEvents: (input) => eventSink.pushEvents(input),
   };
 }
@@ -94,7 +82,7 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
           }),
     eventSink,
     file: {
-      reportChanged: async (fileChange) => {
+      reportChanged: async (fileChange, signal) => {
         const event = {
           kind: "file.changed",
           payload: {
@@ -104,14 +92,11 @@ function createDefaultHostPorts(input: AgentDriverContextInput): AgentDriverHost
           },
         } satisfies DriverEventInput;
 
-        await pushLosslessEvents(eventSink, [event]);
+        await pushLosslessEvents(eventSink, [event], undefined, signal);
       },
     },
-    hostIntegration: {
-      snapshot: async () => null,
-    },
     mcp: {
-      execute: async () => {
+      prepare: async () => {
         throw new Error("Driver MCP host port is not configured.");
       },
     },

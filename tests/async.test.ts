@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   promiseWithTimeout,
   raceWithAbort,
+  readBoundedStreamBytes,
   settlePromiseWithTimeout,
   sleepPromise,
 } from "../src/utils/async";
@@ -96,6 +97,29 @@ describe("async lifecycle utilities", () => {
     await expect(raceWithAbort(Promise.reject(failure), new AbortController().signal)).rejects.toBe(
       failure,
     );
+  });
+
+  test("does not wait for an unresponsive stream cancellation", async () => {
+    const controller = new AbortController();
+    const reason = new Error("stream cancelled");
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+        return new Promise<void>(() => {});
+      },
+      pull() {},
+    });
+    const read = readBoundedStreamBytes(body, 1, new Error("too large"), controller.signal);
+
+    controller.abort(reason);
+
+    const result = await settlePromiseWithTimeout(read, {
+      label: "bounded stream cancellation",
+      timeoutMs: 100,
+    });
+    expect(result).toEqual({ error: reason, status: "failed" });
+    expect(cancelled).toBe(true);
   });
 
   test.each([

@@ -1,108 +1,55 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import * as ts from "typescript";
-
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
-const sourceRoot = resolve(repositoryRoot, "src");
+type SourceGraph = ReadonlyMap<string, ReadonlySet<string>>;
 
-interface SourceGraph {
-  readonly dependencies: ReadonlyMap<string, ReadonlySet<string>>;
-  readonly files: readonly string[];
-}
-
-function loadCompilerOptions(): ts.CompilerOptions {
-  const configPath = resolve(repositoryRoot, "tsconfig.json");
-  const config = ts.readConfigFile(configPath, (path) => readFileSync(path, "utf8"));
-
-  if (config.error !== undefined) {
-    throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, "\n"));
-  }
-
-  return ts.parseJsonConfigFileContent(config.config, ts.sys, repositoryRoot).options;
-}
-
-function moduleSpecifiers(sourceFile: ts.SourceFile): string[] {
-  const specifiers: string[] = [];
-
-  function visit(node: ts.Node): void {
-    if (
-      (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
-      node.moduleSpecifier !== undefined &&
-      ts.isStringLiteralLike(node.moduleSpecifier)
-    ) {
-      specifiers.push(node.moduleSpecifier.text);
-    } else if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length === 1 &&
-      ts.isStringLiteralLike(node.arguments[0]!)
-    ) {
-      specifiers.push(node.arguments[0].text);
-    }
-
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-  return specifiers;
-}
-
-function isSourceFile(path: string): boolean {
-  return path === sourceRoot || path.startsWith(`${sourceRoot}${sep}`);
-}
-
-function createSourceGraph(): SourceGraph {
-  const options = loadCompilerOptions();
-  const config = ts.parseJsonConfigFileContent(
-    ts.readConfigFile(resolve(repositoryRoot, "tsconfig.json"), (path) =>
-      readFileSync(path, "utf8"),
-    ).config,
-    ts.sys,
-    repositoryRoot,
+async function createSourceGraph(): Promise<SourceGraph> {
+  const entrypoints = await Array.fromAsync(
+    new Bun.Glob("src/**/*.ts").scan({ absolute: true, cwd: repositoryRoot, onlyFiles: true }),
   );
-  const program = ts.createProgram(config.fileNames, options);
-  const files = program
-    .getSourceFiles()
-    .map((sourceFile) => sourceFile.fileName)
-    .filter((path) => isSourceFile(path) && !path.endsWith(".d.ts"))
-    .toSorted();
-  const fileSet = new Set(files);
-  const dependencies = new Map<string, ReadonlySet<string>>();
-
-  for (const file of files) {
-    const sourceFile = program.getSourceFile(file);
-
-    if (sourceFile === undefined) {
-      throw new Error(`TypeScript program omitted ${file}.`);
-    }
-
-    const resolvedDependencies = new Set<string>();
-
-    for (const specifier of moduleSpecifiers(sourceFile)) {
-      const resolvedModule = ts.resolveModuleName(specifier, file, options, ts.sys).resolvedModule;
-      const dependency = resolvedModule?.resolvedFileName;
-
-      if (dependency !== undefined && fileSet.has(dependency)) {
-        resolvedDependencies.add(dependency);
-      }
-    }
-
-    dependencies.set(file, resolvedDependencies);
+  const metafile = (
+    await Bun.build({
+      allowUnresolved: [],
+      entrypoints,
+      metafile: true,
+      packages: "external",
+      root: repositoryRoot,
+      treeShaking: false,
+    })
+  ).metafile!;
+  const inputs = new Set(Object.keys(metafile.inputs));
+  const sourceFiles = new Set(
+    [...inputs].filter((path) => path.startsWith("src/") && path.endsWith(".ts")),
+  );
+  const unsupportedInput = [...inputs].find(
+    (path) =>
+      !sourceFiles.has(path) &&
+      path !== "package.json" &&
+      !(path.startsWith("src/") && path.endsWith(".json")),
+  );
+  if (unsupportedInput !== undefined) {
+    throw new Error(`Source import resolved to an unsupported file: ${unsupportedInput}.`);
   }
 
-  return { dependencies, files };
-}
-
-function sourcePath(path: string): string {
-  return relative(repositoryRoot, path).split(sep).join("/");
+  return new Map(
+    [...sourceFiles].map((file) => {
+      const imports = metafile.inputs[file]!.imports;
+      if (imports.some((dependency) => dependency.kind !== "import-statement")) {
+        throw new Error(`Runtime module loaders are unsupported: ${file}.`);
+      }
+      return [
+        file,
+        new Set(
+          imports.map((dependency) => dependency.path).filter((path) => sourceFiles.has(path)),
+        ),
+      ];
+    }),
+  );
 }
 
 function isWithin(path: string, directory: string): boolean {
-  const root = resolve(sourceRoot, directory);
-  return path === root || path.startsWith(`${root}${sep}`);
+  return path.startsWith(`src/${directory}/`);
 }
 
 function isProviderRuntime(path: string): boolean {
@@ -111,21 +58,36 @@ function isProviderRuntime(path: string): boolean {
   );
 }
 
+function reachableDependencies(
+  graph: SourceGraph,
+  file: string,
+  reachable = new Set<string>(),
+): ReadonlySet<string> {
+  for (const dependency of graph.get(file) ?? []) {
+    if (reachable.has(dependency)) {
+      continue;
+    }
+    reachable.add(dependency);
+    reachableDependencies(graph, dependency, reachable);
+  }
+
+  return reachable;
+}
+
 function boundaryViolations(graph: SourceGraph): string[] {
   const violations: string[] = [];
 
-  for (const file of graph.files) {
-    for (const dependency of graph.dependencies.get(file) ?? []) {
+  for (const file of graph.keys()) {
+    for (const dependency of reachableDependencies(graph, file)) {
       const forbidden =
         (isWithin(file, "contract") &&
-          ["core", "runtimes", "infrastructure", "stores", "surfaces"].some((directory) =>
+          ["core", "infrastructure", "runtimes", "stores", "surfaces"].some((directory) =>
             isWithin(dependency, directory),
           )) ||
         (isWithin(file, "protocol") &&
-          (["core", "runtimes", "infrastructure", "runtime-events"].some((directory) =>
+          ["core", "infrastructure", "runtimes", "runtime-events"].some((directory) =>
             isWithin(dependency, directory),
-          ) ||
-            isWithin(dependency, "runtime-events"))) ||
+          )) ||
         (isWithin(file, "core") &&
           (isProviderRuntime(dependency) ||
             ["infrastructure", "stores", "surfaces"].some((directory) =>
@@ -137,7 +99,7 @@ function boundaryViolations(graph: SourceGraph): string[] {
           ));
 
       if (forbidden) {
-        violations.push(`${sourcePath(file)} -> ${sourcePath(dependency)}`);
+        violations.push(`${file} -> ${dependency}`);
       }
     }
   }
@@ -146,101 +108,88 @@ function boundaryViolations(graph: SourceGraph): string[] {
 }
 
 function compositionViolations(graph: SourceGraph): string[] {
-  return graph.files
+  return [...graph.keys()]
     .filter((file) => !isWithin(file, "bin"))
     .filter((file) => {
-      const dependencies = [...(graph.dependencies.get(file) ?? [])];
+      const dependencies = [...reachableDependencies(graph, file)];
       return (
         dependencies.some((dependency) => isWithin(dependency, "core")) &&
         dependencies.some(isProviderRuntime) &&
         dependencies.some((dependency) => isWithin(dependency, "infrastructure"))
       );
     })
-    .map(sourcePath)
     .toSorted();
 }
 
-function fileCycles(graph: SourceGraph): string[] {
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const stack: string[] = [];
-  const cycles = new Set<string>();
-
-  function visit(file: string): void {
-    if (visited.has(file)) {
-      return;
-    }
-
-    visiting.add(file);
-    stack.push(file);
-
-    for (const dependency of graph.dependencies.get(file) ?? []) {
-      if (visiting.has(dependency)) {
-        const start = stack.indexOf(dependency);
-        cycles.add([...stack.slice(start), dependency].map(sourcePath).join(" -> "));
-      } else {
-        visit(dependency);
-      }
-    }
-
-    stack.pop();
-    visiting.delete(file);
-    visited.add(file);
-  }
-
-  for (const file of graph.files) {
-    visit(file);
-  }
-
-  return [...cycles].toSorted();
-}
-
 function sourceDirectory(path: string): string {
-  const parts = relative(sourceRoot, path).split(sep);
+  const parts = path.slice("src/".length).split("/");
   return parts.length === 1 ? "(entrypoints)" : parts[0]!;
 }
 
 function bidirectionalDirectories(graph: SourceGraph): string[] {
   const edges = new Set<string>();
 
-  for (const file of graph.files) {
+  for (const file of graph.keys()) {
     const source = sourceDirectory(file);
-
-    for (const dependency of graph.dependencies.get(file) ?? []) {
+    for (const dependency of graph.get(file) ?? []) {
       const target = sourceDirectory(dependency);
-
       if (source !== target) {
         edges.add(`${source}\0${target}`);
       }
     }
   }
 
-  const pairs = new Set<string>();
-
-  for (const edge of edges) {
-    const [source, target] = edge.split("\0") as [string, string];
-
-    if (edges.has(`${target}\0${source}`)) {
-      pairs.add([source, target].toSorted().join(" <-> "));
-    }
-  }
-
-  return [...pairs].toSorted();
+  return [...edges]
+    .filter((edge) => {
+      const [source, target] = edge.split("\0") as [string, string];
+      return edges.has(`${target}\0${source}`);
+    })
+    .map((edge) => edge.split("\0").toSorted().join(" <-> "))
+    .filter((pair, index, pairs) => pairs.indexOf(pair) === index)
+    .toSorted();
 }
 
-const graph = createSourceGraph();
+const graph = await createSourceGraph();
 
 describe("source architecture", () => {
-  test("keeps contract, protocol, core, and provider imports pointing inward", () => {
+  test("keeps transitive contract, protocol, core, and provider dependencies inward", () => {
     expect(boundaryViolations(graph)).toEqual([]);
+
+    const core = "src/core/audit.ts";
+    const wrapper = "src/audit/wrapper.ts";
+    const provider = "src/runtimes/openai/audit.ts";
+
+    expect(
+      boundaryViolations(
+        new Map([
+          [core, new Set([wrapper])],
+          [wrapper, new Set([provider])],
+          [provider, new Set()],
+        ]),
+      ),
+    ).toEqual(["src/core/audit.ts -> src/runtimes/openai/audit.ts"]);
   });
 
-  test("keeps bin as the only full runtime composition root", () => {
+  test("keeps bin as the only transitive full runtime composition root", () => {
     expect(compositionViolations(graph)).toEqual([]);
-  });
 
-  test("has no file-level import cycles", () => {
-    expect(fileCycles(graph)).toEqual([]);
+    const root = "src/composition-audit.ts";
+    const wrapper = "src/audit/wrapper.ts";
+    const core = "src/core/audit.ts";
+    const provider = "src/runtimes/openai/audit.ts";
+    const infrastructure = "src/infrastructure/audit.ts";
+
+    expect(
+      compositionViolations(
+        new Map([
+          [root, new Set([wrapper])],
+          [wrapper, new Set([core, provider, infrastructure])],
+          [core, new Set()],
+          [provider, new Set()],
+          [infrastructure, new Set()],
+        ]),
+      ),
+    ).toEqual(["src/audit/wrapper.ts", "src/composition-audit.ts"]);
   });
 
   test("has no bidirectional top-level source directory dependencies", () => {

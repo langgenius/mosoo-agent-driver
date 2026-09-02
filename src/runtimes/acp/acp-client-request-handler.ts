@@ -21,13 +21,17 @@ import type {
 
 import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { shouldIgnoreReplay } from "./acp-event-translator";
-import type { AcpPermissionOption, AcpTurnEventState } from "./acp-event-translator";
+import {
+  AcpTurnStateLimitError,
+  type AcpAssistantTranscriptState,
+} from "./acp-assistant-transcript-state";
 import { AcpFileSystem } from "./acp-file-system";
 import { AcpPathScope } from "./acp-path-scope";
+import type { AcpPermissionOption, AcpPermissionTranslation } from "./acp-permission-events";
+import { isTurnScopedSessionUpdate } from "./acp-session-events";
 import { AcpSessionUpdateInbox, type AcpSessionUpdateScope } from "./acp-session-update-inbox";
 import { AcpTerminalManager } from "./acp-terminal-manager";
-import { isRecord, raceWithAbort, readNonEmptyString, stringifyForDisplay } from "./acp-types";
+import { isRecord, raceWithAbort, readNonEmptyString } from "./acp-types";
 
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
@@ -37,41 +41,57 @@ interface AcpClientRequestHandlerOptions {
   nativeSessionId(): string | null;
   onUpdateFailure(error: Error): void;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
-  readonly turnEvents: AcpTurnEventState;
+  readonly turnEvents: AcpAssistantTranscriptState;
+}
+
+interface AcpFileWrite {
+  failure: { readonly error: unknown } | null;
+  readonly task: Promise<unknown>;
+}
+
+interface AcpTurnFileWrites {
+  ingressClosed: boolean;
+  readonly writes: Set<AcpFileWrite>;
 }
 
 export class AcpClientRequestHandler {
+  readonly #activeFileWrites = new Set<AcpFileWrite>();
   readonly #fileSystem: AcpFileSystem;
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
+  readonly #onUpdateFailure: (error: Error) => void;
+  readonly #pathScope: AcpPathScope;
   readonly #pendingPermissions = new Set<Promise<unknown>>();
   readonly #push: AcpClientRequestHandlerOptions["push"];
   #permissionIngressClosed = false;
   #stopping = false;
-  #turnUpdateIngressClosed = false;
+  #transcriptTail: Promise<void> = Promise.resolve();
+  #turnFileWrites: AcpTurnFileWrites | null = null;
+  #turnTranscriptIngressClosed = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
-  readonly #turnEvents: AcpTurnEventState;
+  readonly #turnEvents: AcpAssistantTranscriptState;
 
   constructor(options: AcpClientRequestHandlerOptions) {
     this.#isCancelling = options.isCancelling;
     this.#nativeSessionId = options.nativeSessionId;
+    this.#onUpdateFailure = options.onUpdateFailure;
     this.#push = options.push;
     this.#turnEvents = options.turnEvents;
-    const pathScope = new AcpPathScope({
+    this.#pathScope = new AcpPathScope({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
     });
     this.#fileSystem = new AcpFileSystem({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
-      pathScope,
+      pathScope: this.#pathScope,
     });
     this.#terminalManager = new AcpTerminalManager({
       allowedRoots: options.allowedRoots,
       cwd: options.cwd,
       env: options.env,
-      pathScope,
+      pathScope: this.#pathScope,
       push: options.push,
     });
     this.#updateInbox = new AcpSessionUpdateInbox({
@@ -80,8 +100,16 @@ export class AcpClientRequestHandler {
     });
   }
 
+  initializePathScope(): Promise<void> {
+    return this.#pathScope.initialize();
+  }
+
+  closePathScope(): Promise<void> {
+    return this.#pathScope.close();
+  }
+
   enqueueUpdate(context: AgentDriverContext, notification: SessionNotification): Promise<void> {
-    if (this.#turnUpdateIngressClosed) {
+    if (this.#turnTranscriptIngressClosed && isTurnScopedSessionUpdate(notification)) {
       return Promise.resolve();
     }
 
@@ -106,7 +134,73 @@ export class AcpClientRequestHandler {
     signal?: AbortSignal,
   ): Promise<WriteTextFileResponse> {
     this.#assertSession("fs/write_text_file", params);
-    return this.#fileSystem.writeTextFile(context, params, signal);
+    if (this.#stopping) {
+      throw new Error("ACP client request handler is stopping.");
+    }
+    const turn = this.#turnFileWrites;
+    if (turn?.ingressClosed) {
+      throw new Error("ACP file write ingress is closed for the active turn.");
+    }
+
+    let committed = false;
+    const operation = this.#fileSystem.writeTextFile(context, params, signal, () => {
+      committed = true;
+    });
+    let write!: AcpFileWrite;
+    const task = operation.catch((error: unknown) => {
+      if (committed) {
+        write.failure = { error };
+        this.#onUpdateFailure(
+          error instanceof Error
+            ? error
+            : new Error("ACP committed file report failed.", { cause: error }),
+        );
+      }
+      throw error;
+    });
+    write = { failure: null, task };
+    this.#activeFileWrites.add(write);
+    turn?.writes.add(write);
+
+    return task;
+  }
+
+  beginStop(): void {
+    this.#stopping = true;
+    this.closeFileWriteIngress();
+  }
+
+  async drainFileWrites(signal?: AbortSignal): Promise<void> {
+    await this.#drainFileWrites(this.#activeFileWrites, signal);
+  }
+
+  openFileWriteIngress(): void {
+    if (this.#stopping) {
+      throw new Error("ACP client request handler is stopping.");
+    }
+    if (
+      this.#turnFileWrites !== null &&
+      (!this.#turnFileWrites.ingressClosed || this.#turnFileWrites.writes.size > 0)
+    ) {
+      throw new Error("ACP previous turn file writes have not drained.");
+    }
+
+    this.#turnFileWrites = { ingressClosed: false, writes: new Set() };
+  }
+
+  closeFileWriteIngress(): void {
+    if (this.#turnFileWrites !== null) {
+      this.#turnFileWrites.ingressClosed = true;
+    }
+  }
+
+  async drainTurnFileWrites(signal?: AbortSignal): Promise<void> {
+    const turn = this.#turnFileWrites;
+    if (turn === null) {
+      return;
+    }
+
+    await this.#drainFileWrites(turn.writes, signal);
   }
 
   async requestPermission(
@@ -174,6 +268,10 @@ export class AcpClientRequestHandler {
     return this.#terminalManager.create(context, params, signal);
   }
 
+  beginTurnTerminals(): number {
+    return this.#terminalManager.beginTurn();
+  }
+
   async killTerminal(
     context: AgentDriverContext,
     params: KillTerminalRequest,
@@ -210,6 +308,10 @@ export class AcpClientRequestHandler {
     await this.#terminalManager.stopAll(context);
   }
 
+  async stopTurnTerminals(context: AgentDriverContext, turn: number): Promise<void> {
+    await this.#terminalManager.stopTurn(context, turn);
+  }
+
   async closeUpdates(): Promise<void> {
     this.#stopping = true;
     await this.#updateInbox.close();
@@ -219,8 +321,8 @@ export class AcpClientRequestHandler {
     this.#permissionIngressClosed = true;
   }
 
-  closeTurnUpdateIngress(): void {
-    this.#turnUpdateIngressClosed = true;
+  closeTurnTranscriptIngress(): void {
+    this.#turnTranscriptIngressClosed = true;
   }
 
   async drainUpdates(): Promise<void> {
@@ -246,8 +348,8 @@ export class AcpClientRequestHandler {
     this.#permissionIngressClosed = false;
   }
 
-  openTurnUpdateIngress(): void {
-    this.#turnUpdateIngressClosed = false;
+  openTurnTranscriptIngress(): void {
+    this.#turnTranscriptIngressClosed = false;
   }
 
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
@@ -268,6 +370,23 @@ export class AcpClientRequestHandler {
     );
   }
 
+  async #drainFileWrites(writes: Set<AcpFileWrite>, signal?: AbortSignal): Promise<void> {
+    while (writes.size > 0) {
+      const pending = [...writes];
+      await raceWithAbort(Promise.allSettled(pending.map(({ task }) => task)), signal);
+      for (const write of pending) {
+        writes.delete(write);
+        this.#activeFileWrites.delete(write);
+        this.#turnFileWrites?.writes.delete(write);
+      }
+      const failure = pending.find(({ failure }) => failure !== null)?.failure;
+
+      if (failure !== null && failure !== undefined) {
+        throw failure.error;
+      }
+    }
+  }
+
   async #requestPermission(
     context: AgentDriverContext,
     requestId: string,
@@ -279,25 +398,27 @@ export class AcpClientRequestHandler {
       return { outcome: { outcome: "cancelled" } };
     }
 
-    const translation = this.#turnEvents.translatePermission({
-      params,
-      requestId,
+    const translation = await raceWithAbort(
+      this.#withTranscriptTransaction(async () => {
+        signal?.throwIfAborted();
+        const translated = this.#turnEvents.translatePermission({ params, requestId });
+        if (translated.events.length > 0) {
+          await track(this.#push(context, "driver.acp.permission.tool", translated.events));
+        }
+        return translated;
+      }),
+      signal,
+    ).catch((error: unknown) => {
+      if (error instanceof AcpTurnStateLimitError) {
+        this.#onUpdateFailure(error);
+      }
+      throw error;
     });
-    const toolEvents = translation.events.filter((event) => event.kind !== "permission.requested");
-
-    if (toolEvents.length > 0) {
-      await raceWithAbort(
-        track(this.#push(context, "driver.acp.permission.tool", toolEvents)),
-        signal,
-      );
-    }
 
     let chosen: AcpPermissionOption | null = null;
 
     if (!this.#isCancelling() && !signal?.aborted) {
-      const permission = track(
-        this.#resolvePermission(context, requestId, translation.options, params, signal),
-      );
+      const permission = track(this.#resolvePermission(context, translation, signal));
       chosen = await raceWithAbort(permission, signal);
     }
     const resolvedOption = this.#isCancelling() || signal?.aborted ? null : chosen;
@@ -321,24 +442,40 @@ export class AcpClientRequestHandler {
   ): Promise<void> {
     this.#assertSession("session/update", params);
 
-    if (scope.suppressed && shouldIgnoreReplay(params)) {
-      return;
-    }
-
     if (
-      (scope.replaying || this.#turnEvents.activeRunId() === null) &&
-      shouldIgnoreReplay(params)
+      (scope.suppressed || scope.replaying || this.#turnEvents.activeRunId() === null) &&
+      isTurnScopedSessionUpdate(params)
     ) {
       return;
     }
 
-    const events = this.#turnEvents.translateUpdate(params);
+    await this.#withTranscriptTransaction(async () => {
+      const events = this.#turnEvents.translateUpdate(params);
 
-    if (events.length === 0) {
-      return;
-    }
+      if (events.length === 0) {
+        return;
+      }
 
-    await this.#push(context, "driver.acp.session.update", events);
+      await this.#push(context, "driver.acp.session.update", events);
+    });
+  }
+
+  #withTranscriptTransaction<T>(operation: () => Promise<T>): Promise<T> {
+    const transaction = this.#transcriptTail.then(async () => {
+      const restore = this.#turnEvents.checkpoint();
+
+      try {
+        return await operation();
+      } catch (error) {
+        restore();
+        throw error;
+      }
+    });
+    this.#transcriptTail = transaction.then(
+      () => {},
+      () => {},
+    );
+    return transaction;
   }
 
   #assertSession(method: string, params: unknown): void {
@@ -357,33 +494,17 @@ export class AcpClientRequestHandler {
 
   async #resolvePermission(
     context: AgentDriverContext,
-    requestId: string,
-    options: readonly AcpPermissionOption[],
-    params: unknown,
+    translation: AcpPermissionTranslation,
     signal?: AbortSignal,
   ): Promise<AcpPermissionOption | null> {
-    const allow = options.find((option) => option.kind === "allow_once") ?? null;
-    const reject = options.find((option) => option.kind === "reject_once") ?? null;
+    const allow = translation.options.find((option) => option.kind === "allow_once") ?? null;
+    const reject = translation.options.find((option) => option.kind === "reject_once") ?? null;
 
     if (allow === null && reject === null) {
       return null;
     }
 
-    const record = isRecord(params) ? params : {};
-    const toolCall = isRecord(record["toolCall"]) ? record["toolCall"] : {};
-    const decision = await context.ports.permission.request(
-      {
-        rawInput: stringifyForDisplay(toolCall["rawInput"]),
-        requestId,
-        title:
-          readNonEmptyString(toolCall, "title") ??
-          readNonEmptyString(toolCall, "kind") ??
-          "Allow tool call?",
-        toolCallId: readNonEmptyString(toolCall, "toolCallId"),
-        toolKind: readNonEmptyString(toolCall, "kind"),
-      },
-      signal,
-    );
+    const decision = await context.ports.permission.request(translation.request, signal);
 
     return decision === "allow_once" ? allow : reject;
   }

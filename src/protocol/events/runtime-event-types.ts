@@ -1,11 +1,12 @@
 import type { DriverInstanceId, EventId, RunId, SessionId } from "../id";
 
-export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-05-26";
+export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-08-29";
 
 export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
   "account.updated",
   "agent.task.updated",
+  "agent.tasks.replaced",
   "auth.methods.updated",
   "auth.session.updated",
   "catalog.updated",
@@ -23,7 +24,6 @@ export const RUNTIME_EVENT_KINDS = [
   "file.indexed",
   "hook.completed",
   "hook.started",
-  "image.updated",
   "item.completed",
   "item.started",
   "item.updated",
@@ -31,8 +31,10 @@ export const RUNTIME_EVENT_KINDS = [
   "mcp.server.updated",
   "mcp.tool.updated",
   "message.added",
+  "message.cancelled",
   "message.completed",
   "message.delta",
+  "message.failed",
   "message.started",
   "model.routing.updated",
   "model.verification.updated",
@@ -94,6 +96,7 @@ export const RUNTIME_EVENT_KINDS = [
   "terminal.output.delta",
   "terminal.released",
   "thought.completed",
+  "thought.cancelled",
   "thought.delta",
   "thought.started",
   "tool.call.updated",
@@ -120,6 +123,23 @@ export type RuntimeTimingStage =
   | "prewarm";
 
 export type RuntimeEventRecord = Record<string, unknown>;
+
+type RuntimeToolCallInput =
+  | { readonly rawInput?: undefined; readonly rawInputDelta?: undefined }
+  | { readonly rawInput: string; readonly rawInputDelta?: undefined }
+  | { readonly rawInput?: undefined; readonly rawInputDelta: string };
+
+type RuntimeToolCallOutput =
+  | { readonly rawOutput?: undefined; readonly rawOutputDelta?: undefined }
+  | { readonly rawOutput: string; readonly rawOutputDelta?: undefined }
+  | { readonly rawOutput?: undefined; readonly rawOutputDelta: string };
+
+export type RuntimeToolCallUpdatedPayload = RuntimeEventRecord &
+  RuntimeToolCallInput &
+  RuntimeToolCallOutput & {
+    readonly status: "cancelled" | "completed" | "failed" | "running";
+    readonly toolCallId: string;
+  };
 
 export interface RuntimeEventNativeRef {
   readonly eventName?: string | undefined;

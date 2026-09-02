@@ -1,11 +1,10 @@
-import { promiseWithTimeout } from "../utils/async";
+import { promiseWithTimeout, settlePromiseWithTimeout } from "../utils/async";
 import type { AgentDriverBackend, AgentDriverContext } from "./agent-driver-backend";
 
 export interface AgentBackendLifecycleOptions {
   readonly backend: AgentDriverBackend;
   readonly createContext: () => AgentDriverContext;
   readonly labels: {
-    readonly deferredStop: string;
     readonly finalStop: string;
     readonly start: string;
     readonly stop: string;
@@ -28,6 +27,16 @@ export interface AgentBackendLifecycleOptions {
   readonly stopTimeoutMs: number;
 }
 
+type CleanupOwner = {
+  deadline: number;
+  deferred: DeferredCleanup | null;
+  task: Promise<void>;
+};
+
+type DeferredCleanup =
+  | { after: Promise<void>; kind: "final_stop" }
+  | { generation: number; kind: "late_stop"; task: Promise<void> };
+
 export class AgentBackendLifecycle {
   readonly #backend: AgentDriverBackend;
   readonly #createContext: () => AgentDriverContext;
@@ -39,12 +48,13 @@ export class AgentBackendLifecycle {
   readonly #shutdownSignal: AbortSignal;
   readonly #startTimeoutMs: number;
   readonly #stopTimeoutMs: number;
-  #finalStopTask: Promise<void> | null = null;
+  #cleanupOwner: CleanupOwner | null = null;
+  #inFlightStop: Promise<void> | null = null;
   #startController: AbortController | null = null;
+  #startupStopTask: Promise<void> | null = null;
   #startTask: Promise<void> | null = null;
-  #stopController: AbortController | null = null;
-  #stopNeedsReplay = false;
-  #stopTask: Promise<void> | null = null;
+  #stopGeneration = 0;
+  #stopped = false;
 
   constructor(options: AgentBackendLifecycleOptions) {
     this.#backend = options.backend;
@@ -92,66 +102,11 @@ export class AgentBackendLifecycle {
   }
 
   async shutdown(reason: string): Promise<void> {
-    const startTask = this.#startTask;
-    const finalStopTask = this.#finalStopTask;
-
-    if (startTask !== null) {
-      this.#startController?.abort(new Error(reason));
-      this.#stopNeedsReplay = true;
+    if (this.#stopped) {
+      return;
     }
 
-    if (this.#stopTask === null) {
-      if (startTask === null) {
-        this.#stopNeedsReplay = false;
-      }
-      this.#stop(reason);
-    }
-
-    const tasks: Promise<unknown>[] = [];
-    if (this.#stopTask !== null) {
-      tasks.push(this.#stopTask);
-    }
-    if (startTask !== null) {
-      tasks.push(startTask.catch(() => {}));
-    }
-    if (finalStopTask !== null) {
-      tasks.push(finalStopTask);
-    }
-
-    try {
-      await promiseWithTimeout(Promise.all(tasks), {
-        label: this.#labels.stop,
-        timeoutMs: this.#stopTimeoutMs,
-      });
-
-      if (this.#stopNeedsReplay) {
-        this.#stopNeedsReplay = false;
-        await promiseWithTimeout(this.#stop(reason), {
-          label: this.#labels.finalStop,
-          timeoutMs: this.#stopTimeoutMs,
-        });
-      }
-
-      this.#clear();
-    } catch (error) {
-      this.#stopController?.abort(error);
-      this.#stopController = null;
-      this.#stopTask = null;
-      if (this.#finalStopTask === finalStopTask) {
-        this.#finalStopTask = null;
-      }
-      if (startTask !== null && this.#stopNeedsReplay) {
-        this.#scheduleFinalStop(startTask, reason);
-      }
-      throw error;
-    }
-  }
-
-  #clear(): void {
-    this.#finalStopTask = null;
-    this.#startController = null;
-    this.#stopController = null;
-    this.#stopTask = null;
+    await (this.#cleanupOwner ?? this.#createCleanupOwner(reason)).task;
   }
 
   #clearStart(task: Promise<void>): void {
@@ -161,66 +116,161 @@ export class AgentBackendLifecycle {
     }
   }
 
-  #stop(reason: string): Promise<void> {
-    const controller = new AbortController();
-    const task = Promise.resolve().then(() =>
-      this.#runStop(this.#backend, this.#createContext(), reason, controller.signal),
-    );
-    this.#stopController = controller;
-    this.#stopTask = task;
-    void task.then(undefined, () => {
-      if (this.#stopTask === task) {
-        this.#stopController = null;
-        this.#stopTask = null;
-      }
-    });
-    return task;
-  }
+  #createCleanupOwner(reason: string): CleanupOwner {
+    const startTask = this.#startTask;
+    this.#startController?.abort(new Error(reason));
 
-  #scheduleFinalStop(startTask: Promise<void>, reason: string): void {
-    if (this.#finalStopTask !== null) {
-      return;
-    }
-
-    let stopTask: Promise<void> | null = null;
-    let task!: Promise<void>;
-    task = startTask
-      .catch(() => {})
-      .then(async () => {
-        if (this.#finalStopTask !== task || !this.#stopNeedsReplay) {
-          return;
-        }
-
-        this.#stopNeedsReplay = false;
-        stopTask = this.#stop(reason);
-        await promiseWithTimeout(stopTask, {
-          label: this.#labels.deferredStop,
-          timeoutMs: this.#stopTimeoutMs,
-        });
-
-        if (this.#finalStopTask === task && this.#stopTask === stopTask) {
-          this.#clear();
-          this.#onDeferredStopComplete?.();
-        }
-      });
-    this.#finalStopTask = task;
-    void task.then(
+    const owner: CleanupOwner = {
+      deadline: Date.now() + this.#stopTimeoutMs,
+      deferred: null,
+      task: Promise.resolve(),
+    };
+    owner.task = this.#runCleanup(owner, reason, startTask).then(
       () => {
-        if (this.#finalStopTask === task) {
-          this.#finalStopTask = null;
+        this.#stopped = true;
+        if (this.#cleanupOwner === owner) {
+          this.#cleanupOwner = null;
         }
       },
       (error: unknown) => {
-        if (this.#finalStopTask === task) {
-          this.#finalStopTask = null;
+        if (this.#cleanupOwner === owner) {
+          this.#cleanupOwner = null;
         }
-        if (stopTask !== null && this.#stopTask === stopTask) {
-          this.#stopController?.abort(error);
-          this.#stopController = null;
-          this.#stopTask = null;
+        if (owner.deferred !== null) {
+          this.#watchDeferredCleanup(owner.deferred, reason);
         }
-        this.#onDeferredStopError?.(error);
+        throw error;
       },
     );
+    this.#cleanupOwner = owner;
+    return owner;
+  }
+
+  async #runCleanup(
+    owner: CleanupOwner,
+    reason: string,
+    startTask: Promise<void> | null,
+  ): Promise<void> {
+    if (startTask === null) {
+      await this.#stop(owner, reason, this.#labels.stop, true);
+      return;
+    }
+
+    if (this.#startupStopTask !== startTask) {
+      this.#startupStopTask = startTask;
+      await this.#stop(owner, reason, this.#labels.stop, false).catch(() => {});
+    }
+
+    const startResult = await settlePromiseWithTimeout(startTask, {
+      label: this.#labels.stop,
+      timeoutMs: this.#remaining(owner),
+    });
+    if (startResult.status === "timed_out") {
+      const stopSettled = this.#inFlightStop ?? Promise.resolve();
+      owner.deferred = {
+        after: Promise.allSettled([startTask, stopSettled]).then(() => {}),
+        kind: "final_stop",
+      };
+      throw startResult.error;
+    }
+
+    await this.#stop(owner, reason, this.#labels.finalStop, true);
+  }
+
+  #remaining(owner: CleanupOwner): number {
+    return Math.max(0, owner.deadline - Date.now());
+  }
+
+  async #stop(owner: CleanupOwner, reason: string, label: string, final: boolean): Promise<void> {
+    const previous = this.#inFlightStop;
+    if (previous !== null) {
+      const previousResult = await settlePromiseWithTimeout(previous, {
+        label,
+        timeoutMs: this.#remaining(owner),
+      });
+      if (previousResult.status !== "completed") {
+        if (final && previousResult.status === "timed_out") {
+          owner.deferred = { after: previous, kind: "final_stop" };
+        }
+        throw previousResult.error;
+      }
+    }
+
+    const controller = new AbortController();
+    const generation = (this.#stopGeneration += 1);
+    const task = Promise.resolve().then(() =>
+      this.#runStop(this.#backend, this.#createContext(), reason, controller.signal),
+    );
+    let settled: Promise<void>;
+    settled = task.then(
+      (): void => this.#clearStop(settled),
+      (): void => this.#clearStop(settled),
+    );
+    this.#inFlightStop = settled;
+
+    const result = await settlePromiseWithTimeout(task, {
+      label,
+      timeoutMs: this.#remaining(owner),
+    });
+    if (result.status === "completed") {
+      return;
+    }
+    if (result.status === "timed_out") {
+      controller.abort(result.error);
+      if (final) {
+        owner.deferred = { generation, kind: "late_stop", task };
+      }
+    }
+    throw result.error;
+  }
+
+  #clearStop(operation: Promise<void>): void {
+    if (this.#inFlightStop === operation) {
+      this.#inFlightStop = null;
+    }
+  }
+
+  #watchDeferredCleanup(deferred: DeferredCleanup, reason: string): void {
+    if (deferred.kind === "final_stop") {
+      void deferred.after.then(() => this.#runDeferredCleanup(reason));
+      return;
+    }
+
+    void deferred.task.then(
+      () => this.#acceptLateStop(deferred.generation),
+      (error: unknown) => this.#onDeferredStopError?.(error),
+    );
+  }
+
+  async #runDeferredCleanup(reason: string): Promise<void> {
+    try {
+      await this.shutdown(reason);
+      this.#onDeferredStopComplete?.();
+    } catch (error) {
+      this.#onDeferredStopError?.(error);
+    }
+  }
+
+  async #acceptLateStop(generation: number): Promise<void> {
+    const owner = this.#cleanupOwner;
+    if (owner !== null) {
+      try {
+        await owner.task;
+        this.#onDeferredStopComplete?.();
+        return;
+      } catch (error) {
+        if (generation !== this.#stopGeneration || this.#inFlightStop !== null) {
+          this.#onDeferredStopError?.(error);
+          return;
+        }
+      }
+    }
+
+    if (generation !== this.#stopGeneration) {
+      return;
+    }
+
+    this.#stopped = true;
+    this.#onDeferredStopComplete?.();
   }
 }

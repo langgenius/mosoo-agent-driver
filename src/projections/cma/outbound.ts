@@ -61,10 +61,13 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
 
   switch (event.kind) {
     case "message.added":
+    case "message.cancelled":
     case "message.completed":
     case "message.delta":
+    case "message.failed":
     case "message.started":
       return [{ message: payload, sourceEventKind: event.kind, type: "agent.message" }];
+    case "thought.cancelled":
     case "thought.completed":
     case "thought.delta":
     case "thought.started":
@@ -75,7 +78,20 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
       return [
         {
           requiresAction: {
+            ...(payload["agentId"] === undefined ? {} : { agentId: payload["agentId"] }),
+            ...(payload["blockedPath"] === undefined
+              ? {}
+              : { blockedPath: payload["blockedPath"] }),
+            ...(payload["decisionReason"] === undefined
+              ? {}
+              : { decisionReason: payload["decisionReason"] }),
             details: payload["details"],
+            ...(payload["description"] === undefined
+              ? {}
+              : { description: payload["description"] }),
+            ...(payload["matchedAskRule"] === undefined
+              ? {}
+              : { matchedAskRule: payload["matchedAskRule"] }),
             requestId: payload["requestId"],
             targetItemId: payload["targetItemId"],
             title: payload["title"],

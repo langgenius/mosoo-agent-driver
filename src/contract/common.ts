@@ -1,11 +1,14 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 export const protocolVersionSchema = z.literal(PROTOCOL_VERSION);
 export const timestampSchema = z.iso.datetime({ offset: true });
 export const revisionSchema = z.number().int().nonnegative().safe();
 
-export const protocolIdSchema = z.ulid().transform((value) => value.toUpperCase());
+export const protocolIdSchema = z
+  .ulid()
+  .refine((value) => /^[0-7]/u.test(value), "ULID timestamp exceeds its 128-bit range")
+  .transform((value) => value.toUpperCase());
 export const opaqueIdSchema = z.string().min(1).max(256);
 export const sha256Schema = z.string().regex(/^sha256:[0-9a-f]{64}$/u);
 export const requestDigestSchema = z.strictObject({

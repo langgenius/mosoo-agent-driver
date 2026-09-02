@@ -1,15 +1,40 @@
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, lstat, mkdtemp, rename, rm, rmdir, symlink } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
+import { isDriverId } from "../../protocol/id";
+import type { DriverInstanceId } from "../../protocol/id";
 import type { JsonObject, JsonValue } from "../../protocol/json";
-import { isJsonObject } from "../../protocol/json";
+import {
+  ensureAbsoluteRealDirectory,
+  ensureRealDirectoryAt,
+  hasErrorCode,
+  readPathStats,
+  writeFileAtomicallyAtPath,
+} from "../atomic-file";
 import { mergeProviderOptions } from "../provider-options";
-interface OpenAiApiKeyAuthStateInput {
+
+interface OpenAiRuntimeHomeInput {
+  driverGeneration: number;
+  driverInstanceId: DriverInstanceId;
+  persistentRuntimeHome: string;
+  signal?: AbortSignal;
+}
+
+interface OpenAiRuntimeHomeState {
+  cleanupPath: string;
+  cleanupRoot: string | null;
+  readonly dev: number;
+  readonly ino: number;
+  readonly persistentRuntimeHome: string;
+  readonly runtimeHome: string;
+}
+
+interface OpenAiAuthStateInput {
   env: NodeJS.ProcessEnv;
   runtimeHome: string;
 }
 
-interface OpenAiApiKeyAuthStateResult {
+interface OpenAiAuthStateResult {
   authJsonPath: string;
   hasApiKey: boolean;
   written: boolean;
@@ -34,10 +59,18 @@ const OPENAI_COMPATIBLE_API_KEY_ENV_NAME = "OPENAI_COMPATIBLE_API_KEY";
 const OPENAI_COMPATIBLE_BASE_URL_ENV_NAME = "OPENAI_COMPATIBLE_BASE_URL";
 const OPENAI_BASE_URL_ENV_NAME = "OPENAI_BASE_URL";
 const DISABLED_RUNTIME_FEATURES = ["plugins", "remote_plugin", "tool_suggest"] as const;
+const OPENAI_RUNTIME_HOME_PREFIX = "/tmp/.mosoo-agent-driver-openai-";
+const OPENAI_RUNTIME_HOME_CLEANUP_PREFIX = "/tmp/.mosoo-agent-driver-openai-cleanup-";
+const PERSISTENT_OPENAI_RUNTIME_DIRECTORIES = [
+  "sessions",
+  "archived_sessions",
+  "memories",
+  "memories_extensions",
+] as const;
 
 function readOpenAiApiKey(env: NodeJS.ProcessEnv): string | null {
   const value = env["OPENAI_API_KEY"]?.trim();
-  return value ?? null;
+  return value || null;
 }
 
 function readEnvVar(env: NodeJS.ProcessEnv, key: string): string | null {
@@ -45,114 +78,179 @@ function readEnvVar(env: NodeJS.ProcessEnv, key: string): string | null {
   return value || null;
 }
 
-function toTomlString(value: string): string {
-  return JSON.stringify(value);
-}
-
-function toTomlKeySegment(value: string): string {
-  return /^[A-Za-z0-9_-]+$/.test(value) ? value : toTomlString(value);
-}
-
-function toTomlInlineValue(value: JsonValue, path: string): string {
-  if (value === null) {
-    throw new Error(`OpenAI provider option ${path} cannot be null in config.toml.`);
-  }
-
-  if (typeof value === "string") {
-    return toTomlString(value);
-  }
-
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((entry, index) => toTomlInlineValue(entry, `${path}[${index}]`)).join(", ")}]`;
-  }
-
-  return `{ ${Object.entries(value)
-    .map(
-      ([key, entry]) => `${toTomlKeySegment(key)} = ${toTomlInlineValue(entry, `${path}.${key}`)}`,
-    )
-    .join(", ")} }`;
-}
-
-function isTomlTable(value: unknown): value is JsonObject {
-  return isJsonObject(value);
-}
-
-function appendTomlObject(
-  lines: string[],
-  object: Record<string, JsonValue>,
-  path: string[] = [],
+function assertOpenAiRuntimeIdentity(
+  driverInstanceId: DriverInstanceId,
+  driverGeneration: number,
 ): void {
-  if (path.length > 0) {
-    if (lines.length > 0 && lines.at(-1) !== "") {
-      lines.push("");
+  if (
+    !isDriverId(driverInstanceId) ||
+    !Number.isSafeInteger(driverGeneration) ||
+    driverGeneration < 0
+  ) {
+    throw new TypeError("OpenAI runtime identity is invalid.");
+  }
+}
+
+async function readRuntimeHomeIdentity(runtimeHome: string): Promise<{
+  readonly dev: number;
+  readonly ino: number;
+} | null> {
+  try {
+    const stats = await lstat(runtimeHome);
+    return stats.isDirectory() && !stats.isSymbolicLink()
+      ? { dev: stats.dev, ino: stats.ino }
+      : null;
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function createOpenAiRuntimeHome(
+  input: OpenAiRuntimeHomeInput,
+): Promise<OpenAiRuntimeHomeState> {
+  input.signal?.throwIfAborted();
+  assertOpenAiRuntimeIdentity(input.driverInstanceId, input.driverGeneration);
+  const persistentRuntimeHome = resolve(input.persistentRuntimeHome);
+  await using persistentHome = await ensureAbsoluteRealDirectory(
+    persistentRuntimeHome,
+    "Persistent OpenAI runtime home",
+    input.signal,
+  );
+  const persistentAuthPath = join(persistentRuntimeHome, "auth.json");
+
+  if ((await readPathStats(persistentAuthPath)) !== null) {
+    throw new Error(
+      `Persistent OpenAI runtime home must not contain credentials: ${persistentAuthPath}.`,
+    );
+  }
+
+  for (const name of PERSISTENT_OPENAI_RUNTIME_DIRECTORIES) {
+    await using _directory = await ensureRealDirectoryAt(
+      persistentHome,
+      name,
+      `Persistent OpenAI ${name} directory`,
+      input.signal,
+    );
+  }
+
+  input.signal?.throwIfAborted();
+  const runtimeHome = await mkdtemp(
+    `${OPENAI_RUNTIME_HOME_PREFIX}${input.driverInstanceId}-g${String(input.driverGeneration)}-`,
+  );
+
+  try {
+    input.signal?.throwIfAborted();
+    await chmod(runtimeHome, 0o700);
+    await Promise.all(
+      PERSISTENT_OPENAI_RUNTIME_DIRECTORIES.map((name) =>
+        symlink(join(persistentRuntimeHome, name), join(runtimeHome, name)),
+      ),
+    );
+    input.signal?.throwIfAborted();
+    const identity = await readRuntimeHomeIdentity(runtimeHome);
+
+    if (identity === null) {
+      throw new Error(`OpenAI runtime home is not a real directory: ${runtimeHome}.`);
     }
 
-    lines.push(`[${path.map(toTomlKeySegment).join(".")}]`);
-  }
-
-  const nestedEntries: [string, JsonObject][] = [];
-
-  for (const [key, value] of Object.entries(object)) {
-    if (isTomlTable(value)) {
-      nestedEntries.push([key, value]);
-    } else {
-      lines.push(
-        `${toTomlKeySegment(key)} = ${toTomlInlineValue(value, [...path, key].join("."))}`,
+    return {
+      cleanupPath: runtimeHome,
+      cleanupRoot: null,
+      ...identity,
+      persistentRuntimeHome,
+      runtimeHome,
+    };
+  } catch (error) {
+    try {
+      await rm(runtimeHome, { force: true, recursive: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "OpenAI runtime home creation and cleanup failed.",
       );
     }
-  }
-
-  for (const [key, value] of nestedEntries) {
-    appendTomlObject(lines, value, [...path, key]);
+    throw error;
   }
 }
 
-function stringifyToml(object: Record<string, JsonValue>): string {
-  const lines: string[] = [];
-  appendTomlObject(lines, object);
-  return `${lines.join("\n")}\n`;
-}
+export async function cleanupOpenAiRuntimeHome(state: OpenAiRuntimeHomeState): Promise<boolean> {
+  let cleanupRoot = state.cleanupRoot;
 
-async function writeFileIfChanged(
-  path: string,
-  contents: string,
-  options?: { mode?: number },
-): Promise<boolean> {
-  const existing = await readFile(path, "utf8").catch(() => null);
+  if (cleanupRoot === null) {
+    cleanupRoot = await mkdtemp(OPENAI_RUNTIME_HOME_CLEANUP_PREFIX);
+    const cleanupPath = join(cleanupRoot, "runtime-home");
 
-  if (existing === contents) {
-    if (options?.mode !== undefined) {
-      const fileStat = await stat(path);
-      const currentMode = fileStat.mode & 0o777;
-
-      if (currentMode !== options.mode) {
-        await chmod(path, options.mode);
+    try {
+      await rename(state.cleanupPath, cleanupPath);
+    } catch (error) {
+      let cleanupError: unknown = null;
+      try {
+        await rmdir(cleanupRoot);
+      } catch (failure) {
+        cleanupError = failure;
       }
+
+      if (hasErrorCode(error, "ENOENT") && cleanupError === null) {
+        return false;
+      }
+      throw cleanupError === null
+        ? error
+        : new AggregateError([error, cleanupError], "OpenAI cleanup quarantine failed.");
     }
 
-    return false;
+    state.cleanupPath = cleanupPath;
+    state.cleanupRoot = cleanupRoot;
   }
 
-  await writeFile(path, contents, { encoding: "utf8" });
+  const identity = await readRuntimeHomeIdentity(state.cleanupPath);
 
-  if (options?.mode !== undefined) {
-    await chmod(path, options.mode);
+  if (identity === null) {
+    if ((await readPathStats(state.cleanupPath)) !== null) {
+      throw new Error(
+        `OpenAI cleanup preserved an unexpected runtime home at ${state.cleanupPath}.`,
+      );
+    }
+    await rmdir(cleanupRoot);
+    state.cleanupPath = state.runtimeHome;
+    state.cleanupRoot = null;
+    return true;
   }
 
-  return true;
+  if (identity.dev !== state.dev || identity.ino !== state.ino) {
+    throw new Error(`OpenAI cleanup preserved an unexpected runtime home at ${state.cleanupPath}.`);
+  }
+
+  try {
+    await rm(state.cleanupPath, { recursive: true });
+    await rmdir(cleanupRoot);
+    state.cleanupPath = state.runtimeHome;
+    state.cleanupRoot = null;
+    return true;
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      await rmdir(cleanupRoot).catch((cleanupError: unknown) => {
+        if (!hasErrorCode(cleanupError, "ENOENT")) {
+          throw cleanupError;
+        }
+      });
+      state.cleanupPath = state.runtimeHome;
+      state.cleanupRoot = null;
+      return true;
+    }
+    throw error;
+  }
 }
 
-export async function materializeOpenAiApiKeyAuthState(
-  input: OpenAiApiKeyAuthStateInput,
-): Promise<OpenAiApiKeyAuthStateResult> {
+export async function materializeOpenAiAuthState(
+  input: OpenAiAuthStateInput,
+): Promise<OpenAiAuthStateResult> {
   const authJsonPath = join(input.runtimeHome, "auth.json");
   const apiKey = readOpenAiApiKey(input.env);
 
-  if (!apiKey) {
+  if (apiKey === null) {
     return {
       authJsonPath,
       hasApiKey: false,
@@ -160,8 +258,7 @@ export async function materializeOpenAiApiKeyAuthState(
     };
   }
 
-  await mkdir(input.runtimeHome, { recursive: true });
-  const written = await writeFileIfChanged(
+  await writeFileAtomicallyAtPath(
     authJsonPath,
     `${JSON.stringify(
       {
@@ -179,7 +276,7 @@ export async function materializeOpenAiApiKeyAuthState(
   return {
     authJsonPath,
     hasApiKey: true,
-    written,
+    written: true,
   };
 }
 
@@ -224,8 +321,10 @@ export async function materializeOpenAiModelProviderConfig(
 
   const config = mergeProviderOptions(generatedConfig, input.providerOptions ?? {});
 
-  await mkdir(input.runtimeHome, { recursive: true });
-  const written = await writeFileIfChanged(configTomlPath, stringifyToml(config));
+  const written = await writeFileAtomicallyAtPath(configTomlPath, Bun.TOML.stringify(config)!, {
+    mode: 0o666,
+    skipIfUnchanged: true,
+  });
 
   return {
     configTomlPath,

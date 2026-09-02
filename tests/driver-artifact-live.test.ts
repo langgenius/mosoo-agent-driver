@@ -6,12 +6,14 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   DriverArtifactTestController,
   expectedDriverCapabilities,
   type DriverArtifactBootPayload,
   type DriverArtifactTestEvent,
 } from "./driver-artifact-test-controller";
+import { messageText } from "./driver-event-test-helpers";
 
 const LIVE_START_TIMEOUT_MS = 120_000;
 const LIVE_TURN_TIMEOUT_MS = 180_000;
@@ -282,7 +284,7 @@ function readLiveConfig(): LiveConfig {
     assertCommandVersion(
       openAiCommand,
       ["--version"],
-      resolve(process.cwd(), "node_modules", "@openai", "codex-sdk", "package.json"),
+      resolve(process.cwd(), "node_modules", "@openai", "codex", "package.json"),
       "OpenAI app-server",
     );
   }
@@ -343,16 +345,14 @@ const runtimeCases: LiveRuntimeCase[] = [
     suite: "anthropic",
     transport: "claude-agent-sdk",
   } satisfies LiveRuntimeCase,
-  ...config.openCodeModels.map(
-    (model): LiveRuntimeCase => ({
-      model,
-      nativeResumeKind: "acp_session_id",
-      provider: "openrouter",
-      runtime: "acp-fallback",
-      suite: "opencode",
-      transport: "acp-fallback",
-    }),
-  ),
+  ...config.openCodeModels.map((model): LiveRuntimeCase => ({
+    model,
+    nativeResumeKind: "acp_session_id",
+    provider: "openrouter",
+    runtime: "acp-fallback",
+    suite: "opencode",
+    transport: "acp-fallback",
+  })),
 ].filter((runtimeCase) => config.suite === "all" || config.suite === runtimeCase.suite);
 const representativeOpenCodeModel =
   config.openCodeModels.find((model) => model.includes("/deepseek/")) ?? config.openCodeModels[0]!;
@@ -384,26 +384,25 @@ function payloadRecord(event: DriverArtifactTestEvent): Record<string, unknown> 
 }
 
 function eventText(events: readonly DriverArtifactTestEvent[]): string {
-  const finalText = events
+  const finalMessageId = events
     .filter((event) => event.kind === "run.completed")
-    .map((event) => payloadRecord(event)["finalMessageText"])
+    .map((event) => payloadRecord(event)["finalMessageId"])
     .findLast((value): value is string => typeof value === "string" && value.length > 0);
 
-  if (finalText !== undefined) {
-    return finalText;
+  if (finalMessageId !== undefined) {
+    return messageText(events, finalMessageId);
   }
 
-  return events
-    .flatMap((event) => {
-      const payload = payloadRecord(event);
-
-      if (event.kind === "message.delta" && typeof payload["contentDelta"] === "string") {
-        return [payload["contentDelta"]];
+  const messageIds = new Set(
+    events.flatMap((event) => {
+      if (event.kind !== "message.added" && event.kind !== "message.delta") {
+        return [];
       }
-
-      return [];
-    })
-    .join("");
+      const messageId = payloadRecord(event)["messageId"];
+      return typeof messageId === "string" ? [messageId] : [];
+    }),
+  );
+  return [...messageIds].map((messageId) => messageText(events, messageId)).join("");
 }
 
 function eventOutputText(events: readonly DriverArtifactTestEvent[]): string {
@@ -693,9 +692,8 @@ function expectSingleRunLifecycle(
   if (expectations.requireFinalMessage) {
     const terminal = terminalEvents[0]!;
     const finalMessageId = payloadString(terminal, "finalMessageId");
-    const finalMessageText = payloadString(terminal, "finalMessageText");
     expect(finalMessageId).not.toBeNull();
-    expect(finalMessageText).not.toBeNull();
+    expect(payloadRecord(terminal)).not.toHaveProperty("finalMessageText");
     expect(
       runEvents.some(
         (event) =>
@@ -703,47 +701,8 @@ function expectSingleRunLifecycle(
           payloadString(event, "messageId") === finalMessageId,
       ),
     ).toBe(true);
-    const completedAgentMessageIds = runEvents
-      .filter(
-        (event) => event.kind === "message.completed" && payloadRecord(event)["role"] === "agent",
-      )
-      .map((event) => payloadString(event, "messageId"))
-      .filter((messageId): messageId is string => messageId !== null);
-    expect(completedAgentMessageIds.length).toBeGreaterThan(0);
-    expect(finalMessageId).toBe(completedAgentMessageIds.at(-1));
-
-    let reconstructedFinalMessageText = "";
-    for (const event of runEvents.filter(
-      (candidate) =>
-        payloadString(candidate, "messageId") === finalMessageId &&
-        (candidate.kind === "message.added" || candidate.kind === "message.delta"),
-    )) {
-      const payload = payloadRecord(event);
-      if (event.kind === "message.delta") {
-        const contentDelta = payloadString(event, "contentDelta");
-        expect(contentDelta).not.toBeNull();
-        reconstructedFinalMessageText += contentDelta ?? "";
-        continue;
-      }
-
-      const content = payload["content"];
-      reconstructedFinalMessageText =
-        typeof content === "string"
-          ? content
-          : Array.isArray(content)
-            ? content
-                .flatMap((block) => {
-                  const text =
-                    typeof block === "object" && block !== null && !Array.isArray(block)
-                      ? (block as Record<string, unknown>)["text"]
-                      : null;
-                  return typeof text === "string" ? [text] : [];
-                })
-                .join("")
-            : reconstructedFinalMessageText;
-    }
+    const reconstructedFinalMessageText = messageText(runEvents, finalMessageId!);
     expect(reconstructedFinalMessageText.length).toBeGreaterThan(0);
-    expect(finalMessageText).toBe(reconstructedFinalMessageText);
   }
 }
 
@@ -838,6 +797,7 @@ function createBootPayload(input: {
   readonly sessionId: string;
 }): DriverArtifactBootPayload {
   const runtimeCase = input.runtimeCase;
+  const sandboxId = createTestId();
 
   return {
     bootToken: `artifact-test-${input.driverInstanceId}`,
@@ -881,7 +841,7 @@ function createBootPayload(input: {
             executionOwnerUserId: createTestId(),
             type: "agent",
           },
-          sandboxId: createTestId(),
+          sandboxId,
           sandboxKind: "cattle",
           sandboxSessionId: createTestId(),
           sandboxSubjectId: input.sessionId,
@@ -897,10 +857,10 @@ function createBootPayload(input: {
       skills: [],
     },
     heartbeatIntervalMs: 60_000,
-    protocolVersion: 2,
+    protocolVersion: DRIVER_PROTOCOL_VERSION,
     runtime: runtimeCase.runtime,
     runtimeTransport: runtimeCase.transport,
-    sandboxId: createTestId(),
+    sandboxId,
     traceparent: "00-00000000000000000000000000000001-0000000000000001-01",
   };
 }
@@ -2181,6 +2141,7 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
           commandId: startBoundaryCancelId,
           kind: "turn.cancel",
           reason: "live.cancel.start_boundary",
+          runId: startBoundary.runId,
         });
         await controller.waitForCommandUpdate(
           (update) => update.commandId === startBoundaryCancelId && update.status === "accepted",
@@ -2260,7 +2221,12 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         }
       });
       const cancelId = `cancel-${createTestId()}`;
-      controller.enqueue({ commandId: cancelId, kind: "turn.cancel", reason: "live.cancel" });
+      controller.enqueue({
+        commandId: cancelId,
+        kind: "turn.cancel",
+        reason: "live.cancel",
+        runId: active.runId,
+      });
       const [inputUpdate, cancelUpdate, cancelledEvent] = await Promise.all([
         controller.waitForCommandTerminal(active.commandId, LIVE_TURN_TIMEOUT_MS),
         controller.waitForCommandTerminal(cancelId, LIVE_TURN_TIMEOUT_MS),
@@ -2293,7 +2259,12 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         "run.cancelled",
       );
       const replayIndex = controller.commandUpdates.length;
-      controller.enqueue({ commandId: cancelId, kind: "turn.cancel", reason: "live.cancel" });
+      controller.enqueue({
+        commandId: cancelId,
+        kind: "turn.cancel",
+        reason: "live.cancel",
+        runId: active.runId,
+      });
       expect(
         (await controller.waitForCommandTerminal(cancelId, LIVE_STOP_TIMEOUT_MS, replayIndex))
           .status,
@@ -2313,10 +2284,11 @@ async function testCancellation(runtimeCase: LiveRuntimeCase): Promise<void> {
         commandId: idleCancelId,
         kind: "turn.cancel",
         reason: "live.idle.cancel",
+        runId: active.runId,
       });
       expect(
         (await controller.waitForCommandTerminal(idleCancelId, LIVE_STOP_TIMEOUT_MS)).status,
-      ).toBe("completed");
+      ).toBe("failed");
 
       const events = await runTurn(
         controller,
@@ -2430,6 +2402,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         commandId: cancelId,
         kind: "turn.cancel",
         reason: "live.permission.cancel",
+        runId: cancelled.runId,
       });
       const [inputUpdate, cancelUpdate, cancelledEvent, cancelledResolution] = await Promise.all([
         controller.waitForCommandTerminal(cancelled.commandId, LIVE_TURN_TIMEOUT_MS),
@@ -2482,10 +2455,11 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "allow_once",
         kind: "permission.resolve",
         requestId: cancelledRequestId,
+        runId: cancelled.runId,
       });
       expect(
         (await controller.waitForCommandTerminal(lateResolveId, LIVE_STOP_TIMEOUT_MS)).status,
-      ).toBe("completed");
+      ).toBe("failed");
       expect(
         controller.events.filter(
           (event) =>
@@ -2511,6 +2485,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "reject_once",
         kind: "permission.resolve",
         requestId: rejectedRequestId,
+        runId: rejected.runId,
       });
       const [rejectUpdate, rejectedUpdate, rejectedResolution, rejectedEvent] = await Promise.all([
         controller.waitForCommandTerminal(rejectId, LIVE_TURN_TIMEOUT_MS),
@@ -2567,6 +2542,7 @@ async function testSupervisedPermission(runtimeCase: LiveRuntimeCase): Promise<v
         decision: "allow_once",
         kind: "permission.resolve",
         requestId: allowedRequestId,
+        runId: allowed.runId,
       });
       const [resolveUpdate, allowedUpdate, allowedResolution, completedEvent] = await Promise.all([
         controller.waitForCommandTerminal(resolveId, LIVE_TURN_TIMEOUT_MS),

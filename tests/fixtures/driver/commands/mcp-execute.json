@@ -3,6 +3,7 @@
   "commandId": "command-mcp-1",
   "kind": "mcp.execute",
   "requestId": "request-1",
+  "runId": "01J00000000000000000000012",
   "serverId": "server-1",
   "toolCallId": "tool-1",
   "toolName": "complete"

@@ -1,7 +1,23 @@
+export type DriverTurnCancellationSource = "session.stop" | "shutdown" | "turn.cancel";
+
 export class DriverTurnCancelledError extends Error {
-  constructor(reason: string) {
+  readonly #resumeCancellation = new AbortController();
+  readonly resumeSignal = this.#resumeCancellation.signal;
+
+  get resumeAllowed(): boolean {
+    return !this.resumeSignal.aborted;
+  }
+
+  constructor(reason: string, source: DriverTurnCancellationSource = "turn.cancel") {
     super(reason);
     this.name = "DriverTurnCancelledError";
+    if (source !== "turn.cancel") {
+      this.#resumeCancellation.abort();
+    }
+  }
+
+  preventResume(): void {
+    this.#resumeCancellation.abort();
   }
 }
 

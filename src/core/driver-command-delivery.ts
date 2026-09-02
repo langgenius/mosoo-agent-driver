@@ -14,11 +14,13 @@ const COMMAND_UPDATE_TIMEOUT_MS = 1_000;
 const RUN_TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS = 250;
 const TERMINAL_UPDATE_MAX_ATTEMPTS = 3;
 
-export interface TerminalCommandUpdate {
-  error?: RunError;
-  result?: RuntimeCommandResult;
-  status: "cancelled" | "completed" | "failed";
-}
+export type TerminalCommandUpdate =
+  | { readonly status: "cancelled" }
+  | {
+      readonly result?: Exclude<RuntimeCommandResult, null> | undefined;
+      readonly status: "completed";
+    }
+  | { readonly error: RunError; readonly status: "failed" };
 
 export type RunTerminalUpdate =
   | {
@@ -29,21 +31,8 @@ export type RunTerminalUpdate =
       status: "failed";
     };
 
-type RunTerminalDelivery =
-  | {
-      delivered: boolean;
-      status: "completed";
-      task?: Promise<void>;
-    }
-  | {
-      delivered: boolean;
-      error: RunError;
-      status: "failed";
-      task?: Promise<void>;
-    };
-
 export interface TrackedCommand {
-  readonly command: RuntimeCommand;
+  readonly identity: unknown;
   delivery: Promise<void>;
   terminal?: TerminalCommandUpdate;
   terminalTask?: Promise<void>;
@@ -70,25 +59,19 @@ function toErrorMessage(error: unknown, fallback: string): string {
 async function sendCommandUpdate(
   runtimeContext: AgentDriverContext,
   command: RuntimeCommand,
-  update: {
-    error?: RunError;
-    result?: RuntimeCommandResult;
-    status: "accepted" | "cancelled" | "completed" | "failed";
-  },
+  update: { readonly status: "accepted" } | TerminalCommandUpdate,
   signal: AbortSignal,
 ): Promise<void> {
-  const delivery = structuredClone({
-    commandId: command.commandId,
-    ...(update.error === undefined ? {} : { error: update.error }),
-    ...(update.result === undefined ? {} : { result: update.result }),
-    status: update.status,
-  });
+  const delivery = structuredClone({ commandId: command.commandId, ...update });
   await raceWithAbort(runtimeContext.ports.eventSink.commandUpdate(delivery, signal), signal);
 
   runtimeContext.logger.debug("driver.runtime.command.status.sent", {
     command: summarizeRuntimeCommand(command),
-    ...(update.error ? { error: update.error } : {}),
-    result: update.result ? summarizeRuntimeCommandResult(update.result) : null,
+    ...(update.status === "failed" ? { error: update.error } : {}),
+    result:
+      update.status === "completed" && update.result !== undefined
+        ? summarizeRuntimeCommandResult(update.result)
+        : null,
     status: update.status,
   });
 }
@@ -96,22 +79,16 @@ async function sendCommandUpdate(
 export class DriverCommandDelivery {
   readonly #shutdownSignal: AbortSignal;
   readonly #trackedCommands = new Map<string, TrackedCommand>();
-  #runTerminal: RunTerminalDelivery | null = null;
 
   constructor(shutdownSignal: AbortSignal) {
     this.#shutdownSignal = shutdownSignal;
   }
 
-  receive(command: RuntimeCommand): CommandReceipt {
-    const tracked = this.#trackedCommands.get(command.commandId);
+  receive(command: RuntimeCommand, identity: unknown = command): CommandReceipt {
+    const replay = this.replay(command, identity);
 
-    if (tracked !== undefined) {
-      if (!isDeepStrictEqual(tracked.command, command)) {
-        throw new Error(
-          `Driver command ${command.commandId} was replayed with changed identity or content.`,
-        );
-      }
-      return { replay: true, tracked };
+    if (replay !== null) {
+      return replay;
     }
 
     if (this.#trackedCommands.size >= MAX_TRACKED_COMMANDS) {
@@ -119,19 +96,37 @@ export class DriverCommandDelivery {
     }
 
     const added: TrackedCommand = {
-      command: structuredClone(command),
       delivery: Promise.resolve(),
+      identity: structuredClone(identity),
     };
     this.#trackedCommands.set(command.commandId, added);
     return { replay: false, tracked: added };
+  }
+
+  replay(command: RuntimeCommand, identity: unknown = command): CommandReceipt | null {
+    const tracked = this.#trackedCommands.get(command.commandId);
+
+    if (tracked !== undefined) {
+      if (!isDeepStrictEqual(tracked.identity, identity)) {
+        throw new Error(
+          `Driver command ${command.commandId} was replayed with changed identity or content.`,
+        );
+      }
+      return { replay: true, tracked };
+    }
+    return null;
   }
 
   hasTerminal(commandId: string): boolean {
     return this.#trackedCommands.get(commandId)?.terminal !== undefined;
   }
 
-  resetRunTerminal(): void {
-    this.#runTerminal = null;
+  reject(
+    runtimeContext: AgentDriverContext,
+    command: RuntimeCommand,
+    update: TerminalCommandUpdate,
+  ): Promise<void> {
+    return this.#deliverTerminal(runtimeContext, command, structuredClone(update));
   }
 
   accept(
@@ -197,59 +192,6 @@ export class DriverCommandDelivery {
       () => {},
     );
     await task;
-  }
-
-  claimRunTerminal(
-    socket: DriverRuntimeIo,
-    status: "completed" | "failed",
-    error?: RunError,
-  ): Promise<void> {
-    let terminal = this.#runTerminal;
-
-    if (terminal === null) {
-      if (status === "failed" && error === undefined) {
-        return Promise.reject(new Error("Failed run terminal requires an error."));
-      }
-
-      terminal =
-        status === "completed"
-          ? { delivered: false, status }
-          : { delivered: false, error: structuredClone(error!), status };
-      this.#runTerminal = terminal;
-    }
-
-    if (terminal.status !== status) {
-      return Promise.resolve();
-    }
-    if (
-      terminal.status === "failed" &&
-      (error === undefined || !isDeepStrictEqual(terminal.error, error))
-    ) {
-      return Promise.reject(new Error("Failed run terminal was retried with a different error."));
-    }
-    if (terminal.delivered) {
-      return Promise.resolve();
-    }
-    if (terminal.task !== undefined) {
-      return terminal.task;
-    }
-
-    const task = deliverRunTerminal(socket, terminal);
-    terminal.task = task;
-    void task.then(
-      () => {
-        if (terminal.task === task) {
-          terminal.delivered = true;
-          delete terminal.task;
-        }
-      },
-      () => {
-        if (terminal.task === task) {
-          delete terminal.task;
-        }
-      },
-    );
-    return task;
   }
 
   async #deliverTerminal(

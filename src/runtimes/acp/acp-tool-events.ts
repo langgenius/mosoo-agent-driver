@@ -3,9 +3,9 @@ import { isDeepStrictEqual } from "node:util";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
 import {
+  MAX_ACP_LOSSLESS_EVENT_BYTES,
   isRecord,
   readNonEmptyString,
-  readNullableString,
   readNumber,
   readRecord,
   readString,
@@ -13,7 +13,20 @@ import {
 } from "./acp-types";
 import type { JsonObject } from "./acp-types";
 
-export type RuntimeToolStatus = "completed" | "failed" | "running";
+export type RuntimeToolStatus = "cancelled" | "completed" | "failed" | "running";
+
+// Completed calls are retained only to suppress bounded late replays. They do
+// not participate in terminal settlement admission: only open calls can emit
+// terminal closures. The cache has its own independent memory bound.
+const MAX_ACP_COMPLETED_TOOL_HISTORY_BYTES = MAX_ACP_LOSSLESS_EVENT_BYTES;
+const MAX_ACP_COMPLETED_TOOL_HISTORY_ITEMS = 1_024;
+
+interface AcpToolState {
+  readonly completed: boolean;
+  readonly hasNonzeroExit: boolean;
+  readonly snapshot: JsonObject;
+  readonly started: boolean;
+}
 
 function readToolDisplayString(value: unknown): string | undefined {
   const display = stringifyForDisplay(value);
@@ -41,24 +54,52 @@ function hasNonzeroExecuteExit(kind: unknown, update: JsonObject | null): boolea
 }
 
 export class AcpToolEventState {
-  readonly #completed = new Set<string>();
-  readonly #nonzeroExecuteExits = new Set<string>();
-  readonly #snapshots = new Map<string, JsonObject>();
-  readonly #started = new Set<string>();
+  #hadActivity = false;
+  #tools = new Map<string, AcpToolState>();
 
   hasActivity(): boolean {
-    return this.#started.size > 0;
+    return this.#hadActivity;
   }
 
   hasStarted(toolCallId: string): boolean {
-    return this.#started.has(toolCallId);
+    return this.#tools.get(toolCallId)?.started ?? false;
+  }
+
+  openItemCount(): number {
+    let count = 0;
+
+    for (const tool of this.#tools.values()) {
+      if (tool.started && !tool.completed) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  retainedOpenState(): readonly JsonObject[] {
+    return [...this.#tools.values()].flatMap((tool) =>
+      tool.started && !tool.completed ? [tool.snapshot] : [],
+    );
+  }
+
+  compactHistory(): void {
+    this.#trimCompletedHistory();
   }
 
   clear(): void {
-    this.#completed.clear();
-    this.#nonzeroExecuteExits.clear();
-    this.#snapshots.clear();
-    this.#started.clear();
+    this.#hadActivity = false;
+    this.#tools.clear();
+  }
+
+  checkpoint(): () => void {
+    const hadActivity = this.#hadActivity;
+    const tools = new Map([...this.#tools].map(([toolCallId, tool]) => [toolCallId, { ...tool }]));
+
+    return () => {
+      this.#hadActivity = hadActivity;
+      this.#tools = tools;
+    };
   }
 
   patch(input: {
@@ -67,40 +108,48 @@ export class AcpToolEventState {
     toolCallId: string;
     update: JsonObject | null;
   }): { changed: boolean; payload: JsonObject; status: RuntimeToolStatus } {
-    const previous = this.#snapshots.get(input.toolCallId);
-    const previousStatus = previous?.["status"];
-    const kind = readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool";
+    const previous = this.#tools.get(input.toolCallId);
+    const previousSnapshot = previous?.snapshot;
+    const previousStatus = previousSnapshot?.["status"];
+    const kind = readNonEmptyString(input.update, "kind") ?? previousSnapshot?.["kind"] ?? "tool";
     const nextStatus = input.status ?? "running";
 
-    if (hasNonzeroExecuteExit(kind, input.update)) {
-      this.#nonzeroExecuteExits.add(input.toolCallId);
-    }
+    const hasNonzeroExit =
+      (previous?.hasNonzeroExit ?? false) || hasNonzeroExecuteExit(kind, input.update);
 
     const status =
-      previousStatus === "completed" || previousStatus === "failed"
+      previousStatus === "cancelled" ||
+      previousStatus === "completed" ||
+      previousStatus === "failed"
         ? previousStatus
-        : nextStatus === "completed" && this.#nonzeroExecuteExits.has(input.toolCallId)
+        : nextStatus === "completed" && hasNonzeroExit
           ? "failed"
           : nextStatus;
     // The projection layer links tool calls to their assistant message via
     // parentMessageId; keep the first observed parent for the call's lifetime.
     const parentMessageId =
-      (typeof previous?.["parentMessageId"] === "string"
-        ? previous["parentMessageId"]
+      (typeof previousSnapshot?.["parentMessageId"] === "string"
+        ? previousSnapshot["parentMessageId"]
         : undefined) ?? input.parentMessageId;
+    const title = readNonEmptyString(input.update, "title") ?? previousSnapshot?.["title"];
     const payload = {
-      ...previous,
+      ...previousSnapshot,
       ...toToolCallPayload(input.toolCallId, status, input.update),
       kind,
       ...(parentMessageId === undefined ? {} : { parentMessageId }),
       status,
-      title: readNullableString(input.update, "title") ?? previous?.["title"] ?? null,
+      ...(typeof title === "string" ? { title } : {}),
       toolCallId: input.toolCallId,
     };
-    const changed = previous === undefined || !isDeepStrictEqual(previous, payload);
+    const changed = previousSnapshot === undefined || !isDeepStrictEqual(previousSnapshot, payload);
 
-    if (changed) {
-      this.#snapshots.set(input.toolCallId, structuredClone(payload));
+    if (changed || hasNonzeroExit !== previous?.hasNonzeroExit) {
+      this.#tools.set(input.toolCallId, {
+        completed: previous?.completed ?? false,
+        hasNonzeroExit,
+        snapshot: changed ? structuredClone(payload) : previous!.snapshot,
+        started: previous?.started ?? false,
+      });
     }
 
     return { changed, payload, status };
@@ -112,18 +161,24 @@ export class AcpToolEventState {
     toolCallId: string;
     update: JsonObject | null;
   }): DriverEventInput | null {
-    if (this.#completed.has(input.toolCallId)) {
+    const tool = this.#tools.get(input.toolCallId);
+
+    if (tool === undefined) {
+      throw new Error("ACP tool completion requires a projected tool call.");
+    }
+    if (tool.completed) {
+      this.#trimCompletedHistory();
       return null;
     }
 
-    this.#completed.add(input.toolCallId);
+    this.#tools.set(input.toolCallId, { ...tool, completed: true });
+    this.#trimCompletedHistory();
     return {
       kind: "item.completed",
       payload: {
         error: input.status === "failed" ? readString(input.update, "error") : undefined,
         itemId: input.toolCallId,
         itemType: "tool_call",
-        result: input.update?.["rawOutput"],
         status: input.status,
       },
       runId: input.runId,
@@ -137,16 +192,16 @@ export class AcpToolEventState {
   }): DriverEventInput[] {
     const events: DriverEventInput[] = [];
 
-    for (const itemId of this.#started) {
-      if (this.#completed.has(itemId)) {
+    for (const [itemId, tool] of this.#tools) {
+      if (!tool.started || tool.completed) {
         continue;
       }
 
-      this.#completed.add(itemId);
+      this.#tools.set(itemId, { ...tool, completed: true });
       events.push({
         kind: "tool.call.updated",
         payload: {
-          ...this.#snapshots.get(itemId),
+          ...(input.error === undefined ? {} : { error: input.error }),
           status: input.status,
           toolCallId: itemId,
         },
@@ -164,6 +219,8 @@ export class AcpToolEventState {
       });
     }
 
+    this.#trimCompletedHistory();
+
     return events;
   }
 
@@ -173,11 +230,17 @@ export class AcpToolEventState {
     title: string;
     toolCallId: string;
   }): DriverEventInput[] {
-    if (this.#started.has(input.toolCallId)) {
+    const tool = this.#tools.get(input.toolCallId);
+
+    if (tool?.started) {
       return [];
     }
+    if (tool === undefined) {
+      throw new Error("ACP tool start requires a projected tool call.");
+    }
 
-    this.#started.add(input.toolCallId);
+    this.#hadActivity = true;
+    this.#tools.set(input.toolCallId, { ...tool, started: true });
     return [
       {
         kind: "item.started",
@@ -191,6 +254,29 @@ export class AcpToolEventState {
       },
     ];
   }
+
+  #trimCompletedHistory(): void {
+    const completed = [...this.#tools].filter(([, tool]) => tool.completed);
+    let retainedItems = completed.length;
+    let bytes = completed.reduce(
+      (total, [toolCallId, tool]) =>
+        total + Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8"),
+      0,
+    );
+
+    for (const [toolCallId, tool] of completed) {
+      if (
+        retainedItems <= MAX_ACP_COMPLETED_TOOL_HISTORY_ITEMS &&
+        bytes <= MAX_ACP_COMPLETED_TOOL_HISTORY_BYTES
+      ) {
+        break;
+      }
+
+      this.#tools.delete(toolCallId);
+      retainedItems -= 1;
+      bytes -= Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8");
+    }
+  }
 }
 
 export function toRuntimeToolStatus(status: string | null): RuntimeToolStatus {
@@ -198,7 +284,7 @@ export function toRuntimeToolStatus(status: string | null): RuntimeToolStatus {
     return "completed";
   }
 
-  if (status === "failed" || status === "cancelled") {
+  if (status === "failed") {
     return "failed";
   }
 
@@ -212,9 +298,10 @@ export function toToolCallPayload(
 ): JsonObject {
   const content = readToolContentString(update?.["content"]);
   const kind = readNonEmptyString(update, "kind");
+  const name = readNonEmptyString(update, "name");
   const rawInput = readToolDisplayString(update?.["rawInput"]);
   const rawOutput = readToolDisplayString(update?.["rawOutput"]);
-  const title = readNullableString(update, "title");
+  const title = readNonEmptyString(update, "title");
   const locations = update?.["locations"];
 
   return {
@@ -222,7 +309,8 @@ export function toToolCallPayload(
     ...(kind === null ? {} : { kind }),
     ...(locations === undefined || locations === null ? {} : { locations }),
     ...(rawInput === undefined ? {} : { rawInput }),
-    ...(rawOutput === undefined ? {} : { rawOutput }),
+    ...(rawOutput === undefined || rawOutput === content ? {} : { rawOutput }),
+    ...(name === null ? {} : { name }),
     status,
     ...(title === undefined || title === null ? {} : { title }),
     toolCallId,

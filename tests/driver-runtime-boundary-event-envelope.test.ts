@@ -20,9 +20,19 @@ describe("driver runtime boundary", () => {
       const releaseAccepted = Promise.withResolvers<void>();
       let sideEffects = 0;
       let terminalStarted = false;
-      backend.handleInput = async () => {
+      backend.handleInput = async (context, _input, runId) => {
         sideEffects += 1;
         await releaseEffect.promise;
+        await context.ports.eventSink.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { status: "completed" },
+              runId,
+              sourceEventId: `serialized-replay.completed:${runId}`,
+            },
+          ],
+        });
       };
       const command: RuntimeCommand =
         kind === "input"
@@ -38,11 +48,15 @@ describe("driver runtime boundary", () => {
               commandId: "serialized-mcp-replay",
               kind: "mcp.execute",
               requestId: "serialized-request",
+              runId: DRIVER_TEST_IDS.runId,
               serverId: "mcp-linear",
               toolCallId: "tool-serialized",
               toolName: "createIssue",
             };
-      const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
+      const socket = new FakeDriverRuntimeIo(
+        [command, structuredClone(command)],
+        kind === "mcp" ? DRIVER_TEST_IDS.runId : undefined,
+      );
       const recordUpdate = socket.commandUpdate.bind(socket);
       let accepted = 0;
       socket.commandUpdate = async (update, signal) => {
@@ -84,7 +98,6 @@ describe("driver runtime boundary", () => {
       expect(terminalStarted).toBe(false);
       releaseAccepted.resolve();
       await run;
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(socket.updates.map((update) => update.status)).toEqual([
@@ -100,8 +113,18 @@ describe("driver runtime boundary", () => {
     async (kind) => {
       const backend = createBackend();
       let sideEffects = 0;
-      backend.handleInput = async () => {
+      backend.handleInput = async (context, _input, runId) => {
         sideEffects += 1;
+        await context.ports.eventSink.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { status: "completed" },
+              runId,
+              sourceEventId: `joined-replay.completed:${runId}`,
+            },
+          ],
+        });
       };
       const command: RuntimeCommand =
         kind === "input"
@@ -117,11 +140,15 @@ describe("driver runtime boundary", () => {
               commandId: "joined-mcp-replay",
               kind: "mcp.execute",
               requestId: "joined-request",
+              runId: DRIVER_TEST_IDS.runId,
               serverId: "mcp-linear",
               toolCallId: "tool-joined",
               toolName: "createIssue",
             };
-      const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
+      const socket = new FakeDriverRuntimeIo(
+        [command, structuredClone(command)],
+        kind === "mcp" ? DRIVER_TEST_IDS.runId : undefined,
+      );
       const terminalEntered = Promise.withResolvers<void>();
       const releaseTerminal = Promise.withResolvers<void>();
       const nextCommand = socket.nextCommand.bind(socket);
@@ -174,7 +201,6 @@ describe("driver runtime boundary", () => {
       expect(socket.updates.filter((update) => update.status === "accepted")).toHaveLength(1);
       releaseTerminal.resolve();
       await run;
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(terminalAttempts).toBe(2);
@@ -191,8 +217,18 @@ describe("driver runtime boundary", () => {
     async (kind) => {
       const backend = createBackend();
       let sideEffects = 0;
-      backend.handleInput = async () => {
+      backend.handleInput = async (context, _input, runId) => {
         sideEffects += 1;
+        await context.ports.eventSink.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { status: "completed" },
+              runId,
+              sourceEventId: `failed-joined-replay.completed:${runId}`,
+            },
+          ],
+        });
       };
       const command: RuntimeCommand =
         kind === "input"
@@ -208,11 +244,15 @@ describe("driver runtime boundary", () => {
               commandId: "failed-joined-mcp-replay",
               kind: "mcp.execute",
               requestId: "failed-joined-request",
+              runId: DRIVER_TEST_IDS.runId,
               serverId: "mcp-linear",
               toolCallId: "tool-failed-joined",
               toolName: "createIssue",
             };
-      const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
+      const socket = new FakeDriverRuntimeIo(
+        [command, structuredClone(command)],
+        kind === "mcp" ? DRIVER_TEST_IDS.runId : undefined,
+      );
       const terminalEntered = Promise.withResolvers<void>();
       const releaseTerminal = Promise.withResolvers<void>();
       const nextCommand = socket.nextCommand.bind(socket);
@@ -276,7 +316,6 @@ describe("driver runtime boundary", () => {
         label: `${kind} shared terminal failure`,
         timeoutMs: 1_500,
       });
-      await logger.destroy();
 
       expect(attemptsBeforeRelease).toBe(1);
       expect(outcome).toMatchObject({
@@ -299,11 +338,15 @@ describe("driver runtime boundary", () => {
         commandId: `sink-mutation-${terminalStatus}`,
         kind: "mcp.execute",
         requestId: "sink-mutation-request",
+        runId: DRIVER_TEST_IDS.runId,
         serverId: "mcp-linear",
         toolCallId: "tool-sink-mutation",
         toolName: "createIssue",
       };
-      const socket = new FakeDriverRuntimeIo([command, structuredClone(command)]);
+      const socket = new FakeDriverRuntimeIo(
+        [command, structuredClone(command)],
+        DRIVER_TEST_IDS.runId,
+      );
       const terminalEntered = Promise.withResolvers<void>();
       const releaseTerminal = Promise.withResolvers<void>();
       const nextCommand = socket.nextCommand.bind(socket);
@@ -326,23 +369,23 @@ describe("driver runtime boundary", () => {
 
         terminalSnapshots.push(structuredClone(update));
         if (terminalSnapshots.length === 1) {
-          if (update.result !== undefined && update.result !== null) {
+          if (update.status === "completed" && update.result !== undefined) {
             Reflect.set(update.result, "outputText", "mutated synchronously");
           }
-          if (update.error !== undefined) {
+          if (update.status === "failed") {
             Reflect.set(update.error, "message", "mutated synchronously");
           }
           terminalEntered.resolve();
           await releaseTerminal.promise;
 
           const debug =
-            update.result === undefined || update.result === null
+            update.status !== "completed" || update.result === undefined
               ? undefined
               : (Reflect.get(update.result, "debug") as { nested?: string } | undefined);
           if (debug !== undefined) {
             debug.nested = "mutated after await";
           }
-          if (update.error !== undefined) {
+          if (update.status === "failed") {
             Reflect.set(update.error.details, "commandId", "mutated after await");
           }
         }
@@ -377,7 +420,6 @@ describe("driver runtime boundary", () => {
       await terminalEntered.promise;
       releaseTerminal.resolve();
       await run;
-      await logger.destroy();
 
       expect(executeCalls).toBe(1);
       expect(terminalSnapshots).toHaveLength(2);
@@ -391,8 +433,18 @@ describe("driver runtime boundary", () => {
     async (kind) => {
       const backend = createBackend();
       let sideEffects = 0;
-      backend.handleInput = async () => {
+      backend.handleInput = async (context, _input, runId) => {
         sideEffects += 1;
+        await context.ports.eventSink.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { status: "completed" },
+              runId,
+              sourceEventId: `cached-replay.completed:${runId}`,
+            },
+          ],
+        });
       };
       const runtimeState = new DriverRuntimeStateMachine("ready");
       const command: RuntimeCommand =
@@ -409,11 +461,15 @@ describe("driver runtime boundary", () => {
               commandId: "mcp-report-failure",
               kind: "mcp.execute",
               requestId: "request-report-failure",
+              runId: DRIVER_TEST_IDS.runId,
               serverId: "mcp-linear",
               toolCallId: "tool-report-failure",
               toolName: "createIssue",
             };
-      const socket = new FakeDriverRuntimeIo([command]);
+      const socket = new FakeDriverRuntimeIo(
+        [command],
+        kind === "mcp" ? DRIVER_TEST_IDS.runId : undefined,
+      );
       const recordUpdate = socket.commandUpdate.bind(socket);
       const terminalAttempts: string[] = [];
       socket.commandUpdate = async (update, signal) => {
@@ -446,7 +502,6 @@ describe("driver runtime boundary", () => {
       });
 
       await dispatcher.run(socket, logger);
-      await logger.destroy();
 
       expect(sideEffects).toBe(1);
       expect(terminalAttempts).toEqual(["completed", "completed", "completed"]);

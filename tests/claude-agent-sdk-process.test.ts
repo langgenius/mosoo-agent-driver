@@ -98,6 +98,27 @@ async function expectExited(pid: number): Promise<void> {
 }
 
 describe.skipIf(process.platform !== "linux")("Claude Agent SDK process supervision", () => {
+  test("does not claim supervision when spawn throws synchronously", async () => {
+    const controller = new AbortController();
+    const processTasks = new Set<Promise<void>>();
+
+    expect(() =>
+      spawnClaudeCodeProcess(
+        {
+          command: "invalid\0command",
+          args: [],
+          env: {},
+          signal: controller.signal,
+        },
+        () => {},
+        controller.signal,
+        processTasks,
+      ),
+    ).toThrow("null bytes");
+    expect(processTasks.size).toBe(0);
+    await expect(drainClaudeTasks(processTasks)).resolves.toBeUndefined();
+  });
+
   test("does not retry cleanup before its original attempt fails", async () => {
     const cleanupError = new Error("initial cleanup failed");
     const initialCleanup = Promise.withResolvers<void>();

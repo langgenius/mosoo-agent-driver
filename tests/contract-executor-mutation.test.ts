@@ -46,7 +46,7 @@ function session(id = createDriverId()): Session {
 
 function snapshot(sessionValue = session()): SessionSnapshot {
   return validateSessionSnapshot({
-    protocolVersion: 2,
+    protocolVersion: 3,
     revision: 0,
     capturedAt: time,
     session: sessionValue,
@@ -754,7 +754,7 @@ describe("contract Preview lane", () => {
 describe("contract closed core", () => {
   test("keeps Coordinator resource policies out of peer negotiation", () => {
     const initialize = {
-      protocolVersion: 2,
+      protocolVersion: 3,
       role: "observer",
       implementation: { name: "observer", version: "1" },
       capabilities: {},
@@ -780,7 +780,7 @@ describe("contract closed core", () => {
 
     expect(
       initializeResultSchema.safeParse({
-        protocolVersion: 2,
+        protocolVersion: 3,
         implementation: { name: "coordinator", version: "1" },
         capabilities: {},
         limits,

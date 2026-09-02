@@ -1,7 +1,7 @@
 {
   "actor": "driver",
   "delivery": "lossless",
-  "driverInstanceId": "01J00000000000000000000008",
+  "driverInstanceId": "01J0000000000000000000000F",
   "id": "01J0000000000000000000000G",
   "kind": "usage.updated",
   "occurredAt": "2026-05-26T00:00:00.000Z",
@@ -11,10 +11,10 @@
     "model": "model-1",
     "outputTokens": 3
   },
-  "runId": "01J0000000000000000000000N",
+  "runId": "01J00000000000000000000012",
   "runtimeId": "runtime-1",
-  "schemaVersion": "2026-05-26",
-  "sessionId": "01J0000000000000000000000K",
+  "schemaVersion": "2026-08-29",
+  "sessionId": "01J00000000000000000000008",
   "traceId": "trace-1",
   "visibility": "participant"
 }

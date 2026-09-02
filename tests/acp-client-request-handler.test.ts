@@ -1,29 +1,201 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
-  type DriverPermissionRequest,
 } from "../src/core/driver-permission-broker";
-import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
+import type { DriverPermissionRequest } from "../src/host-ports";
+import {
+  DriverEventRejectedError,
+  type DriverRuntimeEventPort,
+} from "../src/core/driver-runtime-io";
+import type { DriverEventInput } from "../src/protocol/events";
+import { createDisabledLogger } from "../src/observability";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
-import { AcpTurnEventState } from "../src/runtimes/acp/acp-event-translator";
+import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
+import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import { beginAcpTranscript } from "./acp-test-helpers";
+import { driverStartInput } from "./driver-boot-payload-fixture";
+
+const BASE_HANDLER_OPTIONS = {
+  allowedRoots: [],
+  cwd: "/workspace",
+  env: {},
+  isCancelling: () => false,
+  nativeSessionId: () => "native-session-1",
+  onUpdateFailure: () => {},
+} satisfies Omit<ConstructorParameters<typeof AcpClientRequestHandler>[0], "push" | "turnEvents">;
 
 describe("ACP client request handler", () => {
+  test("drains a committed file report and fences writes admitted after stop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-drain-"));
+    const reportEntered = Promise.withResolvers<void>();
+    const releaseReport = Promise.withResolvers<void>();
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+      ports: {
+        file: {
+          reportChanged: async () => {
+            reportEntered.resolve();
+            await releaseReport.promise;
+          },
+        },
+      },
+    });
+    const path = join(root, "committed.txt");
+
+    try {
+      await handler.initializePathScope();
+      const write = handler.writeTextFile(context, {
+        content: "committed",
+        path,
+        sessionId: "native-session-1",
+      });
+      await reportEntered.promise;
+      expect(await readFile(path, "utf8")).toBe("committed");
+
+      handler.beginStop();
+      const drain = handler.drainFileWrites();
+      let drained = false;
+      void drain.then(() => {
+        drained = true;
+      });
+      await Bun.sleep(0);
+      expect(drained).toBe(false);
+      await expect(
+        handler.writeTextFile(context, {
+          content: "late",
+          path: join(root, "late.txt"),
+          sessionId: "native-session-1",
+        }),
+      ).rejects.toThrow("stopping");
+
+      releaseReport.resolve();
+      await expect(Promise.all([write, drain])).resolves.toEqual([{}, undefined]);
+    } finally {
+      releaseReport.resolve();
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("fails the file drain when notification fails after atomic commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-failure-"));
+    const failure = new Error("committed file report failed");
+    const fatalFailures: Error[] = [];
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      onUpdateFailure: (error) => fatalFailures.push(error),
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+      ports: {
+        file: { reportChanged: async () => Promise.reject(failure) },
+      },
+    });
+    const path = join(root, "committed.txt");
+
+    try {
+      await handler.initializePathScope();
+      await expect(
+        handler.writeTextFile(context, {
+          content: "committed",
+          path,
+          sessionId: "native-session-1",
+        }),
+      ).rejects.toBe(failure);
+      expect(await readFile(path, "utf8")).toBe("committed");
+      await expect(handler.drainFileWrites()).rejects.toBe(failure);
+      await expect(handler.drainFileWrites()).resolves.toBeUndefined();
+      expect(fatalFailures).toEqual([failure]);
+    } finally {
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("does not poison turn or stop drains when a write fails before commit", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-client-file-precommit-"));
+    const fatalFailures: Error[] = [];
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      cwd: root,
+      onUpdateFailure: (error) => fatalFailures.push(error),
+      push: async () => {},
+      turnEvents: new AcpAssistantTranscriptState(),
+    });
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+    });
+    const cancellation = new AbortController();
+    const failure = new Error("pre-commit cancellation");
+
+    try {
+      await handler.initializePathScope();
+      handler.openFileWriteIngress();
+      cancellation.abort(failure);
+      await expect(
+        handler.writeTextFile(
+          context,
+          {
+            content: "not committed",
+            path: join(root, "cancelled.txt"),
+            sessionId: "native-session-1",
+          },
+          cancellation.signal,
+        ),
+      ).rejects.toBe(failure);
+      handler.closeFileWriteIngress();
+      await expect(handler.drainTurnFileWrites()).resolves.toBeUndefined();
+      handler.beginStop();
+      await expect(handler.drainFileWrites()).resolves.toBeUndefined();
+      expect(fatalFailures).toEqual([]);
+    } finally {
+      await handler.closePathScope();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("rejects permission requests outside an active turn", async () => {
     let permissionRequests = 0;
     let pushes = 0;
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async () => {
         pushes += 1;
       },
-      turnEvents: new AcpTurnEventState(),
+      turnEvents: new AcpAssistantTranscriptState(),
     });
     const context = {
       ports: {
@@ -50,20 +222,10 @@ describe("ACP client request handler", () => {
   });
 
   test("closes permission ingress before a turn terminal and reopens it for the next turn", async () => {
-    const turnEvents = new AcpTurnEventState();
+    const turnEvents = beginAcpTranscript();
     let permissionRequests = 0;
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async () => {},
       turnEvents,
     });
@@ -96,16 +258,11 @@ describe("ACP client request handler", () => {
   test("suppresses turn-scoped session updates before a turn is active", async () => {
     const pushedReasons: string[] = [];
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason, _events) => {
         pushedReasons.push(reason);
       },
-      turnEvents: new AcpTurnEventState(),
+      turnEvents: new AcpAssistantTranscriptState(),
     });
 
     for (const replaying of [false, true]) {
@@ -135,16 +292,11 @@ describe("ACP client request handler", () => {
   test("discards deferred updates and permits a later gate", async () => {
     const pushedReasons: string[] = [];
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason) => {
         pushedReasons.push(reason);
       },
-      turnEvents: new AcpTurnEventState(),
+      turnEvents: new AcpAssistantTranscriptState(),
     });
     const notification = {
       sessionId: "native-session-1",
@@ -169,47 +321,40 @@ describe("ACP client request handler", () => {
 
   test("passes the runtime environment to terminal child processes", async () => {
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
+      ...BASE_HANDLER_OPTIONS,
       cwd: process.cwd(),
       env: { PATH: "/artifact/bin:/runtime/bin" },
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
       push: async () => {},
-      turnEvents: new AcpTurnEventState(),
+      turnEvents: new AcpAssistantTranscriptState(),
     });
     const context = {} as never;
-    const { terminalId } = await handler.createTerminal(context, {
-      args: ["-e", "process.stdout.write(process.env.PATH ?? '')"],
-      command: process.execPath,
-      env: [],
-      sessionId: "native-session-1",
-    });
+    await handler.initializePathScope();
 
-    await handler.waitForTerminalExit({ sessionId: "native-session-1", terminalId });
+    try {
+      const { terminalId } = await handler.createTerminal(context, {
+        args: ["-e", "process.stdout.write(process.env.PATH ?? '')"],
+        command: process.execPath,
+        env: [],
+        sessionId: "native-session-1",
+      });
 
-    expect(handler.terminalOutput({ sessionId: "native-session-1", terminalId }).output).toBe(
-      "/artifact/bin:/runtime/bin",
-    );
-    await handler.releaseTerminal(context, { sessionId: "native-session-1", terminalId });
+      await handler.waitForTerminalExit({ sessionId: "native-session-1", terminalId });
+
+      expect(handler.terminalOutput({ sessionId: "native-session-1", terminalId }).output).toBe(
+        "/artifact/bin:/runtime/bin",
+      );
+      await handler.releaseTerminal(context, { sessionId: "native-session-1", terminalId });
+    } finally {
+      await handler.stopTerminals(context);
+    }
   });
 
   test("serializes official SDK notifications and drains scoped suppression", async () => {
     const gate = Promise.withResolvers<void>();
     const pushedReasons: string[] = [];
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason) => {
         pushedReasons.push(reason);
         if (pushedReasons.length === 1) {
@@ -259,24 +404,15 @@ describe("ACP client request handler", () => {
     expect(pushedReasons).toEqual(["driver.acp.session.update"]);
   });
 
-  test("does not hold session update admission behind delivery acknowledgement", async () => {
+  test("keeps accepting bounded updates while a prior delivery is pending", async () => {
     const firstDelivery = Promise.withResolvers<void>();
     const firstAdmitted = Promise.withResolvers<void>();
     const failures: Error[] = [];
     const pending: Promise<void>[] = [];
-    const turnEvents = new AcpTurnEventState();
+    const turnEvents = beginAcpTranscript();
     let pushes = 0;
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
+      ...BASE_HANDLER_OPTIONS,
       onUpdateFailure: (error) => failures.push(error),
       push: async () => {
         pushes += 1;
@@ -315,21 +451,134 @@ describe("ACP client request handler", () => {
     expect(pushes).toBe(1_025);
   });
 
+  test("admits replay and completed history but rejects genuinely open retained state", async () => {
+    const createHandler = () => {
+      const failures: Error[] = [];
+      const turnEvents = beginAcpTranscript();
+      return {
+        failures,
+        handler: new AcpClientRequestHandler({
+          ...BASE_HANDLER_OPTIONS,
+          onUpdateFailure: (error) => failures.push(error),
+          push: async () => {},
+          turnEvents,
+        }),
+      };
+    };
+
+    const repeated = createHandler();
+    const repeatedUpdate = {
+      sessionId: "native-session-1",
+      update: {
+        rawOutput: "x".repeat(4 * 1_024),
+        sessionUpdate: "tool_call" as const,
+        status: "in_progress" as const,
+        title: "tool",
+        toolCallId: "same-tool",
+      },
+    };
+    for (let index = 0; index < 100; index += 1) {
+      await repeated.handler.enqueueUpdate({} as never, repeatedUpdate);
+    }
+    expect(repeated.failures).toEqual([]);
+
+    const completed = createHandler();
+    for (let index = 0; index < 600; index += 1) {
+      await completed.handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          status: "completed",
+          title: "tool",
+          toolCallId: `tool-${index}`,
+        },
+      });
+    }
+    expect(completed.failures).toEqual([]);
+
+    const open = createHandler();
+    for (let index = 0; index < 509; index += 1) {
+      await open.handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          status: "in_progress",
+          title: "tool",
+          toolCallId: `open-tool-${index}`,
+        },
+      });
+    }
+    await expect(
+      open.handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          status: "in_progress",
+          title: "tool",
+          toolCallId: "open-tool-over-limit",
+        },
+      }),
+    ).rejects.toThrow("ACP turn state exceeds 510 retained open items");
+    expect(open.failures).toHaveLength(1);
+
+    const byteFlood = createHandler();
+    const content = "x".repeat(8 * 1_024);
+    for (let index = 0; index < 47; index += 1) {
+      await byteFlood.handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          content: { text: content, type: "text" },
+          messageId: "native-message-1",
+          sessionUpdate: "agent_message_chunk",
+        },
+      });
+    }
+    await expect(
+      byteFlood.handler.enqueueUpdate({} as never, {
+        sessionId: "native-session-1",
+        update: {
+          content: { text: content, type: "text" },
+          messageId: "native-message-1",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+    ).rejects.toThrow("ACP turn state exceeds 393216 retained UTF-8 bytes");
+    expect(byteFlood.failures).toHaveLength(1);
+  });
+
+  test("routes permission turn-state overflow through provider fatal cleanup", async () => {
+    const failures: Error[] = [];
+    const turnEvents = beginAcpTranscript();
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      onUpdateFailure: (error) => failures.push(error),
+      push: async () => {},
+      turnEvents,
+    });
+
+    await expect(
+      handler.requestPermission(
+        { ports: { permission: { request: async () => "reject_once" } } } as never,
+        "r".repeat(400_000),
+        {
+          options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+          sessionId: "native-session-1",
+          toolCall: {
+            status: "in_progress",
+            title: "Run command",
+          } as never,
+        },
+      ),
+    ).rejects.toThrow("ACP turn state exceeds 393216 retained UTF-8 bytes");
+    expect(failures).toHaveLength(1);
+  });
+
   test("fails every queued update after the first commit failure", async () => {
     const failures: Error[] = [];
     let pushes = 0;
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
+      ...BASE_HANDLER_OPTIONS,
       onUpdateFailure: (error) => failures.push(error),
       push: async () => {
         pushes += 1;
@@ -362,28 +611,270 @@ describe("ACP client request handler", () => {
     expect(failures).toHaveLength(1);
   });
 
+  test("does not translate a queued update before the prior checkpoint settles", async () => {
+    const firstPublishing = Promise.withResolvers<void>();
+    const rejectFirst = Promise.withResolvers<void>();
+    const attempts: unknown[] = [];
+    const turnEvents = beginAcpTranscript();
+    const createHandler = (
+      push: ConstructorParameters<typeof AcpClientRequestHandler>[0]["push"],
+    ) =>
+      new AcpClientRequestHandler({
+        ...BASE_HANDLER_OPTIONS,
+        push,
+        turnEvents,
+      });
+    const handler = createHandler(async (_context, _reason, events) => {
+      attempts.push(structuredClone(events));
+      firstPublishing.resolve();
+      await rejectFirst.promise;
+      throw new Error("first update rejected");
+    });
+    const update = (messageId: string, text: string) => ({
+      sessionId: "native-session-1",
+      update: {
+        content: { text, type: "text" as const },
+        messageId,
+        sessionUpdate: "agent_message_chunk" as const,
+      },
+    });
+    const first = handler.enqueueUpdate({} as never, update("native-1", "first"));
+    const second = handler.enqueueUpdate({} as never, update("native-2", "second"));
+    void first.catch(() => {});
+    void second.catch(() => {});
+
+    await firstPublishing.promise;
+    await Promise.resolve();
+    expect(attempts).toHaveLength(1);
+    rejectFirst.resolve();
+    await expect(first).rejects.toThrow("first update rejected");
+    await expect(second).rejects.toThrow("first update rejected");
+
+    const replayed: unknown[] = [];
+    await expect(
+      createHandler(async (_context, _reason, events) => {
+        replayed.push(structuredClone(events));
+      }).enqueueUpdate({} as never, update("native-2", "second")),
+    ).resolves.toBeUndefined();
+    expect((replayed[0] as Array<{ kind: string }>).map((event) => event.kind)).toEqual([
+      "message.started",
+      "message.delta",
+    ]);
+  });
+
+  test("rolls back a rejected permission tool before translating a queued update", async () => {
+    const permissionPublishing = Promise.withResolvers<void>();
+    const rejectPermission = Promise.withResolvers<void>();
+    const updateAttempts: unknown[] = [];
+    const turnEvents = beginAcpTranscript();
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      push: async (_context, reason, events) => {
+        if (reason === "driver.acp.permission.tool") {
+          permissionPublishing.resolve();
+          await rejectPermission.promise;
+          throw new Error("permission tool rejected");
+        }
+
+        updateAttempts.push(structuredClone(events));
+      },
+      turnEvents,
+    });
+    const context = {
+      ports: {
+        permission: {
+          request: async () => "allow_once" as const,
+        },
+      },
+    } as never;
+    const permission = handler.requestPermission(context, 1, {
+      options: [{ kind: "allow_once", name: "Allow", optionId: "allow" }],
+      sessionId: "native-session-1",
+      toolCall: {
+        rawInput: "x".repeat(250_000),
+        status: "in_progress",
+        title: "Run command",
+        toolCallId: "tool-1",
+      },
+    });
+    void permission.catch(() => {});
+
+    await permissionPublishing.promise;
+    const update = handler.enqueueUpdate(context, {
+      sessionId: "native-session-1",
+      update: {
+        content: { text: "a".repeat(250_000), type: "text" },
+        messageId: "native-message-1",
+        sessionUpdate: "agent_message_chunk",
+      },
+    });
+    await Promise.resolve();
+    expect(updateAttempts).toHaveLength(0);
+
+    rejectPermission.resolve();
+    await expect(permission).rejects.toThrow("permission tool rejected");
+    await expect(update).resolves.toBeUndefined();
+    expect((updateAttempts[0] as Array<{ kind: string }>).map((event) => event.kind)).toEqual([
+      "message.started",
+      "message.delta",
+    ]);
+  });
+
+  test("commits a tool update after the publisher resumes a retained suffix", async () => {
+    const attempts: DriverEventInput[][] = [];
+    let attempt = 0;
+    let sequence = 0;
+    const turnEvents = beginAcpTranscript();
+    const context = {
+      logger: { debug: () => {} },
+      ports: {
+        eventSink: {
+          currentRunId: () => "run-1",
+          pushEvents: async ({ events }: { events: DriverEventInput[] }) => {
+            attempts.push(structuredClone(events));
+            attempt += 1;
+
+            if (attempt === 1) {
+              return {
+                accepted: [
+                  { eventId: events[0]!.sourceEventId, seq: ++sequence, type: events[0]!.kind },
+                ],
+              };
+            }
+
+            if (attempt === 2) {
+              throw new Error("tool update transport interrupted");
+            }
+
+            return {
+              accepted: events.map((event) => ({
+                eventId: event.sourceEventId,
+                seq: ++sequence,
+                type: event.kind,
+              })),
+            };
+          },
+        },
+      },
+    } as never;
+    const publisher = new DriverEventPublisher("acp-fallback", () => "native-session-1");
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      push: (pushContext, reason, events) => publisher.push(pushContext, reason, events),
+      turnEvents,
+    });
+
+    await expect(
+      handler.enqueueUpdate(context, {
+        sessionId: "native-session-1",
+        update: {
+          kind: "execute",
+          sessionUpdate: "tool_call",
+          status: "in_progress",
+          title: "Run command",
+          toolCallId: "tool-1",
+        },
+      }),
+    ).resolves.toBeUndefined();
+    const replayedSuffix = attempts[2];
+    expect(replayedSuffix?.map((event) => event.kind)).toEqual([
+      "item.started",
+      "tool.call.updated",
+    ]);
+
+    const followupStart = attempts.length;
+    await expect(
+      handler.enqueueUpdate(context, {
+        sessionId: "native-session-1",
+        update: {
+          rawOutput: "done",
+          sessionUpdate: "tool_call_update",
+          status: "completed",
+          toolCallId: "tool-1",
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(
+      attempts.slice(followupStart).flatMap((batch) => batch.map((event) => event.kind)),
+    ).toEqual(["tool.call.updated", "item.completed"]);
+  });
+
+  test("rolls back an unchanged tool update after an explicit sink rejection", async () => {
+    const attempts: DriverEventInput[][] = [];
+    let reject = true;
+    let sequence = 0;
+    const turnEvents = beginAcpTranscript();
+    const context = {
+      logger: { debug: () => {} },
+      ports: {
+        eventSink: {
+          currentRunId: () => "run-1",
+          pushEvents: async ({ events }: { events: DriverEventInput[] }) => {
+            attempts.push(structuredClone(events));
+            if (reject) {
+              throw new DriverEventRejectedError(
+                events[0]!.sourceEventId!,
+                new Error("tool update rejected"),
+              );
+            }
+
+            return {
+              accepted: events.map((event) => ({
+                eventId: event.sourceEventId,
+                seq: ++sequence,
+                type: event.kind,
+              })),
+            };
+          },
+        },
+      },
+    } as never;
+    const publisher = new DriverEventPublisher("acp-fallback", () => "native-session-1");
+    const createHandler = () =>
+      new AcpClientRequestHandler({
+        ...BASE_HANDLER_OPTIONS,
+        push: (pushContext, reason, events) => publisher.push(pushContext, reason, events),
+        turnEvents,
+      });
+    const notification = {
+      sessionId: "native-session-1",
+      update: {
+        kind: "execute" as const,
+        sessionUpdate: "tool_call" as const,
+        status: "in_progress" as const,
+        title: "Run command",
+        toolCallId: "tool-1",
+      },
+    };
+
+    await expect(createHandler().enqueueUpdate(context, notification)).rejects.toThrow(
+      "tool update rejected",
+    );
+    const firstToolEventId = attempts[0]!.at(-1)!.sourceEventId;
+    reject = false;
+    await expect(createHandler().enqueueUpdate(context, notification)).resolves.toBeUndefined();
+
+    expect(attempts.at(-1)!.map((event) => event.kind)).toEqual([
+      "message.started",
+      "item.started",
+      "tool.call.updated",
+    ]);
+    expect(attempts.at(-1)!.at(-1)!.sourceEventId).toBe(firstToolEventId);
+  });
+
   test.each(["update drain", "tool event"] as const)(
     "cancels a permission request while waiting on the %s boundary",
     async (boundary) => {
       const blocked = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
-      const turnEvents = new AcpTurnEventState();
+      const turnEvents = beginAcpTranscript();
       let cancelling = false;
       let permissionRequests = 0;
-      turnEvents.begin({
-        messageId: "message-1" as never,
-        runId: "run-1" as never,
-        sessionId: "native-session-1",
-      });
       const blockedReason =
         boundary === "update drain" ? "driver.acp.session.update" : "driver.acp.permission.tool";
       const handler = new AcpClientRequestHandler({
-        allowedRoots: [],
-        cwd: "/workspace",
-        env: {},
+        ...BASE_HANDLER_OPTIONS,
         isCancelling: () => cancelling,
-        nativeSessionId: () => "native-session-1",
-        onUpdateFailure: () => {},
         push: async (_context, reason) => {
           if (reason === blockedReason) {
             blocked.resolve();
@@ -432,20 +923,10 @@ describe("ACP client request handler", () => {
   test("rejects a permission when its turn ends during the update drain", async () => {
     const updatePublishing = Promise.withResolvers<void>();
     const releaseUpdate = Promise.withResolvers<void>();
-    const turnEvents = new AcpTurnEventState();
+    const turnEvents = beginAcpTranscript();
     let permissionRequests = 0;
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason) => {
         if (reason === "driver.acp.session.update") {
           updatePublishing.resolve();
@@ -490,20 +971,10 @@ describe("ACP client request handler", () => {
 
   test("leaves permission lifecycle events to the host port and keeps typed RPC IDs distinct", async () => {
     const eventKinds: string[] = [];
-    const requestIds: string[] = [];
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const requests: DriverPermissionRequest[] = [];
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, _reason, events) => {
         eventKinds.push(...events.map((event) => event.kind));
       },
@@ -512,8 +983,8 @@ describe("ACP client request handler", () => {
     const context = {
       ports: {
         permission: {
-          request: async ({ requestId }: { requestId: string }) => {
-            requestIds.push(requestId);
+          request: async (request: DriverPermissionRequest) => {
+            requests.push(request);
             return "allow_once" as const;
           },
         },
@@ -530,7 +1001,14 @@ describe("ACP client request handler", () => {
       ).resolves.toEqual({ outcome: { optionId: "allow", outcome: "selected" } });
     }
 
-    expect(requestIds).toEqual(["number:1", "string:1", "null"]);
+    expect(requests.map(({ requestId }) => requestId)).toEqual(["number:1", "string:1", "null"]);
+    expect(requests[0]).toEqual({
+      rawInput: "",
+      requestId: "number:1",
+      title: "Run command",
+      toolCallId: "tool-0",
+      toolKind: null,
+    });
     expect(eventKinds).not.toContain("permission.requested");
     expect(eventKinds).not.toContain("permission.resolved");
   });
@@ -543,19 +1021,9 @@ describe("ACP client request handler", () => {
   ] as const)(
     "maps a %s host decision to a %s option without widening scope",
     async (decision, optionKind, optionId, selectable) => {
-      const turnEvents = new AcpTurnEventState();
-      turnEvents.begin({
-        messageId: "message-1" as never,
-        runId: "run-1" as never,
-        sessionId: "native-session-1",
-      });
+      const turnEvents = beginAcpTranscript();
       const handler = new AcpClientRequestHandler({
-        allowedRoots: [],
-        cwd: "/workspace",
-        env: {},
-        isCancelling: () => false,
-        nativeSessionId: () => "native-session-1",
-        onUpdateFailure: () => {},
+        ...BASE_HANDLER_OPTIONS,
         push: async () => {},
         turnEvents,
       });
@@ -580,19 +1048,9 @@ describe("ACP client request handler", () => {
   test("returns cancelled when the SDK aborts a pending permission request", async () => {
     const entered = Promise.withResolvers<void>();
     const controller = new AbortController();
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async () => {},
       turnEvents,
     });
@@ -628,20 +1086,10 @@ describe("ACP client request handler", () => {
     const toolPublishing = Promise.withResolvers<void>();
     const releaseTool = Promise.withResolvers<void>();
     const controller = new AbortController();
-    const turnEvents = new AcpTurnEventState();
+    const turnEvents = beginAcpTranscript();
     let permissionRequests = 0;
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason) => {
         if (reason === "driver.acp.permission.tool") {
           toolPublishing.resolve();
@@ -694,19 +1142,9 @@ describe("ACP client request handler", () => {
       "resolved",
       new Error("permission transport unavailable"),
     );
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async () => {},
       turnEvents,
     });
@@ -733,7 +1171,7 @@ describe("ACP client request handler", () => {
     await expect(handler.drainPermissions()).resolves.toBeUndefined();
   });
 
-  test("keeps a late cancelled permission resolution on its originating run", async () => {
+  test("closes a late cancelled permission on its captured run after ownership changes", async () => {
     const requestedPublishing = Promise.withResolvers<void>();
     const releaseRequested = Promise.withResolvers<void>();
     let activeRunId = "run-1";
@@ -754,6 +1192,7 @@ describe("ACP client request handler", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -763,19 +1202,9 @@ describe("ACP client request handler", () => {
     const broker = new DriverPermissionBroker(() => null, {
       eventDeliveryTimeoutMs: 1_000,
     });
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: activeRunId as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript({ runId: activeRunId as never });
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async () => {},
       turnEvents,
     });
@@ -820,19 +1249,9 @@ describe("ACP client request handler", () => {
   test("closes update ingress and drains accepted work before stopping", async () => {
     const blocked = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const turnEvents = new AcpTurnEventState();
-    turnEvents.begin({
-      messageId: "message-1" as never,
-      runId: "run-1" as never,
-      sessionId: "native-session-1",
-    });
+    const turnEvents = beginAcpTranscript();
     const handler = new AcpClientRequestHandler({
-      allowedRoots: [],
-      cwd: "/workspace",
-      env: {},
-      isCancelling: () => false,
-      nativeSessionId: () => "native-session-1",
-      onUpdateFailure: () => {},
+      ...BASE_HANDLER_OPTIONS,
       push: async (_context, reason) => {
         if (reason === "driver.acp.session.update") {
           blocked.resolve();

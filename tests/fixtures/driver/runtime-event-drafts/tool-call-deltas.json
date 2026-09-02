@@ -1,0 +1,13 @@
+{
+  "delivery": "best_effort",
+  "kind": "tool.call.updated",
+  "payload": {
+    "future": {
+      "kept": true
+    },
+    "rawInputDelta": "{\"path\":",
+    "rawOutputDelta": "chunk",
+    "status": "running",
+    "toolCallId": "tool-delta-1"
+  }
+}

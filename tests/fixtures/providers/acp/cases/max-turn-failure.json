@@ -1,8 +1,7 @@
 {
   "begin": {
     "messageId": "message-1",
-    "runId": "run-1",
-    "sessionId": "session-1"
+    "runId": "run-1"
   },
   "updates": [
     {
@@ -47,23 +46,27 @@
         "parentMessageId": "assistant-message-1"
       },
       "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:tool-call:1"
+      "sourceEventId": "acp:run-1:tool-call:1"
     },
     {
-      "kind": "message.completed",
+      "kind": "message.failed",
       "payload": {
+        "error": {
+          "code": "acp.max_turn_requests",
+          "message": "ACP prompt stopped with max_turn_requests.",
+          "retryable": false
+        },
         "messageId": "assistant-message-1",
-        "role": "agent"
+        "role": "agent",
+        "stopReason": "max_turn_requests"
       },
       "runId": "run-1"
     },
     {
       "kind": "tool.call.updated",
       "payload": {
-        "kind": "tool",
-        "parentMessageId": "assistant-message-1",
-        "status": "completed",
-        "title": "Run command",
+        "error": "ACP prompt stopped with max_turn_requests.",
+        "status": "failed",
         "toolCallId": "tool-1"
       },
       "runId": "run-1"
@@ -71,15 +74,22 @@
     {
       "kind": "item.completed",
       "payload": {
+        "error": "ACP prompt stopped with max_turn_requests.",
         "itemId": "tool-1",
         "itemType": "tool_call",
-        "status": "completed"
+        "status": "failed"
       },
       "runId": "run-1"
     },
     {
-      "kind": "run.completed",
+      "kind": "run.failed",
       "payload": {
+        "error": {
+          "code": "acp.max_turn_requests",
+          "message": "ACP prompt stopped with max_turn_requests.",
+          "retryable": false
+        },
+        "recoverable": false,
         "stopReason": "max_turn_requests"
       },
       "runId": "run-1"

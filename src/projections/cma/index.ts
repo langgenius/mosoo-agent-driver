@@ -4,6 +4,7 @@ export {
   parseCmaInboundEvent,
   projectCmaInboundToDriverCommand,
   type CmaInboundEvent,
+  type CmaProjectedDriverCommand,
   type CmaUserCustomToolResultEvent,
   type CmaUserInterruptEvent,
   type CmaUserMessageEvent,

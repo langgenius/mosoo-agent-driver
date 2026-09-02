@@ -1,67 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
-import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
-import type { RunId } from "../src/protocol/id";
-import type { DriverEventBatchOutput } from "../src/protocol/orpc";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
-import { bootPayload } from "./driver-runtime-boundary-fixtures";
-
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "driver-event-publisher-test",
-    sink: async () => {},
-  });
-}
-
-function createEvent(kind: "message.started" | "message.completed"): DriverEventInput {
-  return {
-    kind,
-    payload: {
-      messageId: "message-1",
-      ...(kind === "message.started" ? { role: "agent" } : { stopReason: "end_turn" }),
-    },
-  };
-}
-
-function createDelta(contentDelta: string): DriverEventInput {
-  return {
-    delivery: "best_effort",
-    kind: "message.delta",
-    payload: {
-      contentDelta,
-      messageId: "message-1",
-      role: "agent",
-    },
-  };
-}
-
-function kinds(batches: readonly (readonly DriverEventInput[])[]): string[][] {
-  return batches.map((batch) => batch.map((event) => event.kind));
-}
-
-function createContext(input: {
-  currentRunId?: () => RunId | null;
-  pushEvents: (events: DriverEventInput[], signal?: AbortSignal) => Promise<DriverEventBatchOutput>;
-}) {
-  return createAgentDriverContext({
-    eventSink: {
-      commandUpdate: async () => {},
-      ...(input.currentRunId === undefined ? {} : { currentRunId: input.currentRunId }),
-      pushEvents: async ({ events, signal }) => input.pushEvents(events, signal),
-    },
-    logger: createTestLogger(),
-    payload: bootPayload,
-    permission: {
-      request: async () => "reject_once",
-    },
-  });
-}
+import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
 
 describe("DriverEventPublisher", () => {
   test("drains a partial receipt before resolving the same reliable push", async () => {
@@ -81,6 +24,7 @@ describe("DriverEventPublisher", () => {
         const acceptedEvents = attempts.length === 1 ? events.slice(0, 1) : events;
         return {
           accepted: acceptedEvents.map((event) => ({
+            eventId: event.sourceEventId!,
             seq: nextSeq++,
             type: event.kind,
           })),
@@ -106,7 +50,6 @@ describe("DriverEventPublisher", () => {
     ]);
     expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[1]?.sourceEventId);
     expect(publisher.lastAcceptedSeq()).toBe(42);
-    await context.logger.destroy();
   });
 
   test("fails a reliable push that makes no receipt progress and retries it later", async () => {
@@ -121,6 +64,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: 50 + index,
             type: event.kind,
           })),
@@ -141,7 +85,6 @@ describe("DriverEventPublisher", () => {
     expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
     expect(attempts[1]?.[1]?.sourceEventId).toBe(attempts[0]?.[1]?.sourceEventId);
     expect(publisher.lastAcceptedSeq()).toBe(52);
-    await context.logger.destroy();
   });
 
   test("retains only the unaccepted suffix after progress stops", async () => {
@@ -152,7 +95,7 @@ describe("DriverEventPublisher", () => {
 
         if (attempts.length === 1) {
           return {
-            accepted: [{ seq: 40, type: events[0]!.kind }],
+            accepted: [{ eventId: events[0]!.sourceEventId!, seq: 40, type: events[0]!.kind }],
           };
         }
 
@@ -162,6 +105,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: 50 + index,
             type: event.kind,
           })),
@@ -186,7 +130,6 @@ describe("DriverEventPublisher", () => {
     ]);
     expect(attempts[2]?.[0]?.sourceEventId).toBe(attempts[0]?.[1]?.sourceEventId);
     expect(publisher.lastAcceptedSeq()).toBe(51);
-    await context.logger.destroy();
   });
 
   test("reserves a full lossless lane beside queued best-effort deltas", async () => {
@@ -204,6 +147,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: attempts.length * 2_000 + index,
             type: event.kind,
           })),
@@ -237,7 +181,6 @@ describe("DriverEventPublisher", () => {
       "message.started",
       "message.completed",
     ]);
-    await context.logger.destroy();
   });
 
   test("takes ownership of a queued lossless array", async () => {
@@ -254,7 +197,11 @@ describe("DriverEventPublisher", () => {
         }
 
         return {
-          accepted: events.map((event, index) => ({ seq: index + 1, type: event.kind })),
+          accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
+            seq: index + 1,
+            type: event.kind,
+          })),
         };
       },
     });
@@ -269,7 +216,6 @@ describe("DriverEventPublisher", () => {
     await Promise.all([first, second]);
 
     expect(attempts.map((batch) => batch.length)).toEqual([1, 1]);
-    await context.logger.destroy();
   });
 
   test("takes deep ownership of queued lossless payloads", async () => {
@@ -294,7 +240,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -324,7 +270,6 @@ describe("DriverEventPublisher", () => {
       ["original", "message-1"],
     ]);
     expect(observed[2]?.sourceEventIds[0]).toBe(observed[1]?.sourceEventIds[0]);
-    await context.logger.destroy();
   });
 
   test("drops a rejected lossless draft without blocking a terminal event", async () => {
@@ -356,7 +301,6 @@ describe("DriverEventPublisher", () => {
       "unsupported",
     );
     expect(kinds([delivered])).toEqual([["message.completed"]]);
-    await context.logger.destroy();
   });
 
   test("rejects an oversized lossless batch before reading its payloads", async () => {
@@ -383,7 +327,6 @@ describe("DriverEventPublisher", () => {
       ),
     ).rejects.toThrow("exceeds 1024 events");
     expect(payloadReads).toBe(0);
-    await context.logger.destroy();
   });
 
   test("rejects a receipt for a later same-kind event", async () => {
@@ -396,7 +339,7 @@ describe("DriverEventPublisher", () => {
           return {
             accepted: [
               {
-                eventId: events[1]?.sourceEventId,
+                eventId: events[1]!.sourceEventId!,
                 seq: 1,
                 type: events[0]!.kind,
               },
@@ -406,7 +349,7 @@ describe("DriverEventPublisher", () => {
 
         return {
           accepted: events.map((event, index) => ({
-            eventId: event.sourceEventId,
+            eventId: event.sourceEventId!,
             seq: index + 2,
             type: event.kind,
           })),
@@ -419,29 +362,6 @@ describe("DriverEventPublisher", () => {
     await expect(publisher.push(context, "mismatched", firstBatch)).rejects.toThrow("event ID");
     await publisher.push(context, "retry", [createEvent("message.started")]);
     expect(attempt).toBe(2);
-    await context.logger.destroy();
-  });
-
-  test("gives a reused draft object a new identity after a successful push", async () => {
-    const attempts: DriverEventInput[][] = [];
-    const context = createContext({
-      pushEvents: async (events) => {
-        attempts.push(events);
-        return {
-          accepted: events.map((event, index) => ({ seq: index + 1, type: event.kind })),
-        };
-      },
-    });
-    const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-    const event = createEvent("message.completed");
-
-    await publisher.push(context, "first", [event]);
-    await publisher.push(context, "second", [event]);
-
-    expect(attempts[1]?.[0]?.sourceEventId).not.toBe(attempts[0]?.[0]?.sourceEventId);
-    expect(isDriverId(attempts[0]?.[0]?.sourceEventId)).toBe(true);
-    expect(isDriverId(attempts[1]?.[0]?.sourceEventId)).toBe(true);
-    await context.logger.destroy();
   });
 
   test.each([
@@ -477,11 +397,19 @@ describe("DriverEventPublisher", () => {
           attempts.push(events);
 
           if (attempts.length === 1) {
-            return { accepted: malformedReceipts };
+            return {
+              accepted: malformedReceipts.map(
+                (receipt: { readonly seq: number; readonly type: string }, index: number) => ({
+                  ...receipt,
+                  eventId: events[index]?.sourceEventId ?? "extra-event-id",
+                }),
+              ),
+            };
           }
 
           return {
             accepted: events.map((event, index) => ({
+              eventId: event.sourceEventId!,
               seq: 50 + index,
               type: event.kind,
             })),
@@ -503,7 +431,6 @@ describe("DriverEventPublisher", () => {
       expect(attempts[1]?.[0]?.sourceEventId).toBe(attempts[0]?.[0]?.sourceEventId);
       expect(attempts[1]?.[1]?.sourceEventId).toBe(attempts[0]?.[1]?.sourceEventId);
       expect(publisher.lastAcceptedSeq()).toBe(52);
-      await context.logger.destroy();
     },
   );
 });

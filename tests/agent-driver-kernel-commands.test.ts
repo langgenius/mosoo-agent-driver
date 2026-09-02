@@ -1,14 +1,24 @@
 import { describe, expect, test } from "bun:test";
 
+import { ACTIVE_INPUT_SETTLE_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import type {
   AgentDriverContext,
   AgentDriverContextPortOverrides,
 } from "../src/core/agent-driver-backend";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import type { DriverEventInput } from "../src/protocol/events";
-import type { RuntimeCommand } from "../src/runtime-command";
+import {
+  RUNTIME_COMMAND_MAX_UTF8_BYTES,
+  measureRuntimeCommandJson,
+  type RuntimeCommand,
+} from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
-import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
+import {
+  DRIVER_TEST_IDS,
+  bootPayload,
+  createBackend,
+  settleBackendInput,
+} from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
   test("does not publish diagnostics after an adapter run terminal", async () => {
@@ -22,6 +32,10 @@ describe("AgentDriverKernelCore", () => {
             payload: { startedAt: new Date().toISOString() },
             runId,
           },
+        ],
+      });
+      await context.ports.eventSink.pushEvents({
+        events: [
           {
             kind: "run.failed",
             payload: {
@@ -55,67 +69,17 @@ describe("AgentDriverKernelCore", () => {
     expect(events.map((event) => event.kind)).toEqual(["run.started", "run.failed"]);
   });
 
-  test("automatically retries final cleanup after shutdown times out during startup", async () => {
+  test("fails closed for late startup permissions before shutdown closes events", async () => {
     const backend = createBackend();
     const startEntered = Promise.withResolvers<void>();
-    const releaseStart = Promise.withResolvers<void>();
-    const finalCleanup = Promise.withResolvers<void>();
-    let resourceActive = false;
-    let stopCount = 0;
-    let startSignal: AbortSignal | undefined;
-    backend.start = async (_context, signal) => {
-      startSignal = signal;
-      startEntered.resolve();
-      await releaseStart.promise;
-      signal.throwIfAborted();
-      resourceActive = true;
-    };
-    backend.stop = async () => {
-      stopCount += 1;
-      resourceActive = false;
-
-      if (stopCount === 2) {
-        finalCleanup.resolve();
-      }
-    };
-    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
-
-    try {
-      const start = kernel.start(bootPayload);
-      await startEntered.promise;
-      await expect(kernel.stop("startup stop")).rejects.toThrow("timed out");
-      expect(startSignal?.aborted).toBe(true);
-      expect(startSignal?.reason).toMatchObject({ message: "startup stop" });
-      releaseStart.resolve();
-      await start;
-
-      const cleaned = await Promise.race([
-        finalCleanup.promise.then(() => true),
-        Bun.sleep(50).then(() => false),
-      ]);
-      expect(cleaned).toBe(true);
-      expect(stopCount).toBe(2);
-      expect(resourceActive).toBe(false);
-    } finally {
-      releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
-    }
-  });
-
-  test("fails closed for late startup permissions before deferred shutdown closes events", async () => {
-    const backend = createBackend();
-    const startEntered = Promise.withResolvers<void>();
+    const startAborted = Promise.withResolvers<void>();
     const releaseStart = Promise.withResolvers<void>();
     const latePermissionEntered = Promise.withResolvers<void>();
     let latePermission: Promise<unknown> | null = null;
+    let startSignal: AbortSignal | undefined;
     backend.start = async (context, signal) => {
+      startSignal = signal;
+      signal.addEventListener("abort", () => startAborted.resolve(), { once: true });
       startEntered.resolve();
       await releaseStart.promise;
       latePermission = context.ports.permission.request({
@@ -138,26 +102,25 @@ describe("AgentDriverKernelCore", () => {
         permissionPolicy: "supervised" as const,
       },
     };
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
+    let start: Promise<void> | null = null;
+    let stop: Promise<void> | null = null;
 
     try {
-      const start = kernel.start(payload);
+      start = kernel.start(payload);
       await startEntered.promise;
-      await expect(kernel.stop("startup stop")).rejects.toThrow("timed out");
+      stop = kernel.stop("startup stop");
+      await startAborted.promise;
+      expect(startSignal?.aborted).toBe(true);
+      expect(startSignal?.reason).toMatchObject({ message: "startup stop" });
       releaseStart.resolve();
       await latePermissionEntered.promise;
-      await start;
+      await expect(start).resolves.toBeUndefined();
+      await expect(stop).resolves.toBeUndefined();
       await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
       await expect(latePermission).resolves.toBe("reject_once");
     } finally {
       releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
+      await Promise.allSettled([start, stop].filter((task) => task !== null));
     }
   });
 
@@ -180,31 +143,99 @@ describe("AgentDriverKernelCore", () => {
         },
       },
     });
-    const text = "x".repeat(17 * 1_024 * 1_024);
+    const commandAtSize = (index: number) => {
+      const base = {
+        commandId: `large-command-${String(index)}`,
+        input: { text: "" },
+        kind: "input.start" as const,
+        requestId: `large-request-${String(index)}`,
+        runId: DRIVER_TEST_IDS.runId,
+      };
+      return {
+        ...base,
+        input: { text: "x".repeat(800 * 1_024 - measureRuntimeCommandJson(base)) },
+      };
+    };
 
     await kernel.start(bootPayload);
     await pollEntered.promise;
-    const first = kernel.dispatch({
-      commandId: "large-command-1",
-      input: { text },
-      kind: "input.start",
-      requestId: "large-request-1",
-      runId: DRIVER_TEST_IDS.runId,
-    });
-    void first.catch(() => {});
-    await expect(
-      kernel.dispatch({
-        commandId: "large-command-2",
-        input: { text },
-        kind: "input.start",
-        requestId: "large-request-2",
-        runId: DRIVER_TEST_IDS.runId,
-      }),
-    ).rejects.toThrow("UTF-8 JSON bytes");
+    const queued = Array.from({ length: 40 }, (_, index) => kernel.dispatch(commandAtSize(index)));
+    for (const pending of queued) void pending.catch(() => {});
+
+    expect(measureRuntimeCommandJson(commandAtSize(0))).toBe(800 * 1_024);
+    expect(800 * 1_024).toBeLessThan(RUNTIME_COMMAND_MAX_UTF8_BYTES);
+    await expect(kernel.dispatch(commandAtSize(40))).rejects.toThrow("UTF-8 JSON bytes");
 
     (context as AgentDriverContext | null)?.lifecycle.fail(failure);
-    await expect(first).rejects.toBe(failure);
+    for (const pending of queued) await expect(pending).rejects.toBe(failure);
     await expect(kernel.stop("join failure")).rejects.toBe(failure);
+  });
+
+  test("rejects an oversized MCP command before external effects", async () => {
+    const calls: string[] = [];
+    const base = {
+      argumentsJson: "",
+      commandId: "oversized-mcp",
+      kind: "mcp.execute" as const,
+      requestId: "request-1",
+      runId: DRIVER_TEST_IDS.runId,
+      serverId: "server-1",
+      toolCallId: "tool-call-1",
+      toolName: "tool-1",
+    };
+    const command = {
+      ...base,
+      argumentsJson: "x".repeat(
+        RUNTIME_COMMAND_MAX_UTF8_BYTES + 1 - measureRuntimeCommandJson(base),
+      ),
+    };
+    const kernel = new AgentDriverKernelCore({
+      backendFactory: () => createBackend(),
+      externalToolEffectLedger: {
+        async claimExternalToolEffect() {
+          calls.push("claim");
+          throw new Error("unexpected claim");
+        },
+        async observeExternalToolEffect() {
+          calls.push("observe");
+          throw new Error("unexpected observe");
+        },
+        async settleExternalToolEffect() {
+          calls.push("settle");
+          throw new Error("unexpected settle");
+        },
+      },
+      hostPorts: {
+        mcp: {
+          async prepare() {
+            calls.push("prepare");
+            throw new Error("unexpected prepare");
+          },
+        },
+      },
+    });
+
+    expect(measureRuntimeCommandJson(command)).toBe(RUNTIME_COMMAND_MAX_UTF8_BYTES + 1);
+    await kernel.start(bootPayload);
+    await expect(kernel.dispatch(command)).rejects.toThrow("UTF-8 bytes");
+    expect(calls).toEqual([]);
+    await expect(kernel.stop("test.stop")).resolves.toBeUndefined();
+  });
+
+  test("publishes one unscoped completion when an idle driver stops", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const events = kernel.events()[Symbol.asyncIterator]();
+
+    await kernel.start(bootPayload);
+    await expect(kernel.stop("idle stop")).resolves.toBeUndefined();
+    const terminal = await events.next();
+
+    expect(terminal).toMatchObject({
+      done: false,
+      value: { kind: "run.completed" },
+    });
+    expect(terminal.value).not.toHaveProperty("runId");
+    await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 
   test.each([
@@ -239,8 +270,10 @@ describe("AgentDriverKernelCore", () => {
                   entered.resolve();
                   await late.promise;
                 },
+                currentRunId: () => null,
                 pushEvents: async ({ events }) => ({
                   accepted: events.map((event, index) => ({
+                    eventId: event.sourceEventId!,
                     seq: index + 1,
                     type: event.kind,
                   })),
@@ -258,8 +291,8 @@ describe("AgentDriverKernelCore", () => {
           ? kernel
               .dispatch({
                 commandId: "blocked-accepted-command",
-                kind: "turn.cancel",
-                reason: "test.cancel",
+                kind: "session.stop",
+                reason: "test.stop",
               })
               .catch(() => {})
           : null;
@@ -304,6 +337,125 @@ describe("AgentDriverKernelCore", () => {
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 
+  test("finalizes events only after a late backend stop and the run task settle", async () => {
+    type ManualTimer = { active: boolean; run: () => void };
+
+    const backend = createBackend();
+    const inputEntered = Promise.withResolvers<void>();
+    const releaseInput = Promise.withResolvers<void>();
+    const stopEntered = Promise.withResolvers<void>();
+    const stopAborted = Promise.withResolvers<void>();
+    const releaseStop = Promise.withResolvers<void>();
+    const failure = new Error("backend lifecycle failed");
+    let context!: AgentDriverContext;
+    backend.start = async (startedContext) => {
+      context = startedContext;
+    };
+    backend.handleInput = async () => {
+      inputEntered.resolve();
+      await releaseInput.promise;
+      throw failure;
+    };
+    backend.stop = async (_context, _reason, signal) => {
+      stopEntered.resolve();
+      signal.addEventListener("abort", () => stopAborted.resolve(), { once: true });
+      await releaseStop.promise;
+    };
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const events = kernel.events()[Symbol.asyncIterator]();
+
+    await kernel.start(bootPayload);
+    const input = kernel.dispatch({
+      commandId: "late-stop-active-input",
+      input: { text: "wait" },
+      kind: "input.start",
+      requestId: "late-stop-active-request",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+    void input.catch(() => {});
+    await inputEntered.promise;
+
+    const nativeClearTimeout = globalThis.clearTimeout;
+    const nativeNow = Date.now;
+    const nativeSetTimeout = globalThis.setTimeout;
+    let shutdownTimer: ManualTimer | null = null;
+    Date.now = () => 0;
+    globalThis.setTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay = 0,
+      ...args: unknown[]
+    ) => {
+      if (delay !== 5_000 || shutdownTimer !== null) {
+        return nativeSetTimeout(callback, delay, ...args);
+      }
+
+      const timer: ManualTimer = {
+        active: true,
+        run: () => {
+          if (timer.active) {
+            callback(...args);
+          }
+        },
+      };
+      shutdownTimer = timer;
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle: ReturnType<typeof setTimeout>) => {
+      if (handle === (shutdownTimer as unknown as ReturnType<typeof setTimeout>)) {
+        if (shutdownTimer !== null) {
+          shutdownTimer.active = false;
+        }
+      } else {
+        nativeClearTimeout(handle);
+      }
+    }) as typeof clearTimeout;
+
+    try {
+      context.lifecycle.fail(failure);
+      await stopEntered.promise;
+      const timer = shutdownTimer as ManualTimer | null;
+      expect(timer).not.toBeNull();
+      timer?.run();
+      await stopAborted.promise;
+
+      const nextEvent = events.next();
+      const observed = nextEvent.then((value) => ({ kind: "event" as const, value }));
+      releaseStop.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(
+        Promise.race([observed, Promise.resolve({ kind: "pending" as const })]),
+      ).resolves.toEqual({ kind: "pending" });
+
+      releaseInput.resolve();
+      await expect(input).rejects.toBe(failure);
+      await expect(observed).resolves.toMatchObject({
+        kind: "event",
+        value: {
+          done: false,
+          value: {
+            kind: "diagnostic.reported",
+            payload: {
+              code: "driver.command_failed",
+              message: failure.message,
+            },
+          },
+        },
+      });
+      await expect(events.next()).resolves.toMatchObject({
+        done: false,
+        value: { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
+      });
+      await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
+      await expect(kernel.stop("join backend failure")).rejects.toBe(failure);
+    } finally {
+      releaseInput.resolve();
+      releaseStop.resolve();
+      Date.now = nativeNow;
+      globalThis.clearTimeout = nativeClearTimeout;
+      globalThis.setTimeout = nativeSetTimeout;
+    }
+  });
+
   test("publishes an active backend failure only after input and cleanup settle", async () => {
     const backend = createBackend();
     const cleanupEntered = Promise.withResolvers<void>();
@@ -318,6 +470,7 @@ describe("AgentDriverKernelCore", () => {
     backend.handleInput = async () => {
       inputEntered.resolve();
       await releaseInput.promise;
+      throw failure;
     };
     backend.stop = async () => {
       cleanupEntered.resolve();
@@ -342,13 +495,17 @@ describe("AgentDriverKernelCore", () => {
     const stop = kernel.stop("wait for failure cleanup");
     void stop.catch(() => {});
     await cleanupEntered.promise;
-    const terminal = events.next();
-    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
+    const diagnostic = events.next();
+    expect(await Promise.race([diagnostic.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
       false,
     );
     releaseCleanup.resolve();
     await expect(stop).rejects.toBe(failure);
-    await expect(terminal).resolves.toMatchObject({
+    await expect(diagnostic).resolves.toMatchObject({
+      done: false,
+      value: { kind: "diagnostic.reported" },
+    });
+    await expect(events.next()).resolves.toMatchObject({
       done: false,
       value: { kind: "run.failed", runId: DRIVER_TEST_IDS.runId },
     });
@@ -366,6 +523,7 @@ describe("AgentDriverKernelCore", () => {
     backend.handleInput = async () => {
       inputEntered.resolve();
       await releaseInput.promise;
+      throw failure;
     };
     backend.stop = async () => {
       releaseInput.resolve();
@@ -387,6 +545,10 @@ describe("AgentDriverKernelCore", () => {
 
     await expect(input).rejects.toBe(failure);
     await expect(kernel.stop("wait for failed cleanup")).rejects.toBe(failure);
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: { kind: "diagnostic.reported" },
+    });
     const terminal = events.next();
     expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
       false,
@@ -416,6 +578,7 @@ describe("AgentDriverKernelCore", () => {
       });
       permissionEntered.resolve();
       await permission;
+      throw failure;
     };
     backend.stop = async () => {
       cleanupEntered.resolve();
@@ -487,14 +650,25 @@ describe("AgentDriverKernelCore", () => {
       done: false,
       value: {
         kind: "diagnostic.reported",
+        payload: { code: "permission.cancelled" },
         runId: DRIVER_TEST_IDS.runId,
       },
     });
     await cleanupEntered.promise;
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        kind: "diagnostic.reported",
+        payload: { code: "driver.command_failed" },
+      },
+    });
     const terminal = events.next();
-    expect(await Promise.race([terminal.then(() => true), Bun.sleep(20).then(() => false)])).toBe(
-      false,
-    );
+    expect(
+      await Promise.race([
+        terminal.then((value) => ({ kind: "event" as const, value })),
+        Bun.sleep(20).then(() => ({ kind: "pending" as const })),
+      ]),
+    ).toEqual({ kind: "pending" });
     releaseCleanup.resolve();
     await expect(terminal).resolves.toMatchObject({
       done: false,
@@ -514,9 +688,10 @@ describe("AgentDriverKernelCore", () => {
     const inputEntered = Promise.withResolvers<void>();
     const releaseInput = Promise.withResolvers<void>();
     let stopCount = 0;
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       inputEntered.resolve();
       await releaseInput.promise;
+      await settleBackendInput(context, runId, signal);
     };
     backend.stop = async () => {
       stopCount += 1;
@@ -538,19 +713,6 @@ describe("AgentDriverKernelCore", () => {
         .catch(() => {}),
     ];
     await inputEntered.promise;
-    pending.push(
-      kernel
-        .dispatch({
-          commandId: "queued-input",
-          input: { text: "wait again" },
-          kind: "input.start",
-          requestId: "queued-request",
-          runId: DRIVER_TEST_IDS.runId,
-        })
-        .catch(() => {}),
-    );
-    await Bun.sleep(0);
-
     for (let index = 0; index < 1_024; index += 1) {
       pending.push(
         kernel
@@ -558,6 +720,7 @@ describe("AgentDriverKernelCore", () => {
             commandId: `queued-cancel-${index}`,
             kind: "turn.cancel",
             reason: "queued",
+            runId: DRIVER_TEST_IDS.runId,
           })
           .catch(() => {}),
       );
@@ -568,7 +731,7 @@ describe("AgentDriverKernelCore", () => {
     expect(stopCount).toBe(1);
     await expect(events.next()).resolves.toMatchObject({
       done: false,
-      value: { kind: "run.completed" },
+      value: { kind: "run.cancelled", runId: DRIVER_TEST_IDS.runId },
     });
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
@@ -578,9 +741,10 @@ describe("AgentDriverKernelCore", () => {
     const inputEntered = Promise.withResolvers<void>();
     const releaseInput = Promise.withResolvers<void>();
     let stopCount = 0;
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       inputEntered.resolve();
       await releaseInput.promise;
+      await settleBackendInput(context, runId, signal);
     };
     backend.cancelActiveTurn = async (_context, reason) => {
       backend.cancelledReasons.push(reason);
@@ -632,17 +796,38 @@ describe("AgentDriverKernelCore", () => {
       })
       .catch(() => {});
     await inputEntered.promise;
+    const nativeSetTimeout = globalThis.setTimeout;
+    let activeInputTimeouts = 0;
+    const acceleratedSetTimeout = (
+      callback: (...args: unknown[]) => void,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      if (timeout === ACTIVE_INPUT_SETTLE_GRACE_MS) {
+        activeInputTimeouts += 1;
+      }
+      return nativeSetTimeout(
+        callback,
+        timeout === ACTIVE_INPUT_SETTLE_GRACE_MS ? 10 : timeout,
+        ...args,
+      );
+    };
+    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
-    const first = await Promise.allSettled([kernel.stop("first stop")]);
-    const second = await Promise.allSettled([kernel.stop("second stop")]);
-    const settledBeforeRelease = inputSettled;
-    releaseInput.resolve();
-    await input;
+    try {
+      const first = await Promise.allSettled([kernel.stop("first stop")]);
+      const second = await Promise.allSettled([kernel.stop("second stop")]);
 
-    expect(first[0]?.status).toBe("rejected");
-    expect(second[0]?.status).toBe("rejected");
-    expect(settledBeforeRelease).toBe(false);
-  }, 12_000);
+      expect(first[0]?.status).toBe("rejected");
+      expect(second[0]?.status).toBe("rejected");
+      expect(inputSettled).toBe(false);
+      expect(activeInputTimeouts).toBe(1);
+    } finally {
+      globalThis.setTimeout = nativeSetTimeout;
+      releaseInput.resolve();
+      await input;
+    }
+  });
 
   test("keeps cleanup event delivery available across a transient stop failure", async () => {
     const backend = createBackend();
@@ -728,6 +913,7 @@ describe("AgentDriverKernelCore", () => {
           commandId: "after-stop-failure",
           kind: "turn.cancel",
           reason: "test",
+          runId: DRIVER_TEST_IDS.runId,
         }),
       ).rejects.toThrow("not accepting commands: failed");
     },
@@ -756,12 +942,14 @@ describe("AgentDriverKernelCore", () => {
       }
     };
     const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
+    const nativeNow = Date.now;
     const nativeSetTimeout = globalThis.setTimeout;
     const acceleratedSetTimeout = (
       callback: (...args: unknown[]) => void,
       delay?: number,
       ...args: unknown[]
     ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
+    Date.now = () => 0;
     globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
 
     try {
@@ -781,6 +969,7 @@ describe("AgentDriverKernelCore", () => {
       expect(stopSignals[1]).not.toBe(stopSignals[0]);
       expect(stopSignals[1]?.aborted).toBe(false);
     } finally {
+      Date.now = nativeNow;
       globalThis.setTimeout = nativeSetTimeout;
     }
   });
@@ -789,34 +978,44 @@ describe("AgentDriverKernelCore", () => {
     const backend = createBackend();
     let mcpOutput: string | null = null;
     let materializedSkillName: string | null = null;
-    backend.start = async (context: AgentDriverContext) => {
-      const [skill] = await context.ports.skill.materialize(context.payload.execution);
+    backend.start = async (context: AgentDriverContext, signal: AbortSignal) => {
+      const [skill] = await context.ports.skill.materialize(context.payload.execution, signal);
       materializedSkillName = skill?.skillName ?? null;
     };
-    backend.handleInput = async (context: AgentDriverContext) => {
-      const result = await context.ports.mcp.execute(
-        {
-          argumentsJson: '{"ok":true}',
-          commandId: "mcp-port-1",
-          kind: "mcp.execute",
-          requestId: "request-1",
-          serverId: "server-1",
-          toolCallId: "tool-1",
-          toolName: "complete",
-        },
-        new AbortController().signal,
-      );
+    backend.handleInput = async (context: AgentDriverContext, _input, runId, signal) => {
+      const command = {
+        argumentsJson: '{"ok":true}',
+        commandId: "mcp-port-1",
+        kind: "mcp.execute" as const,
+        requestId: "request-1",
+        runId: DRIVER_TEST_IDS.runId,
+        serverId: "server-1",
+        toolCallId: "tool-1",
+        toolName: "complete",
+      };
+      const mcpSignal = new AbortController().signal;
+      await using prepared = await context.ports.mcp.prepare(command, mcpSignal);
+      const result = await prepared.execute({
+        attempt: 1,
+        effectId: "effect-1",
+        idempotencyKey: "effect-1",
+        kind: "claimed",
+      });
       mcpOutput = result.outputText;
+      await settleBackendInput(context, runId, signal);
     };
     const kernel = new AgentDriverKernelCore({
       backendFactory: () => backend,
       hostPorts: {
         mcp: {
-          execute: async (command) => ({
-            outputText: `port:${command.toolName}`,
-            requestId: command.requestId,
-            serverId: command.serverId,
-            toolName: command.toolName,
+          prepare: async (command) => ({
+            execute: async () => ({
+              outputText: `port:${command.toolName}`,
+              requestId: command.requestId,
+              serverId: command.serverId,
+              toolName: command.toolName,
+            }),
+            async [Symbol.asyncDispose]() {},
           }),
         },
         skill: {

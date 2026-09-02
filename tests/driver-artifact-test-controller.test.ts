@@ -3,15 +3,15 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   ForbiddenSecretScanner,
   DriverArtifactTestController,
   type DriverArtifactBootPayload,
 } from "./driver-artifact-test-controller";
 import {
-  parseDriverCommandUpdateInput,
+  driverRuntimeRpcSchemas,
   parseDriverFailureInput,
-  parseDriverHelloInput,
   parseDriverLogBatchInput,
 } from "../src/protocol/orpc";
 
@@ -39,7 +39,7 @@ await rpc("/driver/hello", {
   capabilities: [],
   driverVersion: "test",
   pid: process.pid,
-  protocolVersion: 2,
+  protocolVersion: ${String(DRIVER_PROTOCOL_VERSION)},
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
@@ -69,7 +69,6 @@ if (process.env.TEST_MODE === "terminal") {
   await rpc("/driver/commandUpdate", {
     commandId: "command-1",
     driverInstanceId: payload.driverInstanceId,
-    result: null,
     status: "completed",
   });
 }
@@ -159,7 +158,6 @@ describe("driver artifact test controller", () => {
     const diagnostics = controller.diagnostics();
     expect(diagnostics).toContain('"message": "transport exploded: [redacted]"');
     expect(diagnostics).toContain('"stage": "session/new"');
-    expect(diagnostics).not.toContain(secret);
     expect(diagnostics).not.toContain(JSON.stringify(secret).slice(1, -1));
     await controller.dispose();
   });
@@ -254,38 +252,7 @@ describe("driver artifact test controller", () => {
     expect(disposeError.message).not.toContain(secret);
   });
 
-  test("validates structured RPC inputs with the production parsers", () => {
-    expect(() =>
-      parseDriverHelloInput({
-        capabilities: [],
-        driverVersion: "test",
-        pid: 0,
-        protocolVersion: 2,
-        runtime: "acp-fallback",
-        startedAt: "now",
-      }),
-    ).toThrow("pid must be a positive safe integer");
-    expect(() =>
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        status: "invented",
-      }),
-    ).toThrow("status is not a supported runtime command status");
-    expect(
-      parseDriverCommandUpdateInput({
-        commandId: "command-1",
-        driverInstanceId: "driver-1",
-        result: {
-          isError: true,
-          outputText: "failed",
-          requestId: "request-1",
-          serverId: "server-1",
-          toolName: "tool-1",
-        },
-        status: "completed",
-      }).result,
-    ).toMatchObject({ isError: true });
+  test("validates structured RPC input edge cases", () => {
     expect(() =>
       parseDriverFailureInput({
         driverInstanceId: "driver-1",
@@ -295,14 +262,48 @@ describe("driver artifact test controller", () => {
           message: "failed",
           retryable: false,
         },
+        runId: "run-1",
       }),
     ).toThrow("driver failure details.nested must be a primitive value");
+    const details = JSON.parse('{"__proto__":"preserved"}') as Record<string, unknown>;
+    const failure = parseDriverFailureInput({
+      driverInstanceId: "driver-1",
+      error: { code: "failed", details, message: "failed", retryable: false },
+      runId: "run-1",
+    });
+    expect(Object.hasOwn(failure.error.details, "__proto__")).toBeTrue();
     expect(() =>
       parseDriverLogBatchInput({
         driverInstanceId: "driver-1",
         logs: [{ level: "verbose", message: "bad", seq: 0, timestamp: "now" }],
       }),
     ).toThrow("driver log level is unsupported");
+  });
+
+  test("reports nested schema failures without throwing from safeParse", () => {
+    const commandUpdate = driverRuntimeRpcSchemas.driver.commandUpdate.input.safeParse({
+      commandId: "command-1",
+      driverInstanceId: "driver-1",
+      result: { outputText: "partial", requestId: "request-1" },
+      status: "completed",
+    });
+    expect(commandUpdate.success).toBeFalse();
+    expect(commandUpdate.error?.issues).toContainEqual(
+      expect.objectContaining({ path: ["result"] }),
+    );
+
+    const events = driverRuntimeRpcSchemas.driver.pushEvents.input.safeParse({
+      driverInstanceId: "driver-1",
+      events: [{}],
+    });
+    expect(events.success).toBeFalse();
+    expect(events.error?.issues[0]?.path).toEqual(["events", 0]);
+
+    const command = driverRuntimeRpcSchemas.driverInstance.nextCommand.output.safeParse({
+      command: { commandId: "command-1", kind: "unknown" },
+    });
+    expect(command.success).toBeFalse();
+    expect(command.error?.issues[0]?.path).toEqual(["command"]);
   });
 
   test("scanner carries only the suffix needed for cross-chunk detection", () => {

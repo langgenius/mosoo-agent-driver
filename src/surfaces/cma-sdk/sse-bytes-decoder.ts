@@ -71,13 +71,22 @@ function sseFrameLimitError(): CmaSdkError {
 
 export async function* decodeCmaSseBytes(
   body: ReadableStream<Uint8Array>,
+  signal?: AbortSignal,
 ): AsyncIterable<CmaSessionEventRecord> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const frame = new Uint8Array(CMA_MAX_EVENT_BYTES + 1);
+  let cancellation: Promise<void> | undefined;
   let completed = false;
   let frameLength = 0;
   let scanFrom = 0;
+  const cancel = () =>
+    (cancellation ??= reader.cancel(signal?.reason).then(
+      () => undefined,
+      () => undefined,
+    ));
+  const onAbort = () => void cancel();
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   const consume = (separator: {
     readonly index: number;
@@ -129,8 +138,11 @@ export async function* decodeCmaSseBytes(
   };
 
   try {
+    signal?.throwIfAborted();
+
     while (true) {
       const chunk = await reader.read();
+      signal?.throwIfAborted();
 
       if (chunk.done) {
         completed = true;
@@ -138,6 +150,7 @@ export async function* decodeCmaSseBytes(
       }
 
       for (const record of append(chunk.value)) {
+        signal?.throwIfAborted();
         yield record;
       }
     }
@@ -150,6 +163,7 @@ export async function* decodeCmaSseBytes(
       const record = consume(separator);
 
       if (record) {
+        signal?.throwIfAborted();
         yield record;
       }
     }
@@ -158,12 +172,17 @@ export async function* decodeCmaSseBytes(
       const record = parseSseRecord(decoder.decode(frame.subarray(0, frameLength)));
 
       if (record) {
+        signal?.throwIfAborted();
         yield record;
       }
     }
   } finally {
+    signal?.removeEventListener("abort", onAbort);
+
     if (!completed) {
-      await reader.cancel();
+      void cancel();
     }
+
+    reader.releaseLock();
   }
 }

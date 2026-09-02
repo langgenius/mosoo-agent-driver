@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CmaInboundEvent } from "../src/projections/cma";
+import type { CmaInboundEvent, CmaProjectedDriverCommand } from "../src/projections/cma";
 import { createDriverId } from "../src/protocol/id";
 import { parseRuntimeEventEnvelope } from "../src/runtime-events";
-import type { RuntimeCommand } from "../src/runtime-command";
 import { CmaStoreConflictError } from "../src/stores/cma-store";
 import { createCmaMemoryStore } from "../src/stores/memory";
 
@@ -33,7 +32,7 @@ function driverEvent(
     origin: "driver",
     payload,
     ...(options.runId === undefined ? {} : { runId: options.runId }),
-    schemaVersion: "2026-05-26",
+    schemaVersion: "2026-08-29",
     sessionId,
     ...(options.sourceEventId === undefined ? {} : { sourceEventId: options.sourceEventId }),
     visibility: options.visibility ?? "participant",
@@ -44,7 +43,7 @@ function interrupt(
   commandId: string,
   reason?: string,
 ): {
-  readonly command: RuntimeCommand;
+  readonly command: CmaProjectedDriverCommand;
   readonly event: CmaInboundEvent;
 } {
   return {
@@ -106,7 +105,7 @@ describe("CMA memory store lifecycle", () => {
     ).rejects.toBeInstanceOf(CmaStoreConflictError);
   });
 
-  test("reclaims expired command leases and rejects stale settlers", async () => {
+  test("never reclaims an expired command with an ambiguous effect", async () => {
     let now = new Date("2026-01-01T00:00:00.000Z");
     const sessionId = createDriverId();
     const store = createCmaMemoryStore({
@@ -121,14 +120,12 @@ describe("CMA memory store lifecycle", () => {
     }
 
     now = new Date("2026-01-01T00:00:31.000Z");
-    const reclaimed = await store.claimInboundEvent(input);
+    const retry = await store.claimInboundEvent(input);
 
-    if (!reclaimed.claimed) {
-      throw new Error("Expected the expired command claim to be reclaimed.");
-    }
-
-    expect(reclaimed.event.id).toBe(first.event.id);
-    expect(reclaimed.lease.id).not.toBe(first.lease.id);
+    expect(retry).toMatchObject({
+      claimed: false,
+      event: { commandStatus: "accepted", id: first.event.id },
+    });
     await expect(
       store.settleInboundEvent({
         commandId: "command-1",
@@ -138,15 +135,6 @@ describe("CMA memory store lifecycle", () => {
         status: "completed",
       }),
     ).rejects.toBeInstanceOf(CmaStoreConflictError);
-    await expect(
-      store.settleInboundEvent({
-        commandId: "command-1",
-        commandResult: null,
-        leaseId: reclaimed.lease.id,
-        sessionId,
-        status: "completed",
-      }),
-    ).resolves.toMatchObject({ commandStatus: "completed" });
   });
 
   test.each([
@@ -182,7 +170,7 @@ describe("CMA memory store lifecycle", () => {
           });
 
     await expect(attempt).rejects.toBeInstanceOf(CmaStoreConflictError);
-    await expect(store.claimInboundEvent(input)).resolves.toMatchObject({ claimed: true });
+    await expect(store.claimInboundEvent(input)).resolves.toMatchObject({ claimed: false });
   });
 
   test("keeps a completed settlement idempotent after its lease expires", async () => {

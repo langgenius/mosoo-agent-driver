@@ -1,94 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
-import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
-import { DRIVER_TEST_IDS, driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  events: DriverEventInput[];
-  reason: string;
-}
-
-function readEventPayloadString(event: DriverEventInput, field: string): string | null {
-  const payload = event.payload;
-
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
-    return null;
-  }
-
-  const value = (payload as Record<string, unknown>)[field];
-  return typeof value === "string" ? value : null;
-}
-
-function readAssistantMessageId(events: readonly DriverEventInput[]): string {
-  for (const event of events) {
-    const messageId =
-      readEventPayloadString(event, "messageId") ??
-      readEventPayloadString(event, "parentMessageId");
-
-    if (messageId !== null) {
-      expect(isDriverId(messageId)).toBe(true);
-      return messageId;
-    }
-  }
-
-  throw new Error("Expected a platform assistant message ID.");
-}
-
-function createHarness(options: { failNativeResumePublish?: boolean; holdReason?: string } = {}) {
-  const batches: EventBatch[] = [];
-  const heldPush = Promise.withResolvers<void>();
-  const releasePush = Promise.withResolvers<void>();
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "openai-app-server-event-bridge-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: bootPayload,
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const bridge = new OpenAiAppServerEventBridge({
-    push: async (_context, reason, events) => {
-      batches.push({ events, reason });
-      if (reason === options.holdReason) {
-        heldPush.resolve();
-        await releasePush.promise;
-      }
-      if (
-        options.failNativeResumePublish === true &&
-        reason === "driver.openai.native_resume_ref.updated"
-      ) {
-        throw new Error("event sink unavailable");
-      }
-    },
-    requireThreadId: () => "thread-1",
-  });
-
-  return {
-    batches,
-    bridge,
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    heldPush: heldPush.promise,
-    logger,
-    releasePush: releasePush.resolve,
-  };
-}
+import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
+import {
+  createOpenAiBridgeHarness as createHarness,
+  readAssistantMessageId,
+  readEventPayloadString,
+} from "./openai-app-server-event-bridge-fixture";
 
 describe("OpenAi app-server event bridge", () => {
   test("publishes a lossless completed assistant snapshot", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const finalText = "I will inspect the files.";
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
@@ -106,7 +27,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
 
     const assistantMessageId = readAssistantMessageId(events());
     const snapshot = events().find((event) => event.kind === "message.added");
@@ -122,8 +42,163 @@ describe("OpenAi app-server event bridge", () => {
     expect(snapshot?.delivery).toBe("lossless");
   });
 
+  test("preserves final phase and memory citations on completed snapshots", async () => {
+    const { bridge, context, events } = createHarness();
+    const memoryCitation = {
+      entries: [{ lineEnd: 8, lineStart: 4, note: "Relevant context", path: "MEMORY.md" }],
+      threadIds: ["thread-memory"],
+    };
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        id: "message-final",
+        memoryCitation,
+        phase: "final_answer",
+        text: "Final answer",
+        type: "agentMessage",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    expect(events().find((event) => event.kind === "message.added")).toMatchObject({
+      payload: { memoryCitation, phase: "final" },
+    });
+    expect(events().find((event) => event.kind === "message.delta")?.payload).not.toHaveProperty(
+      "phase",
+    );
+  });
+
+  test("selects only final-phase messages once a turn uses explicit phases", async () => {
+    const { bridge, context, events } = createHarness();
+
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          { id: "legacy", memoryCitation: null, phase: null, text: "Legacy", type: "agentMessage" },
+          {
+            id: "final",
+            memoryCitation: null,
+            phase: "final_answer",
+            text: "Authoritative final",
+            type: "agentMessage",
+          },
+          {
+            id: "commentary",
+            memoryCitation: null,
+            phase: "commentary",
+            text: "Later commentary",
+            type: "agentMessage",
+          },
+          {
+            delivery: "async",
+            id: "async-progress",
+            memoryCitation: null,
+            phase: "final_answer",
+            text: "Asynchronous progress",
+            type: "agentMessage",
+          },
+        ],
+        status: "completed",
+      },
+    });
+
+    const allEvents = events();
+    const finalSnapshot = allEvents.find(
+      (event) =>
+        event.kind === "message.added" &&
+        readEventPayloadString(event, "content") === "Authoritative final",
+    );
+    const runCompleted = allEvents.find((event) => event.kind === "run.completed");
+
+    expect(finalSnapshot).toBeDefined();
+    expect(runCompleted).toBeDefined();
+    expect(readEventPayloadString(runCompleted!, "finalMessageId")).toBe(
+      readEventPayloadString(finalSnapshot!, "messageId"),
+    );
+    expect(runCompleted!.payload).not.toHaveProperty("finalMessageText");
+  });
+
+  test("keeps asynchronous progress out of legacy final selection", async () => {
+    const { bridge, context, events } = createHarness();
+
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: {
+        id: "turn-1",
+        items: [
+          {
+            id: "legacy",
+            memoryCitation: null,
+            phase: null,
+            text: "Legacy final",
+            type: "agentMessage",
+          },
+          {
+            delivery: "async",
+            id: "async-progress",
+            memoryCitation: null,
+            phase: "final_answer",
+            text: "Asynchronous progress",
+            type: "agentMessage",
+          },
+        ],
+        status: "completed",
+      },
+    });
+
+    const allEvents = events();
+    const finalSnapshot = allEvents.find(
+      (event) =>
+        event.kind === "message.added" &&
+        readEventPayloadString(event, "content") === "Legacy final",
+    );
+    const asyncSnapshot = allEvents.find(
+      (event) =>
+        event.kind === "message.added" &&
+        readEventPayloadString(event, "content") === "Asynchronous progress",
+    );
+    const runCompleted = allEvents.find((event) => event.kind === "run.completed");
+
+    expect(readEventPayloadString(runCompleted!, "finalMessageId")).toBe(
+      readEventPayloadString(finalSnapshot!, "messageId"),
+    );
+    expect(asyncSnapshot?.payload).toMatchObject({ phase: "commentary" });
+  });
+
+  test("does not fall back to a legacy snapshot when explicit commentary exists", async () => {
+    const { bridge, context, events } = createHarness();
+
+    for (const item of [
+      { id: "legacy", memoryCitation: null, phase: null, text: "Legacy", type: "agentMessage" },
+      {
+        id: "commentary",
+        memoryCitation: null,
+        phase: "commentary",
+        text: "Commentary",
+        type: "agentMessage",
+      },
+    ]) {
+      await bridge.handleNotification(context, "item/completed", {
+        item,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+    }
+    await bridge.handleNotification(context, "turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "completed" },
+    });
+
+    const terminalPayload = events().find((event) => event.kind === "run.completed")?.payload;
+    expect(terminalPayload).not.toHaveProperty("finalMessageId");
+    expect(terminalPayload).not.toHaveProperty("finalMessageText");
+  });
+
   test("fails an active turn exactly once when the provider exits", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
     const failure = new Error("app-server exited");
     const completion = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
     void completion.catch(() => {});
@@ -142,9 +217,8 @@ describe("OpenAi app-server event bridge", () => {
     });
 
     await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(true);
-    await expect(completion).rejects.toBe(failure);
+    await expect(completion).rejects.toThrow("app-server exited");
     await expect(bridge.failActiveTurns(context, failure)).resolves.toBe(false);
-    await logger.destroy();
 
     expect(
       events().filter((event) =>
@@ -176,8 +250,24 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
+  test("replays run start after delivery rejection before committing deduplication", async () => {
+    const { attempts, bridge, context } = createHarness({
+      failReasonOnce: "driver.openai.turn.started",
+    });
+    const started = { runId: DRIVER_TEST_IDS.runId, turnId: "turn-1" } as const;
+
+    await expect(bridge.publishRunStarted(context, started)).rejects.toThrow("first attempt");
+    await bridge.publishRunStarted(context, started);
+
+    const starts = attempts.flatMap(({ events }) =>
+      events.filter((event) => event.kind === "run.started"),
+    );
+    expect(starts).toHaveLength(2);
+    expect(starts[0]!.sourceEventId).toBe(starts[1]!.sourceEventId);
+  });
+
   test("final turn items do not duplicate already completed messages", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/completed", {
       item: {
@@ -202,22 +292,12 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([
       {
         kind: "message.started",
         payload: {
-          messageId: assistantMessageId,
-          role: "agent",
-        },
-      },
-      {
-        delivery: "best_effort",
-        kind: "message.delta",
-        payload: {
-          contentDelta: "pong",
           messageId: assistantMessageId,
           role: "agent",
         },
@@ -252,6 +332,10 @@ describe("OpenAi app-server event bridge", () => {
         },
       },
       {
+        kind: "agent.tasks.replaced",
+        payload: { tasks: [] },
+      },
+      {
         kind: "run.completed",
         payload: {
           stopReason: "end_turn",
@@ -260,8 +344,8 @@ describe("OpenAi app-server event bridge", () => {
     ]);
   });
 
-  test("rotates assistant message identity after each completed agent item", async () => {
-    const { bridge, context, events, logger } = createHarness();
+  test("isolates assistant items from the turn-scoped tool parent", async () => {
+    const { bridge, context, events } = createHarness();
 
     const progressMessages = [
       "进度 1：已完成读取。",
@@ -289,6 +373,7 @@ describe("OpenAi app-server event bridge", () => {
     await bridge.handleNotification(context, "item/started", {
       item: {
         id: "artifact-tool",
+        status: "inProgress",
         type: "commandExecution",
       },
       threadId: "thread-1",
@@ -298,6 +383,7 @@ describe("OpenAi app-server event bridge", () => {
       item: {
         aggregatedOutput: "artifact 已创建。",
         id: "artifact-tool",
+        status: "completed",
         type: "commandExecution",
       },
       threadId: "thread-1",
@@ -331,6 +417,7 @@ describe("OpenAi app-server event bridge", () => {
           {
             aggregatedOutput: "artifact 已创建。",
             id: "artifact-tool",
+            status: "completed",
             type: "commandExecution",
           },
           {
@@ -342,7 +429,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const assistantMessages = events().flatMap((event) => {
       if (event.kind !== "message.delta") {
@@ -364,13 +450,15 @@ describe("OpenAi app-server event bridge", () => {
       .map((event) => readEventPayloadString(event, "parentMessageId"))
       .find((messageId): messageId is string => messageId !== null);
 
-    expect(toolParentMessageId).toBe(assistantMessages.at(-1)?.messageId);
-    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(4);
+    expect(assistantMessages.some(({ messageId }) => messageId === toolParentMessageId)).toBe(
+      false,
+    );
+    expect(events().filter((event) => event.kind === "message.completed")).toHaveLength(5);
     expect(events().filter((event) => event.kind === "run.completed")).toHaveLength(1);
   });
 
   test("keeps interleaved assistant item identities isolated and ignores late replay", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/agentMessage/delta", {
       delta: "消息甲",
@@ -411,7 +499,6 @@ describe("OpenAi app-server event bridge", () => {
         status: "completed",
       },
     });
-    await logger.destroy();
 
     const deltas = events().flatMap((event) => {
       if (event.kind !== "message.delta") {
@@ -435,11 +522,11 @@ describe("OpenAi app-server event bridge", () => {
     const finalMessageId = readEventPayloadString(runCompleted, "finalMessageId");
 
     expect(finalMessageId).toBe(deltas.find((entry) => entry.contentDelta === "消息乙")?.messageId);
-    expect(readEventPayloadString(runCompleted, "finalMessageText")).toBe("消息乙");
+    expect(runCompleted.payload).not.toHaveProperty("finalMessageText");
   });
 
   test("command output streams as tool result content", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/started", {
       item: {
@@ -461,7 +548,6 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
     const assistantMessageId = readAssistantMessageId(events());
 
     expect(events()).toMatchObject([
@@ -494,9 +580,8 @@ describe("OpenAi app-server event bridge", () => {
       {
         kind: "tool.call.updated",
         payload: {
-          content: "hello",
           messageId: assistantMessageId,
-          rawOutput: "hello",
+          rawOutputDelta: "hello",
           status: "running",
           toolCallId: "cmd-1",
         },
@@ -504,19 +589,41 @@ describe("OpenAi app-server event bridge", () => {
       {
         kind: "tool.call.updated",
         payload: {
-          content: " world",
           messageId: assistantMessageId,
-          rawOutput: " world",
+          rawOutputDelta: " world",
           status: "running",
           toolCallId: "cmd-1",
         },
       },
     ]);
     expect(events().some((event) => event.kind === "item.updated")).toBe(false);
+
+    await bridge.handleNotification(context, "item/completed", {
+      item: {
+        aggregatedOutput: "hello world",
+        command: "printf 'hello world'",
+        id: "cmd-1",
+        status: "completed",
+        type: "commandExecution",
+      },
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+
+    const terminal = events()
+      .filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          readEventPayloadString(event, "toolCallId") === "cmd-1" &&
+          readEventPayloadString(event, "status") === "completed",
+      )
+      .at(-1);
+    expect(terminal?.payload).toMatchObject({ rawOutput: "hello world" });
+    expect(terminal?.payload).not.toHaveProperty("rawOutputDelta");
   });
 
   test("turn plan updates map to the session plan custom event", async () => {
-    const { bridge, context, events, logger } = createHarness();
+    const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "turn/plan/updated", {
       explanation: null,
@@ -533,7 +640,21 @@ describe("OpenAi app-server event bridge", () => {
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await logger.destroy();
+    await bridge.handleNotification(context, "turn/plan/updated", {
+      explanation: null,
+      plan: [
+        {
+          status: "completed",
+          step: "Inspect stream events",
+        },
+        {
+          status: "completed",
+          step: "Patch bridge",
+        },
+      ],
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
 
     expect(events()).toEqual([
       {
@@ -544,6 +665,24 @@ describe("OpenAi app-server event bridge", () => {
               content: "Inspect stream events",
               priority: "medium",
               status: "in_progress",
+            },
+            {
+              content: "Patch bridge",
+              priority: "medium",
+              status: "completed",
+            },
+          ],
+          source: "driver",
+        },
+      },
+      {
+        kind: "plan.updated",
+        payload: {
+          entries: [
+            {
+              content: "Inspect stream events",
+              priority: "medium",
+              status: "completed",
             },
             {
               content: "Patch bridge",

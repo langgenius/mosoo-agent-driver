@@ -9,19 +9,18 @@ function deepMergeRecords(
   base: Record<string, unknown>,
   providerOptions: JsonObject,
 ): Record<string, unknown> {
-  const result: Record<string, unknown> = { ...base };
-
-  for (const [key, value] of Object.entries(providerOptions)) {
-    const current = result[key];
-
-    if (isMergeableRecord(current) && isJsonObject(value)) {
-      result[key] = deepMergeRecords(current, value);
-    } else {
-      result[key] = structuredClone(value);
-    }
-  }
-
-  return result;
+  return Object.fromEntries([
+    ...Object.entries(base),
+    ...Object.entries(providerOptions).map(([key, value]) => {
+      const current = Object.hasOwn(base, key) ? base[key] : undefined;
+      return [
+        key,
+        isMergeableRecord(current) && isJsonObject(value)
+          ? deepMergeRecords(current, value)
+          : structuredClone(value),
+      ];
+    }),
+  ]);
 }
 
 export function mergeProviderOptions<T extends object>(base: T, providerOptions: JsonObject): T {

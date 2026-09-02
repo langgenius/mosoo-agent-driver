@@ -2,20 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import { DriverHeartbeatLoop } from "../src/core/driver-heartbeat-loop";
 import type { DriverRuntimeHeartbeatPort } from "../src/core/driver-runtime-io";
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { promiseWithTimeout, sleepPromise } from "../src/utils/async";
 
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "driver-heartbeat-loop-test",
-    sink: async () => {},
-  });
-}
+const logger = createDisabledLogger();
 
 describe("DriverHeartbeatLoop", () => {
   test("clamps a huge negotiated interval only when scheduling the timer", async () => {
-    const logger = createTestLogger();
     const scheduledDelays: number[] = [];
     const nativeSetTimeout = globalThis.setTimeout;
     const loop = new DriverHeartbeatLoop({
@@ -43,13 +36,11 @@ describe("DriverHeartbeatLoop", () => {
     } finally {
       loop.stop(logger, "test.complete");
       globalThis.setTimeout = nativeSetTimeout;
-      await logger.destroy();
     }
   });
 
   test("never overlaps heartbeat requests", async () => {
     const heartbeat = Promise.withResolvers<{ heartbeatCount: number; ok: true }>();
-    const logger = createTestLogger();
     let heartbeatCalls = 0;
     const socket: DriverRuntimeHeartbeatPort = {
       heartbeat: async () => {
@@ -67,14 +58,12 @@ describe("DriverHeartbeatLoop", () => {
     loop.stop(logger, "test.complete");
     heartbeat.resolve({ heartbeatCount: 1, ok: true });
     await sleepPromise(0);
-    await logger.destroy();
 
     expect(heartbeatCalls).toBe(1);
   });
 
   test("reports one failed heartbeat to the supervisor and stops", async () => {
     const failed = Promise.withResolvers<unknown>();
-    const logger = createTestLogger();
     let heartbeatCalls = 0;
     const socket: DriverRuntimeHeartbeatPort = {
       heartbeat: async () => {
@@ -93,7 +82,6 @@ describe("DriverHeartbeatLoop", () => {
       timeoutMs: 100,
     });
     await sleepPromise(10);
-    await logger.destroy();
 
     expect(error).toBeInstanceOf(Error);
     expect(heartbeatCalls).toBe(1);
@@ -104,7 +92,6 @@ describe("DriverHeartbeatLoop", () => {
     async (termination) => {
       const heartbeatEntered = Promise.withResolvers<void>();
       const heartbeatResult = Promise.withResolvers<{ heartbeatCount: number; ok: true }>();
-      const logger = createTestLogger();
       const failures: unknown[] = [];
       let shuttingDown = false;
       const loop = new DriverHeartbeatLoop({
@@ -130,7 +117,6 @@ describe("DriverHeartbeatLoop", () => {
       heartbeatResult.reject(new Error("late heartbeat failure"));
       await sleepPromise(0);
       loop.stop(logger, "test.cleanup");
-      await logger.destroy();
 
       expect(failures).toEqual([]);
     },

@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import type { CmaInboundEvent } from "../src/projections/cma";
+import type { CmaInboundEvent, CmaProjectedDriverCommand } from "../src/projections/cma";
 import { createDriverId } from "../src/protocol/id";
 import { parseRuntimeEventEnvelope } from "../src/runtime-events";
-import type { RuntimeCommand } from "../src/runtime-command";
 import {
   CMA_MAX_EVENT_BYTES,
   CMA_MAX_REPLAY_BYTES,
@@ -37,7 +36,7 @@ function driverEvent(
     origin: "driver",
     payload,
     ...(options.runId === undefined ? {} : { runId: options.runId }),
-    schemaVersion: "2026-05-26",
+    schemaVersion: "2026-08-29",
     sessionId,
     ...(options.sourceEventId === undefined ? {} : { sourceEventId: options.sourceEventId }),
     visibility: options.visibility ?? "participant",
@@ -48,7 +47,7 @@ function interrupt(
   commandId: string,
   reason?: string,
 ): {
-  readonly command: RuntimeCommand;
+  readonly command: CmaProjectedDriverCommand;
   readonly event: CmaInboundEvent;
 } {
   return {

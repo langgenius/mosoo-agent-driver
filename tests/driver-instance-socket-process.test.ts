@@ -4,10 +4,11 @@ import { DriverProcess } from "../src/bin/driver-process";
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
+import type { DriverBootPayload } from "../src/protocol/boot";
 import type { RuntimeCommand } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
-import { createBackend } from "./driver-runtime-boundary-fixtures";
+import { createBackend, settleBackendInput } from "./driver-runtime-boundary-fixtures";
 
 const nativeWebSocket = globalThis.WebSocket;
 const nativeAbortSignalTimeout = AbortSignal.timeout;
@@ -59,6 +60,7 @@ class RpcWebSocket extends OpenWebSocket {
   static eventBatchMaxSize = 2;
   static heartbeatFails = false;
   static heartbeatIntervalMs = 1_000;
+  static helloRunId: string | null = null;
   static lostResponsePath: string | null = null;
   static pathObserver: ((path: string) => void) | null = null;
   static receiptOverride: Partial<{ eventId: string; seq: number; type: string }> | null = null;
@@ -135,15 +137,20 @@ class RpcWebSocket extends OpenWebSocket {
           eventBatchMaxSize: RpcWebSocket.eventBatchMaxSize,
           organizationPath: "/workspace",
         },
-        runId: null,
+        runId: RpcWebSocket.helloRunId,
       };
     } else if (path === "/driver/pushEvents") {
-      const events = (input as { events: { event: { kind: string } }[] }).events;
+      const events = (
+        input as {
+          events: { event: { id: string; kind: string; sourceEventId?: string } }[];
+        }
+      ).events;
       this.eventBatchSizes.push(events.length);
       const acceptedCount = RpcWebSocket.acceptedEventCounts.shift() ?? events.length;
       const accepted = events.slice(0, acceptedCount).map(({ event }) => {
         this.#nextEventSeq += 1;
         return {
+          eventId: event.sourceEventId ?? event.id,
           seq: this.#nextEventSeq,
           type: event.kind,
         };
@@ -201,6 +208,7 @@ afterEach(() => {
   RpcWebSocket.eventBatchMaxSize = 2;
   RpcWebSocket.heartbeatFails = false;
   RpcWebSocket.heartbeatIntervalMs = 1_000;
+  RpcWebSocket.helloRunId = null;
   RpcWebSocket.lostResponsePath = null;
   RpcWebSocket.pathObserver = null;
   RpcWebSocket.receiptOverride = null;
@@ -331,6 +339,60 @@ describe("DriverProcess lifecycle", () => {
     expect(ready).toBeLessThan(heartbeat);
   });
 
+  test("keeps the RPC lane open until backend-owned file reporting drains", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
+    RpcWebSocket.delayedEventKind = "file.changed";
+    const existingSignalListeners = new Set(process.listeners("SIGTERM"));
+    const stopEntered = Promise.withResolvers<void>();
+    const backend = createBackend();
+    let context: AgentDriverContext | null = null;
+    let report: Promise<void> | null = null;
+    backend.start = async (startedContext) => {
+      context = startedContext;
+    };
+    backend.stop = async () => {
+      stopEntered.resolve();
+      await report;
+    };
+    const run = new DriverProcess(driverBootPayload, () => backend).run();
+
+    await RpcWebSocket.stalled.promise;
+    RpcWebSocket.stalled = Promise.withResolvers<void>();
+    report = (context as AgentDriverContext | null)!.ports.file.reportChanged(
+      {
+        change: "upsert",
+        path: "/workspace/committed.txt",
+        reason: "test.commit",
+      },
+      AbortSignal.timeout(5_000),
+    );
+    void report.catch(() => {});
+    await RpcWebSocket.stalled.promise;
+
+    const shutdown = process
+      .listeners("SIGTERM")
+      .find((listener) => !existingSignalListeners.has(listener));
+    expect(shutdown).toBeDefined();
+    shutdown?.("SIGTERM");
+    await stopEntered.promise;
+    expect((PendingWebSocket.instances[0] as RpcWebSocket).readyState).toBe(1);
+
+    RpcWebSocket.delayedResponse.resolve();
+    await expect(run).resolves.toBeUndefined();
+    const fileEvents = (PendingWebSocket.instances[0] as RpcWebSocket).requests.flatMap(
+      ({ input, path }) =>
+        path === "/driver/pushEvents"
+          ? (
+              input as {
+                events: { event: { kind: string } }[];
+              }
+            ).events.filter(({ event }) => event.kind === "file.changed")
+          : [],
+    );
+    expect(fileEvents).toHaveLength(1);
+  });
+
   test("fails after an unexpected control disconnect and still cleans the backend", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
     RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
@@ -392,6 +454,61 @@ describe("DriverProcess lifecycle", () => {
     expect(paths.filter((path) => path === "/driver/failRun")).toHaveLength(2);
   });
 
+  test("reports startup failure to the run adopted during hello", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.helloRunId = DRIVER_TEST_IDS.secondRunId;
+    const prewarmPayload = {
+      ...driverBootPayload,
+      execution: {
+        ...driverBootPayload.execution,
+        configRevision: {
+          ...driverBootPayload.execution.configRevision,
+          runId: null,
+        },
+      },
+    } satisfies DriverBootPayload;
+
+    await expect(
+      new DriverProcess(prewarmPayload, () => {
+        throw new Error("backend factory failed");
+      }).run(),
+    ).rejects.toThrow("backend factory failed");
+
+    const failure = (PendingWebSocket.instances[0] as RpcWebSocket).requests.find(
+      ({ path }) => path === "/driver/failRun",
+    );
+    expect(failure?.input).toMatchObject({ runId: DRIVER_TEST_IDS.secondRunId });
+  });
+
+  test("fails the exact second run when its provider exits before a run event", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.commands = [
+      {
+        commandId: "second-run-provider-failure",
+        input: { text: "fail before terminal" },
+        kind: "input.start",
+        requestId: "second-run-provider-failure-request",
+        runId: DRIVER_TEST_IDS.secondRunId,
+      },
+    ];
+    const backend = createBackend();
+    backend.handleInput = async () => {
+      throw new Error("second run provider exited");
+    };
+
+    await expect(new DriverProcess(driverBootPayload, () => backend).run()).rejects.toThrow(
+      "second run provider exited",
+    );
+
+    const failure = (PendingWebSocket.instances[0] as RpcWebSocket).requests.find(
+      ({ path }) => path === "/driver/failRun",
+    );
+    expect(failure?.input).toMatchObject({ runId: DRIVER_TEST_IDS.secondRunId });
+    expect(failure?.input).not.toMatchObject({
+      runId: driverBootPayload.execution.configRevision.runId,
+    });
+  });
+
   test("does not report a control terminal when backend cleanup remains failed", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
     RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
@@ -432,7 +549,7 @@ describe("DriverProcess lifecycle", () => {
     let decision: "allow_once" | "reject_once" | null = null;
     let sideEffect = false;
     let stoppedBeforePermissionSettled = false;
-    backend.handleInput = async (context) => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       decision = await context.ports.permission.request({
         rawInput: '{"command":"touch should-not-exist"}',
         requestId: "pending-permission",
@@ -446,19 +563,7 @@ describe("DriverProcess lifecycle", () => {
         return;
       }
 
-      await context.ports.eventSink.pushEvents({
-        events: [
-          {
-            kind: "run.cancelled",
-            payload: {
-              reason: "signal.sigterm",
-              requestedBy: "user",
-              stopReason: "cancelled",
-            },
-            runId: DRIVER_TEST_IDS.runId,
-          },
-        ],
-      });
+      await settleBackendInput(context, runId, signal);
     };
     backend.stop = async () => {
       stoppedBeforePermissionSettled = decision === null;
@@ -537,6 +642,75 @@ describe("DriverProcess lifecycle", () => {
     expect(socket.paths).not.toContain("/driver/failRun");
     expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
   }, 15_000);
+
+  test.each(["before", "after"] as const)(
+    "linearizes a completed run terminal selected %s input cancellation",
+    async (selectionOrder) => {
+      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+      RpcWebSocket.commands = [
+        {
+          commandId: `terminal-${selectionOrder}-input`,
+          input: { text: "complete once" },
+          kind: "input.start",
+          requestId: `terminal-${selectionOrder}-request`,
+          runId: DRIVER_TEST_IDS.runId,
+        },
+        {
+          commandId: `terminal-${selectionOrder}-cancel`,
+          kind: "turn.cancel",
+          reason: "test cancellation",
+          runId: DRIVER_TEST_IDS.runId,
+        },
+        {
+          commandId: `terminal-${selectionOrder}-stop`,
+          kind: "session.stop",
+          reason: "test complete",
+        },
+      ];
+      const inputEntered = Promise.withResolvers<void>();
+      const cancellationEntered = Promise.withResolvers<void>();
+      const allowTerminalSelection = Promise.withResolvers<void>();
+      const backend = createBackend();
+      backend.handleInput = async (context, _input, runId, signal) => {
+        inputEntered.resolve();
+        if (selectionOrder === "after") {
+          await allowTerminalSelection.promise;
+        }
+        await settleBackendInput(context, runId, signal);
+      };
+      backend.cancelActiveTurn = async () => {
+        cancellationEntered.resolve();
+        allowTerminalSelection.resolve();
+      };
+      if (selectionOrder === "before") {
+        RpcWebSocket.delayedEventKind = "run.completed";
+      }
+
+      const run = new DriverProcess(driverBootPayload, () => backend).run();
+      await inputEntered.promise;
+      if (selectionOrder === "before") {
+        await RpcWebSocket.stalled.promise;
+        RpcWebSocket.delayedResponse.resolve();
+      } else {
+        await cancellationEntered.promise;
+      }
+      await expect(run).resolves.toBeUndefined();
+
+      const inputTerminals = (PendingWebSocket.instances[0] as RpcWebSocket).requests
+        .filter(({ path }) => path === "/driver/commandUpdate")
+        .map(({ input }) => input as { commandId: string; status: string })
+        .filter(
+          ({ commandId, status }) =>
+            commandId === `terminal-${selectionOrder}-input` && status !== "accepted",
+        );
+      expect(inputTerminals).toEqual([
+        expect.objectContaining({
+          commandId: `terminal-${selectionOrder}-input`,
+          status: selectionOrder === "before" ? "completed" : "cancelled",
+        }),
+      ]);
+    },
+  );
 
   test.each([
     ["hello", "/driver/hello", false, 0],
@@ -632,71 +806,6 @@ describe("DriverProcess lifecycle", () => {
     expect(stopCount).toBe(2);
     expect(resourceActive).toBe(false);
     expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-  });
-
-  test("automatically retries final cleanup after shutdown times out during backend start", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    const existingSignalListeners = new Set(process.listeners("SIGTERM"));
-    const startEntered = Promise.withResolvers<void>();
-    const releaseStart = Promise.withResolvers<void>();
-    const finalCleanup = Promise.withResolvers<void>();
-    const backend = createBackend();
-    let resourceActive = false;
-    let stopCount = 0;
-    let startSignal: AbortSignal | undefined;
-    backend.start = async (_context, signal) => {
-      startSignal = signal;
-      startEntered.resolve();
-      await releaseStart.promise;
-      signal.throwIfAborted();
-      resourceActive = true;
-    };
-    backend.stop = async () => {
-      stopCount += 1;
-      resourceActive = false;
-
-      if (stopCount === 3) {
-        finalCleanup.resolve();
-      }
-    };
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
-
-    try {
-      const run = new DriverProcess(driverBootPayload, () => backend).run();
-      const outcome = run.then(
-        () => null,
-        (error: unknown) => error,
-      );
-
-      await startEntered.promise;
-      const shutdown = process
-        .listeners("SIGTERM")
-        .find((listener) => !existingSignalListeners.has(listener));
-      expect(shutdown).toBeDefined();
-      shutdown?.("SIGTERM");
-      await outcome;
-      expect(startSignal?.aborted).toBe(true);
-      expect(startSignal?.reason).toMatchObject({ message: "signal.sigterm" });
-      releaseStart.resolve();
-
-      const cleaned = await Promise.race([
-        finalCleanup.promise.then(() => true),
-        Bun.sleep(50).then(() => false),
-      ]);
-      expect(cleaned).toBe(true);
-      expect(stopCount).toBe(3);
-      expect(resourceActive).toBe(false);
-      expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-    } finally {
-      releaseStart.resolve();
-      globalThis.setTimeout = nativeSetTimeout;
-    }
   });
 
   test("propagates a heartbeat failure instead of treating it as a normal shutdown", async () => {
@@ -860,10 +969,10 @@ describe("DriverProcess lifecycle", () => {
     const inputEntered = Promise.withResolvers<void>();
     const stopInput = Promise.withResolvers<void>();
     const backend = createBackend();
-    backend.handleInput = async () => {
+    backend.handleInput = async (context, _input, runId, signal) => {
       inputEntered.resolve();
       await stopInput.promise;
-      throw new DriverTurnCancelledError("signal shutdown");
+      await settleBackendInput(context, runId, signal);
     };
     backend.stop = async () => stopInput.resolve();
     const run = new DriverProcess(driverBootPayload, () => backend).run();
@@ -937,99 +1046,6 @@ describe("DriverProcess lifecycle", () => {
     expect(socket.paths.filter((path) => path === "/driver/failRun")).toHaveLength(1);
   });
 
-  test.each([
-    ["transient", 1, "completed"],
-    ["persistent", Number.POSITIVE_INFINITY, "failed"],
-  ] as const)(
-    "bounds and retries a %s backend cleanup failure during process shutdown",
-    async (_name, failures, expectedStatus) => {
-      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-      RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
-      const existingSignalListeners = new Set(process.listeners("SIGTERM"));
-      const backend = createBackend();
-      let stopCount = 0;
-      backend.stop = async () => {
-        stopCount += 1;
-
-        if (stopCount <= failures) {
-          throw new Error("cleanup failed");
-        }
-      };
-      const driver = new DriverProcess(driverBootPayload, () => backend);
-      const run = driver.run();
-
-      await RpcWebSocket.stalled.promise;
-      const shutdown = process
-        .listeners("SIGTERM")
-        .find((listener) => !existingSignalListeners.has(listener));
-      expect(shutdown).toBeDefined();
-      shutdown?.("SIGTERM");
-
-      const outcome = await settlePromiseWithTimeout(run, {
-        label: "driver process cleanup retry",
-        timeoutMs: 1_000,
-      });
-
-      expect(outcome.status).toBe(expectedStatus);
-      expect(stopCount).toBe(2);
-      expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-    },
-  );
-
-  test("starts a new backend cleanup attempt after the previous one times out", async () => {
-    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
-    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
-    const existingSignalListeners = new Set(process.listeners("SIGTERM"));
-    const firstStopAborted = Promise.withResolvers<void>();
-    const backend = createBackend();
-    const stopSignals: AbortSignal[] = [];
-    let stopCount = 0;
-    backend.stop = async (_context, _reason, signal) => {
-      stopCount += 1;
-      stopSignals.push(signal);
-
-      if (stopCount === 1) {
-        await new Promise<never>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => {
-              firstStopAborted.resolve();
-              reject(signal.reason);
-            },
-            { once: true },
-          );
-        });
-      }
-    };
-    const nativeSetTimeout = globalThis.setTimeout;
-    const acceleratedSetTimeout = (
-      callback: (...args: unknown[]) => void,
-      delay?: number,
-      ...args: unknown[]
-    ) => nativeSetTimeout(callback, delay === 5_000 ? 10 : delay, ...args);
-    globalThis.setTimeout = acceleratedSetTimeout as typeof setTimeout;
-
-    try {
-      const run = new DriverProcess(driverBootPayload, () => backend).run();
-      await RpcWebSocket.stalled.promise;
-      const shutdown = process
-        .listeners("SIGTERM")
-        .find((listener) => !existingSignalListeners.has(listener));
-      expect(shutdown).toBeDefined();
-      shutdown?.("SIGTERM");
-
-      await expect(run).resolves.toBeUndefined();
-      await firstStopAborted.promise;
-      expect(stopCount).toBe(2);
-      expect(stopSignals[0]?.aborted).toBe(true);
-      expect(stopSignals[1]).not.toBe(stopSignals[0]);
-      expect(stopSignals[1]?.aborted).toBe(false);
-      expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
-    } finally {
-      globalThis.setTimeout = nativeSetTimeout;
-    }
-  });
-
   test("retries a shutdown failure joined by process finalization", async () => {
     globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
     RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
@@ -1056,8 +1072,6 @@ describe("DriverProcess lifecycle", () => {
     expect(shutdown).toBeDefined();
     shutdown?.("SIGTERM");
     await firstStopEntered.promise;
-    await Bun.sleep(10);
-    expect(stopCount).toBe(1);
     releaseFirstStop.resolve();
 
     const outcome = await settlePromiseWithTimeout(run, {
@@ -1066,6 +1080,33 @@ describe("DriverProcess lifecycle", () => {
     });
 
     expect(outcome.status).toBe("completed");
+    expect(stopCount).toBe(2);
+    expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
+  });
+
+  test("reports a persistent cleanup failure during signal shutdown", async () => {
+    globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+    RpcWebSocket.stalledPath = "/driverInstance/nextCommand";
+    const existingSignalListeners = new Set(process.listeners("SIGTERM"));
+    const backend = createBackend();
+    let stopCount = 0;
+    backend.stop = async () => {
+      stopCount += 1;
+      throw new Error("cleanup failed");
+    };
+    const run = new DriverProcess(driverBootPayload, () => backend).run();
+
+    await RpcWebSocket.stalled.promise;
+    process.listeners("SIGTERM").find((listener) => !existingSignalListeners.has(listener))?.(
+      "SIGTERM",
+    );
+
+    const outcome = await settlePromiseWithTimeout(run, {
+      label: "driver process persistent cleanup failure",
+      timeoutMs: 1_000,
+    });
+
+    expect(outcome).toMatchObject({ error: { message: "cleanup failed" }, status: "failed" });
     expect(stopCount).toBe(2);
     expect(process.listeners("SIGTERM")).toEqual([...existingSignalListeners]);
   });

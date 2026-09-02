@@ -3,26 +3,24 @@
     "mode": "created",
     "nativeSessionId": "native-session-1",
     "setup": {
-      "availableModes": [
-        {
-          "id": "default",
-          "name": "Default"
-        }
-      ],
-      "capabilities": {
-        "fileSystem": true
-      },
       "configOptions": [
         {
           "id": "approval",
           "type": "select"
         }
       ],
-      "currentModeId": "default",
-      "currentModel": "sonnet",
-      "models": ["sonnet"]
+      "modes": {
+        "availableModes": [
+          {
+            "id": "default",
+            "name": "Default"
+          }
+        ],
+        "currentModeId": "default"
+      }
     }
   },
+  "updates": [],
   "expectedEvents": [
     {
       "kind": "session.created",
@@ -39,6 +37,7 @@
       "visibility": "owner_debug"
     },
     {
+      "delivery": "best_effort",
       "kind": "session.mode.updated",
       "payload": {
         "availableModes": [
@@ -51,13 +50,7 @@
       }
     },
     {
-      "kind": "session.models.updated",
-      "payload": {
-        "availableModels": ["sonnet"],
-        "currentModel": "sonnet"
-      }
-    },
-    {
+      "delivery": "best_effort",
       "kind": "session.config.updated",
       "payload": {
         "options": [
@@ -67,15 +60,6 @@
           }
         ]
       }
-    },
-    {
-      "kind": "session.capabilities.updated",
-      "payload": {
-        "capabilities": {
-          "fileSystem": true
-        }
-      },
-      "visibility": "owner_debug"
     }
   ]
 }

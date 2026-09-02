@@ -1,9 +1,15 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
+import { jsonValueSchema } from "../../contract";
 import type { DriverEventInput } from "../../protocol/events";
-import type { MessageId, RunId } from "../../protocol/id";
+import type { MessageId, RunId, SessionId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { ClaudeAgentSdkEventWriter } from "./agent-sdk-event-writer";
+import { DriverCompletedTerminalSupersededError } from "../driver-event-publisher";
+import {
+  assertClaudeDurableEventFits,
+  ClaudeAgentSdkEventWriter,
+  type ClaudeTerminalOutcome,
+} from "./agent-sdk-event-writer";
 import {
   isRecord,
   readNumber,
@@ -12,58 +18,173 @@ import {
   stringifyForDisplay,
 } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
-import { toClaudeFilesPersistedEvents } from "./agent-sdk-message-events";
+import {
+  aggregateClaudeModelUsage,
+  toClaudeFilesPersistedEvents,
+} from "./agent-sdk-message-events";
+import {
+  claudeAssistantOutcome,
+  claudePermissionDenialAdvisory,
+  claudePermissionDenials,
+  claudeResultErrorDetails,
+  claudeToolOutcome,
+  isClaudeResultCancelled,
+  isClaudeResultRetryable,
+  isClaudeResultSuccessful,
+} from "./agent-sdk-outcomes";
 import { ClaudeAgentSdkMessageState, readClaudeSdkSessionId } from "./agent-sdk-message-state";
+import {
+  claudeBackgroundTasksClosedEvent,
+  projectClaudeBackgroundTasksSnapshot,
+} from "./agent-sdk-task-events";
 import { isToolUseBlock, toToolCallId, toToolCallName, toToolResultText } from "./agent-sdk-tools";
+import type { ClaudePermissionDenialAdvisory } from "./agent-sdk-outcomes";
 interface ClaudeMessageTranslatorOptions {
+  publicToolCallId(nativeToolCallId: string): string;
+  readonly sessionId: SessionId;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
+  pushTerminal(
+    context: AgentDriverContext,
+    reason: string,
+    closures: readonly DriverEventInput[],
+    terminal: DriverEventInput,
+  ): Promise<void>;
   recordNativeSessionId(context: AgentDriverContext, sessionId: string): Promise<void>;
+  replaceNativeSessionId(
+    context: AgentDriverContext,
+    previousSessionId: string,
+    nextSessionId: string,
+  ): Promise<void>;
+}
+
+const MAX_CLAUDE_STRUCTURED_TERMINAL_BYTES = 512 * 1_024;
+
+function exhaustSdkMessage(value: never): unknown {
+  return value;
+}
+
+export type { ClaudeTerminalOutcome } from "./agent-sdk-event-writer";
+
+export interface ClaudePreparedResult {
+  readonly reason: string;
+  readonly terminal: ClaudeTerminalOutcome;
+  readonly toolStatus: "cancelled" | "completed" | "failed";
 }
 
 export class ClaudeTerminalWriteError extends Error {
   override readonly name = "ClaudeTerminalWriteError";
+  readonly terminalKind: ClaudeTerminalOutcome["kind"];
 
-  constructor(cause: unknown) {
+  constructor(cause: unknown, terminalKind: ClaudeTerminalOutcome["kind"]) {
     super("Claude terminal delivery failed.", { cause });
+    this.terminalKind = terminalKind;
   }
 }
 
 export class ClaudeAgentSdkMessageTranslator {
   readonly #events: ClaudeAgentSdkEventWriter;
   readonly #options: ClaudeMessageTranslatorOptions;
-  readonly #state = new ClaudeAgentSdkMessageState();
+  readonly #permissionDenialAdvisories = new Map<string, ClaudePermissionDenialAdvisory>();
+  readonly #state: ClaudeAgentSdkMessageState;
+  #turnClosureCommitted = false;
 
   constructor(options: ClaudeMessageTranslatorOptions) {
     this.#options = options;
     this.#events = new ClaudeAgentSdkEventWriter({ push: options.push });
+    this.#state = new ClaudeAgentSdkMessageState(options.sessionId);
   }
 
   resetTurnMessageState(): void {
     this.#state.reset();
     this.#events.resetTurnState();
+    this.#permissionDenialAdvisories.clear();
+    this.#turnClosureCommitted = false;
   }
 
-  async endActiveThought(context: AgentDriverContext): Promise<void> {
-    for (const thoughtId of this.#state.takeAllThoughtIds()) {
-      await this.#events.endThought(context, thoughtId);
+  async #cancelOpenTurn(context: AgentDriverContext): Promise<void> {
+    for (const [messageId, thoughtId] of this.#state.activeThoughts()) {
+      await this.#events.settleThought(context, thoughtId, "cancelled");
+      this.#state.deleteThoughtId(messageId);
     }
-  }
-
-  async finishTurn(context: AgentDriverContext, toolStatus: "completed" | "failed"): Promise<void> {
-    await this.endActiveThought(context);
 
     for (const [messageId, runId] of this.#state.assistantMessages()) {
-      await this.#endAssistantMessage(context, runId, messageId);
+      await this.#events.settleMessage(context, messageId, { status: "cancelled" });
+      this.#state.completeAssistantMessage(runId, messageId, false);
     }
 
-    await this.#events.finishTools(context, toolStatus);
+    await this.#events.finishTools(context, "cancelled");
+    await this.#options.push(context, "driver.claude.tasks.finished", [
+      claudeBackgroundTasksClosedEvent(),
+    ]);
+  }
+
+  async finishTurnWithTerminal(
+    context: AgentDriverContext,
+    toolStatus: "cancelled" | "completed" | "failed",
+    terminal: DriverEventInput,
+    reason: string,
+  ): Promise<void> {
+    const closure = this.#turnClosureCommitted ? null : this.#events.prepareTurnClosure(toolStatus);
+    const commit = () => {
+      if (closure === null) {
+        return;
+      }
+      closure.commit();
+      this.#turnClosureCommitted = true;
+      this.#state.clearThoughtIds();
+      for (const [messageId, runId] of this.#state.assistantMessages()) {
+        this.#state.completeAssistantMessage(runId, messageId, toolStatus === "completed");
+      }
+    };
+
+    try {
+      await this.#options.pushTerminal(
+        context,
+        reason,
+        closure === null ? [] : [...closure.events, claudeBackgroundTasksClosedEvent()],
+        terminal,
+      );
+    } catch (error) {
+      if (
+        terminal.kind === "run.completed" &&
+        error instanceof DriverCompletedTerminalSupersededError
+      ) {
+        commit();
+      }
+      throw error;
+    }
+    commit();
+  }
+
+  async cancelTurn(context: AgentDriverContext, runId: RunId, reason: string): Promise<void> {
+    await this.finishTurnWithTerminal(
+      context,
+      "cancelled",
+      this.#events.runCancelled(runId, reason),
+      "driver.claude.turn.cancelled",
+    );
+  }
+
+  async failTurn(
+    context: AgentDriverContext,
+    runId: RunId,
+    code: string,
+    message: string,
+  ): Promise<void> {
+    await this.finishTurnWithTerminal(
+      context,
+      "failed",
+      this.#events.runError(runId, code, message, false),
+      "driver.claude.turn.failed",
+    );
   }
 
   async #endThought(context: AgentDriverContext, messageId: string): Promise<void> {
-    const thoughtId = this.#state.takeThoughtId(messageId);
+    const thoughtId = this.#state.thoughtIdForMessage(messageId);
 
     if (thoughtId !== undefined) {
-      await this.#events.endThought(context, thoughtId);
+      await this.#events.settleThought(context, thoughtId, "completed");
+      this.#state.deleteThoughtId(messageId);
     }
   }
 
@@ -71,48 +192,88 @@ export class ClaudeAgentSdkMessageTranslator {
     context: AgentDriverContext,
     message: SDKMessage,
     runId: RunId,
-  ): Promise<boolean> {
+    preserveOpenTurn = false,
+  ): Promise<ClaudeTerminalOutcome | null> {
+    if (message.type === "result") {
+      return this.publishPreparedResult(context, await this.prepareResult(context, message, runId));
+    }
+
     const sessionId = readClaudeSdkSessionId(message);
 
-    if (sessionId) {
+    if (sessionId !== null && message.type !== "conversation_reset") {
       await this.#options.recordNativeSessionId(context, sessionId);
     }
 
     switch (message.type) {
       case "assistant": {
         await this.#handleAssistantMessage(context, message, runId);
-        return false;
+        return null;
       }
       case "auth_status":
       case "rate_limit_event":
-      case "tool_progress":
       case "tool_use_summary": {
         await this.#events.pushDiagnostic(context, message);
-        return false;
+        return null;
       }
-      case "result": {
-        await this.#handleResultMessage(context, message, runId);
-        return true;
+      case "tool_progress": {
+        if (message.heartbeat !== true) {
+          await this.#events.pushDiagnostic(context, message);
+        }
+        return null;
+      }
+      case "conversation_reset": {
+        await this.#handleConversationReset(context, message, preserveOpenTurn);
+        return null;
       }
       case "stream_event": {
         await this.#handleStreamEvent(context, message, runId);
-        return false;
+        return null;
       }
       case "system": {
-        await this.#handleSystemMessage(context, message);
-        return false;
+        await this.#handleSystemMessage(context, message, runId);
+        return null;
       }
       case "user": {
         await this.#handleUserMessage(context, message, runId);
-        return false;
+        return null;
       }
       case "prompt_suggestion": {
-        return false;
+        return null;
       }
       default: {
-        return false;
+        const unexpected = exhaustSdkMessage(message);
+        await this.#events.pushRawDiagnostic(
+          context,
+          "driver.claude.message.unknown",
+          isRecord(unexpected) ? unexpected : { value: String(unexpected) },
+        );
+        return null;
       }
     }
+  }
+
+  async prepareResult(
+    context: AgentDriverContext,
+    message: Extract<SDKMessage, { type: "result" }>,
+    runId: RunId,
+  ): Promise<ClaudePreparedResult> {
+    const sessionId = readClaudeSdkSessionId(message);
+    if (sessionId !== null) {
+      await this.#options.recordNativeSessionId(context, sessionId);
+    }
+    return this.#prepareResultMessage(context, message, runId);
+  }
+
+  async publishPreparedResult(
+    context: AgentDriverContext,
+    result: ClaudePreparedResult,
+  ): Promise<ClaudeTerminalOutcome> {
+    try {
+      await this.finishTurnWithTerminal(context, result.toolStatus, result.terminal, result.reason);
+    } catch (error) {
+      throw new ClaudeTerminalWriteError(error, result.terminal.kind);
+    }
+    return result.terminal;
   }
 
   async #handleAssistantMessage(
@@ -120,15 +281,19 @@ export class ClaudeAgentSdkMessageTranslator {
     message: Extract<SDKMessage, { type: "assistant" }>,
     runId: RunId,
   ): Promise<void> {
+    await this.#retractWireItems(context, message.supersedes ?? []);
+    const outcome = claudeAssistantOutcome(message);
     const messageId = this.#state.assistantMessageId(
       runId,
       this.#state.resolveAssistantMessageNativeId(
         this.#state.streamScopeKey(runId, message),
-        this.#state.readNativeMessageId(message),
+        readString(readRecord(message, "message"), "id"),
+        message.uuid,
       ),
     );
     const content = Array.isArray(message.message.content) ? message.message.content : [];
     const authoritativeText: string[] = [];
+    const toolCallIds: string[] = [];
 
     for (const [index, block] of content.entries()) {
       if (!isRecord(block)) {
@@ -161,7 +326,8 @@ export class ClaudeAgentSdkMessageTranslator {
       }
 
       if (isToolUseBlock(block)) {
-        const toolCallId = toToolCallId(block, messageId, index);
+        const toolCallId = this.#options.publicToolCallId(toToolCallId(block, messageId, index));
+        toolCallIds.push(toolCallId);
         if (!this.#events.hasToolStarted(toolCallId)) {
           // Claude content blocks are protocol-ordered; keep tool start/args/end in wire order.
           await this.#events.ensureToolStarted({
@@ -178,11 +344,43 @@ export class ClaudeAgentSdkMessageTranslator {
       }
     }
 
+    this.#state.bindWireAssistantMessage(message.uuid, messageId);
+    this.#state.bindWireToolCalls(message.uuid, toolCallIds);
+
     if (authoritativeText.length > 0) {
       const text = authoritativeText.join("");
       if (await this.#events.pushMessageSnapshot(context, messageId, text)) {
-        this.#state.markAuthoritative(messageId, text);
+        if (outcome.status === "completed") {
+          this.#state.markAuthoritative(messageId, text);
+        }
       }
+    }
+
+    if (outcome.status === "cancelled") {
+      const thoughtId = this.#state.thoughtIdForMessage(messageId);
+      if (thoughtId !== undefined) {
+        await this.#events.settleThought(context, thoughtId, "cancelled");
+        this.#state.deleteThoughtId(messageId);
+      }
+      await this.#events.ensureMessageStarted(context, messageId);
+      await this.#events.settleMessage(context, messageId, { status: "cancelled" });
+      this.#state.completeAssistantMessage(runId, messageId, false);
+      return;
+    }
+
+    if (outcome.status === "failed") {
+      await this.#endThought(context, messageId);
+      await this.#events.ensureMessageStarted(context, messageId);
+      await this.#events.settleMessage(context, messageId, {
+        error: {
+          code: `claude.${outcome.code}`,
+          message: outcome.message,
+          retryable: outcome.retryable,
+        },
+        status: "failed",
+      });
+      this.#state.completeAssistantMessage(runId, messageId, false);
+      return;
     }
 
     await this.#endAssistantMessage(context, runId, messageId);
@@ -301,10 +499,8 @@ export class ClaudeAgentSdkMessageTranslator {
       return;
     }
 
-    const toolCallId = toToolCallId(
-      block,
-      messageId,
-      index ?? this.#state.toolCallCount(messageId),
+    const toolCallId = this.#options.publicToolCallId(
+      toToolCallId(block, messageId, index ?? this.#state.toolCallCount(messageId)),
     );
     await this.#events.ensureToolStarted({
       context,
@@ -318,13 +514,8 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     const { input } = block;
-    if (input) {
-      await this.#events.pushToolArguments({
-        context,
-        delta: stringifyForDisplay(input),
-        reason: "driver.claude.tool.args",
-        toolCallId,
-      });
+    if (input && (!isRecord(input) || Object.keys(input).length > 0)) {
+      await this.#events.pushToolSnapshot(context, toolCallId, stringifyForDisplay(input));
     }
   }
 
@@ -395,18 +586,24 @@ export class ClaudeAgentSdkMessageTranslator {
   ): Promise<void> {
     const content = isRecord(message.message) ? message.message.content : null;
     const blocks = Array.isArray(content) ? content : [];
+    const structuredOutput = jsonValueSchema.safeParse(message.tool_use_result);
+    const toolCallIds: string[] = [];
 
     for (const block of blocks) {
       if (!isRecord(block)) {
         continue;
       }
 
-      const toolCallId = readString(block, "tool_use_id");
+      const nativeToolCallId = readString(block, "tool_use_id");
       const resultText = toToolResultText(block);
 
-      if (!toolCallId || !resultText) {
+      if (!nativeToolCallId || resultText === null) {
         continue;
       }
+      const toolCallId = this.#options.publicToolCallId(nativeToolCallId);
+      toolCallIds.push(toolCallId);
+
+      const outcome = claudeToolOutcome(message, block);
 
       // Tool results are emitted in transcript order so the live state reducer can attach them deterministically.
       await this.#events.pushToolResult({
@@ -417,9 +614,18 @@ export class ClaudeAgentSdkMessageTranslator {
           this.#state.activeAssistantMessageId(runId) ??
           this.#state.lastCompletedAssistantMessageId(runId) ??
           this.#state.assistantMessageId(runId, null),
-        status: block["is_error"] === true ? "failed" : "completed",
+        ...(outcome.nonExecutionKind === undefined
+          ? {}
+          : { nonExecutionKind: outcome.nonExecutionKind }),
+        status: outcome.status,
+        ...(structuredOutput.success ? { structuredOutput: structuredOutput.data } : {}),
         toolCallId,
+        ...(outcome.userFeedback === undefined ? {} : { userFeedback: outcome.userFeedback }),
       });
+    }
+
+    if (message.uuid !== undefined) {
+      this.#state.bindWireToolCalls(message.uuid, toolCallIds);
     }
   }
 
@@ -428,57 +634,359 @@ export class ClaudeAgentSdkMessageTranslator {
     runId: RunId,
     messageId: MessageId,
   ): Promise<void> {
-    const ended = await this.#events.endMessage(context, messageId);
+    const ended = await this.#events.settleMessage(context, messageId, { status: "completed" });
     this.#state.completeAssistantMessage(runId, messageId, ended);
   }
 
   async #handleSystemMessage(
     context: AgentDriverContext,
     message: Extract<SDKMessage, { type: "system" }>,
+    runId: RunId,
   ): Promise<void> {
-    if (message.subtype === "init") {
-      await this.#options.recordNativeSessionId(context, message.session_id);
-      await this.#events.pushSessionInfoUpdated(context);
-      context.logger.info("driver.claude.session.initialized", {
-        mcpServerCount: message.mcp_servers.length,
-        model: message.model,
-        nativeSessionIdPresent: true,
-        toolCount: message.tools.length,
-      });
+    switch (message.subtype) {
+      case "init": {
+        await this.#events.pushSessionInfoUpdated(context);
+        context.logger.info("driver.claude.session.initialized", {
+          mcpServerCount: message.mcp_servers.length,
+          model: message.model,
+          nativeSessionIdPresent: true,
+          toolCount: message.tools.length,
+        });
+        return;
+      }
+      case "files_persisted": {
+        await this.#handleFilesPersisted(context, message);
+        return;
+      }
+      case "informational": {
+        const nativeToolCallId = message.tool_use_id;
+        await this.#pushStandaloneMessage(context, runId, message.uuid, message.content, {
+          level: message.level,
+          ...(message.prevent_continuation === undefined
+            ? {}
+            : { preventContinuation: message.prevent_continuation }),
+          subtype: message.subtype,
+          ...(nativeToolCallId === undefined
+            ? {}
+            : { toolCallId: this.#options.publicToolCallId(nativeToolCallId) }),
+        });
+        return;
+      }
+      case "local_command_output": {
+        await this.#pushStandaloneMessage(context, runId, message.uuid, message.content, {
+          subtype: message.subtype,
+        });
+        return;
+      }
+      case "mirror_error": {
+        await this.#events.pushRawDiagnostic(
+          context,
+          "driver.claude.mirror_error",
+          {
+            errorBytes: Buffer.byteLength(message.error, "utf8"),
+            kind: "claude.mirror_error",
+          },
+          { message: "Claude transcript mirror write failed.", severity: "error" },
+        );
+        return;
+      }
+      case "model_refusal_fallback": {
+        await this.#retractWireItems(context, message.retracted_message_uuids ?? []);
+        await this.#events.pushDiagnostic(context, message);
+        return;
+      }
+      case "permission_denied": {
+        const denial = claudePermissionDenialAdvisory(message);
+        if (denial !== null) {
+          const toolCallId = this.#options.publicToolCallId(denial.toolCallId);
+          this.#permissionDenialAdvisories.set(`${runId}:${toolCallId}`, {
+            ...denial,
+            toolCallId,
+          });
+        }
+        return;
+      }
+      case "api_retry":
+      case "commands_changed":
+      case "compact_boundary":
+      case "control_request_progress":
+      case "elicitation_complete":
+      case "hook_progress":
+      case "hook_response":
+      case "hook_started":
+      case "memory_recall":
+      case "model_refusal_no_fallback":
+      case "notification":
+      case "plugin_install":
+      case "session_state_changed":
+      case "status":
+      case "task_progress":
+      case "task_started":
+      case "task_updated":
+      case "thinking_tokens":
+      case "worker_shutting_down": {
+        await this.#events.pushDiagnostic(context, message);
+        return;
+      }
+      case "task_notification": {
+        await this.#handleTaskNotification(context, message, runId);
+        return;
+      }
+      case "background_tasks_changed": {
+        await this.#handleBackgroundTasksChanged(context, message);
+        return;
+      }
+      default: {
+        const unexpected = exhaustSdkMessage(message);
+        await this.#events.pushRawDiagnostic(
+          context,
+          "driver.claude.system.unknown",
+          isRecord(unexpected) ? unexpected : { value: String(unexpected) },
+        );
+      }
+    }
+  }
+
+  async #handleBackgroundTasksChanged(
+    context: AgentDriverContext,
+    message: Extract<SDKMessage, { subtype: "background_tasks_changed"; type: "system" }>,
+  ): Promise<void> {
+    const { diagnostic, snapshot } = projectClaudeBackgroundTasksSnapshot(message);
+    await this.#options.push(context, "driver.claude.tasks.replaced", [
+      ...(snapshot === undefined ? [] : [snapshot]),
+      ...(diagnostic === undefined ? [] : [diagnostic]),
+    ]);
+  }
+
+  async #handleTaskNotification(
+    context: AgentDriverContext,
+    message: Extract<SDKMessage, { subtype: "task_notification"; type: "system" }>,
+    runId: RunId,
+  ): Promise<void> {
+    await this.#events.pushDiagnostic(context, message);
+
+    if (
+      message.status !== "completed" ||
+      message.tool_use_id === undefined ||
+      !message.resource_links?.length
+    ) {
       return;
     }
 
-    if (message.subtype === "files_persisted") {
-      await this.#handleFilesPersisted(context, message);
+    const structuredOutput = jsonValueSchema.safeParse({ resourceLinks: message.resource_links });
+    if (!structuredOutput.success) {
+      return;
     }
+
+    const toolCallId = this.#options.publicToolCallId(message.tool_use_id);
+    const messageId =
+      this.#events.toolParentMessageId(toolCallId) ??
+      this.#state.activeAssistantMessageId(runId) ??
+      this.#state.lastCompletedAssistantMessageId(runId) ??
+      null;
+    await this.#events.ensureToolStarted({
+      context,
+      ...(messageId === null ? {} : { parentMessageId: messageId }),
+      toolCallId,
+      toolCallName: "MCP tool",
+    });
+    await this.#events.pushToolResult({
+      authoritative: true,
+      context,
+      ...(messageId === null ? {} : { messageId }),
+      status: "completed",
+      structuredOutput: structuredOutput.data,
+      toolCallId,
+    });
+  }
+
+  async #retractWireItems(
+    context: AgentDriverContext,
+    wireUuids: readonly string[],
+  ): Promise<void> {
+    for (const wireUuid of wireUuids) {
+      const { messageId, toolCallIds } = this.#state.wireItems(wireUuid);
+
+      if (messageId !== null) {
+        const thoughtId = this.#state.thoughtIdForMessage(messageId);
+        if (thoughtId !== undefined) {
+          await this.#events.settleThought(context, thoughtId, "cancelled");
+          this.#state.deleteThoughtId(messageId);
+        }
+        await this.#events.retractMessage(context, messageId);
+        this.#state.commitWireMessageRetraction(wireUuid, messageId);
+      }
+
+      for (const toolCallId of toolCallIds) {
+        await this.#events.retractTool(context, toolCallId);
+      }
+      this.#state.commitWireToolRetractions(wireUuid);
+    }
+  }
+
+  async #pushStandaloneMessage(
+    context: AgentDriverContext,
+    runId: RunId,
+    nativeMessageId: string,
+    content: string,
+    metadata: JsonObject,
+  ): Promise<void> {
+    if (content.length === 0) {
+      await this.#events.pushRawDiagnostic(
+        context,
+        `driver.claude.${String(metadata["subtype"] ?? "message")}`,
+        { content, ...metadata },
+        { message: "Claude emitted an empty display message.", severity: "warn" },
+      );
+      return;
+    }
+
+    const messageId = this.#state.auxiliaryMessageId(runId, nativeMessageId);
+    if (await this.#events.pushMessageSnapshot(context, messageId, content, metadata)) {
+      await this.#events.settleMessage(context, messageId, { status: "completed" });
+    }
+  }
+
+  async #handleConversationReset(
+    context: AgentDriverContext,
+    message: Extract<SDKMessage, { type: "conversation_reset" }>,
+    preserveOpenTurn: boolean,
+  ): Promise<void> {
+    if (!preserveOpenTurn) {
+      await this.#cancelOpenTurn(context);
+    }
+    await this.#options.replaceNativeSessionId(
+      context,
+      message.session_id,
+      message.new_conversation_id,
+    );
+    if (!preserveOpenTurn) {
+      this.resetTurnMessageState();
+    }
+    await this.#events.pushSessionInfoUpdated(context, true);
   }
 
   async #handleFilesPersisted(
     context: AgentDriverContext,
     message: Extract<SDKMessage, { type: "system"; subtype: "files_persisted" }>,
   ): Promise<void> {
-    await this.#options.push(
-      context,
-      "driver.claude.files.persisted",
-      toClaudeFilesPersistedEvents(message),
-    );
+    const events = toClaudeFilesPersistedEvents(message);
+    for (const event of events) {
+      assertClaudeDurableEventFits(
+        event,
+        "claude.files_persisted_too_large",
+        "file persistence event",
+      );
+    }
+    await this.#options.push(context, "driver.claude.files.persisted", events);
   }
 
-  async #handleResultMessage(
+  async #prepareResultMessage(
     context: AgentDriverContext,
     message: Extract<SDKMessage, { type: "result" }>,
     runId: RunId,
-  ): Promise<void> {
-    await this.finishTurn(context, message.subtype === "success" ? "completed" : "failed");
+  ): Promise<ClaudePreparedResult> {
+    const successful = isClaudeResultSuccessful(message);
+    const cancelled = isClaudeResultCancelled(message);
+
+    for (const denial of claudePermissionDenials(message)) {
+      const toolCallId = this.#options.publicToolCallId(denial.toolCallId);
+      const advisory = this.#permissionDenialAdvisories.get(`${runId}:${toolCallId}`);
+      const messageId =
+        this.#events.toolParentMessageId(toolCallId) ??
+        this.#state.activeAssistantMessageId(runId) ??
+        this.#state.lastCompletedAssistantMessageId(runId) ??
+        null;
+      await this.#events.ensureToolStarted({
+        context,
+        ...(messageId === null ? {} : { parentMessageId: messageId }),
+        toolCallId,
+        toolCallName: denial.name,
+      });
+      await this.#events.pushToolResult({
+        ...(advisory?.agentId === undefined ? {} : { agentId: advisory.agentId }),
+        authoritative: true,
+        content: advisory?.message ?? denial.message,
+        context,
+        ...(advisory?.decisionReason === undefined
+          ? {}
+          : { decisionReason: advisory.decisionReason }),
+        ...(advisory?.decisionReasonType === undefined
+          ? {}
+          : { decisionReasonType: advisory.decisionReasonType }),
+        ...(messageId === null ? {} : { messageId }),
+        rawInput: stringifyForDisplay(denial.input),
+        status: "failed",
+        toolCallId,
+        toolCallName: denial.name,
+      });
+      this.#permissionDenialAdvisories.delete(`${runId}:${toolCallId}`);
+    }
+
     await this.#events.pushUsage(
       context,
-      isRecord(message.usage) ? message.usage : null,
+      aggregateClaudeModelUsage(message.modelUsage),
       message.total_cost_usd,
     );
+    const prepareResult = (
+      toolStatus: "cancelled" | "completed" | "failed",
+      terminal: ClaudeTerminalOutcome,
+      reason: string,
+    ): ClaudePreparedResult => ({ reason, terminal, toolStatus });
 
-    if (message.subtype === "success") {
+    if (cancelled) {
+      return prepareResult(
+        "cancelled",
+        this.#events.runCancelled(runId, message.terminal_reason ?? "provider.aborted"),
+        "driver.claude.turn.cancelled",
+      );
+    }
+
+    if (message.subtype === "success" && successful) {
       const resultText = isRecord(message) ? readString(message, "result") : null;
-      if (resultText !== null && resultText.length > 0 && !this.#state.hasAssistantText(runId)) {
+      const structuredOutput =
+        message.structured_output === undefined
+          ? undefined
+          : jsonValueSchema.safeParse(message.structured_output);
+
+      if (structuredOutput !== undefined && !structuredOutput.success) {
+        return prepareResult(
+          "failed",
+          this.#events.runError(
+            runId,
+            "claude.invalid_structured_output",
+            "Claude Agent SDK returned a non-JSON structured output.",
+            false,
+          ),
+          "driver.claude.turn.failed",
+        );
+      }
+
+      const completedTerminal = this.#events.runFinished(runId, null, structuredOutput?.data);
+      const structuredOutputTooLarge =
+        structuredOutput?.success === true &&
+        Buffer.byteLength(JSON.stringify(completedTerminal), "utf8") >
+          MAX_CLAUDE_STRUCTURED_TERMINAL_BYTES;
+
+      if (structuredOutputTooLarge) {
+        return prepareResult(
+          "failed",
+          this.#events.runError(
+            runId,
+            "claude.structured_output_too_large",
+            "Claude Agent SDK structured output exceeds the runtime terminal event limit.",
+            false,
+          ),
+          "driver.claude.turn.failed",
+        );
+      }
+
+      if (
+        structuredOutput === undefined &&
+        resultText !== null &&
+        resultText.length > 0 &&
+        !this.#state.hasAssistantText(runId)
+      ) {
         const messageId = this.#state.assistantMessageId(runId, null);
         if (await this.#events.pushMessageSnapshot(context, messageId, resultText)) {
           this.#state.markAuthoritative(messageId, resultText);
@@ -490,25 +998,29 @@ export class ClaudeAgentSdkMessageTranslator {
       // resume can omit every assistant frame, so the result is materialized
       // above only when no competing text candidate exists.
       const finalMessage =
-        resultText === null ? null : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
+        structuredOutput !== undefined || resultText === null || resultText.trim().length === 0
+          ? null
+          : this.#state.resolveFinalAssistantSnapshot(runId, resultText);
 
-      try {
-        await this.#events.pushRunFinished(context, runId, finalMessage);
-      } catch (error) {
-        throw new ClaudeTerminalWriteError(error);
-      }
-      return;
-    }
-
-    try {
-      await this.#events.pushRunError(
-        context,
-        runId,
-        `claude.${message.subtype}`,
-        message.errors.join("\n") || "Claude Agent SDK turn failed.",
+      return prepareResult(
+        "completed",
+        this.#events.runFinished(runId, finalMessage, structuredOutput?.data),
+        "driver.claude.turn.completed",
       );
-    } catch (error) {
-      throw new ClaudeTerminalWriteError(error);
     }
+
+    return prepareResult(
+      "failed",
+      this.#events.runError(
+        runId,
+        message.subtype === "success" ? "claude.api_error" : `claude.${message.subtype}`,
+        message.subtype === "success"
+          ? message.result || "Claude Agent SDK API request failed."
+          : message.errors.join("\n") || "Claude Agent SDK turn failed.",
+        isClaudeResultRetryable(message),
+        claudeResultErrorDetails(message),
+      ),
+      "driver.claude.turn.failed",
+    );
   }
 }

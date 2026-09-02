@@ -135,7 +135,14 @@ function assertRunTransition(previous: Run | undefined, next: Run): void {
     "Run origin fields cannot change.",
   );
 
-  for (const key of ["cachedInput", "input", "output", "reasoning", "total"] as const) {
+  for (const key of [
+    "cachedInput",
+    "cachedWrite",
+    "input",
+    "output",
+    "reasoning",
+    "total",
+  ] as const) {
     const prior = previous.usage?.[key];
 
     if (prior === undefined) {

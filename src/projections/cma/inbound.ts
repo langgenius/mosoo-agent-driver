@@ -1,5 +1,11 @@
 import type { RuntimeCommand } from "../../runtime-command";
 
+export type CmaProjectedDriverCommand =
+  | Extract<RuntimeCommand, { kind: "input.start" }>
+  | Omit<Extract<RuntimeCommand, { kind: "mcp.execute" }>, "runId">
+  | Omit<Extract<RuntimeCommand, { kind: "permission.resolve" }>, "runId">
+  | Omit<Extract<RuntimeCommand, { kind: "turn.cancel" }>, "runId">;
+
 type CmaInboundType =
   | "user.custom_tool_result"
   | "user.interrupt"
@@ -184,7 +190,7 @@ export function parseCmaInboundEvent(input: unknown): CmaInboundEvent {
   }
 }
 
-export function projectCmaInboundToDriverCommand(input: unknown): RuntimeCommand {
+export function projectCmaInboundToDriverCommand(input: unknown): CmaProjectedDriverCommand {
   const event = parseCmaInboundEvent(input);
 
   switch (event.type) {

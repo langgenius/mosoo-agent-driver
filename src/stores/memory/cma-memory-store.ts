@@ -246,15 +246,6 @@ class CmaMemoryStore implements CmaStore {
         if (session.status === "terminated") {
           throw new CmaSessionTerminatedError(input.sessionId);
         }
-
-        if (existing.lease.expiresAt <= this.#nowIso()) {
-          existing.lease = this.#createLease();
-          return {
-            claimed: true,
-            event: structuredClone(existing.record),
-            lease: structuredClone(existing.lease),
-          };
-        }
       }
 
       return {
@@ -332,16 +323,39 @@ class CmaMemoryStore implements CmaStore {
       throw new CmaStoreConflictError("event", input.commandId);
     }
 
-    const updated = {
+    let updated = {
       ...claim.record,
       commandResult,
       commandStatus: input.status,
       cursor: createDriverId(),
       updatedAt: this.#nowIso(),
     } satisfies CmaSessionEventRecord;
+
+    let settlementError: unknown;
+
+    try {
+      this.#eventBroker.assertFrame(updated);
+    } catch (error) {
+      if (input.status === "failed") {
+        throw error;
+      }
+
+      settlementError = error;
+      updated = {
+        ...updated,
+        commandResult: null,
+        commandStatus: "failed",
+      };
+    }
+
     this.#eventBroker.replace(input.sessionId, claim.record.id, updated);
     claim.record = updated;
     this.#eventBroker.publish(updated);
+
+    if (settlementError !== undefined) {
+      throw settlementError;
+    }
+
     return structuredClone(updated);
   }
 

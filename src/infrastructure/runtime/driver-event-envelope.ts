@@ -1,7 +1,7 @@
 import { DriverEventRejectedError } from "../../core/driver-runtime-io";
 import type { DriverBootPayload } from "../../protocol/boot";
 import type { DriverEventEnvelope, DriverEventInput } from "../../protocol/events";
-import { createDriverId, parseDriverId } from "../../protocol/id";
+import { createDriverId, parseDriverId, parseRunId } from "../../protocol/id";
 import type { DriverInstanceId, EventId, SessionId, RunId } from "../../protocol/id";
 import { isRuntimeEventEnvelope, toRuntimeEventInput } from "../../runtime-events";
 
@@ -11,14 +11,14 @@ function readExplicitSourceEventId(event: DriverEventInput): string | undefined 
     : undefined;
 }
 
-function parseRunId(value: string): RunId {
-  return parseDriverId(value, "Run ID") as RunId;
-}
-
 function readEventRunId(event: DriverEventInput, activeRunId: RunId | null): RunId | undefined {
   const { runId: eventRunId } = event;
 
-  return eventRunId === undefined ? (activeRunId ?? undefined) : parseRunId(eventRunId);
+  return eventRunId === null
+    ? undefined
+    : eventRunId === undefined
+      ? (activeRunId ?? undefined)
+      : parseRunId(eventRunId);
 }
 
 export function toDriverEventEnvelopes(
@@ -54,13 +54,11 @@ export function toDriverEventEnvelopes(
         sourceEventId,
       },
       event,
-    ).map(
-      (canonicalEvent): DriverEventEnvelope => ({
-        event: canonicalEvent,
-        eventId: canonicalEvent.sourceEventId ?? canonicalEvent.id,
-        occurredAt: canonicalEvent.occurredAt,
-      }),
-    );
+    ).map((canonicalEvent): DriverEventEnvelope => ({
+      event: canonicalEvent,
+      eventId: canonicalEvent.sourceEventId ?? canonicalEvent.id,
+      occurredAt: canonicalEvent.occurredAt,
+    }));
   } catch (error) {
     throw new DriverEventRejectedError(sourceEventId, error);
   }

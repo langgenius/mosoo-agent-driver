@@ -1,8 +1,7 @@
 {
   "begin": {
     "messageId": "message-1",
-    "runId": "run-1",
-    "sessionId": "session-1"
+    "runId": "run-1"
   },
   "updates": [
     {
@@ -79,7 +78,7 @@
         "role": "agent"
       },
       "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:agent-message:1"
+      "sourceEventId": "acp:run-1:agent-message:1"
     },
     {
       "kind": "item.started",
@@ -102,7 +101,7 @@
         "parentMessageId": "assistant-message-1"
       },
       "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:tool-call:2"
+      "sourceEventId": "acp:run-1:tool-call:2"
     },
     {
       "delivery": "lossless",
@@ -117,17 +116,24 @@
         "rawOutput": "{\"text\":\"/workspace\"}"
       },
       "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:tool-call-update:3"
+      "sourceEventId": "acp:run-1:tool-call-update:3"
     },
     {
       "kind": "item.completed",
       "payload": {
         "itemId": "tool-1",
         "itemType": "tool_call",
-        "result": {
-          "text": "/workspace"
-        },
         "status": "completed"
+      },
+      "runId": "run-1"
+    },
+    {
+      "delivery": "lossless",
+      "kind": "message.added",
+      "payload": {
+        "content": "hello",
+        "messageId": "assistant-message-1",
+        "role": "agent"
       },
       "runId": "run-1"
     },
@@ -146,13 +152,6 @@
         "cachedWriteTokens": 1,
         "inputTokens": 4,
         "outputTokens": 2,
-        "raw": {
-          "cachedReadTokens": 5,
-          "cachedWriteTokens": 1,
-          "inputTokens": 4,
-          "outputTokens": 2,
-          "totalTokens": 12
-        },
         "source": "prompt_response",
         "totalTokens": 12,
         "usageContract": "anthropic_bucketed"

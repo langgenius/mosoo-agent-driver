@@ -5,6 +5,7 @@
       "params": {
         "error": {
           "additionalDetails": "HTTP 502 from upstream.",
+          "codexErrorInfo": { "responseStreamDisconnected": { "httpStatusCode": 502 } },
           "message": "Response stream disconnected."
         },
         "threadId": "thread-1",
@@ -19,9 +20,11 @@
         "turn": {
           "error": {
             "additionalDetails": "HTTP 502 from upstream.",
+            "codexErrorInfo": { "responseStreamDisconnected": { "httpStatusCode": 502 } },
             "message": "Response stream disconnected."
           },
           "id": "turn-1",
+          "items": [],
           "status": "failed"
         }
       }
@@ -45,6 +48,13 @@
       "sourceEventId": "openai.turn.started:turn-1"
     },
     {
+      "delivery": "lossless",
+      "kind": "agent.tasks.replaced",
+      "payload": { "tasks": [] },
+      "sourceEventId": "openai.derived:sid1_mw1rK-IfsZaez6IOgvoBLwbJVWO3Ou-eANcCdudVblc",
+      "visibility": "participant"
+    },
+    {
       "kind": "run.failed",
       "native": {
         "eventName": "turn.failed",
@@ -54,9 +64,15 @@
       "payload": {
         "error": {
           "code": "openai.turn_failed",
-          "message": "Response stream disconnected.\nHTTP 502 from upstream."
+          "details": {
+            "additionalDetails": "HTTP 502 from upstream.",
+            "codexErrorInfo": "responseStreamDisconnected",
+            "httpStatusCode": 502
+          },
+          "message": "Response stream disconnected.\nHTTP 502 from upstream.",
+          "retryable": true
         },
-        "recoverable": false
+        "recoverable": true
       },
       "sourceEventId": "openai.turn.failed:turn-1"
     }

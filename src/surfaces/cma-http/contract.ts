@@ -1,5 +1,5 @@
-import type { CmaInboundEvent } from "../../projections/cma";
-import type { RuntimeCommand, RuntimeCommandResult } from "../../runtime-command";
+import type { CmaInboundEvent, CmaProjectedDriverCommand } from "../../projections/cma";
+import type { RuntimeCommandResult } from "../../runtime-command";
 import type { CmaSessionRecord, CmaStore } from "../../stores/cma-store";
 
 type HttpMethod = "DELETE" | "GET" | "POST";
@@ -22,7 +22,7 @@ export interface CmaHttpBetaHeaderRequirement {
 }
 
 export interface CmaHttpDriverCommandDispatchInput {
-  readonly command: RuntimeCommand;
+  readonly command: CmaProjectedDriverCommand;
   readonly event: CmaInboundEvent;
   readonly session: CmaSessionRecord;
   readonly signal: AbortSignal;

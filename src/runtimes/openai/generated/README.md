@@ -1,13 +1,17 @@
-# OpenAI app-server protocol
+# OpenAI app-server protocol types
 
-The TypeScript files in this directory are generated as one atomic schema set.
+This directory contains the transitive closure of the OpenAI app-server types imported by the driver.
 
-They correspond to OpenAI app-server runtime version `0.144.5`, which is also pinned by the SDK dependency and container image.
+They correspond to OpenAI app-server runtime version `0.152.0`, which is also pinned by the CLI dependency and container image.
 
-Regenerate them with the matching runtime:
+Runtime validation and the complete supported server method sets come from the adjacent JSON Schemas.
+
+Regenerate the selected schemas and reachable TypeScript files with the matching runtime:
 
 ```sh
-codex app-server generate-ts --out src/runtimes/openai/generated
+bun scripts/sync-openai-generated.mjs
 ```
 
-Do not split or edit individual generated TypeScript files by hand.
+The synchronization script follows every direct generated-type import from `app-server-protocol-types.ts`, so upstream fields and their complete dependency closure are retained automatically.
+
+Do not edit individual generated TypeScript files by hand.

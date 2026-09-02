@@ -40,16 +40,8 @@
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
-    },
-    {
-      "delivery": "best_effort",
-      "kind": "message.delta",
-      "payload": {
-        "contentDelta": "pong",
-        "messageId": "<driver-id>",
-        "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.message.started:<driver-id>"
     },
     {
       "delivery": "lossless",
@@ -58,14 +50,16 @@
         "content": "pong",
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.item.completed:sid1_BN1wwFn-vJ2yK8Ax93DBy3pMPeQlPs_fMiD3xICce38:0"
     },
     {
       "kind": "message.completed",
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.derived:sid1_BARJThUDVPe3fUNTSKJ0PBt0smINLtwyX9wLH2fXPTk"
     },
     {
       "kind": "runtime.resume.updated",
@@ -76,6 +70,13 @@
       "visibility": "owner_debug"
     },
     {
+      "delivery": "lossless",
+      "kind": "agent.tasks.replaced",
+      "payload": { "tasks": [] },
+      "sourceEventId": "openai.derived:sid1_65gCZZFCtIH2m10-eUUIasKg5wmDWEVoaKGA1D26hMk",
+      "visibility": "participant"
+    },
+    {
       "kind": "run.completed",
       "native": {
         "eventName": "turn.completed",
@@ -84,7 +85,6 @@
       },
       "payload": {
         "finalMessageId": "<driver-id>",
-        "finalMessageText": "pong",
         "stopReason": "end_turn"
       },
       "sourceEventId": "openai.turn.completed:turn-1"

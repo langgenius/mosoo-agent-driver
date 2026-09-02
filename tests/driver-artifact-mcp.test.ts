@@ -11,13 +11,16 @@ import {
   type DriverArtifactTestCommand,
 } from "./driver-artifact-test-controller";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
+import type { McpExecuteCommand } from "../src/runtime-command";
 
 const MCP_SERVER_ID = "01J00000000000000000000020";
 const MCP_GRANT = "artifact-mcp-grant";
+const RECOVERY_RUN_ID = "01J00000000000000000000030";
 const TEST_TIMEOUT_MS = 45_000;
 
 const FAKE_ACP_AGENT = String.raw`
 let buffer = "";
+let pendingPromptId;
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const mcpRequest = async (server, message) => {
   const response = await fetch(server.url, {
@@ -43,14 +46,22 @@ const mcpRequest = async (server, message) => {
   return message.id === undefined ? undefined : response.json();
 };
 const handle = async (message) => {
-  if (!("method" in message) || !("id" in message)) return;
+  if (!("method" in message)) return;
+  if (message.method === "session/cancel") {
+    if (pendingPromptId !== undefined) {
+      send({ id: pendingPromptId, jsonrpc: "2.0", result: { stopReason: "cancelled" } });
+      pendingPromptId = undefined;
+    }
+    return;
+  }
+  if (!("id" in message)) return;
   let result;
   switch (message.method) {
     case "initialize":
       result = {
         agentCapabilities: {
           mcpCapabilities: { http: true },
-          sessionCapabilities: { close: {} },
+          sessionCapabilities: { close: {}, resume: {} },
         },
         authMethods: [],
         protocolVersion: 1,
@@ -85,8 +96,12 @@ const handle = async (message) => {
       break;
     }
     case "session/close":
+    case "session/resume":
       result = {};
       break;
+    case "session/prompt":
+      pendingPromptId = message.id;
+      return;
     default:
       result = {};
   }
@@ -114,15 +129,18 @@ function mcpCommand(
   commandId: string,
   toolName: string,
   argumentsJson = "{}",
+  runId: string = driverBootPayload.execution.configRevision.runId,
 ): DriverArtifactTestCommand {
   return {
     argumentsJson,
     commandId,
     kind: "mcp.execute",
     requestId: `request-${commandId}`,
+    runId,
     serverId: MCP_SERVER_ID,
+    toolCallId: `tool-call-${commandId}`,
     toolName,
-  };
+  } satisfies McpExecuteCommand;
 }
 
 function jsonResponse(id: unknown, result: unknown, headers?: HeadersInit): Response {
@@ -158,11 +176,11 @@ artifactTest(
     const sessions = new Map<string, string>();
     const toolCalls = new Map<string, number>();
     let deleteRequests = 0;
-    let hangingRequestId: unknown;
+    let cancellationNotifications = 0;
     let invalidSessionHeaders = 0;
     let unauthorizedRequests = 0;
     const hangStarted = Promise.withResolvers<void>();
-    const hangCancelled = Promise.withResolvers<void>();
+    const hangReleased = Promise.withResolvers<void>();
     const server = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
@@ -206,14 +224,19 @@ artifactTest(
         };
         methods.push(message.method);
 
+        if (message.method === "server/discover") {
+          return Response.json({
+            error: { code: -32601, message: "Method not found" },
+            id: message.id,
+            jsonrpc: "2.0",
+          });
+        }
         if (message.method !== "initialize" && !hasValidSessionHeaders()) {
           invalidSessionHeaders += 1;
           return new Response("Invalid MCP session headers.", { status: 400 });
         }
         if (message.method === "notifications/cancelled") {
-          if (hangingRequestId !== undefined && message.params?.requestId === hangingRequestId) {
-            hangCancelled.resolve();
-          }
+          cancellationNotifications += 1;
           return new Response(null, { status: 202 });
         }
         if (message.method === "notifications/initialized" || message.id === undefined) {
@@ -303,12 +326,10 @@ artifactTest(
           });
         }
         if (toolName === "hang") {
-          hangingRequestId = message.id;
           hangStarted.resolve();
-          await hangCancelled.promise;
+          await hangReleased.promise;
           return jsonResponse(message.id, {
-            content: [{ text: "cancelled", type: "text" }],
-            isError: true,
+            content: [{ text: "committed after cancellation", type: "text" }],
           });
         }
         if (toolName === "tool-error") {
@@ -393,6 +414,23 @@ artifactTest(
       ]);
       expect(unauthorizedRequests).toBe(0);
 
+      const initialRunEventIndex = controller.events.length;
+      controller.enqueue({
+        commandId: "input-mcp-run",
+        input: { text: "hold MCP run open" },
+        kind: "input.start",
+        requestId: "request-input-mcp-run",
+        runId: driverBootPayload.execution.configRevision.runId,
+      });
+      await controller.waitForEvent(
+        (event) =>
+          event.kind === "run.started" &&
+          event.runId === driverBootPayload.execution.configRevision.runId,
+        initialRunEventIndex,
+        10_000,
+        "initial MCP run start",
+      );
+
       const counterCommand = mcpCommand("mcp-counter", "counter");
       controller.enqueue(counterCommand);
       const counter = await controller.waitForCommandTerminal("mcp-counter", 10_000);
@@ -444,7 +482,14 @@ artifactTest(
       controller.enqueue(mcpCommand("mcp-structured", "structured"));
       expect(await controller.waitForCommandTerminal("mcp-structured", 10_000)).toMatchObject({
         result: {
-          outputText: '{\n  "count": 1,\n  "status": "ok"\n}',
+          outputText: JSON.stringify(
+            {
+              content: [],
+              structuredContent: { count: 1, status: "ok" },
+            },
+            null,
+            2,
+          ),
         },
         status: "completed",
       });
@@ -455,16 +500,41 @@ artifactTest(
         commandId: "cancel-mcp-hang",
         kind: "turn.cancel",
         reason: "artifact.mcp.test.cancel",
+        runId: driverBootPayload.execution.configRevision.runId,
       });
-      const [hangUpdate, cancelUpdate] = await Promise.all([
+      hangReleased.resolve();
+      const [hangUpdate, cancelUpdate, initialRunUpdate] = await Promise.all([
         controller.waitForCommandTerminal("mcp-hang", 10_000),
         controller.waitForCommandTerminal("cancel-mcp-hang", 10_000),
+        controller.waitForCommandTerminal("input-mcp-run", 10_000),
       ]);
-      expect(hangUpdate.status).toBe("cancelled");
+      controller.assertHealthy("committed MCP cancellation");
+      expect(hangUpdate).toMatchObject({
+        result: { outputText: "committed after cancellation" },
+        status: "completed",
+      });
       expect(cancelUpdate.status).toBe("completed");
-      await withTimeout(hangCancelled.promise, "MCP cancellation notification");
+      expect(initialRunUpdate.status).toBe("cancelled");
+      expect(cancellationNotifications).toBe(0);
 
-      controller.enqueue(mcpCommand("mcp-after-cancel", "echo", '{"value":"recovered"}'));
+      const recoveryRunEventIndex = controller.events.length;
+      controller.enqueue({
+        commandId: "input-mcp-recovery-run",
+        input: { text: "hold recovery MCP run open" },
+        kind: "input.start",
+        requestId: "request-input-mcp-recovery-run",
+        runId: RECOVERY_RUN_ID,
+      });
+      await controller.waitForEvent(
+        (event) => event.kind === "run.started" && event.runId === RECOVERY_RUN_ID,
+        recoveryRunEventIndex,
+        10_000,
+        "recovery MCP run start",
+      );
+
+      controller.enqueue(
+        mcpCommand("mcp-after-cancel", "echo", '{"value":"recovered"}', RECOVERY_RUN_ID),
+      );
       expect(await controller.waitForCommandTerminal("mcp-after-cancel", 10_000)).toMatchObject({
         result: { outputText: "echo:recovered" },
         status: "completed",
@@ -474,6 +544,7 @@ artifactTest(
         commandId: "changed-replay",
         kind: "turn.cancel",
         reason: "first reason",
+        runId: RECOVERY_RUN_ID,
       });
       expect((await controller.waitForCommandTerminal("changed-replay", 10_000)).status).toBe(
         "completed",
@@ -482,6 +553,7 @@ artifactTest(
         commandId: "changed-replay",
         kind: "turn.cancel",
         reason: "changed reason",
+        runId: RECOVERY_RUN_ID,
       });
       const replayFailure = await controller.waitForRunTerminal(10_000);
       expect(replayFailure.status).toBe("failed");
@@ -494,6 +566,7 @@ artifactTest(
       expect(sessions.size).toBeGreaterThan(1);
       expect(unauthorizedRequests).toBe(0);
     } finally {
+      hangReleased.resolve();
       await controller?.dispose();
       await server.stop(true);
       await rm(rootPath, { force: true, recursive: true });

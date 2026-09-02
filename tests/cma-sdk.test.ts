@@ -9,8 +9,8 @@ import {
   CMA_DEFAULT_BETA_HEADER_VALUE,
   createCmaHttpHandler,
 } from "../src/surfaces/cma-http";
-import type { CmaSdkError } from "../src/surfaces/cma-sdk";
-import { createCmaSdkClient } from "../src/surfaces/cma-sdk";
+import { CmaSdkClient, type CmaSdkError } from "../src/surfaces/cma-sdk";
+import { promiseWithTimeout } from "../src/utils/async";
 
 describe("CMA SDK client", () => {
   test("sends the default beta header and decodes JSON data responses", async () => {
@@ -20,7 +20,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => {
         const request = new Request(input, init);
@@ -47,7 +47,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -56,6 +56,90 @@ describe("CMA SDK client", () => {
       code: "CMA_ENVIRONMENT_NOT_FOUND",
       status: 404,
     } satisfies Partial<CmaSdkError>);
+  });
+
+  test.each(["client", "request"] as const)(
+    "propagates %s cancellation through fetch",
+    async (scope) => {
+      const controller = new AbortController();
+      const entered = Promise.withResolvers<void>();
+      const reason = new Error(`${scope} cancelled`);
+      let fetchSignal: AbortSignal | undefined;
+      const client = new CmaSdkClient({
+        baseUrl: "https://driver.test",
+        fetch: async (_input, init) => {
+          fetchSignal = init?.signal ?? undefined;
+          entered.resolve();
+          return new Promise<Response>(() => {});
+        },
+        ...(scope === "client" ? { signal: controller.signal } : {}),
+      });
+      const pending = client.listAgents(
+        scope === "request" ? { signal: controller.signal } : undefined,
+      );
+      await entered.promise;
+
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      expect(fetchSignal?.aborted).toBe(true);
+    },
+  );
+
+  test("times out an unresponsive fetch", async () => {
+    let fetchSignal: AbortSignal | undefined;
+    const client = new CmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async (_input, init) => {
+        fetchSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      },
+      timeoutMs: 0,
+    });
+
+    await expect(
+      promiseWithTimeout(client.listAgents(), {
+        label: "CMA SDK timeout",
+        timeoutMs: 100,
+      }),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(fetchSignal?.aborted).toBe(true);
+  });
+
+  test.each([
+    ["content-length", "cooperative"],
+    ["content-length", "stalled"],
+    ["stream", "cooperative"],
+    ["stream", "stalled"],
+  ] as const)("bounds %s JSON responses with %s cancellation", async (boundary, cancellation) => {
+    let canceled = false;
+    const client = new CmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              canceled = true;
+              return cancellation === "stalled" ? new Promise<void>(() => {}) : undefined;
+            },
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('{"data":["too large"]}'));
+            },
+          }),
+          boundary === "content-length" ? { headers: { "content-length": "9" } } : undefined,
+        ),
+      maxResponseBytes: 8,
+    });
+
+    await expect(
+      promiseWithTimeout(client.listAgents(), {
+        label: "bounded CMA SDK response",
+        timeoutMs: 250,
+      }),
+    ).rejects.toMatchObject({
+      code: "CMA_SDK_RESPONSE_TOO_LARGE",
+    });
+    expect(canceled).toBe(true);
   });
 
   test("streams server-sent session event replay through fetch", async () => {
@@ -71,7 +155,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -88,7 +172,7 @@ describe("CMA SDK client", () => {
           content: "hello",
           messageId: "message-1",
         },
-        schemaVersion: "2026-05-26",
+        schemaVersion: "2026-08-29",
         sessionId,
         visibility: "participant",
       }),
@@ -119,7 +203,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -133,7 +217,7 @@ describe("CMA SDK client", () => {
         occurredAt: "2026-01-01T00:00:01.000Z",
         origin: "driver",
         payload: { messageId: "message-1" },
-        schemaVersion: "2026-05-26",
+        schemaVersion: "2026-08-29",
         sessionId,
         visibility: "participant",
       }),
@@ -148,19 +232,66 @@ describe("CMA SDK client", () => {
         occurredAt: "2026-01-01T00:00:02.000Z",
         origin: "driver",
         payload: { messageId: "message-2" },
-        schemaVersion: "2026-05-26",
+        schemaVersion: "2026-08-29",
         sessionId,
         visibility: "participant",
       }),
     );
     const resumed = [];
 
-    for await (const event of client.streamSessionEvents(sessionId, first?.cursor)) {
+    for await (const event of client.streamSessionEvents(
+      sessionId,
+      first ? { afterCursor: first.cursor } : {},
+    )) {
       resumed.push(event);
       break;
     }
 
     expect(resumed).toEqual([second]);
+  });
+
+  test("does not yield buffered server-sent events after cancellation", async () => {
+    const controller = new AbortController();
+    const record = (id: string) => ({
+      command: null,
+      commandResult: null,
+      commandStatus: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      cursor: createDriverId(),
+      direction: "outbound",
+      event: {
+        message: { content: id },
+        sourceEventKind: "message.completed",
+        type: "agent.message",
+      },
+      id,
+      sessionId: "session-1",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const bytes = new TextEncoder().encode(
+      [record("event-1"), record("event-2")]
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+        .join(""),
+    );
+    const client = new CmaSdkClient({
+      baseUrl: "https://driver.test",
+      fetch: async () =>
+        new Response(
+          new ReadableStream({
+            start(stream) {
+              stream.enqueue(bytes);
+            },
+          }),
+        ),
+    });
+    const iterator = client
+      .streamSessionEvents("session-1", { signal: controller.signal })
+      [Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { id: "event-1" } });
+    const reason = new Error("stop buffered delivery");
+    controller.abort(reason);
+    await expect(iterator.next()).rejects.toBe(reason);
   });
 
   test.each(
@@ -190,7 +321,7 @@ describe("CMA SDK client", () => {
       .map((event) => `data: ${JSON.stringify(event)}${lineEnding}${blankLineEnding}`)
       .join("");
     const bytes = new TextEncoder().encode(frames);
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async () =>
         new Response(
@@ -241,7 +372,7 @@ describe("CMA SDK client", () => {
       const contentBytes = CMA_MAX_EVENT_BYTES + extraBytes - encoder.encode(emptyFrame).byteLength;
       const frame = `data: ${JSON.stringify(record(`界${"x".repeat(contentBytes - 3)}`))}\n\r\n`;
       const bytes = encoder.encode(frame);
-      const client = createCmaSdkClient({
+      const client = new CmaSdkClient({
         baseUrl: "https://driver.test",
         fetch: async () =>
           new Response(
@@ -285,7 +416,7 @@ describe("CMA SDK client", () => {
         occurredAt: "2026-01-01T00:00:01.000Z",
         origin: "driver",
         payload: { content, messageId: "message-1" },
-        schemaVersion: "2026-05-26",
+        schemaVersion: "2026-08-29",
         sessionId,
         visibility: "participant",
       });
@@ -306,7 +437,7 @@ describe("CMA SDK client", () => {
       dispatchDriverCommand: async () => undefined,
       store,
     });
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async (input, init) => handler(new Request(input, init)),
     });
@@ -325,7 +456,7 @@ describe("CMA SDK client", () => {
     let canceled = false;
     let sent = false;
     const bytes = new Uint8Array(CMA_MAX_EVENT_BYTES + 1).fill("x".charCodeAt(0));
-    const client = createCmaSdkClient({
+    const client = new CmaSdkClient({
       baseUrl: "https://driver.test",
       fetch: async () =>
         new Response(
@@ -353,4 +484,54 @@ describe("CMA SDK client", () => {
     await expect(stream.next()).rejects.toMatchObject({ code: "CMA_SDK_FRAME_TOO_LARGE" });
     expect(canceled).toBe(true);
   });
+
+  test.each(["settles", "stalls"] as const)(
+    "return interrupts a pending SSE read when underlying cancellation %s",
+    async (cancelMode) => {
+      const cancelEntered = Promise.withResolvers<void>();
+      const readEntered = Promise.withResolvers<void>();
+      let fetchSignal: AbortSignal | undefined;
+      const client = new CmaSdkClient({
+        baseUrl: "https://driver.test",
+        fetch: async (_input, init) => {
+          fetchSignal = init?.signal ?? undefined;
+          return new Response(
+            new ReadableStream(
+              {
+                cancel() {
+                  cancelEntered.resolve();
+                  return cancelMode === "stalls" ? new Promise<void>(() => {}) : undefined;
+                },
+                pull() {
+                  readEntered.resolve();
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+          );
+        },
+      });
+      const iterator = client.streamSessionEvents("session-1")[Symbol.asyncIterator]();
+      const pending = iterator.next();
+      await readEntered.promise;
+
+      const returned = iterator.return?.();
+
+      if (!returned) {
+        throw new Error("Expected the CMA stream iterator to support return().");
+      }
+
+      await expect(
+        promiseWithTimeout(pending, { label: "pending CMA stream read", timeoutMs: 100 }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      await expect(
+        promiseWithTimeout(returned, { label: "CMA stream return", timeoutMs: 100 }),
+      ).resolves.toMatchObject({ done: true });
+      await promiseWithTimeout(cancelEntered.promise, {
+        label: "CMA stream cancellation",
+        timeoutMs: 100,
+      });
+      expect(fetchSignal?.aborted).toBe(true);
+    },
+  );
 });

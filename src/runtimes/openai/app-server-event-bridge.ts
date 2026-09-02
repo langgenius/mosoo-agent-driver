@@ -1,34 +1,141 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
-import type { RunId } from "../../protocol/id";
+import { createDriverId, driverIdTimeMs, type RunId } from "../../protocol/id";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { toOpenAiErrorMessage, toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
+import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import {
   OpenAiItemState,
   OpenAiMessageState,
   OpenAiPlanState,
+  OpenAiSessionUsageState,
   OpenAiToolState,
+  type OpenAiTerminalOutcome,
 } from "./app-server-event-state";
-import { OpenAiAppServerItemEventBridge } from "./app-server-item-events";
-import { isRecord, readNonEmptyString, readRecord, readString } from "./app-server-json";
+import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
+import { DriverCompletedTerminalSupersededError } from "../driver-event-publisher";
+import { chunkOpenAiText, OpenAiAppServerItemEventBridge } from "./app-server-item-events";
+import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
-import { OpenAiTurnTracker } from "./app-server-turn-tracker";
-import type {
-  ServerNotificationMethod,
-  ServerNotificationParams,
-} from "./generated/app-server-protocol";
+import { OpenAiTurnTracker, type OpenAiTurnAdmission } from "./app-server-turn-tracker";
+import type { ServerNotificationMethod } from "./app-server-protocol";
 
 interface OpenAiAppServerEventBridgeOptions {
   beforeInterruptedTurn?(context: AgentDriverContext, turnId: string): Promise<void>;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
+  pushSession(
+    context: AgentDriverContext,
+    reason: string,
+    events: DriverEventInput[],
+  ): Promise<void>;
+  pushTerminal(
+    context: AgentDriverContext,
+    reason: string,
+    closures: readonly DriverEventInput[],
+    terminal: DriverEventInput,
+    cancellationSignal?: AbortSignal,
+  ): Promise<void>;
   requireThreadId(): string;
 }
 
-function turnEventId(eventName: string, turnId: string): string {
-  return `openai.${eventName}:${turnId}`;
+const MAX_OPENAI_TELEMETRY_FIELD_BYTES = 4 * 1_024;
+const MAX_WORLD_WRITABLE_SAMPLE_PATHS = 16;
+
+function jsonUtf8Bytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
 }
 
-function turnEventFields(input: { eventName: string; runId?: RunId | undefined; turnId: string }): {
+function toBoundedOpenAiTelemetry(payload: JsonObject, fields: readonly string[]): JsonObject {
+  const summary: JsonObject = { utf8Bytes: jsonUtf8Bytes(payload) };
+
+  for (const field of fields) {
+    const value = payload[field];
+
+    if (typeof value === "string") {
+      const utf8Bytes = Buffer.byteLength(value, "utf8");
+      if (utf8Bytes <= MAX_OPENAI_TELEMETRY_FIELD_BYTES) {
+        summary[field] = value;
+      } else {
+        summary[`${field}Utf8Bytes`] = utf8Bytes;
+      }
+      continue;
+    }
+
+    if (Array.isArray(value)) {
+      const utf8Bytes = jsonUtf8Bytes(value);
+      if (utf8Bytes <= MAX_OPENAI_TELEMETRY_FIELD_BYTES) {
+        summary[field] = value;
+      } else {
+        summary[`${field}Count`] = value.length;
+        summary[`${field}Utf8Bytes`] = utf8Bytes;
+      }
+      continue;
+    }
+
+    if (isRecord(value)) {
+      const utf8Bytes = jsonUtf8Bytes(value);
+      if (utf8Bytes <= MAX_OPENAI_TELEMETRY_FIELD_BYTES) {
+        summary[field] = value;
+      } else {
+        summary[`${field}Utf8Bytes`] = utf8Bytes;
+      }
+      continue;
+    }
+
+    if (
+      value === null ||
+      typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value))
+    ) {
+      summary[field] = value;
+    }
+  }
+
+  return summary;
+}
+
+function toOpenAiUserFacingEvents(
+  method:
+    | "guardianWarning"
+    | "modelProvider/authRecoveryCompleted"
+    | "modelProvider/authRecoveryStarted"
+    | "warning",
+  message: string,
+  details: JsonObject = {},
+): DriverEventInput[] {
+  const chunks = chunkOpenAiText(message);
+  const warning = method === "guardianWarning" || method === "warning";
+
+  return chunks.map((content, index) => ({
+    delivery: warning ? "lossless" : "best_effort",
+    kind: "message.added",
+    payload: {
+      ...details,
+      ...(chunks.length === 1 ? {} : { chunkCount: chunks.length, chunkIndex: index }),
+      content,
+      level: warning ? "warning" : "info",
+      messageId: createDriverId(),
+      role: "agent",
+      subtype:
+        method === "guardianWarning"
+          ? "guardian_warning"
+          : method === "warning"
+            ? "warning"
+            : method === "modelProvider/authRecoveryStarted"
+              ? "model_provider_auth_recovery_started"
+              : "model_provider_auth_recovery_completed",
+    },
+  }));
+}
+
+function turnEventId(eventName: string, publicTurnId: string): string {
+  return `openai.${eventName}:${publicTurnId}`;
+}
+
+function turnEventFields(input: {
+  eventName: string;
+  publicTurnId: string;
+  runId?: RunId | undefined;
+}): {
   native: { eventName: string; provider: string; turnId: string };
   runId?: RunId | undefined;
   sourceEventId: string;
@@ -37,11 +144,41 @@ function turnEventFields(input: { eventName: string; runId?: RunId | undefined; 
     native: {
       eventName: input.eventName,
       provider: "openai",
-      turnId: input.turnId,
+      turnId: input.publicTurnId,
     },
     ...(input.runId === undefined ? {} : { runId: input.runId }),
-    sourceEventId: turnEventId(input.eventName, input.turnId),
+    sourceEventId: turnEventId(input.eventName, input.publicTurnId),
   };
+}
+
+function turnClosureEvents(input: {
+  eventName: string;
+  events: readonly DriverEventInput[];
+  publicTurnId: string;
+  runId?: RunId | undefined;
+}): DriverEventInput[] {
+  const sourcePrefix = createRuntimeSourceEventId(
+    `openai.${input.eventName}.closure`,
+    "turn",
+    input.publicTurnId,
+  );
+  return input.events.map((event, index) => {
+    const scopedEvent = {
+      ...event,
+      ...(event.runId === undefined && input.runId !== undefined ? { runId: input.runId } : {}),
+    };
+    return {
+      ...scopedEvent,
+      sourceEventId:
+        event.sourceEventId ??
+        createRuntimeSourceEventId(
+          "openai.derived",
+          sourcePrefix,
+          index,
+          JSON.stringify(scopedEvent),
+        ),
+    };
+  });
 }
 
 export class OpenAiAppServerEventBridge {
@@ -51,7 +188,9 @@ export class OpenAiAppServerEventBridge {
   readonly #options: OpenAiAppServerEventBridgeOptions;
   readonly #plans = new OpenAiPlanState();
   readonly #tools = new OpenAiToolState();
+  readonly #turnStarts = new Map<string, Promise<void>>();
   readonly #turns = new OpenAiTurnTracker();
+  readonly #usage = new OpenAiSessionUsageState();
 
   constructor(options: OpenAiAppServerEventBridgeOptions) {
     this.#options = options;
@@ -60,6 +199,7 @@ export class OpenAiAppServerEventBridge {
       messages: this.#messages,
       plans: this.#plans,
       push: (context, reason, events) => this.#push(context, reason, events),
+      pushSession: options.pushSession,
       tools: this.#tools,
     });
   }
@@ -68,9 +208,60 @@ export class OpenAiAppServerEventBridge {
     return this.#turns.activeTurnIds();
   }
 
+  beginTurnAdmission(runId: RunId, signal?: AbortSignal): OpenAiTurnAdmission {
+    return this.#turns.admitRootTurn(runId, signal);
+  }
+
+  bindTurnAdmission(admission: OpenAiTurnAdmission, turnId: string): void {
+    this.#turns.bindRootTurn(admission, turnId);
+  }
+
+  armTurnAdmission(admission: OpenAiTurnAdmission): void {
+    this.#turns.armRootTurn(admission);
+  }
+
+  claimTurnAdmission(
+    admission: OpenAiTurnAdmission,
+    turnId: string,
+    runId: RunId,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.#turns.claimRootTurn(admission, turnId, runId, signal);
+  }
+
+  releaseTurnAdmission(admission: OpenAiTurnAdmission): void {
+    this.#turns.releaseRootTurn(admission);
+  }
+
+  releaseTurnAdmissionSelection(admission: OpenAiTurnAdmission): void {
+    this.#turns.releaseRootTurnSelection(admission);
+  }
+
+  admittedTurnId(admission: OpenAiTurnAdmission): string | null {
+    return this.#turns.admittedTurnId(admission);
+  }
+
+  hasTerminalTurn(turnId: string): boolean {
+    return this.#turns.hasTerminal(turnId);
+  }
+
+  hasAdmittedTerminalTurn(): boolean {
+    return this.#turns.hasAdmittedTerminalTurn();
+  }
+
+  mapToolCallId(toolCallId: string): string {
+    return this.#items.publicId(toolCallId);
+  }
+
+  publicTurnId(turnId: string): string {
+    return this.#items.publicId(turnId, "turn");
+  }
+
   clearActiveTurns(): void {
+    this.#turnStarts.clear();
     this.#turns.clearActiveTurns();
     this.#itemEvents.reset();
+    this.#usage.reset();
   }
 
   async cancelTurn(
@@ -79,45 +270,73 @@ export class OpenAiAppServerEventBridge {
     reason: string,
     drainUpdates?: () => Promise<void>,
   ): Promise<void> {
+    await drainUpdates?.();
     const runId = this.#turns.activeRunId(turnId);
 
     if (runId === null) {
       return;
     }
 
-    if (!this.#turns.rejectTurn(turnId, new DriverTurnCancelledError(reason))) {
+    if (!this.#turns.beginSettlement(turnId)) {
       return;
     }
-    await drainUpdates?.();
-    await this.#push(context, "driver.openai.turn.cancelled", [
-      {
-        ...turnEventFields({ eventName: "turn.cancel.requested", runId, turnId }),
-        kind: "run.cancel.requested",
-        payload: {
-          reason,
-          requestedBy: "user",
-          targetRunId: runId,
+    const publicTurnId = this.publicTurnId(turnId);
+    const completionClosuresCommitted = this.#turns.completionClosuresCommitted(turnId);
+    const cancelledClosures = completionClosuresCommitted
+      ? []
+      : this.#itemEvents.terminalEvents({ kind: "cancelled" });
+    const [taskClosure, ...itemClosures] = cancelledClosures;
+
+    try {
+      await this.#options.pushTerminal(
+        context,
+        "driver.openai.turn.cancelled",
+        turnClosureEvents({
+          eventName: "turn.cancelled",
+          events: [
+            ...(taskClosure === undefined ? [] : [taskClosure]),
+            {
+              ...turnEventFields({ eventName: "turn.cancel.requested", publicTurnId, runId }),
+              kind: "run.cancel.requested",
+              payload: {
+                reason,
+                requestedBy: "user",
+                targetRunId: runId,
+              },
+            },
+            ...itemClosures,
+          ],
+          publicTurnId,
+          runId,
+        }),
+        {
+          ...turnEventFields({ eventName: "turn.cancelled", publicTurnId, runId }),
+          kind: "run.cancelled",
+          payload: {
+            requestedBy: "user",
+            stopReason: "cancelled",
+          },
         },
-      },
-      ...this.#itemEvents.finishOpen(),
-      {
-        ...turnEventFields({ eventName: "turn.cancelled", runId, turnId }),
-        kind: "run.cancelled",
-        payload: {
-          requestedBy: "user",
-          stopReason: "cancelled",
-        },
-      },
-    ]);
+      );
+      this.#finishSettlement(turnId, {
+        error: new DriverTurnCancelledError(reason),
+        kind: "failed",
+      });
+    } catch (pushError) {
+      this.#turns.cancelSettlement(turnId);
+      throw pushError;
+    }
   }
 
   rejectTurn(turnId: string, error: Error): void {
     this.#turns.rejectTurn(turnId, error);
+    this.#usage.release(turnId);
   }
 
   rejectActiveTurns(error: Error): void {
     this.#turns.rejectActiveTurns(error);
     this.#itemEvents.reset();
+    this.#usage.reset();
   }
 
   async failActiveTurns(context: AgentDriverContext, error: Error): Promise<boolean> {
@@ -130,21 +349,30 @@ export class OpenAiAppServerEventBridge {
       }
 
       try {
-        await this.#push(context, "driver.openai.provider.failed", [
-          ...this.#itemEvents.finishOpen(),
+        const publicTurnId = this.publicTurnId(turnId);
+        const protocolError = {
+          ...toOpenAiProtocolError({ message: error.message }),
+          code: "openai.provider_failed",
+        };
+        await this.#options.pushTerminal(
+          context,
+          "driver.openai.provider.failed",
+          turnClosureEvents({
+            eventName: "provider.failed",
+            events: this.#itemEvents.terminalEvents({ error: protocolError, kind: "failed" }),
+            publicTurnId,
+            runId,
+          }),
           {
-            ...turnEventFields({ eventName: "provider.failed", runId, turnId }),
+            ...turnEventFields({ eventName: "provider.failed", publicTurnId, runId }),
             kind: "run.failed",
             payload: {
-              error: {
-                code: "openai.provider_failed",
-                message: error.message,
-              },
+              error: protocolError,
               recoverable: false,
             },
           },
-        ]);
-        this.#finishSettlement(turnId, { error, kind: "failed" });
+        );
+        this.#finishSettlement(turnId, { error: new Error(protocolError.message), kind: "failed" });
         failed = true;
       } catch (pushError) {
         this.#turns.cancelSettlement(turnId);
@@ -159,19 +387,26 @@ export class OpenAiAppServerEventBridge {
     this.#itemEvents.reset();
   }
 
-  async trackTurn(turnId: string, runId: RunId): Promise<void> {
-    return this.#turns.track(turnId, runId);
+  turnStartTerminalEvents(
+    outcome: OpenAiTerminalOutcome,
+  ): [DriverEventInput, ...DriverEventInput[]] {
+    return this.#itemEvents.terminalEvents(outcome);
   }
 
-  async handleNotification<M extends ServerNotificationMethod>(
+  async trackTurn(turnId: string, runId: RunId, signal?: AbortSignal): Promise<void> {
+    return this.#turns.track(turnId, runId, signal);
+  }
+
+  async handleNotification(
     context: AgentDriverContext,
-    method: M,
-    params: ServerNotificationParams[M],
+    method: ServerNotificationMethod,
+    params: JsonObject,
   ): Promise<void> {
     const payload = isRecord(params) ? params : {};
     const turnId =
       readNonEmptyString(payload, "turnId") ??
       readNonEmptyString(readRecord(payload, "turn"), "id");
+    const notificationMethod = method;
 
     // Native Codex subagents own child threads and turns. Their direct message
     // and lifecycle frames are provider-internal activity, not authoritative
@@ -184,18 +419,49 @@ export class OpenAiAppServerEventBridge {
     ) {
       return;
     }
+    const item = readRecord(payload, "item");
+    const postTerminalSubAgentActivity =
+      notificationMethod === "item/completed" &&
+      readString(item, "type") === "subAgentActivity" &&
+      (readString(item, "kind") === "completed" || readString(item, "kind") === "interrupted");
 
     if (turnId !== null && this.#turns.hasTerminal(turnId)) {
+      if (postTerminalSubAgentActivity) {
+        await this.#itemEvents.onPostTerminalSubAgentActivity(context, payload);
+      }
+      return;
+    }
+    if (
+      turnId !== null &&
+      (!(await this.#turns.awaitRootTurnAdmission(turnId)) || !this.#turns.acceptsRootTurn(turnId))
+    ) {
       return;
     }
 
-    switch (method) {
+    switch (notificationMethod) {
       case "configWarning": {
         this.#onConfigWarning(context, payload);
         return;
       }
-      case "warning": {
-        this.#onWarning(context, payload);
+      case "warning":
+      case "guardianWarning": {
+        await this.#onWarning(context, payload, notificationMethod);
+        return;
+      }
+      case "modelProvider/authRecoveryStarted":
+      case "modelProvider/authRecoveryCompleted": {
+        const message = readString(payload, "message");
+        if (message !== null) {
+          await this.#push(
+            context,
+            "driver.openai.model_provider.auth_recovery",
+            toOpenAiUserFacingEvents(
+              notificationMethod,
+              message,
+              toBoundedOpenAiTelemetry(payload, ["provider"]),
+            ),
+          );
+        }
         return;
       }
       case "remoteControl/status/changed": {
@@ -218,8 +484,36 @@ export class OpenAiAppServerEventBridge {
         await this.#onTurnStarted(context, payload);
         return;
       }
+      case "hook/started":
+      case "hook/completed": {
+        await this.#onHook(context, payload, notificationMethod);
+        return;
+      }
       case "item/started": {
         await this.#itemEvents.onItemStarted(context, payload);
+        return;
+      }
+      case "item/autoApprovalReview/started":
+      case "item/autoApprovalReview/completed": {
+        await this.#onAutoApprovalReview(context, payload, notificationMethod);
+        return;
+      }
+      case "autoApprovalReview/strictReviewRequired": {
+        await this.#push(context, "driver.openai.autoApprovalReview.strictReviewRequired", [
+          {
+            delivery: "lossless",
+            kind: "message.added",
+            payload: {
+              ...toBoundedOpenAiTelemetry(payload, ["startedAtMs"]),
+              content:
+                "This request requires additional safety checks; tool calls may take longer.",
+              level: "warning",
+              messageId: createDriverId(),
+              role: "agent",
+              subtype: "strict_review_required",
+            },
+          },
+        ]);
         return;
       }
       case "item/agentMessage/delta": {
@@ -239,6 +533,7 @@ export class OpenAiAppServerEventBridge {
         return;
       }
       case "item/reasoning/textDelta": {
+        // Raw reasoning is intentionally private; summary notifications own visible thought output.
         return;
       }
       case "item/completed": {
@@ -252,6 +547,14 @@ export class OpenAiAppServerEventBridge {
       }
       case "item/fileChange/patchUpdated": {
         await this.#itemEvents.onFilePatch(context, payload);
+        return;
+      }
+      case "item/commandExecution/terminalInteraction": {
+        await this.#onTerminalInteraction(context, payload);
+        return;
+      }
+      case "item/mcpToolCall/progress": {
+        await this.#onMcpToolProgress(context, payload);
         return;
       }
       case "thread/tokenUsage/updated": {
@@ -270,23 +573,141 @@ export class OpenAiAppServerEventBridge {
         await this.#itemEvents.onTurnPlan(context, payload);
         return;
       }
+      case "mcpServer/startupStatus/updated": {
+        await this.#push(context, "driver.openai.mcp.server.updated", [
+          {
+            delivery: "best_effort",
+            kind: "mcp.server.updated",
+            payload: toBoundedOpenAiTelemetry(payload, [
+              "error",
+              "failureReason",
+              "name",
+              "status",
+              "threadId",
+            ]),
+          },
+        ]);
+        return;
+      }
+      case "model/rerouted":
+      case "model/safetyBuffering/updated": {
+        await this.#push(context, "driver.openai.model.routing_updated", [
+          {
+            delivery: "best_effort",
+            kind: "model.routing.updated",
+            payload: toBoundedOpenAiTelemetry(payload, [
+              "fasterModel",
+              "fromModel",
+              "model",
+              "reason",
+              "reasons",
+              "showBufferingUi",
+              "threadId",
+              "toModel",
+              "turnId",
+              "useCases",
+            ]),
+          },
+        ]);
+        return;
+      }
+      case "model/verification": {
+        await this.#push(context, "driver.openai.model.verification", [
+          {
+            delivery: "best_effort",
+            kind: "model.verification.updated",
+            payload: toBoundedOpenAiTelemetry(payload, ["threadId", "turnId", "verifications"]),
+          },
+        ]);
+        return;
+      }
       case "error": {
         this.#onRuntimeError(context, payload);
         return;
       }
-      default: {
+      case "deprecationNotice": {
+        const message =
+          readString(payload, "summary") ??
+          readString(payload, "message") ??
+          "OpenAI app-server warning.";
+        const messageUtf8Bytes = Buffer.byteLength(message, "utf8");
+        context.logger.warn("driver.openai.notification.warning", {
+          method: notificationMethod,
+          ...(messageUtf8Bytes <= MAX_OPENAI_TELEMETRY_FIELD_BYTES ? { message } : {}),
+          messageUtf8Bytes,
+        });
         return;
+      }
+      case "windows/worldWritableWarning": {
+        await this.#onWorldWritableWarning(context, payload);
+        return;
+      }
+      case "turn/moderationMetadata":
+      case "skills/changed":
+      case "thread/name/updated":
+      case "thread/goal/updated":
+      case "thread/goal/cleared":
+      case "thread/reverted":
+      case "thread/queue/changed":
+      case "project/changed":
+      case "thread/project/updated":
+      case "thread/environment/connected":
+      case "thread/environment/disconnected":
+      case "account/updated":
+      case "account/rateLimits/updated":
+      case "windowsSandbox/setupCompleted": {
+        context.logger.debug("driver.openai.notification.handled_without_public_event", {
+          method: notificationMethod,
+        });
+        return;
+      }
+      case "thread/archived":
+      case "thread/deleted":
+      case "thread/unarchived":
+      case "thread/closed":
+      case "command/exec/outputDelta":
+      case "process/outputDelta":
+      case "process/exited":
+      case "serverRequest/resolved":
+      case "mcpServer/oauthLogin/completed":
+      case "mcpServer/event/stream/notification":
+      case "app/list/updated":
+      case "externalAgentConfig/import/progress":
+      case "externalAgentConfig/import/completed":
+      case "fs/changed":
+      case "thread/compacted":
+      case "fuzzyFileSearch/sessionUpdated":
+      case "fuzzyFileSearch/sessionCompleted":
+      case "thread/realtime/started":
+      case "thread/realtime/itemAdded":
+      case "thread/realtime/item/started":
+      case "thread/realtime/item/transcript/delta":
+      case "thread/realtime/item/completed":
+      case "thread/realtime/transcript/delta":
+      case "thread/realtime/transcript/done":
+      case "thread/realtime/outputAudio/delta":
+      case "thread/realtime/sdp":
+      case "thread/realtime/error":
+      case "thread/realtime/closed":
+      case "account/login/completed":
+        // Explicitly unsupported request surfaces, deprecated duplicates, or transport bookkeeping.
+        return;
+      default: {
+        const exhaustive: never = notificationMethod;
+        return exhaustive;
       }
     }
   }
 
   async publishNativeResumeRef(context: AgentDriverContext): Promise<void> {
+    const threadId = this.#options.requireThreadId();
+    const publicThreadId = toRuntimePublicId(threadId, "openai-thread");
     await this.#push(context, "driver.openai.native_resume_ref.updated", [
       {
         kind: "runtime.resume.updated",
         payload: {
           resumePointer: this.#options.requireThreadId(),
-          threadId: this.#options.requireThreadId(),
+          threadId: publicThreadId,
         },
         visibility: "owner_debug",
       },
@@ -297,20 +718,217 @@ export class OpenAiAppServerEventBridge {
     context: AgentDriverContext,
     input: { runId?: RunId | undefined; turnId: string },
   ): Promise<void> {
-    if (!this.#turns.markTurnStarted(input.turnId)) {
+    const identityRunId = input.runId ?? context.ports.eventSink.currentRunId();
+    if (identityRunId === null) {
+      return;
+    }
+    if (this.#turns.hasTurnStarted(input.turnId) || this.#turns.hasTerminal(input.turnId)) {
       return;
     }
 
-    await this.#push(context, "driver.openai.turn.started", [
+    const existing = this.#turnStarts.get(input.turnId);
+    if (existing !== undefined) {
+      await existing;
+      return;
+    }
+
+    const starting = (async () => {
+      await this.#push(context, "driver.openai.turn.started", [
+        {
+          ...turnEventFields({
+            eventName: "turn.started",
+            publicTurnId: this.publicTurnId(input.turnId),
+            runId: input.runId,
+          }),
+          kind: "run.started",
+          payload: {
+            startedAt: new Date(driverIdTimeMs(identityRunId)).toISOString(),
+          },
+        },
+      ]);
+      this.#turns.markTurnStarted(input.turnId);
+    })();
+    this.#turnStarts.set(input.turnId, starting);
+
+    try {
+      await starting;
+    } finally {
+      if (this.#turnStarts.get(input.turnId) === starting) {
+        this.#turnStarts.delete(input.turnId);
+      }
+    }
+  }
+
+  async #onAutoApprovalReview(
+    context: AgentDriverContext,
+    params: JsonObject,
+    method: "item/autoApprovalReview/completed" | "item/autoApprovalReview/started",
+  ): Promise<void> {
+    const turnId = readNonEmptyString(params, "turnId");
+    const runId = turnId === null ? null : this.#turns.activeRunId(turnId);
+    const action = readRecord(params, "action");
+    const review = readRecord(params, "review");
+    const targetItemId = readNonEmptyString(params, "targetItemId");
+    const actionSummary =
+      action === null
+        ? null
+        : {
+            ...toBoundedOpenAiTelemetry(action, [
+              "approvalId",
+              "argv",
+              "command",
+              "cwd",
+              "files",
+              "host",
+              "permissions",
+              "port",
+              "processId",
+              "program",
+              "protocol",
+              "reason",
+              "server",
+              "source",
+              "target",
+              "toolName",
+              "toolTitle",
+              "connectorId",
+              "connectorName",
+              "type",
+            ]),
+            ...(typeof action["stdin"] === "string"
+              ? { stdinUtf8Bytes: Buffer.byteLength(action["stdin"], "utf8") }
+              : {}),
+          };
+
+    await this.#push(context, `driver.openai.${method.replaceAll("/", ".")}`, [
       {
-        ...turnEventFields({
-          eventName: "turn.started",
-          runId: input.runId,
-          turnId: input.turnId,
-        }),
-        kind: "run.started",
+        delivery: "best_effort",
+        kind:
+          method === "item/autoApprovalReview/started"
+            ? "permission.review.started"
+            : "permission.review.completed",
         payload: {
-          startedAt: new Date().toISOString(),
+          ...toBoundedOpenAiTelemetry(params, [
+            "completedAtMs",
+            "decisionSource",
+            "reviewId",
+            "startedAtMs",
+            "threadId",
+            "turnId",
+          ]),
+          ...(targetItemId === null ? {} : { targetItemId: this.mapToolCallId(targetItemId) }),
+          ...(actionSummary === null ? {} : { action: actionSummary }),
+          ...(review === null
+            ? {}
+            : {
+                review: toBoundedOpenAiTelemetry(review, [
+                  ...(readString(action, "type") === "writeStdin" ? [] : ["rationale"]),
+                  "riskLevel",
+                  "status",
+                  "userAuthorization",
+                ]),
+              }),
+        },
+        ...(runId === null ? {} : { runId }),
+      },
+    ]);
+  }
+
+  async #onHook(
+    context: AgentDriverContext,
+    params: JsonObject,
+    method: "hook/completed" | "hook/started",
+  ): Promise<void> {
+    const turnId = readNonEmptyString(params, "turnId");
+    const runId = turnId === null ? null : this.#turns.activeRunId(turnId);
+    const run = readRecord(params, "run");
+
+    await this.#push(context, `driver.openai.${method.replace("/", ".")}`, [
+      {
+        delivery: "best_effort",
+        kind: method === "hook/started" ? "hook.started" : "hook.completed",
+        payload: {
+          ...toBoundedOpenAiTelemetry(params, ["threadId", "turnId"]),
+          ...(run === null
+            ? {}
+            : {
+                run: {
+                  ...toBoundedOpenAiTelemetry(run, [
+                    "completedAt",
+                    "displayOrder",
+                    "durationMs",
+                    "eventName",
+                    "executionMode",
+                    "handlerType",
+                    "id",
+                    "scope",
+                    "source",
+                    "sourcePath",
+                    "startedAt",
+                    "status",
+                    "statusMessage",
+                  ]),
+                  entriesCount: readArray(run, "entries").length,
+                },
+              }),
+        },
+        ...(runId === null ? {} : { runId }),
+      },
+    ]);
+  }
+
+  async #onMcpToolProgress(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    const itemId = readNonEmptyString(params, "itemId");
+    const message = readString(params, "message");
+
+    if (itemId === null || message === null) {
+      return;
+    }
+    const publicToolCallId = this.#tools.publicToolCallId(itemId);
+
+    if (publicToolCallId === null) {
+      return;
+    }
+    const parentMessageId = this.#tools.parentMessage(itemId);
+    await this.#push(context, "driver.openai.mcp_tool.progress", [
+      {
+        delivery: "best_effort",
+        kind: "tool.call.updated",
+        payload: {
+          ...(parentMessageId === null ? {} : { messageId: parentMessageId }),
+          ...toBoundedOpenAiTelemetry({ rawOutput: message }, ["rawOutput"]),
+          status: "running",
+          toolCallId: publicToolCallId,
+        },
+      },
+    ]);
+  }
+
+  async #onTerminalInteraction(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    const itemId = readNonEmptyString(params, "itemId");
+    const processId = readNonEmptyString(params, "processId");
+    const threadId = readNonEmptyString(params, "threadId");
+    const turnId = readNonEmptyString(params, "turnId");
+
+    if (itemId === null || processId === null || threadId === null || turnId === null) {
+      return;
+    }
+    const publicItemId = this.#tools.publicToolCallId(itemId);
+
+    if (publicItemId === null) {
+      return;
+    }
+
+    await this.#push(context, "driver.openai.terminal.interaction", [
+      {
+        delivery: "best_effort",
+        kind: "shell.command.updated",
+        payload: {
+          ...toBoundedOpenAiTelemetry({ processId }, ["processId"]),
+          itemId: publicItemId,
+          status: "running",
+          threadId: toRuntimePublicId(threadId, "openai-thread"),
+          turnId: this.publicTurnId(turnId),
         },
       },
     ]);
@@ -368,24 +986,86 @@ export class OpenAiAppServerEventBridge {
     }
   }
 
-  #onWarning(context: AgentDriverContext, params: JsonObject): void {
+  async #onWarning(
+    context: AgentDriverContext,
+    params: JsonObject,
+    method: "guardianWarning" | "warning",
+  ): Promise<void> {
+    const message = readString(params, "message") ?? "OpenAi app-server warning.";
+    const messageUtf8Bytes = Buffer.byteLength(message, "utf8");
+
     context.logger.warn("driver.openai.warning", {
-      message: readString(params, "message") ?? "OpenAi app-server warning.",
+      ...(messageUtf8Bytes <= MAX_OPENAI_TELEMETRY_FIELD_BYTES ? { message } : {}),
+      messageUtf8Bytes,
       threadIdPresent: readString(params, "threadId") !== null,
     });
+
+    await this.#push(context, `driver.openai.${method}`, toOpenAiUserFacingEvents(method, message));
+  }
+
+  async #onWorldWritableWarning(context: AgentDriverContext, params: JsonObject): Promise<void> {
+    const rawSamplePaths = Array.isArray(params["samplePaths"])
+      ? params["samplePaths"].filter((path): path is string => typeof path === "string")
+      : [];
+    const samplePaths: string[] = [];
+    let omittedSampleCount = 0;
+
+    for (const path of rawSamplePaths) {
+      if (
+        samplePaths.length < MAX_WORLD_WRITABLE_SAMPLE_PATHS &&
+        Buffer.byteLength(path, "utf8") <= MAX_OPENAI_TELEMETRY_FIELD_BYTES
+      ) {
+        samplePaths.push(path);
+      } else {
+        omittedSampleCount += 1;
+      }
+    }
+    const rawExtraCount = params["extraCount"];
+    const providerExtraCount =
+      typeof rawExtraCount === "number" && Number.isSafeInteger(rawExtraCount) && rawExtraCount >= 0
+        ? rawExtraCount
+        : 0;
+    const extraCount = Math.min(Number.MAX_SAFE_INTEGER, providerExtraCount + omittedSampleCount);
+    const failedScan = params["failedScan"] === true;
+    const content = [
+      "Windows sandbox protection is incomplete because world-writable directories were found.",
+      samplePaths.length === 0 ? null : `Affected paths:\n${samplePaths.join("\n")}`,
+      extraCount === 0 ? null : `${String(extraCount)} additional affected paths were omitted.`,
+      failedScan ? "The world-writable directory scan did not complete." : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join("\n\n");
+
+    context.logger.warn("driver.openai.windows.world_writable", {
+      extraCount,
+      failedScan,
+      samplePaths,
+    });
+    await this.#push(context, "driver.openai.windows.world_writable", [
+      {
+        delivery: "lossless",
+        kind: "message.added",
+        payload: {
+          content,
+          extraCount,
+          failedScan,
+          level: "warning",
+          messageId: createDriverId(),
+          role: "agent",
+          samplePaths,
+          subtype: "windows_world_writable_warning",
+        },
+      },
+    ]);
   }
 
   #onRuntimeError(context: AgentDriverContext, params: JsonObject): void {
     const error = readRecord(params, "error");
-    const message =
-      readString(error, "message") ?? readString(params, "message") ?? "OpenAi app-server error.";
-    const additionalDetails = readString(error, "additionalDetails");
     const turnId = readString(params, "turnId");
     const willRetry = params["willRetry"] === true;
 
     context.logger.warn("driver.openai.error.awaiting_turn_completion", {
-      additionalDetails,
-      message,
+      ...toBoundedOpenAiTelemetry(error ?? params, ["additionalDetails", "message"]),
       threadIdPresent: readString(params, "threadId") !== null,
       turnIdPresent: turnId !== null,
       willRetry,
@@ -406,7 +1086,13 @@ export class OpenAiAppServerEventBridge {
       throw new Error("OpenAi turn/completed requires a terminal turn status.");
     }
 
-    const runId = this.#turns.activeRunId(turnId) ?? undefined;
+    const pendingTurn = this.#turns.pendingTurnContext(turnId);
+    if (pendingTurn !== null && !this.#turns.hasTurnStarted(turnId)) {
+      throw new Error("OpenAi turn/completed arrived before its turn/started notification.");
+    }
+    const runId = this.#turns.activeRunId(turnId) ?? pendingTurn?.runId;
+    const cancellationSignal =
+      this.#turns.cancellationSignal(turnId) ?? pendingTurn?.cancellationSignal ?? null;
 
     await this.publishRunStarted(context, { runId, turnId });
     await this.#itemEvents.onTurnItems(context, params, turnId);
@@ -415,25 +1101,36 @@ export class OpenAiAppServerEventBridge {
       params,
       turnId,
     );
+    const authoritativeFinalSnapshot =
+      authoritativeFinalMessage !== null && authoritativeFinalMessage.text.trim().length > 0
+        ? authoritativeFinalMessage
+        : null;
     if (!this.#turns.beginSettlement(turnId)) {
       return;
     }
+    const publicTurnId = this.publicTurnId(turnId);
 
-    const error = turn ? readRecord(turn, "error") : null;
     try {
       if (status === "interrupted") {
         await this.#options.beforeInterruptedTurn?.(context, turnId);
-        await this.#push(context, "driver.openai.turn.interrupted", [
-          ...this.#itemEvents.finishOpen(),
+        await this.#options.pushTerminal(
+          context,
+          "driver.openai.turn.interrupted",
+          turnClosureEvents({
+            eventName: "turn.interrupted",
+            events: this.#itemEvents.terminalEvents({ kind: "cancelled" }),
+            publicTurnId,
+            runId,
+          }),
           {
-            ...turnEventFields({ eventName: "turn.interrupted", runId, turnId }),
+            ...turnEventFields({ eventName: "turn.interrupted", publicTurnId, runId }),
             kind: "run.cancelled",
             payload: {
               requestedBy: "provider",
               stopReason: "cancelled",
             },
           },
-        ]);
+        );
         this.#finishSettlement(turnId, {
           error: new DriverTurnCancelledError("OpenAI turn was interrupted."),
           kind: "failed",
@@ -442,30 +1139,31 @@ export class OpenAiAppServerEventBridge {
       }
 
       if (status === "failed") {
-        const message = toOpenAiErrorMessage(
-          readString(error, "message") ?? "OpenAi turn failed.",
-          readString(error, "additionalDetails"),
-        );
-        await this.#push(context, "driver.openai.turn.failed", [
-          ...this.#itemEvents.finishOpen(),
+        const error = toOpenAiProtocolError(readRecord(turn, "error"));
+        await this.#options.pushTerminal(
+          context,
+          "driver.openai.turn.failed",
+          turnClosureEvents({
+            eventName: "turn.failed",
+            events: this.#itemEvents.terminalEvents({ error, kind: "failed" }),
+            publicTurnId,
+            runId,
+          }),
           {
             ...turnEventFields({
               eventName: "turn.failed",
+              publicTurnId,
               runId,
-              turnId,
             }),
             kind: "run.failed",
             payload: {
-              error: {
-                code: "openai.turn_failed",
-                message,
-              },
-              recoverable: false,
+              error,
+              recoverable: error.retryable,
             },
           },
-        ]);
+        );
         this.#finishSettlement(turnId, {
-          error: new Error(message),
+          error: new Error(error.message),
           kind: "failed",
         });
         return;
@@ -485,29 +1183,46 @@ export class OpenAiAppServerEventBridge {
         });
       }
 
-      await this.#push(context, "driver.openai.turn.completed", [
-        ...this.#itemEvents.finishOpen(),
+      await this.#options.pushTerminal(
+        context,
+        "driver.openai.turn.completed",
+        turnClosureEvents({
+          eventName: "turn.completed",
+          events: this.#itemEvents.terminalEvents({ kind: "completed" }),
+          publicTurnId,
+          runId,
+        }),
         {
           ...turnEventFields({
             eventName: "turn.completed",
+            publicTurnId,
             runId,
-            turnId,
           }),
           kind: "run.completed",
           payload: {
-            ...(authoritativeFinalMessage === null
+            ...(authoritativeFinalSnapshot === null
               ? {}
-              : {
-                  finalMessageId: authoritativeFinalMessage.id,
-                  finalMessageText: authoritativeFinalMessage.text,
-                }),
+              : { finalMessageId: authoritativeFinalSnapshot.id }),
             stopReason: "end_turn",
           },
         },
-      ]);
+        cancellationSignal ?? undefined,
+      );
       this.#finishSettlement(turnId, { kind: "completed" });
     } catch (pushError) {
       this.#turns.cancelSettlement(turnId);
+      if (
+        status === "completed" &&
+        cancellationSignal?.aborted === true &&
+        (pushError === cancellationSignal.reason ||
+          (pushError instanceof DriverCompletedTerminalSupersededError &&
+            pushError.cause === cancellationSignal.reason))
+      ) {
+        if (pushError instanceof DriverCompletedTerminalSupersededError) {
+          this.#turns.markCompletionClosuresCommitted(turnId);
+        }
+        return;
+      }
       throw pushError;
     }
   }
@@ -527,12 +1242,15 @@ export class OpenAiAppServerEventBridge {
 
     await this.#push(context, "driver.openai.turn.diff.updated", [
       {
+        delivery: "best_effort",
         kind: "diagnostic.reported",
         payload: {
-          diff,
+          details: {
+            utf8Bytes: Buffer.byteLength(diff, "utf8"),
+          },
           message: "OpenAI turn diff updated.",
           severity: "info",
-          turnId,
+          turnId: this.publicTurnId(turnId),
         },
         runId,
         visibility: "owner_debug",
@@ -548,26 +1266,33 @@ export class OpenAiAppServerEventBridge {
       return;
     }
 
-    const runId = this.#turns.activeRunId(turnId) ?? undefined;
+    const runId = this.#turns.activeRunId(turnId) ?? this.#turns.pendingTurnContext(turnId)?.runId;
 
     await this.publishRunStarted(context, { runId, turnId });
   }
 
   async #onUsage(context: AgentDriverContext, params: JsonObject): Promise<void> {
     const turnId = readNonEmptyString(params, "turnId");
-    const runId = turnId === null ? null : this.#turns.activeRunId(turnId);
 
-    if (runId === null) {
+    if (turnId === null) {
+      return;
+    }
+    const runId = this.#turns.activeRunId(turnId);
+    const update = this.#usage.prepareUpdate(runId === null ? null : turnId, params);
+
+    if (runId === null || update.usage === null) {
+      update.commit();
       return;
     }
 
     await this.#push(context, "driver.openai.usage.updated", [
       {
         kind: "usage.updated",
-        payload: toOpenAiSessionUsageSummary(params),
+        payload: update.usage,
         runId,
       },
     ]);
+    update.commit();
   }
 
   async #push(
@@ -588,5 +1313,6 @@ export class OpenAiAppServerEventBridge {
   ): void {
     this.#turns.finishSettlement(turnId, terminalTurn);
     this.#itemEvents.reset();
+    this.#usage.release(turnId);
   }
 }

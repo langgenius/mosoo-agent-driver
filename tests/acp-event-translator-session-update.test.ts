@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
-import { AcpTurnEventState, toSessionReadyEvents } from "../src/runtimes/acp/acp-event-translator";
+import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
+import {
+  toAuthEvent,
+  toInitializeEvents,
+  toSessionReadyEvents,
+} from "../src/runtimes/acp/acp-session-events";
+import { beginAcpTranscript } from "./acp-test-helpers";
 
 const RUN_ID = "run-1" as RunId;
 
@@ -37,13 +43,7 @@ function requireEvent(events: readonly DriverEventInput[], kind: string): Driver
 
 describe("ACP runtime event translation", () => {
   test("starts permission tool calls through the turn event state", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const translation = state.translatePermission({
       params: {
@@ -64,7 +64,6 @@ describe("ACP runtime event translation", () => {
       "message.started",
       "item.started",
       "tool.call.updated",
-      "permission.requested",
       "message.completed",
       "tool.call.updated",
       "item.completed",
@@ -73,13 +72,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("closes unfinished tool calls when a turn completes", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -112,14 +105,8 @@ describe("ACP runtime event translation", () => {
     });
   });
 
-  test("maps max turn request stops to completed limited runs", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+  test("fails open items when max turn requests stops a prompt", () => {
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -137,32 +124,79 @@ describe("ACP runtime event translation", () => {
       "message.started",
       "item.started",
       "tool.call.updated",
-      "message.completed",
+      "message.failed",
       "tool.call.updated",
       "item.completed",
-      "run.completed",
+      "run.failed",
     ]);
     expect(eventPayload(events[4]!)).toMatchObject({
-      status: "completed",
+      error: "ACP prompt stopped with max_turn_requests.",
+      status: "failed",
       toolCallId: "tool-1",
     });
     expect(eventPayload(events[5]!)).toMatchObject({
+      error: "ACP prompt stopped with max_turn_requests.",
       itemId: "tool-1",
-      status: "completed",
+      status: "failed",
     });
     expect(eventPayload(events[6]!)).toMatchObject({
+      error: {
+        code: "acp.max_turn_requests",
+        message: "ACP prompt stopped with max_turn_requests.",
+        retryable: false,
+      },
+      recoverable: false,
       stopReason: "max_turn_requests",
     });
   });
 
-  test("fails an empty end turn instead of reporting a blank completed run", () => {
-    const state = new AcpTurnEventState();
+  test("cancels every open item when the prompt is cancelled", () => {
+    const state = beginAcpTranscript({ runId: RUN_ID });
+    const events = [
+      ...state.translateUpdate({
+        update: {
+          content: { text: "partial answer", type: "text" },
+          messageId: "native-message-1",
+          sessionUpdate: "agent_message_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          content: { text: "partial thought", type: "text" },
+          messageId: "native-message-1",
+          sessionUpdate: "agent_thought_chunk",
+        },
+      }),
+      ...state.translateUpdate({
+        update: {
+          sessionUpdate: "tool_call",
+          status: "running",
+          title: "Run command",
+          toolCallId: "tool-1",
+        },
+      }),
+      ...state.completePrompt("cancelled", null),
+    ];
 
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    expect(eventKinds(events)).toContain("message.cancelled");
+    expect(eventKinds(events)).toContain("thought.cancelled");
+    expect(eventKinds(events)).toContain("run.cancelled");
+    expect(
+      events.some(
+        (event) =>
+          event.kind === "tool.call.updated" && eventPayload(event)["status"] === "cancelled",
+      ),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) => event.kind === "item.completed" && eventPayload(event)["status"] === "cancelled",
+      ),
+    ).toBe(true);
+    expect(eventKinds(events)).not.toContain("message.completed");
+  });
+
+  test("fails an empty end turn instead of reporting a blank completed run", () => {
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = state.completePrompt("end_turn", {
       inputTokens: 0,
@@ -175,6 +209,7 @@ describe("ACP runtime event translation", () => {
       error: {
         code: "acp.empty_turn",
         message: "ACP prompt ended without assistant output or tool activity.",
+        retryable: true,
       },
       recoverable: true,
       stopReason: "end_turn",
@@ -182,13 +217,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("ignores ACP user message echo chunks because driver input is the source of truth", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     expect(
       state.translateUpdate({
@@ -204,15 +233,9 @@ describe("ACP runtime event translation", () => {
   });
 
   test("promotes message-scoped thought-only ACP output into an assistant message", () => {
-    const state = new AcpTurnEventState();
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
-
-    const events = [
+    const streamed = [
       ...state.translateUpdate({
         update: {
           content: {
@@ -233,15 +256,16 @@ describe("ACP runtime event translation", () => {
           sessionUpdate: "agent_thought_chunk",
         },
       }),
-      ...state.completePrompt("end_turn", null),
     ];
+    const terminal = state.completePrompt("end_turn", null);
+    const events = [...streamed, ...terminal];
 
     expect(eventKinds(events)).toEqual([
       "thought.started",
       "thought.delta",
       "thought.delta",
       "message.started",
-      "message.delta",
+      "message.added",
       "message.completed",
       "thought.completed",
       "run.completed",
@@ -249,24 +273,18 @@ describe("ACP runtime event translation", () => {
     const fallbackMessageId = eventPayloadString(events[3]!, "messageId");
 
     expect(eventPayload(events[4]!)).toMatchObject({
-      contentDelta: "\npong\n",
+      content: "\npong\n",
       messageId: fallbackMessageId,
-      role: "agent",
     });
-    expect(eventPayload(events[7]!)).toMatchObject({
+    expect(eventPayload(events[7]!)).toEqual({
       finalMessageId: fallbackMessageId,
-      finalMessageText: "\npong\n",
+      stopReason: "end_turn",
     });
+    expect(terminal.every((event) => event.delivery !== "best_effort")).toBe(true);
   });
 
   test("treats a different native thought as the final assistant message boundary", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const progressText = "PROGRESS：正在整理资料。";
     const finalText = "FINAL：中文表格与结论均已完成。";
@@ -287,39 +305,43 @@ describe("ACP runtime event translation", () => {
       }),
       ...state.completePrompt("end_turn", null),
     ];
-    const messageDeltas = events.filter((event) => event.kind === "message.delta");
-    const progressMessageId = eventPayloadString(messageDeltas[0]!, "messageId");
-    const finalMessageId = eventPayloadString(messageDeltas[1]!, "messageId");
+    const progressMessageId = eventPayloadString(
+      requireEvent(events, "message.delta"),
+      "messageId",
+    );
+    const finalMessageId = eventPayloadString(
+      events.find(
+        (event) => event.kind === "message.added" && eventPayload(event)["content"] === finalText,
+      )!,
+      "messageId",
+    );
     const completed = requireEvent(events, "run.completed");
 
     expect(eventKinds(events)).toEqual([
       "message.started",
       "message.delta",
+      "message.added",
       "message.completed",
       "thought.started",
       "thought.delta",
       "message.started",
-      "message.delta",
+      "message.added",
       "message.completed",
       "thought.completed",
       "run.completed",
     ]);
     expect(progressMessageId).not.toBe(finalMessageId);
-    expect(eventPayload(completed)).toMatchObject({
-      finalMessageId,
-      finalMessageText: finalText,
-    });
-    expect(eventPayloadString(completed, "finalMessageText")).not.toContain(progressText);
+    expect(eventPayload(completed)).toEqual({ finalMessageId, stopReason: "end_turn" });
+    expect(
+      events.find(
+        (event) =>
+          event.kind === "message.added" && eventPayload(event)["messageId"] === finalMessageId,
+      )?.payload,
+    ).toMatchObject({ content: finalText });
   });
 
   test("fails closed when an anonymous thought follows identified progress", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -342,6 +364,7 @@ describe("ACP runtime event translation", () => {
     expect(eventKinds(events)).toEqual([
       "message.started",
       "message.delta",
+      "message.added",
       "message.completed",
       "thought.started",
       "thought.delta",
@@ -358,13 +381,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("closes open stream items before a failed turn event", () => {
-    const state = new AcpTurnEventState();
-
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
-    });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const events = [
       ...state.translateUpdate({
@@ -395,11 +412,16 @@ describe("ACP runtime event translation", () => {
       "message.delta",
       "item.started",
       "tool.call.updated",
-      "message.completed",
+      "message.failed",
       "tool.call.updated",
       "item.completed",
       "run.failed",
     ]);
+    expect(eventPayload(requireEvent(events, "run.failed"))).toMatchObject({
+      error: { message: "transport closed", retryable: false },
+    });
+    expect(eventPayload(events[5]!)).not.toHaveProperty("error");
+    expect(eventPayload(events[6]!)).not.toHaveProperty("error");
   });
 
   test("emits native resume state from ACP session setup", () => {
@@ -407,7 +429,10 @@ describe("ACP runtime event translation", () => {
       mode: "created",
       nativeSessionId: "native-session-1",
       setup: {
-        currentModeId: "default",
+        modes: {
+          availableModes: [{ id: "default", name: "Default" }],
+          currentModeId: "default",
+        },
       },
     });
 
@@ -419,6 +444,11 @@ describe("ACP runtime event translation", () => {
     expect("resumePointer" in eventPayload(events[0]!)).toBe(false);
     expect(events[1]).toMatchObject({
       visibility: "owner_debug",
+    });
+    expect(events[2]?.delivery).toBe("best_effort");
+    expect(eventPayload(events[2]!)).toEqual({
+      availableModes: [{ id: "default", name: "Default" }],
+      currentMode: "default",
     });
   });
 
@@ -447,6 +477,7 @@ describe("ACP runtime event translation", () => {
     const configEvent = events.find((event) => event.kind === "session.config.updated");
     const payload = eventPayload(configEvent as DriverEventInput);
 
+    expect(configEvent?.delivery).toBe("best_effort");
     expect(payload).toEqual({
       options: [
         {
@@ -523,7 +554,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("normalizes ACP commands to the mosoo session commands contract", () => {
-    const state = new AcpTurnEventState();
+    const state = new AcpAssistantTranscriptState();
     const events = state.translateUpdate({
       update: {
         availableCommands: [
@@ -551,14 +582,103 @@ describe("ACP runtime event translation", () => {
     ]);
   });
 
-  test("normalizes ACP usage sources to the mosoo usage contract", () => {
-    const state = new AcpTurnEventState();
+  test("fails closed on an oversized lossless session snapshot", () => {
+    const state = new AcpAssistantTranscriptState();
 
-    state.begin({
-      messageId: "message-1",
-      runId: RUN_ID,
-      sessionId: "session-1",
+    expect(() =>
+      state.translateUpdate({
+        update: {
+          availableCommands: [{ description: "x".repeat(600_000), name: "huge" }],
+          sessionUpdate: "available_commands_update",
+        },
+      }),
+    ).toThrow("ACP session.commands.updated event exceeds 524288 UTF-8 bytes");
+  });
+
+  test("bounds provider IDs without copying the native session ID into source IDs", () => {
+    const nativeSessionId = "s".repeat(600_000);
+
+    expect(() => toSessionReadyEvents({ mode: "created", nativeSessionId, setup: {} })).toThrow(
+      "ACP runtime.resume.updated event exceeds 524288 UTF-8 bytes",
+    );
+    expect(() => toAuthEvent({ methodId: nativeSessionId, status: "authenticated" })).toThrow(
+      "ACP auth.session.updated event exceeds 524288 UTF-8 bytes",
+    );
+
+    const state = beginAcpTranscript({ runId: RUN_ID });
+    const sourceEventId = state.translateUpdate({
+      update: {
+        content: { text: "hello", type: "text" },
+        sessionUpdate: "agent_message_chunk",
+      },
+    })[1]?.sourceEventId;
+
+    expect(sourceEventId).toBe("acp:run-1:agent-message:1");
+  });
+
+  test("keeps unbounded initialize telemetry best effort", () => {
+    const value = "x".repeat(600_000);
+    const events = toInitializeEvents({
+      agentCapabilities: { _meta: { value } },
+      authMethods: [{ id: value, name: value }],
+      protocolVersion: 1,
+    } as never);
+
+    expect(events.map((event) => event.delivery)).toEqual(["best_effort", "best_effort"]);
+  });
+
+  test("maps ACP 1.3 session timestamps and ignores removed setup aliases", () => {
+    const state = new AcpAssistantTranscriptState();
+    const info = state.translateUpdate({
+      update: {
+        sessionUpdate: "session_info_update",
+        title: "Session title",
+        updatedAt: "2026-08-13T00:00:00.000Z",
+      },
     });
+    const legacyReady = toSessionReadyEvents({
+      mode: "created",
+      nativeSessionId: "native-session-1",
+      setup: {
+        capabilities: { fileSystem: true },
+        currentModeId: "legacy-mode",
+        currentModel: "legacy-model",
+        models: ["legacy-model"],
+        options: [],
+        providers: ["legacy-provider"],
+        sessionCapabilities: { legacy: true },
+        visibleModes: [],
+      },
+    });
+
+    expect(info).toEqual([
+      {
+        kind: "session.info.updated",
+        payload: {
+          title: "Session title",
+          updatedAt: "2026-08-13T00:00:00.000Z",
+        },
+      },
+    ]);
+    expect(
+      [
+        { sessionUpdate: "session_info_update", title: "" },
+        { sessionUpdate: "session_info_update", updatedAt: "not-a-time" },
+      ].flatMap((update) => state.translateUpdate({ update })),
+    ).toEqual([]);
+    expect(eventKinds(legacyReady)).toEqual(["session.created", "runtime.resume.updated"]);
+    expect(
+      state.translateUpdate({
+        update: {
+          commands: [{ name: "legacy" }],
+          sessionUpdate: "available_commands_update",
+        },
+      }),
+    ).toEqual([]);
+  });
+
+  test("normalizes ACP usage sources to the mosoo usage contract", () => {
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const sessionUsage = state.translateUpdate({
       update: {
@@ -600,14 +720,6 @@ describe("ACP runtime event translation", () => {
         cachedWriteTokens: 7,
         inputTokens: 10,
         outputTokens: 2,
-        raw: {
-          cachedReadTokens: 90,
-          cachedWriteTokens: 7,
-          inputTokens: 10,
-          outputTokens: 2,
-          thoughtTokens: 3,
-          totalTokens: 112,
-        },
         source: "prompt_response",
         thoughtTokens: 3,
         totalTokens: 112,
@@ -623,8 +735,7 @@ describe("ACP runtime event translation", () => {
     ["unsafe", Number.MAX_SAFE_INTEGER + 1],
     ["non-finite", Number.POSITIVE_INFINITY],
   ] as const)("drops wholly invalid %s usage without blocking Run completion", (_name, value) => {
-    const state = new AcpTurnEventState();
-    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    const state = beginAcpTranscript({ runId: RUN_ID });
     state.translateUpdate({
       update: {
         content: { text: "done", type: "text" },
@@ -654,8 +765,7 @@ describe("ACP runtime event translation", () => {
   });
 
   test("keeps valid usage fields while omitting malformed siblings", () => {
-    const state = new AcpTurnEventState();
-    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    const state = beginAcpTranscript({ runId: RUN_ID });
 
     const [sessionUsage] = state.translateUpdate({
       update: {

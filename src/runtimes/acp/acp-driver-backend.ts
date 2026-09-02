@@ -14,7 +14,6 @@ import { Readable, Writable } from "node:stream";
 
 import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
-import type { DriverHostIntegrationSnapshot } from "../../protocol/host-integration";
 import type { RunId } from "../../protocol/id";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
@@ -26,10 +25,10 @@ import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
   computeRuntimeBootstrapDigest,
+  exposeNativeSkillAliases,
   writeNativeRuntimeSystemPrompt,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
-import { exposeNativeSkillAliases } from "../skill-materialization";
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
@@ -49,7 +48,7 @@ import {
   supportsSessionLoad,
   supportsSessionResume,
 } from "./acp-configuration";
-import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-event-translator";
+import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-session-events";
 import { setupAcpSession } from "./acp-session-setup";
 import { withAcpStartupStage } from "./acp-startup";
 import { AcpTurnController } from "./acp-turn-controller";
@@ -58,6 +57,7 @@ const ACP_STOP_BUDGET_MS = 4_000;
 const ACP_RECYCLE_BUDGET_MS = 4_500;
 const ACP_SESSION_SHUTDOWN_TIMEOUT_MS = 750;
 const ACP_UPDATE_DRAIN_TIMEOUT_MS = 750;
+const MAX_ACTIVE_ACP_CLIENT_REQUESTS = 8;
 
 function toErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
@@ -70,18 +70,21 @@ export class AcpDriverBackend implements AgentDriverBackend {
   #agentCapabilities: AgentCapabilities | null = null;
   #agentLaunch: { readonly args: readonly string[]; readonly command: string } | null = null;
   #agentProcess: AcpAgentProcess | null = null;
+  #agentProcessStop: { readonly process: AcpAgentProcess; readonly task: Promise<void> } | null =
+    null;
   readonly #childProcessEnv: Record<string, string>;
   readonly #clientRequests: AcpClientRequestHandler;
   #connection: ClientConnection | null = null;
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
-  #hostSnapshot: DriverHostIntegrationSnapshot | null = null;
   #nativeSessionId: string | null = null;
   #nativeInstructionPath: string | null = null;
   readonly #payload: DriverStartInput;
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
   #started = false;
+  #stopFailure: { readonly error: unknown } | null = null;
   #stopRequested = false;
+  #stopSucceeded = false;
   #stopTask: Promise<void> | null = null;
   readonly #turnController: AcpTurnController;
 
@@ -93,7 +96,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
     this.#runtimeBootstrapText = buildRuntimeBootstrapText(payload.execution);
     this.#turnController = new AcpTurnController(
       (context, reason, events) => this.#push(context, reason, events),
-      (context) => this.#recycleCancelledTurn(context),
+      (context, providerPromptAdmitted, resumeSignal) =>
+        this.#settleCancelledTurn(context, providerPromptAdmitted, resumeSignal),
+      (context, reason, closures, terminal, cancellationSignal) =>
+        this.#eventPublisher.pushTerminal(context, reason, closures, terminal, cancellationSignal),
     );
     this.#clientRequests = new AcpClientRequestHandler({
       allowedRoots: payload.execution.session.additionalDirectories,
@@ -113,41 +119,33 @@ export class AcpDriverBackend implements AgentDriverBackend {
       throw new Error("ACP driver backend cannot restart after stopping.");
     }
 
-    const hostSnapshot = await raceWithAbort(context.ports.hostIntegration.snapshot(), signal);
-
-    if (hostSnapshot === null) {
-      throw new Error("ACP fallback requires a host integration snapshot.");
-    }
-
-    this.#hostSnapshot = hostSnapshot;
-    const materializedSkills = await raceWithAbort(
-      context.ports.skill.materialize(this.#payload.execution),
-      signal,
-    );
-    const nativeSkillAliases = await raceWithAbort(
-      exposeNativeSkillAliases(this.#payload.execution, context.logger, materializedSkills),
-      signal,
-    );
-    const bootstrapArtifacts = await raceWithAbort(
-      writeSkillBootstrapArtifacts(this.#payload.execution),
-      signal,
-    );
-    const launch = (this.#agentLaunch ??= {
-      args: readFallbackArgs(),
-      command: readFallbackCommand(),
-    });
-    this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
-      ? await raceWithAbort(writeNativeRuntimeSystemPrompt(this.#payload.execution), signal)
-      : null;
-
-    if (this.#stopRequested || signal.aborted) {
-      signal.throwIfAborted();
-      throw new Error("ACP driver backend stopped during startup.");
-    }
-
     try {
-      signal.throwIfAborted();
-      if (this.#stopRequested) {
+      await raceWithAbort(this.#clientRequests.initializePathScope(), signal);
+      const materializedSkills = await context.ports.skill.materialize(
+        this.#payload.execution,
+        signal,
+      );
+      const nativeSkillAliases = await exposeNativeSkillAliases(
+        this.#payload.execution,
+        context.logger,
+        materializedSkills,
+        signal,
+      );
+      const bootstrapArtifacts = await writeSkillBootstrapArtifacts(
+        this.#payload.execution,
+        materializedSkills,
+        signal,
+      );
+      const launch = (this.#agentLaunch ??= {
+        args: readFallbackArgs(),
+        command: readFallbackCommand(),
+      });
+      this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
+        ? await writeNativeRuntimeSystemPrompt(this.#payload.execution, materializedSkills, signal)
+        : null;
+
+      if (this.#stopRequested || signal.aborted) {
+        signal.throwIfAborted();
         throw new Error("ACP driver backend stopped during startup.");
       }
 
@@ -188,7 +186,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
         this.#connection?.close(
           signal.reason instanceof Error ? signal.reason : new Error("ACP startup aborted."),
         );
-        signal.throwIfAborted();
       }
 
       await this.stop(context, "startup.failed", signal).catch((cleanupError: unknown) => {
@@ -196,6 +193,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
           message: toErrorMessage(cleanupError, "startup cleanup failed"),
         });
       });
+      signal.throwIfAborted();
       throw error;
     }
   }
@@ -214,17 +212,51 @@ export class AcpDriverBackend implements AgentDriverBackend {
       this.#nativeInstructionPath === null
         ? this.#childProcessEnv
         : appendOpenCodeInstruction(this.#childProcessEnv, this.#nativeInstructionPath);
-    const agentProcess = await startAcpAgentProcess(
+    const startedProcess = await startAcpAgentProcess(
       context,
       this.#payload,
       processEnv,
       signal,
       launch,
     );
+    const agentProcess = startedProcess.process;
     this.#agentProcess = agentProcess;
+    let activeClientRequests = 0;
     let connection: ClientConnection | null = null;
+    const serveRequest = async <T>(
+      requestSignal: AbortSignal,
+      operation: (signal: AbortSignal) => Promise<T> | T,
+    ): Promise<T> => {
+      const signal = this.#requestSignal(requestSignal);
+
+      if (this.#stopRequested || signal.aborted) {
+        throw RequestError.requestCancelled();
+      }
+      if (activeClientRequests >= MAX_ACTIVE_ACP_CLIENT_REQUESTS) {
+        const error = RequestError.internalError(
+          { maxActiveRequests: MAX_ACTIVE_ACP_CLIENT_REQUESTS },
+          "ACP client request capacity exceeded",
+        );
+        connection?.close(error);
+        throw error;
+      }
+      activeClientRequests += 1;
+
+      try {
+        return await operation(signal);
+      } catch (error) {
+        if (signal.aborted) {
+          throw RequestError.requestCancelled();
+        }
+
+        throw error;
+      } finally {
+        activeClientRequests -= 1;
+      }
+    };
 
     try {
+      await startedProcess.ready;
       signal.throwIfAborted();
       if (this.#stopRequested) {
         throw new Error("ACP driver backend stopped while connecting.");
@@ -235,42 +267,42 @@ export class AcpDriverBackend implements AgentDriverBackend {
           this.#clientRequests.enqueueUpdate(context, params),
         )
         .onRequest(acpMethods.client.session.requestPermission, ({ params, requestId, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.requestPermission(context, requestId, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.fs.readTextFile, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.readTextFile(params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.fs.writeTextFile, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.writeTextFile(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.create, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.createTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.kill, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.killTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.output, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.terminalOutput(params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.release, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.releaseTerminal(context, params, requestSignal),
           ),
         )
         .onRequest(acpMethods.client.terminal.waitForExit, ({ params, signal }) =>
-          this.#serveRequest(signal, (requestSignal) =>
+          serveRequest(signal, (requestSignal) =>
             this.#clientRequests.waitForTerminalExit(params, requestSignal),
           ),
         );
@@ -295,16 +327,21 @@ export class AcpDriverBackend implements AgentDriverBackend {
         const error =
           reason instanceof Error ? reason : new Error("ACP transport closed unexpectedly.");
         context.logger.error("driver.acp.transport.failed", error, {});
-        const cleanup = stopAcpAgentProcess(context, agentProcess, "connection.failed");
-        if (this.#turnController.failActive(error, cleanup)) {
+        this.#connection = null;
+        const cleanup = this.#stopOwnedAgent(context, agentProcess, "connection.failed");
+        const turnSettled = this.#turnController.routeFatal(error, cleanup);
+        if (turnSettled === null) {
           return;
         }
-        void cleanup.then(
-          () => context.lifecycle.fail(error),
-          (cleanupError: unknown) =>
-            context.lifecycle.fail(
-              new AggregateError([error, cleanupError], "ACP provider failure cleanup failed."),
-            ),
+        void Promise.allSettled([cleanup, turnSettled]).then(([cleanupResult]) =>
+          context.lifecycle.fail(
+            cleanupResult?.status === "rejected"
+              ? new AggregateError(
+                  [error, cleanupResult.reason],
+                  "ACP provider failure cleanup failed.",
+                )
+              : error,
+          ),
         );
       });
 
@@ -356,13 +393,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
         signal,
       );
 
-      if (setup.droppedAdditionalDirectories.length > 0) {
-        context.logger.warn("driver.acp.session.additional_directories_dropped", {
-          count: setup.droppedAdditionalDirectories.length,
-          reason: "agent_capability_missing",
-        });
-      }
-
       if (
         requiredResumeSessionId !== null &&
         (setup.mode !== "resumed" || setup.sessionId !== requiredResumeSessionId)
@@ -398,12 +428,9 @@ export class AcpDriverBackend implements AgentDriverBackend {
         this.#connection = null;
       }
       connection?.close(error instanceof Error ? error : new Error("ACP connection failed."));
-      if (this.#agentProcess === agentProcess) {
-        this.#agentProcess = null;
-      }
 
       try {
-        await stopAcpAgentProcess(
+        await this.#stopOwnedAgent(
           context,
           agentProcess,
           "connection.failed",
@@ -429,7 +456,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
       runId,
       this.#requireConnection(),
       this.#requireSessionId(),
-      this.#requireHostSnapshot(),
       this.#clientRequests,
       signal,
     );
@@ -449,9 +475,22 @@ export class AcpDriverBackend implements AgentDriverBackend {
     if (this.#stopTask !== null) {
       return this.#stopTask;
     }
+    if (this.#stopSucceeded) {
+      return Promise.resolve();
+    }
 
-    const task = Promise.resolve()
+    const operation = Promise.resolve()
       .then(() => this.#performStop(context, reason, signal))
+      .finally(() => this.#clientRequests.closePathScope());
+    const task = operation
+      .then(() => {
+        this.#stopFailure = null;
+        this.#stopSucceeded = true;
+      })
+      .catch((error: unknown) => {
+        this.#stopFailure = { error };
+        throw error;
+      })
       .finally(() => {
         if (this.#stopTask === task) {
           this.#stopTask = null;
@@ -461,9 +500,19 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return task;
   }
 
-  async #recycleCancelledTurn(context: AgentDriverContext): Promise<void> {
+  async #settleCancelledTurn(
+    context: AgentDriverContext,
+    providerPromptAdmitted: boolean,
+    resumeSignal: AbortSignal,
+  ): Promise<void> {
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
+      return;
+    }
+    if (resumeSignal.aborted) {
+      return;
+    }
+    if (!providerPromptAdmitted) {
       return;
     }
 
@@ -476,32 +525,36 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     const deadline = Date.now() + ACP_RECYCLE_BUDGET_MS;
     this.#connection = null;
-    this.#agentProcess = null;
     transport.close(new Error("ACP cancelled turn recycling provider process."));
-    await stopAcpAgentProcess(context, agentProcess, "turn.cancelled.recycle", deadline);
+    await this.#stopOwnedAgent(context, agentProcess, "turn.cancelled.recycle", deadline);
 
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
-
+    if (resumeSignal.aborted) {
+      return;
+    }
     try {
       await this.#connect(
         context,
-        AbortSignal.timeout(this.#remainingStopMs(deadline)),
+        AbortSignal.any([AbortSignal.timeout(this.#remainingStopMs(deadline)), resumeSignal]),
         false,
         sessionId,
       );
     } catch (error) {
+      if (resumeSignal.aborted) {
+        return;
+      }
       if (!this.#stopRequested) {
         throw error;
       }
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
 
     if (this.#stopRequested) {
-      await this.#stopTask;
+      await this.#joinStop();
       return;
     }
 
@@ -515,6 +568,12 @@ export class AcpDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const deadline = Date.now() + ACP_STOP_BUDGET_MS;
     this.#turnController.abort("ACP driver backend stopped.");
+    this.#clientRequests.beginStop();
+    const fileWriteDrainTask = settlePromiseWithTimeout(this.#clientRequests.drainFileWrites(), {
+      label: "ACP committed file report drain",
+      signal,
+      timeoutMs: this.#remainingStopMs(deadline),
+    });
     const terminalCleanupTask = settlePromiseWithTimeout(
       this.#clientRequests.stopTerminals(context),
       {
@@ -578,6 +637,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
       });
     }
 
+    const fileWriteDrain = await fileWriteDrainTask;
+
+    if (fileWriteDrain.status !== "completed") {
+      context.logger.warn("driver.acp.files.drain.failed", {
+        message: toErrorMessage(fileWriteDrain.error, "committed file report drain failed"),
+        reason,
+      });
+    }
+
     transport?.close(new Error("ACP driver backend stopped."));
     if (this.#connection === transport) {
       this.#connection = null;
@@ -587,11 +655,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     try {
       if (agentProcess !== null) {
-        await stopAcpAgentProcess(context, agentProcess, reason, deadline, signal);
-      }
-
-      if (this.#agentProcess === agentProcess) {
-        this.#agentProcess = null;
+        await this.#stopOwnedAgent(context, agentProcess, reason, deadline, signal);
       }
     } catch (error) {
       processFailure = { error };
@@ -612,6 +676,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     if (updateDrain.status !== "completed") {
       throw updateDrain.error;
+    }
+
+    if (fileWriteDrain.status !== "completed") {
+      throw fileWriteDrain.error;
     }
 
     if (terminalCleanup.status !== "completed") {
@@ -707,12 +775,49 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return this.#nativeSessionId;
   }
 
-  #requireHostSnapshot(): DriverHostIntegrationSnapshot {
-    if (this.#hostSnapshot === null) {
-      throw new Error("ACP driver backend host integration snapshot is not initialized.");
+  async #joinStop(): Promise<void> {
+    if (this.#stopTask !== null) {
+      await this.#stopTask;
+      return;
+    }
+    if (this.#stopSucceeded) {
+      return;
+    }
+    if (this.#stopFailure !== null) {
+      throw this.#stopFailure.error;
+    }
+    throw new Error("ACP driver stop was requested without an owned cleanup barrier.");
+  }
+
+  async #stopOwnedAgent(
+    context: AgentDriverContext,
+    agentProcess: AcpAgentProcess,
+    reason: string,
+    deadline?: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const existing = this.#agentProcessStop;
+    if (existing?.process === agentProcess) {
+      await existing.task;
+      return;
     }
 
-    return this.#hostSnapshot;
+    const cleanup =
+      deadline === undefined
+        ? stopAcpAgentProcess(context, agentProcess, reason)
+        : stopAcpAgentProcess(context, agentProcess, reason, deadline, signal);
+    this.#agentProcessStop = { process: agentProcess, task: cleanup };
+
+    try {
+      await cleanup;
+      if (this.#agentProcess === agentProcess) {
+        this.#agentProcess = null;
+      }
+    } finally {
+      if (this.#agentProcessStop?.task === cleanup) {
+        this.#agentProcessStop = null;
+      }
+    }
   }
 
   #remainingStopMs(deadline: number): number {
@@ -724,25 +829,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     return turnSignal === undefined ? signal : AbortSignal.any([signal, turnSignal]);
   }
 
-  async #serveRequest<T>(
-    signal: AbortSignal,
-    operation: (signal: AbortSignal) => Promise<T> | T,
-  ): Promise<T> {
-    const requestSignal = this.#requestSignal(signal);
-
-    try {
-      return await operation(requestSignal);
-    } catch (error) {
-      if (requestSignal.aborted) {
-        throw RequestError.requestCancelled();
-      }
-
-      throw error;
-    }
-  }
-
   async #setupSession(signal: AbortSignal): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
-    const hostSnapshot = this.#requireHostSnapshot();
     signal.throwIfAborted();
     const deferredUpdates =
       this.#nativeSessionId === null ||
@@ -758,7 +845,6 @@ export class AcpDriverBackend implements AgentDriverBackend {
           connection: this.#requireConnection(),
           currentSessionId: this.#nativeSessionId,
           payload: this.#payload,
-          sessionContext: hostSnapshot.sessionContext,
           replaySession: async (operation) => this.#clientRequests.withSessionReplay(operation),
         }),
         signal,

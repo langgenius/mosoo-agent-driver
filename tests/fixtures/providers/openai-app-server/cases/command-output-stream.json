@@ -4,9 +4,14 @@
       "method": "item/started",
       "params": {
         "item": {
+          "command": "printf 'hello world'",
+          "commandActions": [],
+          "cwd": "/workspace",
           "id": "cmd-1",
+          "status": "inProgress",
           "type": "commandExecution"
         },
+        "startedAtMs": 1700000003000,
         "threadId": "thread-1",
         "turnId": "turn-1"
       }
@@ -36,7 +41,8 @@
       "payload": {
         "messageId": "<driver-id>",
         "role": "agent"
-      }
+      },
+      "sourceEventId": "openai.message.started:<driver-id>"
     },
     {
       "kind": "item.started",
@@ -45,7 +51,8 @@
         "itemType": "tool_call",
         "parentMessageId": "<driver-id>",
         "title": "Shell"
-      }
+      },
+      "sourceEventId": "openai.item.started:sid1_diOiKEZok2HcGrWKr19uxht3PPOLSj_ZVMcjnOYcZYo"
     },
     {
       "kind": "tool.call.updated",
@@ -55,15 +62,15 @@
         "status": "running",
         "title": "Shell",
         "toolCallId": "cmd-1"
-      }
+      },
+      "sourceEventId": "openai.tool.started:sid1_RWKjM-yo_eO1O7FFfDWAa7yqJPtBWMGIYPSniQQkjHs"
     },
     {
       "delivery": "best_effort",
       "kind": "tool.call.updated",
       "payload": {
-        "content": "hello",
         "messageId": "<driver-id>",
-        "rawOutput": "hello",
+        "rawOutputDelta": "hello",
         "status": "running",
         "toolCallId": "cmd-1"
       }
@@ -72,9 +79,8 @@
       "delivery": "best_effort",
       "kind": "tool.call.updated",
       "payload": {
-        "content": " world",
         "messageId": "<driver-id>",
-        "rawOutput": " world",
+        "rawOutputDelta": " world",
         "status": "running",
         "toolCallId": "cmd-1"
       }

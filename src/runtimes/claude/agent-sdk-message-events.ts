@@ -22,9 +22,11 @@ export function toClaudeFilesPersistedEvents(message: SDKFilesPersistedEvent): D
 
   if (message.failed.length > 0) {
     events.push({
+      delivery: "best_effort",
       kind: "diagnostic.reported",
       payload: {
-        failed: message.failed,
+        failedCount: message.failed.length,
+        failedUtf8Bytes: Buffer.byteLength(JSON.stringify(message.failed), "utf8"),
         message: "Claude file persistence failed.",
         severity: "warn",
       },
@@ -46,12 +48,42 @@ export function toClaudeDiagnosticEvent(message: SDKMessage): JsonObject {
   };
 }
 
+function sumModelUsage(modelUsage: unknown, key: string): number | null {
+  if (!isRecord(modelUsage)) {
+    return null;
+  }
+
+  const counts = Object.values(modelUsage).flatMap((value) => {
+    const count = isRecord(value) ? toTokenCount(value[key]) : null;
+    return count === null ? [] : [count];
+  });
+  return counts.length === 0 ? null : toTokenCount(counts.reduce((total, count) => total + count));
+}
+
+export function aggregateClaudeModelUsage(modelUsage: unknown): JsonObject | null {
+  const inputTokens = sumModelUsage(modelUsage, "inputTokens");
+  const outputTokens = sumModelUsage(modelUsage, "outputTokens");
+  const thinkingTokens = sumModelUsage(modelUsage, "thinkingTokens");
+  const cacheReadTokens = sumModelUsage(modelUsage, "cacheReadInputTokens");
+  const cacheCreationTokens = sumModelUsage(modelUsage, "cacheCreationInputTokens");
+  const usage: JsonObject = {
+    ...(cacheCreationTokens === null ? {} : { cache_creation_input_tokens: cacheCreationTokens }),
+    ...(cacheReadTokens === null ? {} : { cache_read_input_tokens: cacheReadTokens }),
+    ...(inputTokens === null ? {} : { input_tokens: inputTokens }),
+    ...(outputTokens === null ? {} : { output_tokens: outputTokens }),
+    ...(thinkingTokens === null ? {} : { thinking_tokens: thinkingTokens }),
+  };
+
+  return Object.keys(usage).length === 0 ? null : usage;
+}
+
 export function toClaudeUsageUpdatedEvents(
   usage: JsonObject | null,
   costAmount: number | null,
 ): DriverEventInput[] {
   const inputTokens = toTokenCount(usage?.["input_tokens"]);
   const outputTokens = toTokenCount(usage?.["output_tokens"]);
+  const thoughtTokens = toTokenCount(usage?.["thinking_tokens"]);
   const cacheReadTokens = toTokenCount(usage?.["cache_read_input_tokens"]);
   const cacheCreationTokens = toTokenCount(usage?.["cache_creation_input_tokens"]);
   const totalTokens = sumTokenCounts(inputTokens, outputTokens);
@@ -60,6 +92,7 @@ export function toClaudeUsageUpdatedEvents(
   if (
     inputTokens === null &&
     outputTokens === null &&
+    thoughtTokens === null &&
     cacheReadTokens === null &&
     cacheCreationTokens === null &&
     cost === null
@@ -79,7 +112,7 @@ export function toClaudeUsageUpdatedEvents(
         outputTokens,
         size: null,
         source: "session_update",
-        thoughtTokens: null,
+        thoughtTokens,
         totalTokens,
         usageContract: "anthropic_bucketed",
         used: null,

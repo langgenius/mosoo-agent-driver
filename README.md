@@ -102,7 +102,7 @@ import { expect, test } from "bun:test";
 
 import { createCmaMemoryStore } from "@mosoo/agent-driver";
 import { createCmaHttpHandler } from "@mosoo/agent-driver/cma-http";
-import { createCmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
+import { CmaSdkClient } from "@mosoo/agent-driver/cma-sdk";
 
 test("create an agent, environment, and session over the CMA surface", async () => {
   // 1. An in-memory store stands in for the host's persistence port.
@@ -119,7 +119,7 @@ test("create an agent, environment, and session over the CMA surface", async () 
   // 3. The client talks to the handler directly through fetch — point
   //    baseUrl at a server that explicitly embeds this preview. The default beta header
   //    (anthropic-beta: managed-agents-2026-04-01) is sent automatically.
-  const client = createCmaSdkClient({
+  const client = new CmaSdkClient({
     baseUrl: "https://driver.local",
     fetch: async (input, init) => handler(new Request(input, init)),
   });
@@ -158,9 +158,9 @@ vp run check
 vp run clean
 ```
 
-`vp run build:image` uses Buildah to produce a local `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
+`vp run build:image` uses Buildah to produce a local linux/amd64 `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
-The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run docker:smoke:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
+The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 
 ## Boundaries
 
@@ -176,10 +176,20 @@ The image contract in `environment-package-managers.json` exposes `npm` and `pip
 
 - `vp run check`
 - `vp run build:image`
-- `vp run docker:smoke:environment`
+- `vp run test:image:environment`
 - no `@mosoo/*` runtime dependencies in `package.json`
 - public entries include typed exports
 - live artifact tests are gated by environment credentials
+
+## OpenAI Credential Boundary
+
+Each OpenAI app-server process receives a private temporary `CODEX_HOME` that is deleted only after its supervised process tree stops.
+
+OpenAI persistence in the session home is limited to native rollout, memory, and SQLite state.
+
+It must never contain `auth.json` or be used as a credential archive.
+
+The Driver fails closed when it finds legacy credentials there and accepts OpenAI API-key auth only from the current execution environment.
 
 ## Artifact Live Tests
 
@@ -215,7 +225,7 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 - `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
 - `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
 
-The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the complete matrix.
+The release workflow extracts the packed NPM archive to `packed/`, verifies its declarations, runs the provider-free MCP artifact test, and blocks image and package publication until the same `packed/dist/driver.mjs` passes the complete OpenAI, Claude, and OpenCode live matrix.
 
 ## License
 

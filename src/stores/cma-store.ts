@@ -1,6 +1,11 @@
-import type { CmaInboundEvent, CmaOutboundEvent, CmaSessionStatus } from "../projections/cma";
+import type {
+  CmaInboundEvent,
+  CmaOutboundEvent,
+  CmaProjectedDriverCommand,
+  CmaSessionStatus,
+} from "../projections/cma";
 import type { RuntimeEventEnvelope } from "../runtime-events";
-import type { RuntimeCommand, RuntimeCommandResult } from "../runtime-command";
+import type { RuntimeCommandResult } from "../runtime-command";
 
 export const CMA_MAX_EVENT_BYTES = 1_024 * 1_024;
 export const CMA_MAX_REPLAY_BYTES = 8 * CMA_MAX_EVENT_BYTES;
@@ -98,7 +103,7 @@ export interface CmaSessionRecord {
 }
 
 export interface CmaSessionEventRecord {
-  readonly command: RuntimeCommand | null;
+  readonly command: CmaProjectedDriverCommand | null;
   readonly commandResult: RuntimeCommandResult | null;
   readonly commandStatus: "accepted" | "completed" | "failed" | null;
   readonly createdAt: string;
@@ -145,7 +150,7 @@ export interface CmaCreateSessionInput {
 }
 
 export interface CmaClaimInboundEventInput {
-  readonly command: RuntimeCommand;
+  readonly command: CmaProjectedDriverCommand;
   readonly event: CmaInboundEvent;
   readonly sessionId: string;
 }
@@ -187,6 +192,10 @@ export interface CmaStore {
     driverEvent: RuntimeEventEnvelope,
   ): Promise<readonly CmaSessionEventRecord[]>;
   archiveEnvironment(id: string): Promise<CmaEnvironmentRecord>;
+  /**
+   * Claims a command only on first admission. An accepted command is never
+   * reissued because an expired worker cannot prove that its effect did not happen.
+   */
   claimInboundEvent(input: CmaClaimInboundEventInput): Promise<CmaClaimInboundEventResult>;
   createAgent(input: CmaCreateAgentInput): Promise<CmaAgentRecord>;
   createEnvironment(input: CmaCreateEnvironmentInput): Promise<CmaEnvironmentRecord>;

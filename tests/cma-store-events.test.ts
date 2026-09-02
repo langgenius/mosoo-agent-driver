@@ -36,7 +36,7 @@ function driverEvent(
     origin: "driver",
     payload,
     ...(options.runId === undefined ? {} : { runId: options.runId }),
-    schemaVersion: "2026-05-26",
+    schemaVersion: "2026-08-29",
     sessionId,
     ...(options.sourceEventId === undefined ? {} : { sourceEventId: options.sourceEventId }),
     visibility: options.visibility ?? "participant",
@@ -44,6 +44,49 @@ function driverEvent(
 }
 
 describe("CMA memory store lifecycle", () => {
+  test("preserves dangerous payload keys as data without changing failure semantics", async () => {
+    const sessionId = createDriverId();
+    const runId = createDriverId();
+    const sourceEventId = createDriverId();
+    const store = createCmaMemoryStore({ sessions: [{ id: sessionId }] });
+    const payload = JSON.parse(
+      '{"__proto__":{"recoverable":true},"error":{"code":"fatal","details":{},"message":"failed","retryable":false},"recoverable":false}',
+    );
+    const event = driverEvent(sessionId, "run.failed", payload, { runId, sourceEventId });
+    const eventPayload = event.payload as Record<string, unknown>;
+
+    expect(Object.hasOwn(eventPayload, "__proto__")).toBe(true);
+    expect(eventPayload["recoverable"]).toBe(false);
+    const first = await store.appendDriverEvent(sessionId, event);
+
+    expect(first).toMatchObject([
+      { event: { sessionStatus: "terminated", type: "session.error" } },
+    ]);
+    await expect(store.appendDriverEvent(sessionId, event)).resolves.toEqual(first);
+    expect(await store.getSession(sessionId)).toMatchObject({ status: "terminated" });
+  });
+
+  test.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "rejects non-JSON error detail number %s",
+    (value) => {
+      expect(() =>
+        driverEvent(
+          createDriverId(),
+          "run.failed",
+          {
+            error: {
+              code: "fatal",
+              details: { value },
+              message: "failed",
+              retryable: false,
+            },
+          },
+          { runId: createDriverId() },
+        ),
+      ).toThrow("must be JSON-serializable");
+    },
+  );
+
   test("deduplicates stable source events and rejects changed or cross-session identities", async () => {
     const sessionId = createDriverId();
     const otherSessionId = createDriverId();
@@ -97,7 +140,10 @@ describe("CMA memory store lifecycle", () => {
       ),
     ).rejects.toBeInstanceOf(CmaStoreConflictError);
     await expect(
-      store.appendDriverEvent(sessionId, driverEvent(otherSessionId, "message.completed", {})),
+      store.appendDriverEvent(
+        sessionId,
+        driverEvent(otherSessionId, "message.completed", { messageId: "message-1" }),
+      ),
     ).rejects.toThrow("sessionId");
     expect(await store.listSessionEvents(otherSessionId)).toHaveLength(0);
   });
@@ -251,10 +297,12 @@ describe("CMA memory store lifecycle", () => {
         expect(encodeCmaSseRecord(record)).toHaveLength(CMA_MAX_EVENT_BYTES);
       } else {
         await expect(result).rejects.toThrow("SSE event frame exceeds");
-        expect(await store.listSessionEvents(sessionId)).toEqual([claim.event]);
+        expect(await store.listSessionEvents(sessionId)).toMatchObject([
+          { commandResult: null, commandStatus: "failed" },
+        ]);
         await expect(store.claimInboundEvent(input)).resolves.toMatchObject({
           claimed: false,
-          event: { commandStatus: "accepted" },
+          event: { commandStatus: "failed" },
         });
       }
     },

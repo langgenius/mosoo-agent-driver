@@ -1,5 +1,10 @@
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
-import type { AgentCapabilities, ClientCapabilities, McpServer } from "@agentclientprotocol/sdk";
+import type {
+  AgentCapabilities,
+  AuthMethod,
+  ClientCapabilities,
+  McpServer,
+} from "@agentclientprotocol/sdk";
 import { basename } from "node:path";
 
 import type { DriverExecutionSessionContext } from "../../protocol/boot";
@@ -207,7 +212,7 @@ export function readResumeId(payload: DriverStartInput): string | null {
 }
 
 export function resolveAuthMethod(
-  authMethods: readonly { readonly id: string }[],
+  authMethods: readonly AuthMethod[],
   env: Record<string, string>,
 ): string | null {
   const requestedMethodId = env["MOSOO_ACP_AUTH_METHOD_ID"]?.trim();
@@ -216,11 +221,17 @@ export function resolveAuthMethod(
     return null;
   }
 
-  if (authMethods.some((method) => method.id === requestedMethodId)) {
-    return requestedMethodId;
+  const method = authMethods.find((candidate) => candidate.id === requestedMethodId);
+
+  if (method === undefined) {
+    throw new Error(`Configured ACP auth method is not advertised: ${requestedMethodId}.`);
   }
 
-  throw new Error(`Configured ACP auth method is not advertised: ${requestedMethodId}.`);
+  if ("type" in method && method.type === "terminal") {
+    throw new Error(`Configured ACP auth method requires unsupported terminal auth: ${method.id}.`);
+  }
+
+  return method.id;
 }
 
 export function toRequestMeta(input: {

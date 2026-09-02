@@ -16,11 +16,38 @@ const payloadIdentityFields = new Set<string>([
   "traceId",
 ]);
 
+export function requireExactKeys(
+  value: RuntimeEventRecord,
+  allowedKeys: ReadonlySet<string>,
+  label: string,
+): void {
+  const unexpected = Object.keys(value).find((key) => !allowedKeys.has(key));
+
+  if (unexpected !== undefined) {
+    throw new Error(`${label} ${unexpected} is not allowed.`);
+  }
+}
+
 export function isRuntimeEventRecord(value: unknown): value is RuntimeEventRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function parseNativeRef(value: RuntimeEventRecord): RuntimeEventNativeRef {
+  requireExactKeys(
+    value,
+    new Set([
+      "eventName",
+      "itemId",
+      "protocolVersion",
+      "provider",
+      "requestId",
+      "sequence",
+      "threadId",
+      "turnId",
+    ]),
+    "Runtime event native reference",
+  );
+
   return {
     ...(readOptionalString(value, "eventName", "Runtime event native reference") === undefined
       ? {}
@@ -90,15 +117,9 @@ export function hasRunStartedAt(record: RuntimeEventRecord): boolean {
 }
 
 export function omitPayloadIdentity(payload: RuntimeEventRecord): RuntimeEventRecord {
-  const result: RuntimeEventRecord = {};
-
-  for (const [key, value] of Object.entries(payload)) {
-    if (!payloadIdentityFields.has(key)) {
-      result[key] = value;
-    }
-  }
-
-  return result;
+  return Object.fromEntries(
+    Object.entries(payload).filter(([key]) => !payloadIdentityFields.has(key)),
+  );
 }
 
 export function requirePayloadRecord(
@@ -170,6 +191,20 @@ export function requireOptionalString(
   }
 
   requireString(value, field, label);
+}
+
+export function requireOptionalBoolean(
+  value: RuntimeEventRecord,
+  field: string,
+  label: RuntimeEventKind | string,
+): void {
+  if (!(field in value) || value[field] === undefined) {
+    return;
+  }
+
+  if (typeof value[field] !== "boolean") {
+    throw new Error(`${label} ${field} must be a boolean.`);
+  }
 }
 
 export function requireOptionalContentString(
@@ -312,23 +347,26 @@ export function assertTimestamp(value: string, label: string): void {
 
 export function readPrimitiveRecord(
   value: unknown,
+  label: string,
 ): Record<string, string | number | boolean | null> {
-  if (!isRuntimeEventRecord(value)) {
+  if (value === undefined) {
     return {};
   }
 
-  const result: Record<string, string | number | boolean | null> = {};
+  if (!isRuntimeEventRecord(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
 
-  for (const [key, entry] of Object.entries(value)) {
+  for (const [field, entry] of Object.entries(value)) {
     if (
-      entry === null ||
-      typeof entry === "string" ||
-      typeof entry === "number" ||
-      typeof entry === "boolean"
+      entry !== null &&
+      typeof entry !== "string" &&
+      typeof entry !== "number" &&
+      typeof entry !== "boolean"
     ) {
-      result[key] = entry;
+      throw new Error(`${label}.${field} must be a primitive JSON value.`);
     }
   }
 
-  return result;
+  return value as Record<string, string | number | boolean | null>;
 }

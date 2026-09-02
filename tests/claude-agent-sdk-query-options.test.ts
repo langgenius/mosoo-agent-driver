@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
@@ -20,14 +20,6 @@ async function createRuntimeHome(): Promise<string> {
   const runtimeHome = await mkdtemp(join(tmpdir(), "mosoo-claude-query-options-"));
   runtimeHomes.push(runtimeHome);
   return runtimeHome;
-}
-
-function createTestLogger() {
-  return createBufferedSinkLogger({
-    level: "debug",
-    service: "claude-agent-sdk-query-options-test",
-    sink: async () => {},
-  });
 }
 
 afterEach(async () => {
@@ -176,7 +168,6 @@ describe("Claude Agent SDK query options", () => {
       runtime: "claude-agent-sdk",
       runtimeTransport: "claude-agent-sdk",
     });
-    const logger = createTestLogger();
     const permission = Promise.withResolvers<"allow_once" | "reject_once">();
     let permissionInput:
       | Parameters<ReturnType<typeof createAgentDriverContext>["ports"]["permission"]["request"]>[0]
@@ -184,9 +175,10 @@ describe("Claude Agent SDK query options", () => {
     let permissionSignal: AbortSignal | undefined;
     const context = createAgentDriverContext({
       eventSink: {
+        currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
-      logger,
+      logger: createDisabledLogger(),
       payload,
       permission: {
         request: async (input, signal) => {
@@ -229,10 +221,20 @@ describe("Claude Agent SDK query options", () => {
     );
 
     const abortController = new AbortController();
+    const nativeAgentId = `subagent-${"a".repeat(300)}`;
     const result = options.canUseTool?.(
       "Bash",
       { command: "pwd" },
       {
+        agentID: nativeAgentId,
+        blockedPath: "/workspace/secret",
+        decisionReason: "Path is outside the allowed roots.",
+        description: "Read access to /workspace/secret",
+        matchedAskRule: {
+          ruleContent: "Bash(*)",
+          source: "project",
+          toolName: "Bash",
+        },
         requestId: "permission-request-1",
         signal: abortController.signal,
         toolUseID: "tool-1",
@@ -252,11 +254,21 @@ describe("Claude Agent SDK query options", () => {
     await drainClaudeTasks(permissionTasks);
     expect(permissionTasks.size).toBe(0);
     expect(permissionInput).toMatchObject({
+      blockedPath: "/workspace/secret",
+      decisionReason: "Path is outside the allowed roots.",
+      description: "Read access to /workspace/secret",
+      matchedAskRule: {
+        ruleContent: "Bash(*)",
+        source: "project",
+        toolName: "Bash",
+      },
       requestId: "permission-request-1",
       toolCallId: "tool-1",
     });
+    const publicAgentId = (permissionInput as { agentId?: string } | null)?.agentId;
+    expect(publicAgentId).toMatch(/^rid1_[A-Za-z0-9_-]{43}$/);
+    expect(publicAgentId).not.toBe(nativeAgentId);
     expect(permissionSignal).toBe(abortController.signal);
-    await logger.destroy();
   });
 
   test("retains an early permission rejection for terminal cleanup", async () => {
@@ -279,12 +291,12 @@ describe("Claude Agent SDK query options", () => {
       runtimeTransport: "claude-agent-sdk",
     });
     const permissionError = new Error("permission delivery failed");
-    const logger = createTestLogger();
     const context = createAgentDriverContext({
       eventSink: {
+        currentRunId: () => null,
         pushEvents: async () => ({ accepted: [] }),
       },
-      logger,
+      logger: createDisabledLogger(),
       payload,
       permission: {
         request: async () => {
@@ -315,6 +327,5 @@ describe("Claude Agent SDK query options", () => {
     expect(permissionTasks.size).toBe(1);
     await expect(drainClaudeTasks(permissionTasks)).rejects.toBe(permissionError);
     expect(permissionTasks.size).toBe(0);
-    await logger.destroy();
   });
 });

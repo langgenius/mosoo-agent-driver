@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { ClientContext } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -9,25 +9,32 @@ import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
+import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
-import { createBufferedSinkLogger } from "../src/observability";
-import type { AgentDriverPermissionPort } from "../src/host-ports";
+import { DriverTerminalStateMachine } from "../src/core/driver-terminal-state";
+import { createDisabledLogger } from "../src/observability";
+import type { AgentDriverFilePort, AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
+import * as acpAgentProcess from "../src/runtimes/acp/acp-agent-process";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
 import { AcpTurnController } from "../src/runtimes/acp/acp-turn-controller";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
+import { waitForAcpTestCondition } from "./acp-test-helpers";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
+import { createDispatcher, FakeDriverRuntimeIo } from "./driver-runtime-boundary-fixtures";
 
 const FAKE_AGENT = String.raw`
 const { appendFileSync, existsSync } = require("node:fs");
 const { spawn } = require("node:child_process");
 const logPath = process.env.TEST_LOG_PATH;
+const agentPidPath = process.env.TEST_AGENT_PID_PATH;
+const backpressurePath = process.env.TEST_BACKPRESSURE_PATH;
+const closeWritePath = process.env.TEST_CLOSE_WRITE_PATH;
 const latePidPath = process.env.TEST_LATE_PID_PATH;
 const openCodeConfigPath = process.env.TEST_OPENCODE_CONFIG_PATH;
 const responsePath = process.env.TEST_RESPONSE_PATH;
@@ -36,12 +43,35 @@ const triggerPath = process.env.TEST_TRIGGER_PATH;
 if (openCodeConfigPath) {
   appendFileSync(openCodeConfigPath, process.env.OPENCODE_CONFIG_CONTENT || "");
 }
+if (agentPidPath) appendFileSync(agentPidPath, process.pid + "\n");
 let buffer = "";
+let floodTerminalId = null;
 let sessionReady = false;
 let updateSent = false;
 let pendingPromptId = null;
+let pendingGenerationProbePromptId = null;
 let pendingProviderCancelPromptId = null;
 let pendingEndTurnPromptId = null;
+let resumeMetadataSent = false;
+let waitingForFloodBackpressure = false;
+let pendingCloseId = null;
+const requestFloodOutput = (id) =>
+  requestClient({
+    id,
+    jsonrpc: "2.0",
+    method: "terminal/output",
+    params: { sessionId: "native-session-1", terminalId: floodTerminalId },
+  });
+const sendFloodWaits = () => {
+  for (let index = 0; index < 9; index += 1) {
+    requestClient({
+      id: "flood-wait-" + index,
+      jsonrpc: "2.0",
+      method: "terminal/wait_for_exit",
+      params: { sessionId: "native-session-1", terminalId: floodTerminalId },
+    });
+  }
+};
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const requestClient = (message) => {
   appendFileSync(logPath, message.method + "\n");
@@ -67,6 +97,48 @@ const handle = (message) => {
       }
     } else if (message.id === "nested-wait") {
       appendFileSync(responsePath, JSON.stringify(message) + "\n");
+    } else if (message.id === "flood-create") {
+      if (!message.result?.terminalId) {
+        throw new Error("Flood terminal creation failed.");
+      }
+      floodTerminalId = message.result.terminalId;
+      requestFloodOutput("flood-output-ready");
+    } else if (message.id === "flood-output-ready") {
+      if (message.result?.output?.length < 1024 * 1024) {
+        setImmediate(() => requestFloodOutput("flood-output-ready"));
+      } else {
+        waitingForFloodBackpressure = true;
+        requestFloodOutput("flood-output-blocked");
+      }
+    } else if (String(message.id).startsWith("flood-wait-")) {
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+    } else if (message.id === "generation-probe-read") {
+      if (message.result?.content !== "generation-0") {
+        throw new Error("Generation probe read failed.");
+      }
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "native-session-1",
+          update: {
+            content: { text: "reconnected", type: "text" },
+            messageId: "generation-probe-assistant",
+            sessionUpdate: "agent_message_chunk",
+          },
+        },
+      });
+      send({
+        id: pendingGenerationProbePromptId,
+        jsonrpc: "2.0",
+        result: { stopReason: "end_turn" },
+      });
+      pendingGenerationProbePromptId = null;
+    } else if (message.id === "close-write") {
+      appendFileSync(responsePath, JSON.stringify(message) + "\n");
+      send({ id: pendingCloseId, jsonrpc: "2.0", result: {} });
+      pendingCloseId = null;
     }
     return;
   }
@@ -139,10 +211,59 @@ const handle = (message) => {
         }, 5);
         return;
       }
+      if (process.env.TEST_METADATA_ON_RESUME === "1" && !resumeMetadataSent) {
+        resumeMetadataSent = true;
+        for (const update of [
+          {
+            availableCommands: [{ description: "Resume command", name: "resume" }],
+            sessionUpdate: "available_commands_update",
+          },
+          {
+            configOptions: [{ currentValue: true, id: "resume-config", type: "boolean" }],
+            sessionUpdate: "config_option_update",
+          },
+          {
+            availableModes: [{ id: "resume-mode", name: "Resume mode" }],
+            currentModeId: "resume-mode",
+            sessionUpdate: "current_mode_update",
+          },
+          { sessionUpdate: "session_info_update", title: "Resumed session" },
+        ]) {
+          send({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: { sessionId: "native-session-1", update },
+          });
+        }
+      }
       sessionReady = true;
       result = {};
       break;
     case "session/prompt":
+      if (message.params.prompt[0]?.text === "eof-before-response") {
+        process.exit(0);
+        return;
+      }
+      if (message.params.prompt[0]?.text === "response-then-eof") {
+        const update = {
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              content: { text: "done", type: "text" },
+              messageId: "assistant-1",
+              sessionUpdate: "agent_message_chunk",
+            },
+          },
+        };
+        const response = { id: message.id, jsonrpc: "2.0", result: { stopReason: "end_turn" } };
+        process.stdout.write(
+          JSON.stringify(update) + "\n" + JSON.stringify(response) + "\n",
+          () => process.exit(0),
+        );
+        return;
+      }
       if (message.params.prompt[0]?.text === "crash") {
         process.exit(17);
       }
@@ -191,6 +312,10 @@ const handle = (message) => {
         }
         return;
       }
+      if (message.params.prompt[0]?.text === "provider-cancel") {
+        result = { stopReason: "cancelled" };
+        break;
+      }
       if (message.params.prompt[0]?.text === "hang") {
         pendingPromptId = message.id;
         send({
@@ -223,6 +348,156 @@ const handle = (message) => {
         });
         return;
       }
+      if (message.params.prompt[0]?.text === "request-flood") {
+        requestClient({
+          id: "flood-create",
+          jsonrpc: "2.0",
+          method: "terminal/create",
+          params: {
+            args: [
+              "-e",
+              "process.stdout.write('x'.repeat(1024 * 1024)); setInterval(() => {}, 1000)",
+            ],
+            command: process.execPath,
+            outputByteLimit: 1024 * 1024,
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
+      if (message.params.prompt[0]?.text === "generation-leak") {
+        pendingPromptId = message.id;
+        for (let index = 0; index < 8; index += 1) {
+          requestClient({
+            id: "generation-write-" + index,
+            jsonrpc: "2.0",
+            method: "fs/write_text_file",
+            params: {
+              content: "generation-" + index,
+              path: process.cwd() + "/generation-" + index + ".txt",
+              sessionId: "native-session-1",
+            },
+          });
+        }
+        return;
+      }
+      if (message.params.prompt[0]?.text === "generation-probe") {
+        pendingGenerationProbePromptId = message.id;
+        requestClient({
+          id: "generation-probe-read",
+          jsonrpc: "2.0",
+          method: "fs/read_text_file",
+          params: {
+            path: process.cwd() + "/generation-0.txt",
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
+      if (message.params.prompt[0]?.text === "ignore-file-report") {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              content: { text: "written", type: "text" },
+              messageId: "ignore-file-report-assistant",
+              sessionUpdate: "agent_message_chunk",
+            },
+          },
+        });
+        requestClient({
+          id: "ignored-write",
+          jsonrpc: "2.0",
+          method: "fs/write_text_file",
+          params: {
+            content: "committed",
+            path: process.cwd() + "/ignored-write.txt",
+            sessionId: "native-session-1",
+          },
+        });
+        const promptId = message.id;
+        setTimeout(
+          () => send({ id: promptId, jsonrpc: "2.0", result: { stopReason: "end_turn" } }),
+          50,
+        );
+        return;
+      }
+      if (message.params.prompt[0]?.text === "many-tools") {
+        for (let index = 0; index < 32; index += 1) {
+          send({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "native-session-1",
+              update: {
+                kind: "execute",
+                sessionUpdate: "tool_call",
+                status: "in_progress",
+                title: "Tool " + index,
+                toolCallId: "tool-" + index,
+              },
+            },
+          });
+        }
+        result = { stopReason: "end_turn" };
+        break;
+      }
+      if (message.params.prompt[0]?.text === "invalid-stop-reason") {
+        for (let index = 0; index < 509; index += 1) {
+          send({
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: {
+              sessionId: "native-session-1",
+              update: {
+                kind: "execute",
+                sessionUpdate: "tool_call",
+                status: "in_progress",
+                title: "Tool " + index,
+                toolCallId: "tool-" + index,
+              },
+            },
+          });
+        }
+        result = { stopReason: "s".repeat(1_000) };
+        break;
+      }
+      if (message.params.prompt[0]?.text === "sticky-update-failure") {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              kind: "execute",
+              sessionUpdate: "tool_call",
+              status: "in_progress",
+              title: "Fail delivery",
+              toolCallId: "tool-sticky",
+            },
+          },
+        });
+        result = { stopReason: "end_turn" };
+        break;
+      }
+      if (message.params.prompt[0]?.text === "thought-only") {
+        send({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "native-session-1",
+            update: {
+              content: { text: "final from thought", type: "text" },
+              messageId: "assistant-thought",
+              sessionUpdate: "agent_thought_chunk",
+            },
+          },
+        });
+        result = { stopReason: "end_turn" };
+        break;
+      }
       const chunks =
         message.params.prompt[0]?.text === "burst" ? ["one", "two", "three"] : ["done"];
       for (const text of chunks) {
@@ -243,6 +518,20 @@ const handle = (message) => {
       break;
     case "session/close":
       if (process.env.TEST_HANG_CLOSE === "1") return;
+      if (closeWritePath) {
+        pendingCloseId = message.id;
+        requestClient({
+          id: "close-write",
+          jsonrpc: "2.0",
+          method: "fs/write_text_file",
+          params: {
+            content: "must not be written",
+            path: closeWritePath,
+            sessionId: "native-session-1",
+          },
+        });
+        return;
+      }
       send({
         jsonrpc: "2.0",
         method: "session/update",
@@ -261,6 +550,18 @@ const handle = (message) => {
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
+  if (
+    waitingForFloodBackpressure &&
+    buffer.includes('"id":"flood-output-blocked"')
+  ) {
+    if (buffer.includes("\n")) {
+      throw new Error("Flood response completed before output backpressure was established.");
+    }
+    waitingForFloodBackpressure = false;
+    process.stdin.pause();
+    appendFileSync(backpressurePath, String(Buffer.byteLength(buffer)));
+    sendFloodWaits();
+  }
   for (let newline; (newline = buffer.indexOf("\n")) >= 0; ) {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
@@ -322,15 +623,21 @@ async function createHarness(
     readonly authenticate?: boolean;
     readonly blockResume?: boolean;
     readonly failResume?: boolean;
+    readonly file?: AgentDriverFilePort;
     readonly hangClose?: boolean;
+    readonly metadataOnResume?: boolean;
     readonly openCodeInstructions?: boolean;
     onEvents?(events: readonly DriverEventInput[]): void;
     readonly permission?: AgentDriverPermissionPort["request"];
     readonly spawnLateChild?: boolean;
     readonly updateBeforeSessionResponse?: boolean;
+    readonly writeOnClose?: boolean;
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "driver-acp-backend-"));
+  const agentPidPath = join(root, "agent.pid");
+  const backpressurePath = join(root, "backpressure.log");
+  const closeWritePath = join(root, "close-write.txt");
   const logPath = join(root, "methods.log");
   const latePidPath = join(root, "late.pid");
   const openCodeConfigPath = join(root, "opencode-config.json");
@@ -349,6 +656,8 @@ async function createHarness(
       environment: {
         variables: {
           ...(options.openCodeInstructions ? { OPENCODE_CONFIG_CONTENT: "{}" } : {}),
+          TEST_AGENT_PID_PATH: agentPidPath,
+          TEST_BACKPRESSURE_PATH: backpressurePath,
           TEST_LOG_PATH: logPath,
           TEST_LATE_PID_PATH: latePidPath,
           TEST_OPENCODE_CONFIG_PATH: openCodeConfigPath,
@@ -356,8 +665,10 @@ async function createHarness(
           TEST_RESUME_GATE_PATH: resumeGatePath,
           TEST_TRIGGER_PATH: triggerPath,
           TEST_BLOCK_RESUME: options.blockResume ? "1" : "0",
+          TEST_CLOSE_WRITE_PATH: options.writeOnClose ? closeWritePath : "",
           TEST_FAIL_RESUME: options.failResume ? "1" : "0",
           TEST_HANG_CLOSE: options.hangClose ? "1" : "0",
+          TEST_METADATA_ON_RESUME: options.metadataOnResume ? "1" : "0",
           TEST_SPAWN_LATE_CHILD: options.spawnLateChild ? "1" : "0",
           TEST_UPDATE_BEFORE_SESSION_RESPONSE: options.updateBeforeSessionResponse ? "1" : "0",
           ...(options.authenticate ? { MOSOO_ACP_AUTH_METHOD_ID: "test-auth" } : {}),
@@ -378,23 +689,27 @@ async function createHarness(
     runtimeTransport: "acp-fallback",
   } satisfies DriverBootPayload;
   const payload = createDriverStartInputFromBootPayload(boot);
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-driver-backend-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
   let acceptedSeq = 0;
   const lifecycleFailures: Error[] = [];
+  const lifecycleFailure = Promise.withResolvers<Error>();
   const publishedEvents: DriverEventInput[] = [];
   let block: {
     readonly entered: ReturnType<typeof Promise.withResolvers<void>>;
     readonly kind: string;
     readonly release: ReturnType<typeof Promise.withResolvers<void>>;
   } | null = null;
+  let activeRunId: RunId | null = null;
   let failKind: string | null = null;
   const context = createAgentDriverContext({
     eventSink: {
+      currentRunId: () => activeRunId,
       pushEvents: async ({ events }) => {
+        const runStarted = events.find((event) => event.kind === "run.started");
+        if (runStarted !== undefined) {
+          activeRunId = runStarted.runId ?? null;
+        }
+
         if (failKind !== null && events.some((event) => event.kind === failKind)) {
           failKind = null;
           throw new Error("event sink unavailable");
@@ -409,23 +724,39 @@ async function createHarness(
         }
 
         publishedEvents.push(...events);
+        for (const event of events) {
+          if (
+            event.kind === "run.cancelled" ||
+            event.kind === "run.completed" ||
+            event.kind === "run.failed"
+          ) {
+            activeRunId = null;
+          }
+        }
         options.onEvents?.(events);
 
         return {
-          accepted: events.map((event) => ({ seq: ++acceptedSeq, type: event.kind })),
+          accepted: events.map((event) => {
+            const eventId = event.sourceEventId ?? event.id;
+            if (eventId === undefined) {
+              throw new Error("Test event is missing its source identity.");
+            }
+            return { eventId, seq: ++acceptedSeq, type: event.kind };
+          }),
         };
       },
     },
     logger,
     lifecycle: {
-      fail: (error) => lifecycleFailures.push(error),
+      fail: (error) => {
+        lifecycleFailures.push(error);
+        lifecycleFailure.resolve(error);
+      },
     },
     payload,
     permission: { request: options.permission ?? (async () => "reject_once") },
     ports: {
-      hostIntegration: {
-        snapshot: async () => createDriverHostIntegrationSnapshotFromBootExecution(boot.execution),
-      },
+      ...(options.file === undefined ? {} : { file: options.file }),
       skill: { materialize: async () => [] },
     },
   });
@@ -451,8 +782,29 @@ async function createHarness(
     }
   }
 
+  const handleInput = backend.handleInput.bind(backend);
+  backend.handleInput = async (inputContext, input, runId, signal) => {
+    activeRunId ??= runId;
+
+    try {
+      await handleInput(inputContext, input, runId, signal);
+    } finally {
+      if (activeRunId === runId) {
+        activeRunId = null;
+      }
+    }
+  };
+
   return {
+    agentPidPath,
     backend,
+    backpressurePath,
+    beginRun(runId: RunId) {
+      if (activeRunId !== null) {
+        throw new Error(`Test driver run ${activeRunId} is already active.`);
+      }
+      activeRunId = runId;
+    },
     blockNext(kind: string) {
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -460,10 +812,10 @@ async function createHarness(
       return { entered: entered.promise, release: release.resolve };
     },
     context,
+    closeWritePath,
     async destroy() {
       block?.release.reject(new Error("test cleanup"));
       await backend.stop(context, "test cleanup", new AbortController().signal).catch(() => {});
-      await logger.destroy();
       await rm(root, { force: true, recursive: true });
     },
     failNext(kind: string) {
@@ -471,6 +823,7 @@ async function createHarness(
     },
     events: publishedEvents,
     latePidPath,
+    lifecycleFailure: lifecycleFailure.promise,
     lifecycleFailures,
     async methods() {
       return (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean);
@@ -493,6 +846,66 @@ async function createHarness(
 }
 
 describe("ACP driver backend lifecycle", () => {
+  test("fails before provider setup when a configured root cannot be acquired", async () => {
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-root-init-failure-"));
+    const missing = join(root, "missing");
+    const boot = {
+      ...driverBootPayload,
+      execution: {
+        ...driverBootPayload.execution,
+        session: {
+          ...driverBootPayload.execution.session,
+          additionalDirectories: [missing],
+          context: {
+            ...driverBootPayload.execution.session.context,
+            homePath: join(root, "home"),
+            sessionOrganizationPath: root,
+          },
+          cwd: root,
+        },
+      },
+      runtime: "acp-fallback",
+      runtimeTransport: "acp-fallback",
+    } satisfies DriverBootPayload;
+    const payload = createDriverStartInputFromBootPayload(boot);
+    const logger = createDisabledLogger();
+    let materializations = 0;
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => null,
+        pushEvents: async () => ({ accepted: [] }),
+      },
+      logger,
+      payload,
+      permission: { request: async () => "reject_once" },
+      ports: {
+        skill: {
+          materialize: async () => {
+            materializations += 1;
+            return [];
+          },
+        },
+      },
+    });
+    const backend = new AcpDriverBackend(payload);
+
+    try {
+      await expect(backend.start(context, new AbortController().signal)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(materializations).toBe(0);
+      await expect(
+        Promise.all([
+          backend.stop(context, "retry cleanup", new AbortController().signal),
+          backend.stop(context, "retry cleanup", new AbortController().signal),
+        ]),
+      ).resolves.toEqual([undefined, undefined]);
+    } finally {
+      await backend.stop(context, "test cleanup", new AbortController().signal).catch(() => {});
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("uses OpenCode native instructions without a hidden bootstrap prompt", async () => {
     const harness = await createHarness({ openCodeInstructions: true });
 
@@ -531,6 +944,267 @@ describe("ACP driver backend lifecycle", () => {
     }
   });
 
+  test("fails closed when ACP client request capacity is exhausted", async () => {
+    const harness = await createHarness();
+    let replacement: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      const settlement = await settlePromiseWithTimeout(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "request-flood" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+        { label: "backpressured ACP capacity close", timeoutMs: 4_000 },
+      );
+      expect(settlement).toMatchObject({
+        error: expect.objectContaining({
+          message: expect.stringContaining("ACP client request capacity exceeded"),
+        }),
+        status: "failed",
+      });
+      expect(
+        (await harness.methods()).filter((method) => method === "terminal/wait_for_exit"),
+      ).toHaveLength(9);
+      const bufferedBytes = Number.parseInt(await readFile(harness.backpressurePath, "utf8"), 10);
+      expect(bufferedBytes).toBeGreaterThan(0);
+      expect(bufferedBytes).toBeLessThan(1024 * 1024);
+      const [agentPid] = (await readFile(harness.agentPidPath, "utf8")).trim().split("\n");
+      expect(isRunning(Number.parseInt(agentPid!, 10))).toBe(false);
+
+      replacement = await createHarness();
+      await expect(
+        replacement.backend.handleInput(
+          replacement.context,
+          { text: "after backpressure" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await replacement?.destroy();
+      await harness.destroy();
+    }
+  }, 10_000);
+
+  test("drains accepted file requests before recycling their connection", async () => {
+    const blockedReports = Promise.withResolvers<void>();
+    const reportsEntered = Promise.withResolvers<void>();
+    let reportCount = 0;
+    const harness = await createHarness({
+      file: {
+        reportChanged: async (_change, _signal) => {
+          reportCount += 1;
+          if (reportCount === 8) {
+            reportsEntered.resolve();
+          }
+          await blockedReports.promise;
+        },
+      },
+    });
+
+    try {
+      const abandoned = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-leak" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void abandoned.catch(() => {});
+      await reportsEntered.promise;
+      await harness.backend.cancelActiveTurn(harness.context, "test generation recycle");
+      expect(
+        await settlePromiseWithTimeout(abandoned, {
+          label: "cancelled ACP file request drain",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+      blockedReports.resolve();
+      await expect(abandoned).rejects.toThrow("cancelled");
+
+      const probe = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-probe" },
+        DRIVER_TEST_IDS.secondRunId as RunId,
+      );
+      void probe.catch(() => {});
+      await waitForAcpTestCondition(
+        async () =>
+          (await harness.responses()).some(
+            (response) => response["id"] === "generation-probe-read",
+          ),
+        "recycled ACP client response",
+      );
+      await probe;
+    } finally {
+      blockedReports.resolve();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await harness.destroy();
+    }
+  });
+
+  test("drains committed file reports before full-stop process cleanup", async () => {
+    const blockedReports = Promise.withResolvers<void>();
+    const reportsEntered = Promise.withResolvers<void>();
+    const processStopEntered = Promise.withResolvers<void>();
+    const originalStop = acpAgentProcess.stopAcpAgentProcess;
+    const stopSpy = spyOn(acpAgentProcess, "stopAcpAgentProcess").mockImplementation(
+      async (...args) => {
+        processStopEntered.resolve();
+        await originalStop(...args);
+      },
+    );
+    let reportCount = 0;
+    let harness: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      harness = await createHarness({
+        file: {
+          reportChanged: async () => {
+            reportCount += 1;
+            if (reportCount === 8) {
+              reportsEntered.resolve();
+            }
+            await blockedReports.promise;
+          },
+        },
+      });
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "generation-leak" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await reportsEntered.promise;
+
+      const stop = harness.backend.stop(
+        harness.context,
+        "test committed file drain",
+        new AbortController().signal,
+      );
+      void stop.catch(() => {});
+      expect(
+        await settlePromiseWithTimeout(processStopEntered.promise, {
+          label: "ACP process stop before file drain",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+
+      blockedReports.resolve();
+      await expect(stop).resolves.toBeUndefined();
+      await expect(processStopEntered.promise).resolves.toBeUndefined();
+      expect(reportCount).toBe(8);
+      await Promise.allSettled([input]);
+    } finally {
+      blockedReports.resolve();
+      await harness?.destroy();
+      stopSpy.mockRestore();
+    }
+  });
+
+  test("fails the turn before its terminal when a provider ignores a committed file report", async () => {
+    const failure = new Error("committed file.changed failed");
+    const reportEntered = Promise.withResolvers<void>();
+    const releaseReport = Promise.withResolvers<void>();
+    const harness = await createHarness({
+      file: {
+        reportChanged: async () => {
+          reportEntered.resolve();
+          await releaseReport.promise;
+          throw failure;
+        },
+      },
+    });
+
+    try {
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "ignore-file-report" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await reportEntered.promise;
+      expect(
+        await settlePromiseWithTimeout(input, {
+          label: "ACP committed file terminal fence",
+          timeoutMs: 50,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+
+      releaseReport.resolve();
+      expect(
+        await settlePromiseWithTimeout(input, {
+          label: "ACP committed file turn failure",
+          timeoutMs: 2_000,
+        }),
+      ).toEqual({ error: failure, status: "failed" });
+      expect(
+        await settlePromiseWithTimeout(harness.lifecycleFailure, {
+          label: "ACP committed file lifecycle failure",
+          timeoutMs: 2_000,
+        }),
+      ).toEqual({ status: "completed", value: failure });
+      expect(
+        harness.events
+          .filter(
+            (event) =>
+              event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed",
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.failed"]);
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "must not continue" },
+          DRIVER_TEST_IDS.secondRunId as RunId,
+        ),
+      ).rejects.toThrow("connection is not initialized");
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test committed file failure cleanup",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test committed file cleanup join",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      releaseReport.resolve();
+      await harness.destroy();
+    }
+  });
+
+  test("rejects a file write arriving after the full-stop ingress fence", async () => {
+    const harness = await createHarness({ writeOnClose: true });
+
+    try {
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test close write fence",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(await harness.responses()).toContainEqual(
+        expect.objectContaining({
+          error: expect.any(Object),
+          id: "close-write",
+        }),
+      );
+      await expect(readFile(harness.closeWritePath, "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("projects an active transport loss as a failed turn", async () => {
     const harness = await createHarness();
 
@@ -544,6 +1218,113 @@ describe("ACP driver backend lifecycle", () => {
       ).rejects.toThrow();
       expect(harness.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
       expect(harness.events.some((event) => event.kind === "run.cancelled")).toBe(false);
+      expect(harness.lifecycleFailures).toEqual([]);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("commits a complete prompt response before a same-tick transport EOF", async () => {
+    const originalStop = acpAgentProcess.stopAcpAgentProcess;
+    let cleanupFailed = false;
+    const cleanupRejected = Promise.withResolvers<void>();
+    let failedProcess: Parameters<typeof originalStop>[1] | null = null;
+    let retriedOwnedProcess = false;
+    const stopSpy = spyOn(acpAgentProcess, "stopAcpAgentProcess").mockImplementation(
+      async (context, process, reason, deadline, signal) => {
+        if (reason === "connection.failed" && !cleanupFailed) {
+          cleanupFailed = true;
+          failedProcess = process;
+          cleanupRejected.resolve();
+          throw new Error("test connection cleanup failed");
+        }
+        if (failedProcess !== null && process === failedProcess) {
+          retriedOwnedProcess = true;
+        }
+        await originalStop(context, process, reason, deadline, signal);
+      },
+    );
+    let harness: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      harness = await createHarness();
+      const terminal = harness.blockNext("run.completed");
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "response-then-eof" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+
+      await Promise.all([terminal.entered, cleanupRejected.promise]);
+      try {
+        await expect(
+          harness.backend.handleInput(
+            harness.context,
+            { text: "unreachable" },
+            DRIVER_TEST_IDS.secondRunId,
+          ),
+        ).rejects.toThrow("ACP driver backend connection is not initialized");
+        await Promise.resolve();
+        expect(harness.lifecycleFailures).toEqual([]);
+      } finally {
+        terminal.release();
+      }
+      await expect(input).resolves.toBeUndefined();
+      await harness.lifecycleFailure;
+
+      expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+      expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
+      expect(harness.lifecycleFailures).toHaveLength(1);
+      expect(harness.lifecycleFailures[0]).toBeInstanceOf(AggregateError);
+      await expect(
+        harness.backend.stop(harness.context, "test retry cleanup", new AbortController().signal),
+      ).resolves.toBeUndefined();
+      expect(retriedOwnedProcess).toBe(true);
+    } finally {
+      await harness?.destroy();
+      stopSpy.mockRestore();
+    }
+  });
+
+  test("lets a transport EOF before the prompt response fail the active turn", async () => {
+    const harness = await createHarness();
+
+    try {
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "eof-before-response" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).rejects.toThrow();
+
+      expect(harness.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+      expect(harness.events.some((event) => event.kind === "run.completed")).toBe(false);
+      expect(harness.lifecycleFailures).toEqual([]);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("publishes a thought-only fallback through lossless terminal closures", async () => {
+    const harness = await createHarness();
+
+    try {
+      await harness.backend.handleInput(
+        harness.context,
+        { text: "thought-only" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+
+      expect(
+        harness.events.find(
+          (event) =>
+            event.kind === "message.added" &&
+            (event.payload as Record<string, unknown>)["role"] === "agent",
+        )?.payload,
+      ).toMatchObject({ content: "final from thought" });
+      expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
       expect(harness.lifecycleFailures).toEqual([]);
     } finally {
       await harness.destroy();
@@ -632,6 +1413,98 @@ describe("ACP driver backend lifecycle", () => {
     }
   });
 
+  test("fails a pre-admission cancelled turn when backend stop cleanup fails", async () => {
+    const originalStop = acpAgentProcess.stopAcpAgentProcess;
+    let failedProcess: Parameters<typeof originalStop>[1] | null = null;
+    let retriedOwnedProcess = false;
+    const stopSpy = spyOn(acpAgentProcess, "stopAcpAgentProcess").mockImplementation(
+      async (context, process, reason, deadline, signal) => {
+        if (reason === "test pre-admission stop" && failedProcess === null) {
+          failedProcess = process;
+          throw new Error("test pre-admission cleanup failed");
+        }
+        if (failedProcess !== null && process === failedProcess) {
+          retriedOwnedProcess = true;
+        }
+        await originalStop(context, process, reason, deadline, signal);
+      },
+    );
+    let harness: Awaited<ReturnType<typeof createHarness>> | null = null;
+
+    try {
+      harness = await createHarness();
+      const gate = harness.blockNext("run.started");
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "must not run" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await gate.entered;
+
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test pre-admission stop",
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow("test pre-admission cleanup failed");
+      gate.release();
+
+      await expect(input).rejects.toThrow("cancelled turn process recycle failed");
+      expect(await harness.methods()).not.toContain("session/prompt");
+      expect(
+        harness.events
+          .filter(
+            (event) =>
+              event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed",
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.failed"]);
+      await expect(
+        harness.backend.stop(
+          harness.context,
+          "test pre-admission retry",
+          new AbortController().signal,
+        ),
+      ).resolves.toBeUndefined();
+      expect(retriedOwnedProcess).toBe(true);
+    } finally {
+      await harness?.destroy();
+      stopSpy.mockRestore();
+    }
+  });
+
+  test("fails a prompt response with an invalid stop reason before terminal projection", async () => {
+    const harness = await createHarness();
+
+    try {
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "invalid-stop-reason" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).rejects.toThrow("ACP prompt response contains an invalid stop reason");
+
+      expect(
+        harness.events
+          .filter(
+            (event) =>
+              event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed",
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.failed"]);
+      expect(harness.events.filter((event) => event.kind === "item.completed")).toHaveLength(509);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("sends provider cancellation while its observation event is blocked", async () => {
     const harness = await createHarness();
 
@@ -642,21 +1515,17 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
       const gate = harness.blockNext("run.cancel.requested");
       const cancel = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await gate.entered;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/cancel")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/cancel"),
+        "ACP session/cancel request",
+      );
 
       expect(await harness.methods()).toContain("session/cancel");
       expect(
@@ -691,22 +1560,24 @@ describe("ACP driver backend lifecycle", () => {
           DRIVER_TEST_IDS.runId as RunId,
         );
         void input.catch(() => {});
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          if ((await harness.methods()).includes("session/prompt")) {
-            break;
-          }
-          await Bun.sleep(5);
-        }
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
 
-        await expect(
-          harness.backend.cancelActiveTurn(harness.context, "test cancellation"),
-        ).resolves.toBeUndefined();
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          if ((await harness.methods()).includes("session/resume")) {
-            break;
-          }
-          await Bun.sleep(5);
-        }
+        const gate = harness.blockNext("run.cancel.requested");
+        const cancellation = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
+        await gate.entered;
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/cancel"),
+          "ACP session/cancel request",
+        );
+        gate.release();
+        await expect(cancellation).resolves.toBeUndefined();
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/resume"),
+          "ACP session/resume request",
+        );
 
         expect(await harness.methods()).toContain("session/resume");
         expect(harness.events).not.toContainEqual(
@@ -764,12 +1635,10 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
       );
       void input.catch(() => {});
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       await expect(
         harness.backend.cancelActiveTurn(harness.context, "test cancellation"),
@@ -778,6 +1647,89 @@ describe("ACP driver backend lifecycle", () => {
       expect(harness.events).toContainEqual(expect.objectContaining({ kind: "run.failed" }));
       expect(harness.events).not.toContainEqual(expect.objectContaining({ kind: "run.cancelled" }));
       expect(harness.lifecycleFailures).toEqual([]);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("keeps session metadata admitted while cancelled-turn transcript replay is closed", async () => {
+    const harness = await createHarness({ metadataOnResume: true });
+
+    try {
+      const eventOffset = harness.events.length;
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "hang" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
+
+      await harness.backend.cancelActiveTurn(harness.context, "test cancellation");
+      await expect(input).rejects.toThrow("cancelled");
+
+      expect(harness.events.slice(eventOffset).map((event) => event.kind)).toEqual(
+        expect.arrayContaining([
+          "session.commands.updated",
+          "session.config.updated",
+          "session.mode.updated",
+          "session.info.updated",
+          "run.cancelled",
+        ]),
+      );
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("publishes a failed terminal even when fatal provider cleanup rejects", async () => {
+    const harness = await createHarness();
+    const promptRequested = Promise.withResolvers<void>();
+    const prompt = Promise.withResolvers<{ stopReason: "end_turn" }>();
+    const events: DriverEventInput[] = [];
+    const turn = new AcpTurnController(async (_context, _reason, pushed) => {
+      events.push(...pushed);
+    });
+    const clientRequests = new AcpClientRequestHandler({
+      allowedRoots: [process.cwd()],
+      cwd: process.cwd(),
+      env: {},
+      isCancelling: () => turn.isCancelling(),
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents: turn.events,
+    });
+    const connection = {
+      notify: async () => {},
+      request: async () => {
+        promptRequested.resolve();
+        return prompt.promise;
+      },
+    } as unknown as ClientContext;
+    const providerError = new Error("provider transport failed");
+    const cleanupError = new Error("provider cleanup failed");
+
+    try {
+      const input = turn.handleInput(
+        harness.context,
+        { text: "fail" },
+        DRIVER_TEST_IDS.runId as RunId,
+        connection,
+        "native-session-1",
+        clientRequests,
+      );
+      void input.catch(() => {});
+      await promptRequested.promise;
+      expect(turn.routeFatal(providerError, Promise.reject(cleanupError))).toBeNull();
+      prompt.reject(providerError);
+
+      await expect(input).rejects.toThrow("ACP provider failure cleanup failed");
+      expect(events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+      expect(events.some((event) => event.kind === "run.cancelled")).toBe(false);
     } finally {
       await harness.destroy();
     }
@@ -822,7 +1774,6 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
         connection,
         "native-session-1",
-        createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
         clientRequests,
       );
       void input.catch(() => {});
@@ -837,6 +1788,152 @@ describe("ACP driver backend lifecycle", () => {
       await expect(cancel).resolves.toBeUndefined();
       await expect(input).rejects.toThrow("cancelled");
     } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("restores an explicitly rejected terminal settlement for authoritative replay", async () => {
+    const harness = await createHarness();
+    let rejectedSettlement: DriverEventInput[] | null = null;
+    const turn = new AcpTurnController(
+      async () => {},
+      async () => {},
+      async (_context, _reason, closures, terminal) => {
+        rejectedSettlement = structuredClone([...closures, terminal]);
+        throw new Error("terminal settlement rejected");
+      },
+    );
+    const clientRequests = new AcpClientRequestHandler({
+      allowedRoots: [process.cwd()],
+      cwd: process.cwd(),
+      env: {},
+      isCancelling: () => turn.isCancelling(),
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents: turn.events,
+    });
+    const connection = {
+      notify: async () => {},
+      request: async () => {
+        await clientRequests.enqueueUpdate(harness.context, {
+          sessionId: "native-session-1",
+          update: {
+            content: { text: "authoritative answer", type: "text" },
+            messageId: "native-final",
+            sessionUpdate: "agent_message_chunk",
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    } as unknown as ClientContext;
+
+    try {
+      await expect(
+        turn.handleInput(
+          harness.context,
+          { text: "complete" },
+          DRIVER_TEST_IDS.runId as RunId,
+          connection,
+          "native-session-1",
+          clientRequests,
+        ),
+      ).rejects.toThrow("terminal settlement rejected");
+
+      expect(turn.events.activeRunId()).toBe(DRIVER_TEST_IDS.runId);
+      expect(turn.events.completePrompt("end_turn", null)).toEqual(rejectedSettlement);
+    } finally {
+      turn.events.clear();
+      await harness.destroy();
+    }
+  });
+
+  test("cancels an unresponsive provider only after the request event is durable", async () => {
+    const harness = await createHarness();
+    const state = new DriverTerminalStateMachine();
+    const ticket = state.beginRun(DRIVER_TEST_IDS.runId as RunId);
+    const promptRequested = Promise.withResolvers<void>();
+    const cancellationPushEntered = Promise.withResolvers<void>();
+    const releaseCancellationPush = Promise.withResolvers<void>();
+    const barrierEntered = Promise.withResolvers<void>();
+    let resumeAllowedAtBarrier: boolean | null = null;
+    const events: DriverEventInput[] = [];
+    const turn = new AcpTurnController(
+      async (_context, _reason, pushed) => {
+        if (pushed.some(({ kind }) => kind === "run.cancel.requested")) {
+          cancellationPushEntered.resolve();
+          await releaseCancellationPush.promise;
+        }
+        events.push(...pushed);
+      },
+      async (_context, _providerPromptAdmitted, resumeSignal) => {
+        resumeAllowedAtBarrier = !resumeSignal.aborted;
+        barrierEntered.resolve();
+      },
+    );
+    const clientRequests = new AcpClientRequestHandler({
+      allowedRoots: [process.cwd()],
+      cwd: process.cwd(),
+      env: {},
+      isCancelling: () => turn.isCancelling(),
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents: turn.events,
+    });
+    const connection = {
+      notify: () => new Promise<never>(() => {}),
+      request: async () => {
+        promptRequested.resolve();
+        return new Promise<never>(() => {});
+      },
+    } as unknown as ClientContext;
+
+    try {
+      const input = turn.handleInput(
+        harness.context,
+        { text: "cancel me" },
+        DRIVER_TEST_IDS.runId as RunId,
+        connection,
+        "native-session-1",
+        clientRequests,
+        ticket.signal,
+      );
+      void input.catch(() => {});
+      await promptRequested.promise;
+      expect(state.claimCancellation(ticket, "test cancellation", "turn.cancel")).toBe("claimed");
+      const cancel = turn.cancel(
+        harness.context,
+        "test cancellation",
+        connection,
+        "native-session-1",
+      );
+
+      await cancellationPushEntered.promise;
+      await expect(cancel).resolves.toBeUndefined();
+      expect(
+        await settlePromiseWithTimeout(barrierEntered.promise, {
+          label: "ACP cancellation request acknowledgement",
+          timeoutMs: 25,
+        }),
+      ).toMatchObject({ status: "timed_out" });
+      expect(state.claimCancellation(ticket, "test shutdown", "shutdown")).toBe("already_claimed");
+      releaseCancellationPush.resolve();
+      await expect(input).rejects.toThrow("cancelled");
+      await barrierEntered.promise;
+      expect(resumeAllowedAtBarrier).toBe(false);
+
+      const eventKinds = events.map(({ kind }) => kind);
+      expect(eventKinds.indexOf("run.cancel.requested")).toBeLessThan(
+        eventKinds.indexOf("run.cancelled"),
+      );
+      expect(
+        eventKinds.filter(
+          (kind) => kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+        ),
+      ).toEqual(["run.cancelled"]);
+    } finally {
+      releaseCancellationPush.resolve();
       await harness.destroy();
     }
   });
@@ -882,7 +1979,6 @@ describe("ACP driver backend lifecycle", () => {
         DRIVER_TEST_IDS.runId as RunId,
         connection,
         "native-session-1",
-        createDriverHostIntegrationSnapshotFromBootExecution(driverBootPayload.execution),
         clientRequests,
       );
       void input.catch(() => {});
@@ -1068,6 +2164,7 @@ describe("ACP driver backend lifecycle", () => {
         }
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -1129,6 +2226,7 @@ describe("ACP driver backend lifecycle", () => {
         acceptedKinds.push(...events.map((event) => event.kind));
         return {
           accepted: events.map((event, index) => ({
+            eventId: event.sourceEventId!,
             seq: index + 1,
             type: event.kind,
           })),
@@ -1155,12 +2253,10 @@ describe("ACP driver backend lifecycle", () => {
       const requestId = await requestedDelivered.promise;
       expect(broker.resolve(requestId, "allow_once")).toBe(true);
       await permissionSettled.promise;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.responses()).length > 0) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.responses()).length > 0,
+        "ACP nested permission response",
+      );
       expect(await harness.responses()).toHaveLength(1);
 
       const cancel = harness.backend.cancelActiveTurn(harness.context, "test cancellation");
@@ -1258,7 +2354,15 @@ describe("ACP driver backend lifecycle", () => {
 
       releasePermission.resolve();
       await expect(input).rejects.toThrow("cancelled");
-      expect(harness.events).toContainEqual(expect.objectContaining({ kind: "run.cancelled" }));
+      expect(harness.events).toContainEqual(
+        expect.objectContaining({
+          kind: "run.cancelled",
+          payload: expect.objectContaining({ requestedBy: "provider" }),
+        }),
+      );
+      expect(harness.events).not.toContainEqual(
+        expect.objectContaining({ kind: "run.cancel.requested" }),
+      );
       expect(harness.events).not.toContainEqual(expect.objectContaining({ kind: "run.failed" }));
     } finally {
       releasePermission.resolve();
@@ -1294,6 +2398,361 @@ describe("ACP driver backend lifecycle", () => {
     }
   });
 
+  test("lets a cancellation request use the durable event delivery budget", async () => {
+    const harness = await createHarness();
+    const gateEntered = Promise.withResolvers<void>();
+    const releaseGate = Promise.withResolvers<void>();
+    let gateOpen = false;
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-durable-cancel-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-durable-cancel-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-durable-cancel-command",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const pushEvents = socket.pushEvents.bind(socket);
+    socket.pushEvents = async (input) => {
+      if (!gateOpen && input.events.some(({ kind }) => kind === "run.cancel.requested")) {
+        gateOpen = true;
+        gateEntered.resolve();
+        await releaseGate.promise;
+      }
+      return pushEvents(input);
+    };
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const { dispatcher, logger, shutdownCalls } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
+      runtimeState,
+    });
+
+    try {
+      const running = dispatcher.run(socket, logger);
+      await gateEntered.promise;
+      await Bun.sleep(2_100);
+      releaseGate.resolve();
+      await running;
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(runtimeState.status()).toBe("ready");
+      expect(shutdownCalls).toEqual([]);
+    } finally {
+      releaseGate.resolve();
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("honors dispatcher cancellation before the completed terminal is selected", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const windowEntered = Promise.withResolvers<void>();
+    const releaseWindow = Promise.withResolvers<void>();
+    const cancellationClaimed = Promise.withResolvers<void>();
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-terminal-race-input",
+        input: { text: "complete" },
+        kind: "input.start",
+        requestId: "acp-terminal-race-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-terminal-race-cancel",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "turn.cancel") {
+        await windowEntered.promise;
+      }
+      return command;
+    };
+    const registerRunTerminalBarrier = socket.registerRunTerminalBarrier.bind(socket);
+    socket.registerRunTerminalBarrier = (barrier) =>
+      registerRunTerminalBarrier((events) => {
+        const pending = barrier(events);
+        if (!events.some(({ kind }) => kind === "run.completed")) {
+          return pending;
+        }
+        return Promise.resolve(pending).then(async () => {
+          windowEntered.resolve();
+          await releaseWindow.promise;
+        });
+      });
+    const claimRunCancellation = socket.claimRunCancellation.bind(socket);
+    socket.claimRunCancellation = (ticket, reason) => {
+      const result = claimRunCancellation(ticket, reason);
+      cancellationClaimed.resolve();
+      return result;
+    };
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const { dispatcher, logger, shutdownCalls } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
+      runtimeState,
+    });
+
+    try {
+      const running = dispatcher.run(socket, logger);
+      await windowEntered.promise;
+      await cancellationClaimed.promise;
+      releaseWindow.resolve();
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "ACP session/resume request",
+      );
+      await Bun.sleep(2_100);
+      await writeFile(harness.resumeGatePath, "resume");
+      await running;
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(
+            ({ kind }) =>
+              kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+          )
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(
+        events
+          .filter(({ kind }) => kind === "message.completed" || kind === "message.cancelled")
+          .map(({ kind }) => kind),
+      ).toEqual(["message.completed"]);
+      expect(socket.updates).toEqual([
+        { commandId: "acp-terminal-race-input", status: "accepted" },
+        { commandId: "acp-terminal-race-cancel", status: "accepted" },
+        { commandId: "acp-terminal-race-input", status: "cancelled" },
+        { commandId: "acp-terminal-race-cancel", status: "completed" },
+      ]);
+      expect(socket.failedRuns).toEqual([]);
+      expect(shutdownCalls).toEqual([]);
+      expect(runtimeState.status()).toBe("ready");
+    } finally {
+      releaseWindow.resolve();
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("interrupts a provider-cancelled resume when session stop arrives", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-provider-cancel-input",
+        input: { text: "provider-cancel" },
+        kind: "input.start",
+        requestId: "acp-provider-cancel-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-provider-cancel-stop",
+        kind: "session.stop",
+        reason: "test.stop",
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "session.stop") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/resume"),
+          "blocked ACP session/resume request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => runtimeState.isShuttingDown(),
+      runtimeState,
+      shutdown: async (_runtimeIo, reason) =>
+        harness.backend.stop(harness.context, reason, new AbortController().signal),
+    });
+    const running = dispatcher.run(socket, logger);
+
+    try {
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "blocked ACP session/resume request",
+      );
+      expect(
+        await settlePromiseWithTimeout(running, {
+          label: "provider-cancelled ACP session stop",
+          timeoutMs: 1_500,
+        }),
+      ).toMatchObject({ status: "completed" });
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      const eventKinds = events.map(({ kind }) => kind);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(eventKinds.filter((kind) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(eventKinds.indexOf("run.cancel.requested")).toBeLessThan(
+        eventKinds.indexOf("run.cancelled"),
+      );
+      expect(events.filter(({ kind }) => kind === "session.resumed")).toHaveLength(0);
+      expect(runtimeState.status()).toBe("stopped");
+    } finally {
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await running.catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("interrupts a turn-cancel resume when shutdown upgrades the claim", async () => {
+    const harness = await createHarness({ blockResume: true });
+    const shutdown = new AbortController();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-cancel-upgrade-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-cancel-upgrade-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-cancel-upgrade-command",
+        kind: "turn.cancel",
+        reason: "test.cancel",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "turn.cancel") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => shutdown.signal.aborted,
+      runtimeState,
+      shutdownSignal: shutdown.signal,
+    });
+    const running = dispatcher.run(socket, logger);
+
+    try {
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/resume"),
+        "blocked ACP session/resume after turn cancellation",
+      );
+      shutdown.abort(new Error("test shutdown"));
+      expect(
+        await settlePromiseWithTimeout(running, {
+          label: "upgraded ACP turn cancellation",
+          timeoutMs: 1_500,
+        }),
+      ).toMatchObject({ status: "completed" });
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(({ kind }) => ["run.cancelled", "run.completed", "run.failed"].includes(kind))
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "session.resumed")).toHaveLength(0);
+    } finally {
+      shutdown.abort(new Error("test cleanup"));
+      await writeFile(harness.resumeGatePath, "cleanup").catch(() => {});
+      await running.catch(() => {});
+      await harness.destroy();
+    }
+  }, 7_000);
+
+  test("stops an active session without resuming its cancelled provider", async () => {
+    const harness = await createHarness();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const socket = new FakeDriverRuntimeIo([
+      {
+        commandId: "acp-stop-input",
+        input: { text: "hang" },
+        kind: "input.start",
+        requestId: "acp-stop-request",
+        runId: DRIVER_TEST_IDS.runId,
+      },
+      {
+        commandId: "acp-stop-session",
+        kind: "session.stop",
+        reason: "test.stop",
+      },
+    ]);
+    const nextCommand = socket.nextCommand.bind(socket);
+    socket.nextCommand = async (signal) => {
+      const command = await nextCommand(signal);
+      if (command?.kind === "session.stop") {
+        await waitForAcpTestCondition(
+          async () => (await harness.methods()).includes("session/prompt"),
+          "ACP session/prompt request",
+        );
+      }
+      return command;
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend: harness.backend,
+      isShuttingDown: () => runtimeState.isShuttingDown(),
+      runtimeState,
+      shutdown: async (_runtimeIo, reason) =>
+        harness.backend.stop(harness.context, reason, new AbortController().signal),
+    });
+
+    try {
+      await dispatcher.run(socket, logger);
+
+      const events = socket.pushedEvents.flatMap(({ events }) => events);
+      expect(
+        events
+          .filter(
+            ({ kind }) =>
+              kind === "run.cancelled" || kind === "run.completed" || kind === "run.failed",
+          )
+          .map(({ kind }) => kind),
+      ).toEqual(["run.cancelled"]);
+      expect(events.filter(({ kind }) => kind === "run.cancel.requested")).toHaveLength(1);
+      expect(await harness.methods()).not.toContain("session/resume");
+      expect(socket.updates).toContainEqual({
+        commandId: "acp-stop-input",
+        status: "cancelled",
+      });
+      expect(socket.updates).toContainEqual({
+        commandId: "acp-stop-session",
+        status: "completed",
+      });
+      expect(socket.completedRunReasons).toEqual(["completed"]);
+      expect(runtimeState.status()).toBe("stopped");
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("drains burst updates sent immediately before the prompt response", async () => {
     const harness = await createHarness();
 
@@ -1315,6 +2774,66 @@ describe("ACP driver backend lifecycle", () => {
     }
   });
 
+  test("closes 32 open tools before publishing the run terminal", async () => {
+    const order: DriverEventInput[] = [];
+    const harness = await createHarness({ onEvents: (events) => order.push(...events) });
+
+    try {
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "many-tools" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).resolves.toBeUndefined();
+
+      const completedTools = order.filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          (event.payload as { readonly status?: unknown }).status === "completed",
+      );
+      const completedItems = order.filter(
+        (event) =>
+          event.kind === "item.completed" &&
+          (event.payload as { readonly status?: unknown }).status === "completed",
+      );
+      const terminalIndex = order.findIndex((event) => event.kind === "run.completed");
+
+      expect(completedTools).toHaveLength(32);
+      expect(completedItems).toHaveLength(32);
+      expect(terminalIndex).toBe(order.length - 1);
+      expect(harness.lifecycleFailures).toEqual([]);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("publishes one failed terminal after a sticky update inbox failure", async () => {
+    const harness = await createHarness();
+
+    try {
+      harness.failNext("item.started");
+      await expect(
+        harness.backend.handleInput(
+          harness.context,
+          { text: "sticky-update-failure" },
+          DRIVER_TEST_IDS.runId as RunId,
+        ),
+      ).rejects.toThrow("event sink unavailable");
+
+      const terminals = harness.events.filter(
+        (event) =>
+          event.kind === "run.cancelled" ||
+          event.kind === "run.completed" ||
+          event.kind === "run.failed",
+      );
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]?.kind).toBe("run.failed");
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("returns ACP request-cancelled for a nested terminal RPC when the turn is cancelled", async () => {
     const harness = await createHarness();
 
@@ -1326,23 +2845,19 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("terminal/wait_for_exit")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("terminal/wait_for_exit"),
+        "ACP terminal/wait_for_exit request",
+      );
 
       expect(await harness.methods()).toContain("terminal/wait_for_exit");
       await harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await expect(input).rejects.toThrow("cancelled");
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.responses()).length > 0) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.responses()).length > 0,
+        "ACP nested terminal response",
+      );
 
       expect(await harness.responses()).toContainEqual(
         expect.objectContaining({
@@ -1366,12 +2881,10 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("session/prompt")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
 
       expect(await harness.methods()).toContain("session/prompt");
       await expect(
@@ -1393,8 +2906,8 @@ describe("ACP driver backend lifecycle", () => {
           })),
       ).toEqual([
         { kind: "tool.call.updated", status: "running" },
-        { kind: "tool.call.updated", status: "failed" },
-        { kind: "item.completed", status: "failed" },
+        { kind: "tool.call.updated", status: "cancelled" },
+        { kind: "item.completed", status: "cancelled" },
         { kind: "run.cancelled", status: undefined },
       ]);
     } finally {
@@ -1438,6 +2951,61 @@ describe("ACP driver backend lifecycle", () => {
       await harness.destroy();
     }
   });
+
+  test("joins a successful stop retry before settling the active turn", async () => {
+    const harness = await createHarness();
+
+    try {
+      const input = harness.backend.handleInput(
+        harness.context,
+        { text: "hang" },
+        DRIVER_TEST_IDS.runId as RunId,
+      );
+      void input.catch(() => {});
+      await waitForAcpTestCondition(
+        async () => (await harness.methods()).includes("session/prompt"),
+        "ACP session/prompt request",
+      );
+
+      const gate = harness.blockNext("usage.updated");
+      const stop = harness.backend.stop(
+        harness.context,
+        "test failed stop",
+        new AbortController().signal,
+      );
+      await gate.entered;
+      await expect(stop).rejects.toThrow("ACP update drain");
+      expect(
+        harness.events.some(
+          (event) =>
+            event.kind === "run.cancelled" ||
+            event.kind === "run.completed" ||
+            event.kind === "run.failed",
+        ),
+      ).toBe(false);
+
+      const retryStop = harness.backend.stop(
+        harness.context,
+        "test retry stop",
+        new AbortController().signal,
+      );
+      gate.release();
+      await expect(input).rejects.toThrow("cancelled");
+      expect(
+        harness.events
+          .filter(
+            (event) =>
+              event.kind === "run.cancelled" ||
+              event.kind === "run.completed" ||
+              event.kind === "run.failed",
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.cancelled"]);
+      await expect(retryStop).resolves.toBeUndefined();
+    } finally {
+      await harness.destroy();
+    }
+  }, 10_000);
 
   test("shares one bounded stop budget across a stuck close and update drain", async () => {
     const harness = await createHarness({ hangClose: true });

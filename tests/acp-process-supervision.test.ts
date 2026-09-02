@@ -81,12 +81,14 @@ const payload = {
 };
 process.env.MOSOO_ACP_FALLBACK_COMMAND = "/bin/sh";
 process.env.MOSOO_ACP_FALLBACK_ARGS = JSON.stringify(["-c", ${JSON.stringify(agentSource)}]);
-const agent = await startAcpAgentProcess(
+const startedAgent = await startAcpAgentProcess(
   context,
   payload,
   { MOSOO_ACP_HOME: ${JSON.stringify(join(directory, "acp-home"))}, PATH: process.env.PATH ?? "" },
   new AbortController().signal,
 );
+const agent = startedAgent.process;
+await startedAgent.ready;
 writeFileSync(${JSON.stringify(paths.agentRoot)}, String(agent.pid));
 const terminals = new AcpTerminalManager({
   allowedRoots: [],

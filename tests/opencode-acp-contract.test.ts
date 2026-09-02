@@ -21,8 +21,8 @@ import {
 } from "../src/runtimes/acp/acp-configuration";
 import { limitAcpInput } from "../src/runtimes/acp/acp-input-limit";
 import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
-import { createBufferedSinkLogger } from "../src/observability";
-import { exposeNativeSkillAliases } from "../src/runtimes/skill-materialization";
+import { createDisabledLogger } from "../src/observability";
+import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
 import type { DriverStartInput } from "../src/protocol/start";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
@@ -108,7 +108,7 @@ async function stopOpenCode(
   }
 }
 
-test("OpenCode creates a session after unadvertised additional directories are dropped", async () => {
+test("OpenCode rejects unadvertised additional directories before session creation", async () => {
   expect(existsSync(OPENCODE_COMMAND)).toBe(true);
 
   const root = await mkdtemp(join(tmpdir(), "agent-driver-opencode-acp-contract-"));
@@ -176,6 +176,7 @@ test("OpenCode creates a session after unadvertised additional directories are d
         session: {
           ...driverStartInput.execution.session,
           additionalDirectories: [additionalDirectory],
+          context: sessionContext,
           cwd,
           homePath,
           sharedRootPath: cwd,
@@ -184,20 +185,15 @@ test("OpenCode creates a session after unadvertised additional directories are d
       runtime: "acp-fallback",
       runtimeTransport: "acp-fallback",
     };
-    const setup = await requestWithTimeout(connection, "OpenCode ACP session/new", () =>
+    await expect(
       setupAcpSession({
         agentCapabilities: initialize.agentCapabilities ?? null,
         connection: connection.agent,
         currentSessionId: null,
         payload,
-        sessionContext,
         replaySession: async (operation) => operation(),
       }),
-    );
-
-    expect(setup.mode).toBe("created");
-    expect(setup.sessionId.trim().length).toBeGreaterThan(0);
-    expect(setup.droppedAdditionalDirectories).toEqual([additionalDirectory]);
+    ).rejects.toThrow("does not advertise additionalDirectories support");
   } finally {
     await stopOpenCode(connection, child, closed);
     await rm(root, { force: true, recursive: true });
@@ -231,22 +227,23 @@ Check the diff.`,
       sharedRootPath: root,
     },
   };
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "opencode-acp-contract-test",
-    sink: async () => {},
-  });
+  const logger = createDisabledLogger();
 
   try {
-    await exposeNativeSkillAliases(execution, logger, [
-      {
-        mountPath,
-        skillId: "skill-1",
-        skillMarkdownPath,
-        skillName: "review",
-        snapshotId: "snapshot-1",
-      },
-    ]);
+    await exposeNativeSkillAliases(
+      execution,
+      logger,
+      [
+        {
+          mountPath,
+          skillId: "skill-1",
+          skillMarkdownPath,
+          skillName: "review",
+          snapshotId: "snapshot-1",
+        },
+      ],
+      new AbortController().signal,
+    );
 
     const expectedSkillPath = join(await realpath(root), ".agents", "skills", "review", "SKILL.md");
     expect(discoverOpenCodeSkills(root, homePath)).toContainEqual(
@@ -256,13 +253,12 @@ Check the diff.`,
       }),
     );
 
-    await exposeNativeSkillAliases(execution, logger, []);
+    await exposeNativeSkillAliases(execution, logger, [], new AbortController().signal);
 
     expect(discoverOpenCodeSkills(root, homePath).some((skill) => skill.name === "review")).toBe(
       false,
     );
   } finally {
-    await logger.destroy();
     await rm(root, { force: true, recursive: true });
   }
 });

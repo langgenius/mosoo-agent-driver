@@ -1,8 +1,7 @@
 {
   "begin": {
     "messageId": "message-1",
-    "runId": "run-1",
-    "sessionId": "session-1"
+    "runId": "run-1"
   },
   "updates": [
     {
@@ -47,9 +46,10 @@
         "thoughtId": "message-1:thought"
       },
       "runId": "run-1",
-      "sourceEventId": "acp:session-1:run-1:agent-thought:1"
+      "sourceEventId": "acp:run-1:agent-thought:1"
     },
     {
+      "delivery": "best_effort",
       "kind": "diagnostic.reported",
       "payload": {
         "message": "Unsupported ACP session update: mystery_update.",
@@ -74,7 +74,8 @@
       "payload": {
         "error": {
           "code": "acp.empty_turn",
-          "message": "ACP prompt ended without assistant output or tool activity."
+          "message": "ACP prompt ended without assistant output or tool activity.",
+          "retryable": true
         },
         "recoverable": true,
         "stopReason": "end_turn"

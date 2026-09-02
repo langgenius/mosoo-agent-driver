@@ -8,51 +8,80 @@ on:
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: release
+  queue: max
 
 jobs:
-  build:
-    name: Build
+  verify:
+    name: Verify release
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      version: ${{ steps.verify.outputs.version }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.sha }}
 
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@v1
-        with:
-          cache: false
-          run-install: |
-            - args: ['--frozen-lockfile']
-
-      - id: verify
+      - id: release
         name: Verify release tag
         run: |
           set -euo pipefail
 
           tag="${GITHUB_REF_NAME}"
           version="$(node -p "require('./package.json').version")"
-          release_commit="$(git rev-parse "${tag}^{commit}")"
 
           if [[ "${tag}" != "v${version}" ]]; then
             echo "::error::Tag ${tag} does not match package version ${version}."
             exit 1
           fi
 
-          if ! git merge-base --is-ancestor "${release_commit}" origin/main; then
-            echo "::error::Tag ${tag} must point to a commit reachable from origin/main."
+          if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release version must be canonical stable MAJOR.MINOR.PATCH: ${version}."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::Release commit ${GITHUB_SHA} must be reachable from origin/main."
             exit 1
           fi
 
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      artifact_attempt: ${{ github.run_attempt }}
+      digest: ${{ steps.image.outputs.digest }}
+      version: ${{ needs.verify.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@313600b80b104eadebb9111787d37a2e83e014ca # v1.17.0
+        with:
+          cache: false
+          run-install: |
+            - args: ['--frozen-lockfile']
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
 
       - name: Check
         run: vp run check
@@ -63,24 +92,53 @@ jobs:
           npm pack --ignore-scripts --pack-destination package
 
       - name: Test packed driver
+        env:
+          AGENT_DRIVER_LIVE: "1"
+          AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
+        run: |
+          set -euo pipefail
+
+          tarballs=(package/*.tgz)
+          if [[ "${#tarballs[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one npm package."
+            exit 1
+          fi
+
+          mkdir packed
+          tar -xzf "${tarballs[0]}" -C packed --strip-components=1
+          shopt -s globstar nullglob
+          declarations=(packed/dist/types/**/*.d.ts)
+          vp exec tsc --ignoreConfig --noEmit --moduleResolution Bundler --module ESNext --target ESNext "${declarations[@]}"
+          bun test tests/driver-artifact-mcp.test.ts
+
+      - name: Test packed driver live matrix
         timeout-minutes: 180
         env:
           AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          mkdir packed
-          tar -xzf package/*.tgz -C packed --strip-components=1
+          set -euo pipefail
+
+          if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+            echo "::error::OPENROUTER_API_KEY is required for release live artifact tests."
+            exit 1
+          fi
+
           vp run test:live:artifact
 
-      - name: Build image
+      - id: image
+        name: Build image
         env:
-          VERSION: ${{ steps.verify.outputs.version }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
+          set -euo pipefail
+
           title="$(node -p "require('./package.json').name")"
           description="$(node -p "require('./package.json').description")"
           license="$(node -p "require('./package.json').license")"
 
           buildah build \
+            --http-proxy=false \
             --platform linux/amd64 \
             --label "org.opencontainers.image.title=$title" \
             --label "org.opencontainers.image.description=$description" \
@@ -92,70 +150,258 @@ jobs:
             .
           buildah push localhost/agent-driver oci-archive:image.oci.tar
 
-      - name: Upload package
-        uses: actions/upload-artifact@v7
+          image_digest="$(skopeo inspect --format '{{.Digest}}' oci-archive:image.oci.tar)"
+          if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid image digest: $image_digest"
+            exit 1
+          fi
+          printf 'digest=%s\n' "$image_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Test image environment
+        run: podman run --pull=never --rm --entrypoint node localhost/agent-driver /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke
+
+      - name: Attest image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          name: npm-package
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ github.run_attempt }}
           path: package/*.tgz
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 31
 
       - name: Upload image
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: container-image
+          name: container-image-${{ github.run_attempt }}
           path: image.oci.tar
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
-  publish-image:
-    name: Publish image
+  publish-versioned-image:
+    name: Publish versioned image
     needs: build
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       VERSION: ${{ needs.build.outputs.version }}
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      version: ${{ steps.publish.outputs.version }}
     permissions:
+      attestations: read
+      contents: read
       packages: write
     steps:
       - name: Download image
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: container-image
+          name: container-image-${{ needs.build.outputs.artifact_attempt }}
 
-      - name: Publish image
+      - id: publish
+        name: Publish versioned image
         env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/docker/config.json
         run: |
-          printf '%s' "$GHCR_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
-          skopeo copy oci-archive:image.oci.tar "docker://$IMAGE:$VERSION"
-          skopeo copy oci-archive:image.oci.tar "docker://$IMAGE:latest"
+          set -euo pipefail
+
+          printf '%s' "$GHCR_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+
+          if remote_digest="$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$VERSION" 2>inspect.err)"; then
+            echo "$IMAGE:$VERSION already exists at $remote_digest."
+          else
+            inspect_error="$(<inspect.err)"
+            case "${inspect_error,,}" in
+              *"manifest unknown"*|*"name unknown"*|*"404"*) ;;
+              *)
+                printf '%s\n' "$inspect_error" >&2
+                exit 1
+                ;;
+            esac
+
+            archive_digest="$(skopeo inspect --format '{{.Digest}}' oci-archive:image.oci.tar)"
+            if [[ "$archive_digest" != "$EXPECTED_DIGEST" ]]; then
+              echo "::error::Downloaded image digest $archive_digest does not match attested build $EXPECTED_DIGEST."
+              exit 1
+            fi
+
+            skopeo copy --preserve-digests oci-archive:image.oci.tar "docker://$IMAGE:$VERSION"
+            remote_digest="$(skopeo inspect --format '{{.Digest}}' "docker://$IMAGE:$VERSION")"
+            if [[ "$remote_digest" != "$EXPECTED_DIGEST" ]]; then
+              echo "::error::Published image digest $remote_digest does not match attested build $EXPECTED_DIGEST."
+              exit 1
+            fi
+          fi
+
+          if [[ ! "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid remote image digest: $remote_digest"
+            exit 1
+          fi
+
+          gh attestation verify "oci://$IMAGE@$remote_digest" \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners
+          printf 'digest=%s\n' "$remote_digest" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
 
   publish-npm:
     name: Publish to npm
-    needs: build
+    needs: [build, publish-versioned-image]
     runs-on: ubuntu-latest
     environment:
       name: npm
       url: https://www.npmjs.com/package/@mosoo/agent-driver/v/${{ needs.build.outputs.version }}
     permissions:
       id-token: write
+    outputs:
+      promote_latest: ${{ steps.publish.outputs.promote_latest }}
     steps:
       - name: Download package
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: npm-package
+          name: npm-package-${{ needs.build.outputs.artifact_attempt }}
           path: package
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "lts/*"
+          node-version: "24.19.0"
           registry-url: https://registry.npmjs.org
 
-      - name: Publish package
-        run: npm publish package/*.tgz --ignore-scripts
-        # Bootstrap only: remove this env block after configuring npm Trusted Publishing.
+      - id: publish
+        name: Publish package
+        # Bootstrap only: remove NODE_AUTH_TOKEN after configuring npm Trusted Publishing.
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tarballs=(./package/*.tgz)
+          if [[ "${#tarballs[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one npm package."
+            exit 1
+          fi
+
+          tarball="${tarballs[0]}"
+          package_name="$(tar -xOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).name")"
+          local_integrity="$(node -e "const { createHash } = require('node:crypto'); const { readFileSync } = require('node:fs'); process.stdout.write('sha512-' + createHash('sha512').update(readFileSync(process.argv[1])).digest('base64'));" "$tarball")"
+
+          if remote_integrity="$(npm view "$package_name@$VERSION" dist.integrity 2>view.err)"; then
+            if [[ "$remote_integrity" != "$local_integrity" ]]; then
+              echo "::error::Refusing to replace $package_name@$VERSION ($remote_integrity) with $local_integrity."
+              exit 1
+            fi
+
+            echo "$package_name@$VERSION already contains $local_integrity."
+            publish_needed=false
+          else
+            view_error="$(<view.err)"
+            case "${view_error,,}" in
+              *"e404"*|*"404 not found"*) ;;
+              *)
+                printf '%s\n' "$view_error" >&2
+                exit 1
+                ;;
+            esac
+
+            publish_needed=true
+          fi
+
+          promote_latest=true
+          if newer_versions="$(npm view "$package_name@>$VERSION" version --json 2>newer.err)"; then
+            if [[ "$publish_needed" == true ]]; then
+              echo "::error::Refusing to publish $package_name@$VERSION after newer versions: $newer_versions"
+              exit 1
+            fi
+            promote_latest=false
+          else
+            newer_error="$(<newer.err)"
+            case "${newer_error,,}" in
+              *"e404"*|*"404 not found"*) ;;
+              *)
+                printf '%s\n' "$newer_error" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [[ "$publish_needed" == true ]]; then
+            npm publish "$tarball" --ignore-scripts --provenance
+          fi
+          printf 'promote_latest=%s\n' "$promote_latest" >> "$GITHUB_OUTPUT"
+
+  publish-latest-image:
+    name: Publish latest image
+    needs: [publish-versioned-image, publish-npm]
+    if: needs.publish-npm.outputs.promote_latest == 'true'
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      DIGEST: ${{ needs.publish-versioned-image.outputs.digest }}
+      PACKAGE_NAME: "@mosoo/agent-driver"
+      VERSION: ${{ needs.publish-versioned-image.outputs.version }}
+    permissions:
+      packages: write
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.19.0"
+
+      - name: Verify npm latest
+        run: |
+          set -euo pipefail
+
+          if npm_latest="$(npm view "$PACKAGE_NAME" dist-tags.latest 2>latest.err)"; then
+            if [[ "$npm_latest" != "$VERSION" ]]; then
+              echo "::error::Refusing to move $IMAGE:latest to $VERSION while npm latest is $npm_latest."
+              exit 1
+            fi
+          else
+            latest_error="$(<latest.err)"
+            case "${latest_error,,}" in
+              *"e404"*|*"404 not found"*)
+                echo "::error::$PACKAGE_NAME is missing from npm."
+                ;;
+              *) printf '%s\n' "$latest_error" >&2 ;;
+            esac
+            exit 1
+          fi
+
+          if newer_versions="$(npm view "$PACKAGE_NAME@>$VERSION" version --json 2>newer.err)"; then
+            echo "::error::Refusing to move $IMAGE:latest to $VERSION after newer npm versions: $newer_versions"
+            exit 1
+          else
+            newer_error="$(<newer.err)"
+            case "${newer_error,,}" in
+              *"e404"*|*"404 not found"*) ;;
+              *)
+                printf '%s\n' "$newer_error" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Publish latest image
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/docker/config.json
+        run: |
+          set -euo pipefail
+
+          printf '%s' "$GHCR_TOKEN" | docker login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          skopeo copy --preserve-digests "docker://$IMAGE@$DIGEST" "docker://$IMAGE:latest"

@@ -1,26 +1,20 @@
 import type { DriverEventInput } from "../protocol/events";
 import type { DriverExecutionInput } from "../protocol/execution";
-import type { DriverHostIntegrationSnapshot } from "../protocol/host-integration";
 import type { RunId } from "../protocol/id";
 import type { DriverEventBatchOutput } from "../protocol/orpc";
 import type {
+  DriverCommandUpdate,
   McpExecuteCommand,
-  McpExecuteCommandResult,
   McpExternalToolEffectClaim,
   McpExternalToolEffectExecution,
+  McpExternalToolEffectSettlement,
+  McpExternalToolEffectState,
   McpExternalToolExecutionResult,
   RuntimeCommand,
-  RuntimeCommandResult,
 } from "../runtime-command";
 
-export type AgentDriverHostPortName =
-  | "command_source"
-  | "event_sink"
-  | "permission"
-  | "mcp"
-  | "skill"
-  | "file"
-  | "host_integration";
+/** Maximum provider-call duration after the durable MCP claim commits. */
+export const AGENT_DRIVER_MCP_EXECUTE_TIMEOUT_MS = 60_000;
 
 export interface AgentDriverCommandSource {
   nextCommand(signal: AbortSignal): Promise<RuntimeCommand | null>;
@@ -28,27 +22,24 @@ export interface AgentDriverCommandSource {
 
 export interface AgentDriverEventSink {
   claimExternalToolEffect?(
-    input: { commandId: string },
+    input: { claimToken: string; commandId: string },
     signal: AbortSignal,
   ): Promise<McpExternalToolEffectClaim>;
-  commandUpdate(
+  commandUpdate(input: DriverCommandUpdate, signal: AbortSignal): Promise<void>;
+  observeExternalToolEffect?(
+    input: { commandId: string },
+    signal: AbortSignal,
+  ): Promise<McpExternalToolEffectState>;
+  settleExternalToolEffect?(
     input: {
+      claimToken: string;
       commandId: string;
-      result?: RuntimeCommandResult;
-      status: "accepted" | "cancelled" | "completed" | "failed";
+      effectId: string;
+      settlement: McpExternalToolEffectSettlement;
     },
     signal: AbortSignal,
-  ): Promise<void>;
-  completeExternalToolEffect?(
-    input: {
-      commandId: string;
-      providerReceiptJson?: string | null | undefined;
-      result: McpExecuteCommandResult;
-    },
-    signal: AbortSignal,
-  ): Promise<void>;
-  currentRunId?(): RunId | null;
-  markExternalToolEffectUnknown?(input: { commandId: string }, signal: AbortSignal): Promise<void>;
+  ): Promise<McpExternalToolEffectState>;
+  currentRunId(): RunId | null;
   pushEvents(input: {
     events: DriverEventInput[];
     signal?: AbortSignal;
@@ -57,23 +48,39 @@ export interface AgentDriverEventSink {
 
 export interface AgentDriverPermissionPort {
   request(
-    input: {
-      rawInput: string | null;
-      requestId: string;
-      title: string;
-      toolCallId: string | null;
-      toolKind: string | null;
-    },
+    input: DriverPermissionRequest,
     signal?: AbortSignal,
   ): Promise<"allow_once" | "reject_once">;
 }
 
+export interface DriverPermissionRequest {
+  agentId?: string;
+  blockedPath?: string;
+  decisionReason?: string;
+  description?: string;
+  matchedAskRule?: {
+    readonly ruleContent?: string;
+    readonly source: string;
+    readonly toolName: string;
+  };
+  rawInput: string | null;
+  requestId: string;
+  title: string;
+  toolCallId: string | null;
+  toolKind: string | null;
+}
+
+export interface AgentDriverMcpExecution extends AsyncDisposable {
+  /**
+   * Runs after the durable effect claim commits. Implementations must bound
+   * this call independently instead of reusing the cancellable prepare signal.
+   */
+  execute(effect: McpExternalToolEffectExecution): Promise<McpExternalToolExecutionResult>;
+}
+
 export interface AgentDriverMcpPort {
-  execute(
-    command: McpExecuteCommand,
-    signal: AbortSignal,
-    effect?: McpExternalToolEffectExecution,
-  ): Promise<McpExternalToolExecutionResult>;
+  /** Prepares provider state without invoking the external tool. */
+  prepare(command: McpExecuteCommand, signal: AbortSignal): Promise<AgentDriverMcpExecution>;
 }
 
 export interface AgentDriverMaterializedSkill {
@@ -85,26 +92,27 @@ export interface AgentDriverMaterializedSkill {
 }
 
 export interface AgentDriverSkillPort {
-  materialize(execution: DriverExecutionInput): Promise<readonly AgentDriverMaterializedSkill[]>;
+  materialize(
+    execution: DriverExecutionInput,
+    signal: AbortSignal,
+  ): Promise<readonly AgentDriverMaterializedSkill[]>;
 }
 
 export interface AgentDriverFilePort {
-  reportChanged(input: {
-    change: "delete" | "upsert";
-    path: string;
-    reason: string;
-  }): Promise<void>;
-}
-
-export interface AgentDriverHostIntegrationPort {
-  snapshot(): Promise<DriverHostIntegrationSnapshot | null>;
+  reportChanged(
+    input: {
+      change: "delete" | "upsert";
+      path: string;
+      reason: string;
+    },
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 export interface AgentDriverHostPorts {
   commandSource: AgentDriverCommandSource;
   eventSink: AgentDriverEventSink;
   file: AgentDriverFilePort;
-  hostIntegration: AgentDriverHostIntegrationPort;
   mcp: AgentDriverMcpPort;
   permission: AgentDriverPermissionPort;
   skill: AgentDriverSkillPort;

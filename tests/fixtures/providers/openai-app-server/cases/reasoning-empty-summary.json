@@ -3,6 +3,7 @@
     {
       "method": "item/completed",
       "params": {
+        "completedAtMs": 1700000003000,
         "item": {
           "id": "reasoning-empty",
           "summary": [],

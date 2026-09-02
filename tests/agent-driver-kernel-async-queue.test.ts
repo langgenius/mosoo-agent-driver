@@ -7,7 +7,12 @@ import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { RuntimeCommand } from "../src/runtime-command";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
-import { DRIVER_TEST_IDS, bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
+import {
+  DRIVER_TEST_IDS,
+  bootPayload,
+  createBackend,
+  settleBackendInput,
+} from "./driver-runtime-boundary-fixtures";
 
 const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
 
@@ -161,6 +166,7 @@ describe("AgentDriverKernelCore", () => {
       delivery: "lossless",
       kind: "diagnostic.reported",
       payload: { message: "" },
+      sourceEventId: "large-lossless-event",
     };
     const event: DriverEventInput = {
       ...base,
@@ -187,7 +193,7 @@ describe("AgentDriverKernelCore", () => {
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 
-  test("can retry a run terminal after an oversized reserve admission fails", async () => {
+  test("omits an oversized run error before terminal queue admission", async () => {
     const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
     const events = kernel.events()[Symbol.asyncIterator]();
     kernel.beginRun(DRIVER_TEST_IDS.runId);
@@ -199,25 +205,20 @@ describe("AgentDriverKernelCore", () => {
         message: "x".repeat(1_024 * 1_024),
         retryable: false,
       }),
-    ).rejects.toThrow("queue reserve exceeds 1048576 UTF-8 JSON bytes");
-    const retryError = {
-      code: "retry",
-      details: {},
-      message: "retry fits",
-      retryable: false,
-    };
-    const retry = kernel.failRun(retryError);
-    Reflect.set(retryError, "code", "mutated");
-    Reflect.set(retryError, "message", "mutated after admission");
-    await expect(retry).resolves.toBeUndefined();
-    await kernel.completeRun();
+    ).resolves.toBeUndefined();
+    await expect(kernel.completeRun()).rejects.toThrow("conflicts");
     await kernel.stop("test.complete");
 
     await expect(events.next()).resolves.toMatchObject({
       done: false,
       value: {
         kind: "run.failed",
-        payload: { error: { code: "retry" } },
+        payload: {
+          error: {
+            code: "driver.error_oversized",
+            details: { originalBytes: expect.any(Number) },
+          },
+        },
         runId: DRIVER_TEST_IDS.runId,
       },
     });
@@ -265,6 +266,144 @@ describe("AgentDriverKernelCore", () => {
     },
   );
 
+  test("commits only an admitted terminal for the active run", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const events = kernel.events()[Symbol.asyncIterator]();
+    const delta: DriverEventInput = {
+      delivery: "lossless",
+      kind: "message.delta",
+      payload: {
+        contentDelta: "x",
+        messageId: "message-1",
+        role: "agent",
+      },
+    };
+    kernel.beginRun(DRIVER_TEST_IDS.runId);
+
+    for (const runId of [null, DRIVER_TEST_IDS.secondRunId]) {
+      await expect(
+        kernel.pushEvents({
+          events: [
+            {
+              kind: "run.completed",
+              payload: { stopReason: "end_turn" },
+              runId,
+            },
+          ],
+        }),
+      ).rejects.toThrow("must target the active run");
+    }
+    await kernel.pushEvents({ events: Array.from({ length: 1_024 }, () => delta) });
+    await expect(
+      kernel.pushEvents({
+        events: [
+          {
+            kind: "run.completed",
+            payload: { stopReason: "end_turn" },
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        ],
+      }),
+    ).rejects.toThrow("exceeds 1024 items");
+    expect(kernel.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toBeNull();
+
+    await kernel.failRun({
+      code: "terminal_admission_failed",
+      details: {},
+      message: "Terminal admission failed.",
+      retryable: false,
+    });
+    await kernel.stop("test.complete");
+
+    const received: DriverEventInput[] = [];
+    for await (const event of { [Symbol.asyncIterator]: () => events }) {
+      received.push(event);
+    }
+
+    expect(received).toHaveLength(1_025);
+    expect(received.at(-1)).toMatchObject({
+      kind: "run.failed",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+  });
+
+  test("linearizes each run at its single final terminal", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const delta: DriverEventInput = {
+      delivery: "lossless",
+      kind: "message.delta",
+      payload: {
+        contentDelta: "x",
+        messageId: "message-1",
+        role: "agent",
+      },
+    };
+    const completed: DriverEventInput = {
+      kind: "run.completed",
+      payload: { stopReason: "end_turn" },
+      runId: DRIVER_TEST_IDS.runId,
+    };
+    const ticket = kernel.beginRun(DRIVER_TEST_IDS.runId);
+
+    await expect(kernel.pushEvents({ events: [completed, delta] })).rejects.toThrow(
+      "must be the only event",
+    );
+    await expect(
+      kernel.pushEvents({
+        events: [
+          completed,
+          {
+            kind: "run.failed",
+            payload: { error: { code: "failed", message: "failed", retryable: false } },
+            runId: DRIVER_TEST_IDS.runId,
+          },
+        ],
+      }),
+    ).rejects.toThrow("multiple run terminals");
+    await expect(
+      kernel.pushEvents({ events: [{ ...delta, runId: DRIVER_TEST_IDS.secondRunId }] }),
+    ).rejects.toThrow("must target the active run");
+    await expect(
+      kernel.pushEvents({ events: [{ ...completed, delivery: "best_effort" }] }),
+    ).rejects.toThrow("must be lossless");
+    expect(kernel.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toBeNull();
+
+    await expect(kernel.pushEvents({ events: [delta, completed] })).rejects.toThrow(
+      "must be the only event",
+    );
+    await expect(kernel.pushEvents({ events: [delta] })).resolves.toMatchObject({
+      accepted: [{ type: "message.delta" }],
+    });
+    await expect(kernel.pushEvents({ events: [completed] })).resolves.toMatchObject({
+      accepted: [{ type: "run.completed" }],
+    });
+    expect(kernel.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toMatchObject({
+      phase: "acked",
+      value: { status: "completed" },
+    });
+
+    await expect(kernel.pushEvents({ events: [delta] })).rejects.toThrow(
+      "cannot target a terminated run",
+    );
+    await expect(kernel.pushEvents({ events: [{ ...delta, runId: null }] })).resolves.toMatchObject(
+      { accepted: [{ type: "message.delta" }] },
+    );
+
+    expect(() => kernel.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+      `Driver run ${DRIVER_TEST_IDS.runId} is already active.`,
+    );
+    expect(kernel.currentRunId()).toBe(DRIVER_TEST_IDS.runId);
+    expect(kernel.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toMatchObject({
+      phase: "acked",
+      value: { status: "completed" },
+    });
+
+    kernel.releaseRun(ticket, "command_acked");
+    kernel.beginRun(DRIVER_TEST_IDS.secondRunId);
+    expect(kernel.currentRunId()).toBe(DRIVER_TEST_IDS.secondRunId);
+    expect(kernel.runSnapshot(DRIVER_TEST_IDS.secondRunId)?.terminal).toBeNull();
+  });
+
   test("treats stop before start as a terminal lifecycle", async () => {
     const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
     const events = kernel.events()[Symbol.asyncIterator]();
@@ -293,7 +432,9 @@ describe("AgentDriverKernelCore", () => {
     expect(startInput).not.toHaveProperty("traceparent");
     expect(startInput.execution).not.toHaveProperty("configRevision");
     expect(startInput.execution).toHaveProperty("run");
-    expect(startInput.execution.session).not.toHaveProperty("context");
+    expect(startInput.execution.session.context).toEqual(
+      driverBootPayload.execution.session.context,
+    );
     expect(startInput.execution.session).toHaveProperty("sharedRootPath");
   });
 
@@ -334,8 +475,9 @@ describe("AgentDriverKernelCore", () => {
   test("owns a command before the caller can mutate its identity or payload", async () => {
     const backend = createBackend();
     let handledText: string | null = null;
-    backend.handleInput = async (_context, input) => {
+    backend.handleInput = async (context, input, runId, signal) => {
       handledText = input.text;
+      await settleBackendInput(context, runId, signal);
     };
     const kernel = new AgentDriverKernelCore({ backendFactory: () => backend });
     const command = {
@@ -378,6 +520,7 @@ describe("AgentDriverKernelCore", () => {
       commandId: "owned-result-command",
       kind: "mcp.execute",
       requestId: "owned-result-request",
+      runId: DRIVER_TEST_IDS.runId,
       serverId: "mcp-server",
       toolCallId: "owned-result-tool",
       toolName: "tool",

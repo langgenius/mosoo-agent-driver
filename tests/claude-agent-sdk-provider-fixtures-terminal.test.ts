@@ -1,21 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
-import type { RunId } from "../src/protocol/id";
-import type { AgentDriverContext } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
-import { driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
-
-interface EventBatch {
-  readonly events: DriverEventInput[];
-  readonly reason: string;
-}
+import type { MessageId, RunId } from "../src/protocol/id";
+import {
+  createClaudeAgentSdkHarness as createHarness,
+  isRecord,
+  messageText,
+} from "./claude-agent-sdk-test-helpers";
+import {
+  normalizeClaudeProviderEvents as normalizeClaudeEvents,
+  readProviderFixture,
+} from "./provider-fixture-test-helpers";
 
 interface ClaudeProviderFixtureCase {
   readonly expectedEvents: readonly unknown[];
@@ -29,168 +25,67 @@ const claudeFixtureNames = [
   "result-failure-diagnostic",
   "stream-text-thinking-tool-result",
   "system-files-and-session",
-  "unknown-message-ignored",
+  "unknown-message-diagnostic",
 ] as const;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readJsonFixture(path: string): unknown {
-  return JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
-}
-
 function readClaudeProviderFixtureCase(path: string): ClaudeProviderFixtureCase {
-  const fixture = readJsonFixture(path);
-
-  if (!isRecord(fixture)) {
-    throw new Error("Claude provider fixture must be an object.");
-  }
-
-  const messages = fixture["messages"];
-  const expectedEvents = fixture["expectedEvents"];
-  const expectedNativeSessionIds = fixture["expectedNativeSessionIds"] ?? [];
-  const runId = fixture["runId"];
+  const fixture = readProviderFixture<ClaudeProviderFixtureCase>(path, {
+    arrays: ["expectedEvents", "messages"],
+    strings: ["runId"],
+  });
+  const expectedNativeSessionIds = fixture.expectedNativeSessionIds ?? [];
 
   if (
-    !Array.isArray(messages) ||
-    !Array.isArray(expectedEvents) ||
     !Array.isArray(expectedNativeSessionIds) ||
-    typeof runId !== "string"
+    !expectedNativeSessionIds.every((entry) => typeof entry === "string")
   ) {
-    throw new Error("Claude provider fixture shape is malformed.");
+    throw new TypeError(`Provider fixture ${path} has malformed native session IDs.`);
   }
 
-  if (!expectedNativeSessionIds.every((entry) => typeof entry === "string")) {
-    throw new Error("Claude provider fixture expectedNativeSessionIds must be strings.");
-  }
-
-  return {
-    expectedEvents,
-    expectedNativeSessionIds,
-    messages,
-    runId: runId as RunId,
-  };
-}
-
-function collectDriverIds(value: unknown, ids: Set<string>): void {
-  if (typeof value === "string") {
-    if (isDriverId(value)) {
-      ids.add(value);
-    }
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const entry of value) {
-      collectDriverIds(entry, ids);
-    }
-    return;
-  }
-
-  if (!isRecord(value)) {
-    return;
-  }
-
-  for (const entry of Object.values(value)) {
-    collectDriverIds(entry, ids);
-  }
-}
-
-function isIsoTimestamp(value: string): boolean {
-  return value.endsWith("Z") && !Number.isNaN(Date.parse(value));
-}
-
-function normalizeClaudeValue(
-  value: unknown,
-  driverIds: ReadonlySet<string>,
-  fieldName?: string,
-): unknown {
-  if (typeof value === "string") {
-    for (const driverId of driverIds) {
-      if (value === driverId) {
-        return "<driver-id>";
-      }
-
-      if (value.startsWith(`${driverId}:`)) {
-        return value.replace(driverId, "<driver-id>");
-      }
-    }
-
-    if (fieldName !== undefined && fieldName.endsWith("At") && isIsoTimestamp(value)) {
-      return "<iso-timestamp>";
-    }
-
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeClaudeValue(entry, driverIds));
-  }
-
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  const entries = Object.entries(value).flatMap(([key, entry]): [string, unknown][] =>
-    entry === undefined ? [] : [[key, normalizeClaudeValue(entry, driverIds, key)]],
-  );
-
-  return Object.fromEntries(entries);
-}
-
-function normalizeClaudeEvents(events: readonly DriverEventInput[]): unknown[] {
-  const driverIds = new Set<string>();
-
-  for (const event of events) {
-    collectDriverIds(event, driverIds);
-  }
-
-  return events.map((event) => normalizeClaudeValue(event, driverIds));
-}
-
-function createHarness() {
-  const batches: EventBatch[] = [];
-  const nativeSessionIds: string[] = [];
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "claude-agent-sdk-provider-fixtures-test",
-    sink: async () => {},
-  });
-  const context: AgentDriverContext = createAgentDriverContext({
-    eventSink: {
-      pushEvents: async () => ({ accepted: [] }),
-    },
-    logger,
-    payload: bootPayload,
-    permission: {
-      request: async () => "allow_once",
-    },
-  });
-  const translator = new ClaudeAgentSdkMessageTranslator({
-    push: async (_context, reason, events) => {
-      batches.push({ events, reason });
-    },
-    recordNativeSessionId: async (_context, sessionId) => {
-      nativeSessionIds.push(sessionId);
-    },
-  });
-
-  return {
-    context,
-    events: () => batches.flatMap((batch) => batch.events),
-    logger,
-    nativeSessionIds,
-    translator,
-  };
+  return { ...fixture, expectedNativeSessionIds };
 }
 
 describe("Claude Agent SDK provider fixtures", () => {
+  test("preserves Driver ID equivalence classes while normalizing fixtures", () => {
+    const firstMessageId = "01ARZ3NDEKTSV4RRFFQ69G5FAV" as MessageId;
+    const secondMessageId = "01ARZ3NDEKTSV4RRFFQ69G5FAW" as MessageId;
+
+    expect(
+      normalizeClaudeEvents([
+        {
+          kind: "message.started",
+          payload: { messageId: firstMessageId, role: "agent" },
+        },
+        {
+          kind: "thought.started",
+          payload: { channel: "summary", thoughtId: `${firstMessageId}:thought` },
+        },
+        {
+          kind: "message.started",
+          payload: { messageId: secondMessageId, role: "agent" },
+        },
+      ]),
+    ).toEqual([
+      {
+        kind: "message.started",
+        payload: { messageId: "<driver-id>", role: "agent" },
+      },
+      {
+        kind: "thought.started",
+        payload: { channel: "summary", thoughtId: "<driver-id>:thought" },
+      },
+      {
+        kind: "message.started",
+        payload: { messageId: "<driver-id-2>", role: "agent" },
+      },
+    ]);
+  });
+
   test("keeps chunked stream deltas and the complete assistant snapshot on one message", async () => {
     // Real SDK wire shape: every envelope (each stream chunk and the complete
     // assistant replay) carries a distinct uuid; only the API message id inside
     // message_start / assistant.message is stable across the whole message.
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -256,10 +151,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const startedEvents = events().filter((event) => event.kind === "message.started");
     const completedEvents = events().filter((event) => event.kind === "message.completed");
@@ -283,11 +175,12 @@ describe("Claude Agent SDK provider fixtures", () => {
     expect(textMessages.map((entry) => entry.contentDelta)).toEqual(["Got it —", " I'm here."]);
     expect(new Set(textMessages.map((entry) => entry.messageId)).size).toBe(1);
     expect(payload?.["finalMessageId"]).toBe(textMessages[0]?.messageId);
-    expect(payload?.["finalMessageText"]).toBe("Got it — I'm here.");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), payload?.["finalMessageId"])).toBe("Got it — I'm here.");
   });
 
   test("scopes interleaved subagent stream chunks away from the main message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -336,10 +229,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const textByMessageId = new Map<string, string>();
 
@@ -360,7 +250,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("does not promote a replayed stream-only message stop to canonical final", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -393,10 +283,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const liveText = events().flatMap((event) => {
       if (event.kind !== "message.delta" || !isRecord(event.payload)) {
@@ -417,7 +304,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("materializes a result-only native resume completion", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: { type: "message_stop" },
@@ -434,10 +321,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const translated = events();
     const started = translated.filter((event) => event.kind === "message.started");
@@ -455,11 +339,358 @@ describe("Claude Agent SDK provider fixtures", () => {
       { text: "recovered final answer", type: "text" },
     ]);
     expect(completedPayload?.["finalMessageId"]).toBe(snapshotPayload?.["messageId"]);
-    expect(completedPayload?.["finalMessageText"]).toBe("recovered final answer");
+    expect(completedPayload).not.toHaveProperty("finalMessageText");
+    expect(messageText(translated, completedPayload?.["finalMessageId"])).toBe(
+      "recovered final answer",
+    );
+  });
+
+  test("keeps structured output as the canonical final payload", async () => {
+    const { context, events, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [],
+        result: "structured output placeholder",
+        structured_output: { answer: 42, citations: ["source-1"] },
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-structured",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+
+    expect(events().map(({ kind }) => kind)).not.toContain("message.added");
+    expect(events()).toContainEqual({
+      kind: "run.completed",
+      payload: {
+        stopReason: "end_turn",
+        structuredOutput: { answer: 42, citations: ["source-1"] },
+      },
+      runId: "run-1" as RunId,
+    });
+  });
+
+  test("fails closed for a non-JSON structured output", async () => {
+    const { context, events, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [],
+        result: "structured output placeholder",
+        structured_output: Symbol("invalid"),
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-invalid-structured",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "run.failed",
+        payload: expect.objectContaining({
+          error: expect.objectContaining({ code: "claude.invalid_structured_output" }),
+        }),
+      }),
+    );
+    expect(events().map(({ kind }) => kind)).not.toContain("run.completed");
+  });
+
+  test("retracts a superseded refusal before publishing its replacement", async () => {
+    const { events, handleMessages } = createHarness();
+    const messages = [
+      {
+        message: {
+          content: [{ text: "stale refusal", type: "text" }],
+          id: "native-refusal",
+        },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        type: "assistant",
+        uuid: "wire-refusal",
+      },
+      {
+        message: {
+          content: [{ text: "canonical replacement", type: "text" }],
+          id: "native-replacement",
+        },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        supersedes: ["wire-refusal"],
+        type: "assistant",
+        uuid: "wire-replacement",
+      },
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [],
+        result: "canonical replacement",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-replacement",
+      },
+    ] as unknown as SDKMessage[];
+
+    await handleMessages(messages);
+
+    const snapshots = events().flatMap((event) => {
+      if (event.kind !== "message.added" || !isRecord(event.payload)) {
+        return [];
+      }
+      const content = event.payload["content"];
+      const messageId = event.payload["messageId"];
+      return Array.isArray(content) && typeof messageId === "string"
+        ? [{ messageId, text: (content[0] as { text?: unknown } | undefined)?.text }]
+        : [];
+    });
+    const stale = snapshots.find(({ text }) => text === "stale refusal");
+    const replacement = snapshots.find(({ text }) => text === "canonical replacement");
+    const cancellationIndex = events().findIndex(
+      (event) =>
+        event.kind === "message.cancelled" &&
+        isRecord(event.payload) &&
+        event.payload["messageId"] === stale?.messageId,
+    );
+    const replacementIndex = events().findIndex(
+      (event) =>
+        event.kind === "message.added" &&
+        isRecord(event.payload) &&
+        event.payload["messageId"] === replacement?.messageId,
+    );
+    const completed = events().find((event) => event.kind === "run.completed");
+
+    expect(stale).toBeDefined();
+    expect(replacement).toBeDefined();
+    expect(cancellationIndex).toBeGreaterThan(-1);
+    expect(cancellationIndex).toBeLessThan(replacementIndex);
+    expect(completed?.payload).toMatchObject({
+      finalMessageId: replacement?.messageId,
+    });
+    expect(completed?.payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), replacement?.messageId)).toBe("canonical replacement");
+  });
+
+  test("applies refusal fallback retractions idempotently to messages and tool results", async () => {
+    const { events, handleMessages } = createHarness();
+    const fallback = {
+      content: "Retrying with fallback model.",
+      direction: "retry",
+      fallback_model: "claude-fallback",
+      original_model: "claude-primary",
+      request_id: "request-1",
+      retracted_message_uuids: ["wire-refusal", "wire-tool-result", "unknown-wire"],
+      session_id: "session-1",
+      subtype: "model_refusal_fallback",
+      trigger: "refusal",
+      type: "system",
+      uuid: "fallback-notice",
+    };
+    const messages = [
+      {
+        message: {
+          content: [
+            { text: "stale refusal", type: "text" },
+            { id: "tool-old", input: { command: "pwd" }, name: "Bash", type: "tool_use" },
+          ],
+          id: "native-refusal",
+        },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        type: "assistant",
+        uuid: "wire-refusal",
+      },
+      {
+        message: {
+          content: [{ content: "stale tool result", tool_use_id: "tool-old", type: "tool_result" }],
+        },
+        session_id: "session-1",
+        type: "user",
+        uuid: "wire-tool-result",
+      },
+      fallback,
+      { ...fallback, uuid: "fallback-notice-replayed" },
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [
+          {
+            decisionReason: "denied before fallback",
+            tool_input: { command: "pwd" },
+            tool_name: "Bash",
+            tool_use_id: "tool-old",
+          },
+        ],
+        result: "canonical replacement",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "late-authoritative-denial",
+      },
+      {
+        message: {
+          content: [{ text: "canonical replacement", type: "text" }],
+          id: "native-replacement",
+        },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        type: "assistant",
+        uuid: "wire-replacement",
+      },
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [],
+        result: "canonical replacement",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-replacement",
+      },
+    ] as unknown as SDKMessage[];
+
+    await handleMessages(messages);
+
+    const retractedMessages = events().filter(
+      (event) =>
+        event.kind === "message.cancelled" &&
+        isRecord(event.payload) &&
+        event.payload["reason"] === "superseded",
+    );
+    const cancelledTools = events().filter(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        isRecord(event.payload) &&
+        event.payload["status"] === "cancelled" &&
+        event.payload["toolCallId"] === "tool-old",
+    );
+    const completed = events().find((event) => event.kind === "run.completed");
+    const retractionIndex = events().findIndex(
+      (event) =>
+        event.kind === "tool.call.updated" &&
+        isRecord(event.payload) &&
+        event.payload["status"] === "cancelled" &&
+        event.payload["toolCallId"] === "tool-old",
+    );
+    const toolUpdatesAfterRetraction = events()
+      .slice(retractionIndex + 1)
+      .filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          isRecord(event.payload) &&
+          event.payload["toolCallId"] === "tool-old",
+      );
+
+    expect(retractedMessages).toHaveLength(1);
+    expect(cancelledTools).toHaveLength(1);
+    expect(toolUpdatesAfterRetraction).toEqual([]);
+    expect(completed?.payload).not.toHaveProperty("finalMessageText");
+    expect(
+      messageText(
+        events(),
+        isRecord(completed?.payload) ? completed.payload["finalMessageId"] : null,
+      ),
+    ).toBe("canonical replacement");
+  });
+
+  test("keeps assistant envelopes distinct when they share an API message id", async () => {
+    const { events, handleMessages } = createHarness();
+    const messages = [
+      {
+        message: { content: [{ text: "first", type: "text" }], id: "shared-native" },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        type: "assistant",
+        uuid: "wire-first",
+      },
+      {
+        message: { content: [{ text: "second", type: "text" }], id: "shared-native" },
+        parent_tool_use_id: null,
+        session_id: "session-1",
+        type: "assistant",
+        uuid: "wire-second",
+      },
+      {
+        is_error: false,
+        modelUsage: {},
+        permission_denials: [],
+        result: "second",
+        subtype: "success",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-second",
+      },
+    ] as unknown as SDKMessage[];
+
+    await handleMessages(messages);
+
+    const snapshots = events().flatMap((event) => {
+      if (event.kind !== "message.added" || !isRecord(event.payload)) {
+        return [];
+      }
+      const content = event.payload["content"];
+      const messageId = event.payload["messageId"];
+      return Array.isArray(content) && typeof messageId === "string"
+        ? [{ messageId, text: (content[0] as { text?: unknown } | undefined)?.text }]
+        : [];
+    });
+    const completed = events().find((event) => event.kind === "run.completed");
+
+    expect(snapshots.map(({ text }) => text)).toEqual(["first", "second"]);
+    expect(new Set(snapshots.map(({ messageId }) => messageId)).size).toBe(2);
+    expect(completed?.payload).toMatchObject({
+      finalMessageId: snapshots[1]?.messageId,
+    });
+    expect(completed?.payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), snapshots[1]?.messageId)).toBe("second");
+  });
+
+  test("turns provider-aborted result frames into runtime cancellation", async () => {
+    const { context, events, translator } = createHarness();
+
+    await translator.handleSdkMessage(
+      context,
+      {
+        errors: ["aborted"],
+        is_error: true,
+        modelUsage: {},
+        permission_denials: [],
+        subtype: "error_during_execution",
+        terminal_reason: "aborted_tools",
+        total_cost_usd: 0,
+        type: "result",
+        usage: {},
+        uuid: "result-aborted",
+      } as unknown as SDKMessage,
+      "run-1" as RunId,
+    );
+
+    expect(events()).toContainEqual(
+      expect.objectContaining({
+        kind: "run.cancelled",
+        payload: expect.objectContaining({ reason: "aborted_tools" }),
+      }),
+    );
+    expect(events().map(({ kind }) => kind)).not.toContain("run.failed");
   });
 
   test("does not let a late older assistant completion replace the final message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -493,10 +724,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -504,11 +732,12 @@ describe("Claude Agent SDK provider fixtures", () => {
 
     expect(runCompleted).toBeDefined();
     expect(payload).not.toBeNull();
-    expect(payload?.["finalMessageText"]).toBe("最终回答 B");
+    expect(payload).not.toHaveProperty("finalMessageText");
+    expect(messageText(events(), payload?.["finalMessageId"])).toBe("最终回答 B");
   });
 
   test("fails closed when a newer assistant is still incomplete at result success", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         message: {
@@ -535,10 +764,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -551,7 +777,7 @@ describe("Claude Agent SDK provider fixtures", () => {
   });
 
   test("fails closed when an older full frame arrives after a newer incomplete message", async () => {
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const messages = [
       {
         event: {
@@ -578,10 +804,7 @@ describe("Claude Agent SDK provider fixtures", () => {
       },
     ] as unknown as SDKMessage[];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const runCompleted = events().find((event) => event.kind === "run.completed");
     const payload =
@@ -598,7 +821,7 @@ describe("Claude Agent SDK provider fixtures", () => {
     // scope comes from the burst anchor: parallel tool blocks of one message
     // are told apart by content-block index, and a message_stop boundary
     // separates one message's thought stream from the next.
-    const { context, events, logger, translator } = createHarness();
+    const { events, handleMessages } = createHarness();
     const stream = (uuid: string, event: Record<string, unknown>) =>
       ({ event, type: "stream_event", uuid }) as unknown as SDKMessage;
     const messages = [
@@ -656,20 +879,17 @@ describe("Claude Agent SDK provider fixtures", () => {
       }),
     ];
 
-    for (const message of messages) {
-      await translator.handleSdkMessage(context, message, "run-1" as RunId);
-    }
-    await logger.destroy();
+    await handleMessages(messages);
 
     const toolArguments = events().flatMap((event) => {
       if (event.kind !== "tool.call.updated" || !isRecord(event.payload)) {
         return [];
       }
 
-      const rawInput = event.payload["rawInput"];
+      const rawInputDelta = event.payload["rawInputDelta"];
       const toolCallId = event.payload["toolCallId"];
-      return typeof rawInput === "string" && typeof toolCallId === "string"
-        ? [{ rawInput, toolCallId }]
+      return typeof rawInputDelta === "string" && typeof toolCallId === "string"
+        ? [{ rawInputDelta, toolCallId }]
         : [];
     });
     const thoughtDeltas = events().flatMap((event) => {
@@ -688,9 +908,9 @@ describe("Claude Agent SDK provider fixtures", () => {
     );
 
     expect(toolArguments).toEqual([
-      { rawInput: '{"a":', toolCallId: "tool-a" },
-      { rawInput: '{"b":1}', toolCallId: "tool-b" },
-      { rawInput: "1}", toolCallId: "tool-a" },
+      { rawInputDelta: '{"a":', toolCallId: "tool-a" },
+      { rawInputDelta: '{"b":1}', toolCallId: "tool-b" },
+      { rawInputDelta: "1}", toolCallId: "tool-a" },
     ]);
     expect(thoughts["A1"]).toBe(thoughts["A2"]);
     expect(thoughts["A1"]).not.toBe(thoughts["B1"]);
@@ -700,13 +920,9 @@ describe("Claude Agent SDK provider fixtures", () => {
     const fixture = readClaudeProviderFixtureCase(
       `./fixtures/providers/claude-agent-sdk/cases/${name}.json`,
     );
-    const { context, events, logger, nativeSessionIds, translator } = createHarness();
+    const { events, handleMessages, nativeSessionIds } = createHarness();
 
-    for (const message of fixture.messages) {
-      await translator.handleSdkMessage(context, message as SDKMessage, fixture.runId);
-    }
-
-    await logger.destroy();
+    await handleMessages(fixture.messages as SDKMessage[], fixture.runId);
 
     expect(nativeSessionIds).toEqual(fixture.expectedNativeSessionIds);
     expect(normalizeClaudeEvents(events())).toEqual(fixture.expectedEvents);

@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createBufferedSinkLogger } from "../src/observability";
+import { createDisabledLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   startAcpAgentProcess,
@@ -19,19 +19,17 @@ import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
 
 function createHarness() {
-  const logger = createBufferedSinkLogger({
-    level: "debug",
-    service: "acp-agent-process-test",
-    sink: async () => {},
-  });
   const context = createAgentDriverContext({
-    eventSink: { pushEvents: async () => ({ accepted: [] }) },
-    logger,
+    eventSink: {
+      currentRunId: () => null,
+      pushEvents: async () => ({ accepted: [] }),
+    },
+    logger: createDisabledLogger(),
     payload: driverStartInput,
     permission: { request: async () => "reject_once" },
   });
 
-  return { context, logger };
+  return { context };
 }
 
 function createPayload(root: string) {
@@ -63,9 +61,10 @@ async function startTestAgentProcess(
   const root = await mkdtemp(join(tmpdir(), "driver-acp-stop-"));
   const payload = createPayload(root);
   const readyPath = join(root, "ready");
+  let startedChild: AcpAgentProcess | undefined;
 
   try {
-    const child = await startAcpAgentProcess(
+    const started = await startAcpAgentProcess(
       harness.context,
       payload,
       buildChildEnv(payload),
@@ -79,6 +78,9 @@ async function startTestAgentProcess(
         ...(spawnWatchdog === undefined ? {} : { spawnWatchdog }),
       },
     );
+    const child = started.process;
+    startedChild = child;
+    await started.ready;
     while (!(await Bun.file(readyPath).exists())) {
       await Bun.sleep(5);
     }
@@ -92,6 +94,11 @@ async function startTestAgentProcess(
       },
     };
   } catch (error) {
+    if (startedChild !== undefined) {
+      await stopAcpAgentProcess(harness.context, startedChild, "test.startup.cleanup").catch(
+        () => {},
+      );
+    }
     await rm(root, { force: true, recursive: true });
     throw error;
   }
@@ -136,6 +143,46 @@ async function waitForProcessExit(pid: number): Promise<void> {
 }
 
 describe("ACP agent process lifecycle", () => {
+  test("does not claim supervision when spawn throws synchronously", async () => {
+    const harness = createHarness();
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-sync-spawn-"));
+    const payload = createPayload(root);
+    let child: AcpAgentProcess | undefined;
+
+    try {
+      await expect(
+        startAcpAgentProcess(
+          harness.context,
+          payload,
+          buildChildEnv(payload),
+          new AbortController().signal,
+          { command: "invalid\0command" },
+        ),
+      ).rejects.toThrow("null bytes");
+
+      const started = await startAcpAgentProcess(
+        harness.context,
+        payload,
+        buildChildEnv(payload),
+        new AbortController().signal,
+        {
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          command: process.execPath,
+        },
+      );
+      child = started.process;
+      await started.ready;
+      await expect(
+        stopAcpAgentProcess(harness.context, child, "test.stop"),
+      ).resolves.toBeUndefined();
+    } finally {
+      if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test.each(["SIGTERM", "SIGKILL"] as const)("observes exit after %s", async (exitSignal) => {
     const harness = createHarness();
     const process = await startTestAgentProcess(
@@ -150,7 +197,6 @@ describe("ACP agent process lifecycle", () => {
       expect(process.child.signalCode).toBe(exitSignal);
     } finally {
       await process.dispose();
-      await harness.logger.destroy();
     }
   });
 
@@ -175,7 +221,6 @@ describe("ACP agent process lifecycle", () => {
     } finally {
       cleanup.resolve();
       await process.dispose();
-      await harness.logger.destroy();
     }
   });
 
@@ -190,7 +235,7 @@ describe("ACP agent process lifecycle", () => {
       let child: AcpAgentProcess | undefined;
 
       try {
-        child = await startAcpAgentProcess(
+        const started = await startAcpAgentProcess(
           harness.context,
           payload,
           buildChildEnv(payload),
@@ -204,6 +249,8 @@ describe("ACP agent process lifecycle", () => {
             spawnWatchdog: fakeWatchdog(cleanup.promise),
           },
         );
+        child = started.process;
+        await started.ready;
         while (!(await Bun.file(readyPath).exists())) {
           await Bun.sleep(10);
         }
@@ -226,7 +273,6 @@ describe("ACP agent process lifecycle", () => {
           child.kill("SIGKILL");
         }
         await rm(root, { force: true, recursive: true });
-        await harness.logger.destroy();
       }
     },
   );
@@ -266,12 +312,11 @@ describe("ACP agent process lifecycle", () => {
       } finally {
         cleanup.resolve();
         await agent.dispose();
-        await harness.logger.destroy();
       }
     },
   );
 
-  test("cleans the marked tree when watchdog creation throws and allows a later start", async () => {
+  test("returns ownership when watchdog creation throws and allows explicit cleanup", async () => {
     const harness = createHarness();
     const root = await mkdtemp(join(tmpdir(), "driver-acp-watchdog-create-"));
     const payload = createPayload(root);
@@ -289,29 +334,33 @@ setInterval(() => {}, 1_000);
     let rootPid = 0;
     let shellPid = 0;
     let workerPid = 0;
+    let failedChild: AcpAgentProcess | undefined;
     let retryChild: AcpAgentProcess | undefined;
     process.env["MOSOO_ACP_FALLBACK_COMMAND"] = process.execPath;
     process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["-e", script]);
 
     try {
-      await expect(
-        startAcpAgentProcess(
-          harness.context,
-          payload,
-          buildChildEnv(payload),
-          new AbortController().signal,
-          {
-            spawnWatchdog: (pid) => {
-              rootPid = pid;
-              const deadline = Date.now() + 3_000;
-              while (!existsSync(workerPidPath) && Date.now() < deadline) {
-                Atomics.wait(sleeper, 0, 0, 10);
-              }
-              throw new Error("test watchdog creation failed");
-            },
+      const failedStart = await startAcpAgentProcess(
+        harness.context,
+        payload,
+        buildChildEnv(payload),
+        new AbortController().signal,
+        {
+          spawnWatchdog: (pid) => {
+            rootPid = pid;
+            const deadline = Date.now() + 3_000;
+            while (!existsSync(workerPidPath) && Date.now() < deadline) {
+              Atomics.wait(sleeper, 0, 0, 10);
+            }
+            throw new Error("test watchdog creation failed");
           },
-        ),
-      ).rejects.toThrow("test watchdog creation failed");
+        },
+      );
+      failedChild = failedStart.process;
+      await expect(failedStart.ready).rejects.toThrow("test watchdog creation failed");
+      await expect(
+        stopAcpAgentProcess(harness.context, failedChild, "startup.failed"),
+      ).resolves.toBeUndefined();
       [shellPid, workerPid] = await Promise.all([
         waitForPidFile(shellPidPath),
         waitForPidFile(workerPidPath),
@@ -322,16 +371,25 @@ setInterval(() => {}, 1_000);
         "-e",
         "setInterval(() => {}, 1_000)",
       ]);
-      retryChild = await startAcpAgentProcess(
+      const retryStart = await startAcpAgentProcess(
         harness.context,
         payload,
         buildChildEnv(payload),
         new AbortController().signal,
       );
+      retryChild = retryStart.process;
+      await retryStart.ready;
       await expect(
         stopAcpAgentProcess(harness.context, retryChild, "test.retry"),
       ).resolves.toBeUndefined();
     } finally {
+      if (
+        failedChild !== undefined &&
+        failedChild.exitCode === null &&
+        failedChild.signalCode === null
+      ) {
+        failedChild.kill("SIGKILL");
+      }
       if (
         retryChild !== undefined &&
         retryChild.exitCode === null &&
@@ -355,11 +413,10 @@ setInterval(() => {}, 1_000);
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 7_000);
 
-  test("waits for and propagates rejected cleanup when startup aborts", async () => {
+  test("keeps the handle when startup aborts so rejected cleanup can be retried", async () => {
     const harness = createHarness();
     const root = await mkdtemp(join(tmpdir(), "driver-acp-startup-abort-"));
     const payload = createPayload(root);
@@ -378,44 +435,37 @@ setInterval(() => {}, 1_000);
     let rootPid = 0;
     let shellPid = 0;
     let workerPid = 0;
-
-    const starting = startAcpAgentProcess(
-      harness.context,
-      payload,
-      buildChildEnv(payload),
-      controller.signal,
-      {
-        args: ["-e", script],
-        command: process.execPath,
-        spawnWatchdog: (pid, marker) => {
-          rootPid = pid;
-          const deadline = Date.now() + 3_000;
-          while (!existsSync(workerPidPath) && Date.now() < deadline) {
-            Atomics.wait(sleeper, 0, 0, 10);
-          }
-          controller.abort();
-          const watchdog = spawnLinuxProcessTreeWatchdog(pid, marker);
-          if (watchdog === null) {
-            throw new Error("Test process supervision could not start.");
-          }
-          return {
-            cleanup: watchdog.cleanup.then(() => cleanup.promise),
-            process: watchdog.process,
-          };
-        },
-      },
-    );
-    let settled = false;
-    void starting.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
+    let child: AcpAgentProcess | undefined;
 
     try {
+      const started = await startAcpAgentProcess(
+        harness.context,
+        payload,
+        buildChildEnv(payload),
+        controller.signal,
+        {
+          args: ["-e", script],
+          command: process.execPath,
+          spawnWatchdog: (pid, marker) => {
+            rootPid = pid;
+            const deadline = Date.now() + 3_000;
+            while (!existsSync(workerPidPath) && Date.now() < deadline) {
+              Atomics.wait(sleeper, 0, 0, 10);
+            }
+            controller.abort();
+            const watchdog = spawnLinuxProcessTreeWatchdog(pid, marker);
+            if (watchdog === null) {
+              throw new Error("Test process supervision could not start.");
+            }
+            return {
+              cleanup: watchdog.cleanup.then(() => cleanup.promise),
+              process: watchdog.process,
+            };
+          },
+        },
+      );
+      child = started.process;
+      await expect(started.ready).rejects.toThrow();
       [shellPid, workerPid] = await Promise.all([
         waitForPidFile(shellPidPath),
         waitForPidFile(workerPidPath),
@@ -423,28 +473,25 @@ setInterval(() => {}, 1_000);
       await Promise.all(
         [rootPid, shellPid, workerPid].filter((pid) => pid > 0).map(waitForProcessExit),
       );
-      expect(settled).toBe(false);
 
       cleanup.reject(new Error("test startup cleanup rejected"));
-      const error = await starting.then(
-        () => null,
-        (reason: unknown) => reason,
+      await expect(stopAcpAgentProcess(harness.context, child, "startup.failed")).rejects.toThrow(
+        "test startup cleanup rejected",
       );
-      expect(error).toBeInstanceOf(AggregateError);
-      expect(
-        (error as AggregateError).errors.some(
-          (entry) => entry instanceof Error && entry.message === "test startup cleanup rejected",
-        ),
-      ).toBe(true);
+      await expect(
+        stopAcpAgentProcess(harness.context, child, "startup.failed.retry"),
+      ).resolves.toBeUndefined();
     } finally {
       cleanup.resolve();
+      if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+      }
       for (const pid of [rootPid, shellPid, workerPid]) {
         if (pid > 0 && isProcessRunning(pid)) {
           process.kill(pid, "SIGKILL");
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 7_000);
 
@@ -469,13 +516,15 @@ setInterval(() => {}, 1_000);
     let workerPid = 0;
 
     try {
-      child = await startAcpAgentProcess(
+      const started = await startAcpAgentProcess(
         harness.context,
         payload,
         buildChildEnv(payload),
         new AbortController().signal,
         { args: ["-e", script], command: process.execPath },
       );
+      child = started.process;
+      await started.ready;
       [shellPid, workerPid] = await Promise.all([
         waitForPidFile(shellPidPath),
         waitForPidFile(workerPidPath),
@@ -506,7 +555,6 @@ setInterval(() => {}, 1_000);
         }
       }
       await rm(root, { force: true, recursive: true });
-      await harness.logger.destroy();
     }
   }, 5_000);
 });

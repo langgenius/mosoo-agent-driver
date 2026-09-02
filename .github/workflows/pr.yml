@@ -24,7 +24,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Validate PR title
-        uses: amannn/action-semantic-pull-request@v6
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -48,12 +48,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@v1
+        uses: voidzero-dev/setup-vp@313600b80b104eadebb9111787d37a2e83e014ca # v1.17.0
         with:
           cache: true
           run-install: |
@@ -61,3 +61,9 @@ jobs:
 
       - name: Check
         run: vp run check
+
+      - name: Build image
+        run: buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .
+
+      - name: Test image environment
+        run: vp run test:image:environment

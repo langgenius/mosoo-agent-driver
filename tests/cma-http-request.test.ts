@@ -8,6 +8,7 @@ import {
   CMA_DEFAULT_BETA_HEADER_VALUE,
   createCmaHttpHandler,
 } from "../src/surfaces/cma-http";
+import { readCmaJsonBody } from "../src/surfaces/cma-http/request";
 
 function cmaRequest(path: string, init: RequestInit = {}): Request {
   const headers = new Headers(init.headers);
@@ -180,6 +181,21 @@ describe("CMA HTTP surface", () => {
     expect(canceled).toBe(true);
   });
 
+  test("propagates request cancellation while reading a streaming body", async () => {
+    const controller = new AbortController();
+    const reason = new Error("client disconnected");
+    const request = new Request("https://driver.test/v1/agents", {
+      body: new ReadableStream({ pull() {} }),
+      method: "POST",
+      signal: controller.signal,
+    });
+    const pending = readCmaJsonBody(request);
+
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+  });
+
   test("rejects an inbound event whose admitted record exceeds the wire limit", async () => {
     let dispatches = 0;
     const store = createCmaMemoryStore({ sessions: [{ id: "session-1" }] });
@@ -206,33 +222,43 @@ describe("CMA HTTP surface", () => {
   });
 
   test("does not persist an oversized settlement result", async () => {
-    const store = createCmaMemoryStore({ sessions: [{ id: "session-1" }] });
+    let dispatches = 0;
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const store = createCmaMemoryStore({
+      now: () => now,
+      sessions: [{ id: "session-1" }],
+    });
     const handler = createCmaHttpHandler({
-      dispatchDriverCommand: async () => ({
-        outputText: "x".repeat(8 * CMA_MAX_EVENT_BYTES),
-        requestId: "request-1",
-        serverId: "server-1",
-        toolName: "tool-1",
-      }),
+      dispatchDriverCommand: async () => {
+        dispatches += 1;
+        return {
+          outputText: "x".repeat(8 * CMA_MAX_EVENT_BYTES),
+          requestId: "request-1",
+          serverId: "server-1",
+          toolName: "tool-1",
+        };
+      },
       store,
     });
-    const response = await handler(
-      jsonRequest("/v1/sessions/session-1/events", "POST", {
-        argumentsJson: "{}",
-        commandId: "command-1",
-        requestId: "request-1",
-        serverId: "server-1",
-        toolCallId: "tool-call-1",
-        toolName: "tool-1",
-        type: "user.custom_tool_result",
-      }),
-    );
+    const event = {
+      argumentsJson: "{}",
+      commandId: "command-1",
+      requestId: "request-1",
+      serverId: "server-1",
+      toolCallId: "tool-call-1",
+      toolName: "tool-1",
+      type: "user.custom_tool_result",
+    };
+    const response = await handler(jsonRequest("/v1/sessions/session-1/events", "POST", event));
 
     expect(response.status).toBe(413);
     expect(await readJson(response)).toMatchObject({ error: { code: "CMA_RESOURCE_LIMIT" } });
-    expect(await store.listSessionEvents("session-1")).toMatchObject([
-      { commandStatus: "accepted" },
-    ]);
+    expect(await store.listSessionEvents("session-1")).toMatchObject([{ commandStatus: "failed" }]);
+
+    now = new Date(now.getTime() + 31_000);
+    const retry = await handler(jsonRequest("/v1/sessions/session-1/events", "POST", event));
+    expect(retry.status).toBe(502);
+    expect(dispatches).toBe(1);
   });
 
   test("creates, lists, retrieves, archives, and deletes environments", async () => {

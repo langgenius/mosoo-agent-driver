@@ -31,10 +31,8 @@ import { fileURLToPath } from "node:url";
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
 import type { PermissionDecision } from "../src/core/driver-permission-broker";
 import type { DriverEventInput } from "../src/protocol/events";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverStartInput } from "../src/protocol/start";
 import { AGENT_DRIVER_PROVIDER_REGISTRY } from "../src/runtimes/provider-registry";
-import { driverBootPayload } from "../tests/driver-boot-payload-fixture";
 import { DRIVER_TEST_IDS, bootPayload } from "../tests/driver-runtime-boundary-fixtures";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -176,6 +174,11 @@ function claudeStartInput(a: StartInputArgs): DriverStartInput {
       session: {
         ...bootPayload.execution.session,
         additionalDirectories: [],
+        context: {
+          ...bootPayload.execution.session.context,
+          homePath: a.homePath,
+          sessionOrganizationPath: a.sharedRootPath,
+        },
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
@@ -204,6 +207,11 @@ function openaiStartInput(a: StartInputArgs): DriverStartInput {
       session: {
         ...bootPayload.execution.session,
         additionalDirectories: [],
+        context: {
+          ...bootPayload.execution.session.context,
+          homePath: a.homePath,
+          sessionOrganizationPath: a.sharedRootPath,
+        },
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
@@ -250,6 +258,11 @@ function opencodeStartInput(
       session: {
         ...bootPayload.execution.session,
         additionalDirectories: [],
+        context: {
+          ...bootPayload.execution.session.context,
+          homePath: a.homePath,
+          sessionOrganizationPath: a.sharedRootPath,
+        },
         cwd: a.cwd,
         homePath: a.homePath,
         mcpServers: [],
@@ -265,34 +278,12 @@ function opencodeStartInput(
   };
 }
 
-function opencodeHostSnapshot(paths: { cwd: string; homePath: string; sharedRootPath: string }) {
-  return createDriverHostIntegrationSnapshotFromBootExecution({
-    ...driverBootPayload.execution,
-    profilePrompt: "",
-    session: {
-      ...driverBootPayload.execution.session,
-      additionalDirectories: [],
-      context: {
-        ...driverBootPayload.execution.session.context,
-        homePath: paths.homePath,
-        sessionOrganizationPath: paths.sharedRootPath,
-      },
-      cwd: paths.cwd,
-      mcpServers: [],
-      nativeResumeRef: null,
-    },
-    skillCatalog: [],
-    skills: [],
-  });
-}
-
 async function runTrial(input: {
   runtime: RuntimeId;
   scenario: Scenario;
   startInput: (paths: StartInputArgs) => DriverStartInput;
   apiKey: string;
   model: string;
-  isOpenCode: boolean;
 }): Promise<TrialMetrics> {
   const paths = await makePaths(`ttft-${input.runtime}-`);
   const args: StartInputArgs = {
@@ -303,13 +294,11 @@ async function runTrial(input: {
     model: input.model,
     systemPrompt: input.scenario.systemPrompt,
   };
-  const hostSnapshot = input.isOpenCode ? opencodeHostSnapshot(paths) : null;
   const kernel = new AgentDriverKernelCore({
     backendFactory: (i) => AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(i),
     hostPorts: {
       permission: { request: async () => input.scenario.permission },
       skill: { materialize: async () => [] },
-      ...(hostSnapshot === null ? {} : { hostIntegration: { snapshot: async () => hostSnapshot } }),
     },
   });
   const events = kernel.events();
@@ -500,15 +489,12 @@ async function main(): Promise<void> {
     model: string,
     build: (paths: StartInputArgs) => DriverStartInput,
     apiKey: string,
-    isOpenCode: boolean,
   ): Promise<void> => {
     process.stdout.write(`\n[${runtime}/${scenario.id}] model=${model} warmup...`);
-    await runTrial({ runtime, scenario, startInput: build, apiKey, model, isOpenCode }).catch(
-      () => undefined,
-    );
+    await runTrial({ runtime, scenario, startInput: build, apiKey, model }).catch(() => undefined);
     const results: TrialMetrics[] = [];
     for (let i = 0; i < trials; i += 1) {
-      const m = await runTrial({ runtime, scenario, startInput: build, apiKey, model, isOpenCode });
+      const m = await runTrial({ runtime, scenario, startInput: build, apiKey, model });
       results.push(m);
       process.stdout.write(
         ` t${i + 1}=${m.ok ? "ok" : "FAIL"}(ttft=${m.ttftMs ?? "-"},total=${m.totalMs ?? "-"})`,
@@ -519,17 +505,10 @@ async function main(): Promise<void> {
 
   for (const scenario of SCENARIOS.filter((s) => scenarioFilter.has(s.id))) {
     if (requested.includes("claude") && anthropicKey) {
-      await runCell(
-        "claude",
-        scenario,
-        claudeModel,
-        (p) => claudeStartInput(p),
-        anthropicKey,
-        false,
-      );
+      await runCell("claude", scenario, claudeModel, (p) => claudeStartInput(p), anthropicKey);
     }
     if (requested.includes("openai") && openaiKey) {
-      await runCell("openai", scenario, openaiModel, (p) => openaiStartInput(p), openaiKey, false);
+      await runCell("openai", scenario, openaiModel, (p) => openaiStartInput(p), openaiKey);
     }
     if (requested.includes("opencode")) {
       const key = opencodeProvider === "anthropic" ? anthropicKey : openaiKey;
@@ -546,7 +525,6 @@ async function main(): Promise<void> {
           model,
           (p) => opencodeStartInput(p, opencodeProvider, apiKeyEnv),
           key,
-          true,
         );
       }
     }

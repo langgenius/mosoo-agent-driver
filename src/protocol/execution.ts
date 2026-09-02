@@ -1,6 +1,7 @@
 import type {
   DriverBootMcpServer,
   DriverExecutionEnvironment,
+  DriverExecutionSessionContext,
   DriverExecutionSpec,
   DriverNativeRuntimeRef,
   DriverPermissionPolicy,
@@ -17,6 +18,7 @@ export interface DriverExecutionRunInput {
 
 export interface DriverExecutionSessionInput {
   readonly additionalDirectories: string[];
+  readonly context: DriverExecutionSessionContext;
   readonly cwd: string;
   readonly homePath: string;
   readonly mcpServers: DriverBootMcpServer[];
@@ -55,6 +57,7 @@ export function createDriverExecutionInputFromBootExecution(
     },
     session: {
       additionalDirectories: execution.session.additionalDirectories,
+      context: execution.session.context,
       cwd: execution.session.cwd,
       homePath: execution.session.context.homePath,
       mcpServers: execution.session.mcpServers,
