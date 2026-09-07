@@ -25,7 +25,8 @@ export interface DriverRuntimeEventPort {
   runEventTerminal?(runId: RunId): "cancelled" | "completed" | "failed" | null;
 }
 
-export const DRIVER_EVENT_DELIVERY_TIMEOUT_MS = 10_000;
+// Allow bounded transport retries without dropping an already committed event.
+export const DRIVER_EVENT_DELIVERY_TIMEOUT_MS = 30_000;
 
 export class DriverEventRejectedError extends Error {
   readonly sourceEventId: string;

@@ -226,13 +226,15 @@ export class DriverInstanceSocket {
   }
 
   async heartbeat(input: Omit<DriverHeartbeatInput, "pid">): Promise<DriverHeartbeatOutput> {
-    return this.#requireClient().driver.heartbeat(
-      {
-        at: input.at,
-        pid: process.pid,
-        reason: input.reason,
-      },
-      this.#rpcOptions(),
+    return this.#retryRpcTimeout((options) =>
+      this.#requireClient().driver.heartbeat(
+        {
+          at: input.at,
+          pid: process.pid,
+          reason: input.reason,
+        },
+        options,
+      ),
     );
   }
 
@@ -300,13 +302,18 @@ export class DriverInstanceSocket {
       let remaining = events.slice(index, index + maxBatchSize);
 
       while (remaining.length > 0) {
-        const result = await this.#requireClient().driver.pushEvents(
-          {
-            driverInstanceId: this.payload.driverInstanceId,
-            events: remaining,
-          },
-          rpcOptions,
-        );
+        const send = (options: DriverRpcOptions) =>
+          this.#requireClient().driver.pushEvents(
+            {
+              driverInstanceId: this.payload.driverInstanceId,
+              events: remaining,
+            },
+            options,
+          );
+        const result =
+          delivery === "best_effort"
+            ? await send(rpcOptions)
+            : await this.#retryRpcTimeout(send, input.signal);
 
         assertDriverEventReceiptPrefix(
           remaining.map((envelope) => envelope.event),
@@ -494,6 +501,34 @@ export class DriverInstanceSocket {
     }
 
     return this.#client;
+  }
+
+  // Only use for receipt-deduplicated events and observational heartbeats.
+  // A timed-out request may already have committed; retain its exact payload/IDs.
+  async #retryRpcTimeout<T>(
+    operation: (options: DriverRpcOptions) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    this.#requireClient();
+    const connectionSignal = this.#rpcAbortController.signal;
+    for (let attempt = 0; ; attempt += 1) {
+      connectionSignal.throwIfAborted();
+      signal?.throwIfAborted();
+      const timeout = AbortSignal.timeout(DRIVER_RPC_TIMEOUT_MS);
+      try {
+        return await operation(this.#rpcOptions(signal, timeout));
+      } catch (error) {
+        if (
+          attempt >= 2 ||
+          !timeout.aborted ||
+          error !== timeout.reason ||
+          connectionSignal.aborted ||
+          signal?.aborted
+        ) {
+          throw error;
+        }
+      }
+    }
   }
 
   #rpcOptions(

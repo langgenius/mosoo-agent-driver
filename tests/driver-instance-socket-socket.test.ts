@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
+import { pushLosslessEvents } from "../src/core/driver-runtime-io";
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
@@ -593,6 +594,88 @@ describe("DriverInstanceSocket lifecycle", () => {
     const secondWire = PendingWebSocket.instances[1] as RpcWebSocket;
     expect(firstWire.paths.filter((sent) => sent === path)).toHaveLength(1);
     expect(secondWire.paths.filter((sent) => sent === path)).toHaveLength(1);
+  });
+
+  test("replays the identical lossless envelope after a lost acknowledgement", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.lostResponsePath = "/driver/pushEvents";
+    AbortSignal.timeout = (ms) => nativeAbortSignalTimeout(ms / 500);
+
+    const result = await pushLosslessEvents(socket, [
+      { kind: "message.completed", payload: { messageId: "message-1", stopReason: "end_turn" } },
+    ]);
+    const wire = PendingWebSocket.instances[0] as RpcWebSocket;
+    const requests = wire.requests.filter(({ path }) => path === "/driver/pushEvents");
+    expect(requests).toHaveLength(2);
+    expect(requests[1]!.input).toEqual(requests[0]!.input);
+    expect(result).toHaveLength(1);
+  });
+
+  test("recovers a heartbeat whose first reply was lost", async () => {
+    const socket = await connectRpcSocket();
+    RpcWebSocket.lostResponsePath = "/driver/heartbeat";
+    AbortSignal.timeout = () => nativeAbortSignalTimeout(20);
+    await expect(
+      socket.heartbeat({ at: new Date(0).toISOString(), reason: "interval" }),
+    ).resolves.toMatchObject({ ok: true });
+    const wire = PendingWebSocket.instances[0] as RpcWebSocket;
+    expect(wire.paths.filter((path) => path === "/driver/heartbeat")).toHaveLength(2);
+  });
+
+  test("bounds a permanently stalled event delivery to three attempts", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.stalledPath = "/driver/pushEvents";
+    AbortSignal.timeout = () => nativeAbortSignalTimeout(20);
+    await expect(
+      socket.pushEvents({
+        events: [
+          {
+            kind: "message.completed",
+            payload: { messageId: "message-1", stopReason: "end_turn" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+    const wire = PendingWebSocket.instances[0] as RpcWebSocket;
+    expect(wire.paths.filter((path) => path === "/driver/pushEvents")).toHaveLength(3);
+  });
+
+  test("does not retry lossless delivery after caller cancellation", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    RpcWebSocket.stalledPath = "/driver/pushEvents";
+    const controller = new AbortController();
+    const task = socket.pushEvents({
+      events: [
+        { kind: "message.completed", payload: { messageId: "message-1", stopReason: "end_turn" } },
+      ],
+      signal: controller.signal,
+    });
+    await RpcWebSocket.stalled.promise;
+    controller.abort(new Error("caller cancelled"));
+    await expect(task).rejects.toThrow("caller cancelled");
+    const wire = PendingWebSocket.instances[0] as RpcWebSocket;
+    expect(wire.paths.filter((path) => path === "/driver/pushEvents")).toHaveLength(1);
   });
 
   test("splits event delivery at the negotiated batch limit", async () => {
