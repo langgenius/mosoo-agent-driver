@@ -43,6 +43,7 @@ function hasNonzeroExecuteExit(kind: unknown, update: JsonObject | null): boolea
 export class AcpToolEventState {
   readonly #completed = new Set<string>();
   readonly #nonzeroExecuteExits = new Set<string>();
+  readonly #runningTitles = new Map<string, string>();
   readonly #snapshots = new Map<string, JsonObject>();
   readonly #started = new Set<string>();
 
@@ -57,6 +58,7 @@ export class AcpToolEventState {
   clear(): void {
     this.#completed.clear();
     this.#nonzeroExecuteExits.clear();
+    this.#runningTitles.clear();
     this.#snapshots.clear();
     this.#started.clear();
   }
@@ -69,7 +71,10 @@ export class AcpToolEventState {
   }): { changed: boolean; payload: JsonObject; status: RuntimeToolStatus } {
     const previous = this.#snapshots.get(input.toolCallId);
     const previousStatus = previous?.["status"];
-    const kind = readNonEmptyString(input.update, "kind") ?? previous?.["kind"] ?? "tool";
+    const kind =
+      readNonEmptyString(input.update, "kind") ??
+      readNonEmptyString(previous ?? null, "kind") ??
+      "tool";
     const nextStatus = input.status ?? "running";
 
     if (hasNonzeroExecuteExit(kind, input.update)) {
@@ -101,6 +106,16 @@ export class AcpToolEventState {
 
     if (changed) {
       this.#snapshots.set(input.toolCallId, structuredClone(payload));
+    }
+
+    // ACP titles are mutable display text (OpenCode replaces "bash" with the
+    // command once its input arrives). Keep the running heading stable for host
+    // tool identity, while retaining the latest title in the terminal snapshot.
+    if (status === "running") {
+      const title =
+        this.#runningTitles.get(input.toolCallId) ?? readNonEmptyString(payload, "title") ?? kind;
+      this.#runningTitles.set(input.toolCallId, title);
+      return { changed, payload: { ...payload, title }, status };
     }
 
     return { changed, payload, status };
