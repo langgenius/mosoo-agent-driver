@@ -36,6 +36,51 @@ function requireEvent(events: readonly DriverEventInput[], kind: string): Driver
 }
 
 describe("ACP runtime event translation", () => {
+  test("keeps permission tool updates on the running identity while preserving the permission title", () => {
+    const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    const started = state.translateUpdate({
+      update: {
+        kind: "execute",
+        sessionUpdate: "tool_call",
+        status: "pending",
+        title: "bash",
+        toolCallId: "tool-1",
+      },
+    });
+    const translation = state.translatePermission({
+      params: {
+        options: [{ kind: "allow_once", name: "Allow once", optionId: "allow" }],
+        toolCall: {
+          kind: "execute",
+          rawInput: { command: "ls /tmp/project" },
+          title: "Read project directory",
+          toolCallId: "tool-1",
+        },
+      },
+      requestId: "rpc-42",
+    });
+
+    expect(eventPayload(requireEvent(translation.events, "tool.call.updated"))).toMatchObject({
+      parentMessageId: eventPayloadString(
+        requireEvent(started, "tool.call.updated"),
+        "parentMessageId",
+      ),
+      rawInput: JSON.stringify({ command: "ls /tmp/project" }),
+      status: "running",
+      title: "bash",
+      toolCallId: "tool-1",
+    });
+    expect(translation.title).toBe("Read project directory");
+    expect(eventPayload(requireEvent(translation.events, "permission.requested"))).toMatchObject({
+      title: "Read project directory",
+    });
+    expect(translation.events.filter((event) => event.kind === "item.started")).toHaveLength(0);
+    expect(
+      eventPayload(requireEvent(state.completePrompt("cancelled", null), "tool.call.updated")),
+    ).toMatchObject({ status: "failed", title: "Read project directory" });
+  });
+
   test("starts permission tool calls through the turn event state", () => {
     const state = new AcpTurnEventState();
 

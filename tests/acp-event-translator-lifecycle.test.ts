@@ -421,6 +421,78 @@ describe("ACP runtime event translation", () => {
     expect(patchPayload).toMatchObject({ kind: "shell", title: "Run command" });
   });
 
+  test.each(["completed", "cancelled"] as const)(
+    "keeps running tool titles stable and the latest title when %s",
+    (terminalStatus) => {
+      const state = new AcpTurnEventState();
+      state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+      const started = state.translateUpdate({
+        update: {
+          kind: "execute",
+          rawInput: {},
+          sessionUpdate: "tool_call",
+          status: "pending",
+          title: "bash",
+          toolCallId: "tool-1",
+        },
+      });
+      const progress = state.translateUpdate({
+        update: {
+          rawInput: { command: "printf 'ok'" },
+          sessionUpdate: "tool_call_update",
+          status: "in_progress",
+          title: "printf 'ok'",
+          toolCallId: "tool-1",
+        },
+      });
+
+      for (const events of [started, progress]) {
+        expect(eventPayload(requireEvent(events, "tool.call.updated"))).toMatchObject({
+          status: "running",
+          title: "bash",
+          toolCallId: "tool-1",
+        });
+      }
+      expect(eventPayload(requireEvent(progress, "tool.call.updated"))).toMatchObject({
+        rawInput: JSON.stringify({ command: "printf 'ok'" }),
+      });
+
+      const terminal =
+        terminalStatus === "completed"
+          ? state.translateUpdate({
+              update: {
+                rawOutput: { output: "ok" },
+                sessionUpdate: "tool_call_update",
+                status: "completed",
+                toolCallId: "tool-1",
+              },
+            })
+          : state.completePrompt("cancelled", null);
+
+      expect(eventPayload(requireEvent(terminal, "tool.call.updated"))).toMatchObject({
+        rawInput: JSON.stringify({ command: "printf 'ok'" }),
+        status: terminalStatus === "completed" ? "completed" : "failed",
+        title: "printf 'ok'",
+        toolCallId: "tool-1",
+      });
+      expect(terminal.filter((event) => event.kind === "item.completed")).toHaveLength(1);
+
+      state.begin({ messageId: "message-2", runId: SECOND_RUN_ID, sessionId: "session-2" });
+      const nextTurn = state.translateUpdate({
+        update: {
+          kind: "read",
+          sessionUpdate: "tool_call",
+          status: "pending",
+          title: "Read README",
+          toolCallId: "tool-1",
+        },
+      });
+      expect(eventPayload(requireEvent(nextTurn, "tool.call.updated"))).toMatchObject({
+        title: "Read README",
+      });
+    },
+  );
+
   test.each([
     ["raw output", { rawOutput: { late: true } }, { rawOutput: expect.stringContaining("late") }],
     [
