@@ -296,7 +296,9 @@ export class AcpAssistantTranscriptState {
       return translation;
     }
 
-    this.#tools.patch({
+    const parentStart = this.#ensureToolParentMessage(translation.targetItemId);
+    const projected = this.#tools.patch({
+      parentMessageId: this.#toolParentMessageId(),
       status: toRuntimeToolStatus(readString(translation.toolCall, "status")),
       toolCallId: translation.targetItemId,
       update: translation.toolCall,
@@ -305,14 +307,16 @@ export class AcpAssistantTranscriptState {
     return {
       ...translation,
       events: [
-        ...this.#ensureToolParentMessage(translation.targetItemId),
+        ...parentStart,
         ...this.#tools.ensureStarted({
           parentMessageId: this.#toolParentMessageId(),
           runId,
-          title: translation.title,
+          title: readNonEmptyString(projected.payload, "title") ?? translation.title,
           toolCallId: translation.targetItemId,
         }),
-        ...translation.events,
+        ...translation.events.map((event) =>
+          event.kind === "tool.call.updated" ? { ...event, payload: projected.payload } : event,
+        ),
       ],
     };
   }
