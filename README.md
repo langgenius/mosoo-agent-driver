@@ -160,6 +160,20 @@ vp run clean
 
 `vp run build:image` uses Buildah to produce a local linux/amd64 `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
+Single-runtime hosts build the same Containerfile with `--build-arg RUNTIME=claude`,
+`openai`, or `opencode`. These profiles preinstall only the selected native CLI;
+the default `all` preserves existing consumers and the published all-runtime image.
+Bun, Node, Python, npm, and pip remain available in every profile. For Cloudflare
+Wrangler builds, set `image_vars = { RUNTIME = "claude" }` (or the matching profile)
+on the container class. Pin the chosen class with the workspace identity so
+restore and teardown cannot accidentally select a different Durable Object.
+No package installation occurs when selecting a profile at runtime.
+
+`/etc/mosoo/runtime` and the `ai.mosoo.runtime` image label identify the build.
+The build and PR checks run `scripts/runtime-image-check.mjs` inside every profile
+to verify the chosen CLI, absence of unrelated runtime packages, and shared tools.
+PR checks also install and execute a real npm and pip package in every image.
+
 The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 
 ## Boundaries
