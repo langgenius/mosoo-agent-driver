@@ -1,7 +1,7 @@
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
-import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiErrorMessage, toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
 import {
   OpenAiItemState,
@@ -21,7 +21,7 @@ import type {
 interface OpenAiAppServerEventBridgeOptions {
   beforeInterruptedTurn?(context: AgentDriverContext, turnId: string): Promise<void>;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
-  requireThreadId(): string;
+  getThreadId(): string | null;
 }
 
 function turnEventId(eventName: string, turnId: string): string {
@@ -178,9 +178,12 @@ export class OpenAiAppServerEventBridge {
     // mutations of the Mosoo Run attached to the root app-server thread. Root
     // collabAgentToolCall/subAgentActivity items still arrive on the root thread
     // and continue through the normal item projection below.
+    // Resume can replay historical turn notifications before its response
+    // establishes the root thread. They do not belong to a newly admitted Run.
+    const rootThreadId = this.#options.getThreadId();
     if (
       turnId !== null &&
-      readNonEmptyString(payload, "threadId") !== this.#options.requireThreadId()
+      (rootThreadId === null || readNonEmptyString(payload, "threadId") !== rootThreadId)
     ) {
       return;
     }
@@ -281,12 +284,16 @@ export class OpenAiAppServerEventBridge {
   }
 
   async publishNativeResumeRef(context: AgentDriverContext): Promise<void> {
+    const threadId = this.#options.getThreadId();
+    if (threadId === null) {
+      throw new Error("OpenAI runtime app-server thread is not initialized.");
+    }
     await this.#push(context, "driver.openai.native_resume_ref.updated", [
       {
         kind: "runtime.resume.updated",
         payload: {
-          resumePointer: this.#options.requireThreadId(),
-          threadId: this.#options.requireThreadId(),
+          resumePointer: threadId,
+          threadId,
         },
         visibility: "owner_debug",
       },
