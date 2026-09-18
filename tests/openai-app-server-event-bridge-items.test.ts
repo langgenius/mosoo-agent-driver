@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { createBufferedSinkLogger } from "../src/observability";
-import type { DriverEventInput } from "../src/protocol/events";
 import type { AgentDriverContext } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { createBufferedSinkLogger } from "../src/observability";
+import type { DriverEventInput } from "../src/protocol/events";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
 import { OpenAiTurnTracker } from "../src/runtimes/openai/app-server-turn-tracker";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
@@ -58,7 +58,7 @@ function createHarness(options: { failNativeResumePublish?: boolean; holdReason?
         throw new Error("event sink unavailable");
       }
     },
-    requireThreadId: () => "thread-1",
+    getThreadId: () => "thread-1",
   });
 
   return {

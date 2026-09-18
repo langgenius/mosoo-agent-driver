@@ -1,3 +1,4 @@
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { isDriverFullAccess } from "../../core/driver-permission-policy";
 import { pushLosslessEvents } from "../../core/driver-runtime-io";
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
@@ -12,7 +13,6 @@ import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
-import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildNativeRuntimeSystemPrompt,
@@ -172,7 +172,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       }
     },
     push: async (context, reason, events) => this.#eventPublisher.push(context, reason, events),
-    requireThreadId: () => this.#requireThreadId(),
+    getThreadId: () => this.#threadId,
   });
 
   constructor(payload: DriverStartInput) {

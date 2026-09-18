@@ -72,7 +72,7 @@ function createHarness(options: { failNativeResumePublish?: boolean; holdReason?
         throw new Error("event sink unavailable");
       }
     },
-    requireThreadId: () => "thread-1",
+    getThreadId: () => "thread-1",
   });
 
   return {
