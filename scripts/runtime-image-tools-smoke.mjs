@@ -8,13 +8,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const profile = (await readFile("/etc/mosoo/runtime", "utf8")).trim();
-const runtimes = profile === "all" ? ["claude", "openai", "opencode"] : [profile];
+const profiles = JSON.parse(await readFile("/etc/mosoo/runtime-images.json", "utf8"));
+const runtimes = profiles
+  .filter((entry) => profile === "all" || entry.profile === profile)
+  .map((entry) => entry.profile);
+assert.ok(runtimes.length > 0, `Unknown runtime image profile: ${profile}`);
 for (const runtime of runtimes) {
   const cwd = await mkdtemp(join(tmpdir(), "mosoo-native-image-"));
   await chmod(cwd, 0o777);
   const marker = join(cwd, "marker.txt");
-  const command = `printf 'native-tool-ok' > ${marker}`;
+  const command = `printf 'native-tool-ok' > ${marker}; cat ${marker}`;
   let called = false;
+  let receivedToolResult = false;
   let requests = 0;
   const server = createServer(async (req, res) => {
     try {
@@ -34,6 +39,31 @@ for (const runtime of runtimes) {
         return;
       }
       requests += 1;
+      // Auxiliary/title requests and prompt retries must not count as returning
+      // the tool result. Match the call id and stdout in the native protocol.
+      const toolResults = req.url.includes("messages")
+        ? (body.messages ?? []).flatMap((message) =>
+            Array.isArray(message.content)
+              ? message.content.filter(
+                  (item) => item.type === "tool_result" && item.tool_use_id === "tool_marker",
+                )
+              : [],
+          )
+        : req.url.includes("responses")
+          ? (Array.isArray(body.input) ? body.input : []).filter(
+              (item) => item.type === "function_call_output" && item.call_id === "call_marker",
+            )
+          : (body.messages ?? []).filter(
+              (message) => message.role === "tool" && message.tool_call_id === "call_marker",
+            );
+      if (
+        called &&
+        toolResults.some((result) =>
+          JSON.stringify(result.content ?? result.output).includes("native-tool-ok"),
+        )
+      ) {
+        receivedToolResult = true;
+      }
       const tool = body.tools?.find((entry) =>
         /^(Bash|bash|exec_command|shell_command|shell)$/.test(entry.name ?? entry.function?.name),
       );
@@ -247,7 +277,10 @@ for (const runtime of runtimes) {
         "native-tool-ok",
         `${runtime} (${requests} requests): ${output.slice(-8000)}`,
       );
-      assert.ok(requests >= 2, "Native runtime must return the tool result to the model");
+      assert.ok(
+        receivedToolResult,
+        "Native runtime must return the matching tool result to the model",
+      );
       console.log(
         `${runtime}: real native shell tool round trip passed (${requests} model fixture requests)`,
       );

@@ -3,26 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
 const profile = readFileSync("/etc/mosoo/runtime", "utf8").trim();
-const runtimes = [
-  {
-    profile: "claude",
-    command: "mosoo-claude-code",
-    package: "@anthropic-ai/claude-agent-sdk-linux-x64",
-    probe: ["--version"],
-  },
-  {
-    profile: "openai",
-    command: "codex",
-    package: "@openai/codex",
-    probe: ["app-server", "--help"],
-  },
-  {
-    profile: "opencode",
-    command: "opencode",
-    package: "opencode-linux-x64-baseline",
-    probe: ["acp", "--help"],
-  },
-];
+const runtimes = JSON.parse(readFileSync("/etc/mosoo/runtime-images.json", "utf8"));
 assert.ok(
   ["all", ...runtimes.map((runtime) => runtime.profile)].includes(profile),
   "Unknown runtime image profile",
