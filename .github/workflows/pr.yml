@@ -62,8 +62,14 @@ jobs:
       - name: Check
         run: vp run check
 
-      - name: Build image
-        run: buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .
-
-      - name: Test image environment
-        run: vp run test:image:environment
+      - name: Build and test runtime images
+        run: |
+          set -euo pipefail
+          for runtime in all claude openai opencode; do
+            buildah build --http-proxy=false --platform linux/amd64 \
+              --build-arg "RUNTIME=$runtime" -t "agent-driver:$runtime" .
+            podman run --pull=never --rm --entrypoint node "agent-driver:$runtime" \
+              /usr/local/libexec/mosoo/runtime-image-check.mjs
+            podman run --pull=never --rm --entrypoint node "agent-driver:$runtime" \
+              /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke
+          done

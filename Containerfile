@@ -28,27 +28,29 @@ COPY scripts/environment-package-manager-check.mjs /usr/local/libexec/mosoo/envi
 # failures surface while building the image rather than during a user Run.
 RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 
-# Native agent CLIs pre-installed so the driver can spawn them via PATH.
-# Installed in a single npm invocation to keep the agent packages in one layer.
-#
-# Package -> binary -> runtime:
-#   Claude native package                 -> claude           -> claude-agent-sdk
-#   OpenAI app-server package             -> OpenAI CLI       -> openai-runtime
-#   OpenCode baseline package             -> opencode         -> acp-fallback
-#   bun (bun-runtime stage)               -> bun              -> driver launcher
-#
-RUN npm install -g --ignore-scripts \
-      @anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION} \
-      opencode-linux-x64-baseline@${OPENCODE_VERSION} \
-      @openai/codex@${OPENAI_RUNTIME_VERSION} \
-    && ln -s /usr/local/lib/node_modules/opencode-linux-x64-baseline/bin/opencode /usr/local/bin/opencode \
-    && ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude /usr/local/bin/mosoo-claude-code \
-    && codex --version \
-    && codex app-server --help >/dev/null \
-    && opencode --version \
-    && opencode acp --help >/dev/null \
-    && mosoo-claude-code --version \
-    && rm -rf /root/.npm
+# One build definition, with common tool layers shared by every runtime. The
+# default preserves existing consumers; new single-runtime subjects select a
+# profile at build time, never install a runtime on the task startup path.
+ARG RUNTIME=all
+RUN set -eu; \
+    case "$RUNTIME" in all|claude|openai|opencode) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
+    if [ "$RUNTIME" = all ] || [ "$RUNTIME" = claude ]; then \
+      npm install -g --ignore-scripts @anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}; \
+      ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude /usr/local/bin/mosoo-claude-code; \
+    fi; \
+    if [ "$RUNTIME" = all ] || [ "$RUNTIME" = openai ]; then \
+      npm install -g --ignore-scripts @openai/codex@${OPENAI_RUNTIME_VERSION}; \
+    fi; \
+    if [ "$RUNTIME" = all ] || [ "$RUNTIME" = opencode ]; then \
+      npm install -g --ignore-scripts opencode-linux-x64-baseline@${OPENCODE_VERSION}; \
+      ln -s /usr/local/lib/node_modules/opencode-linux-x64-baseline/bin/opencode /usr/local/bin/opencode; \
+    fi; \
+    printf '%s\n' "$RUNTIME" > /etc/mosoo/runtime; \
+    rm -rf /root/.npm
+
+LABEL ai.mosoo.runtime="${RUNTIME}"
+COPY scripts/runtime-image-check.mjs /usr/local/libexec/mosoo/runtime-image-check.mjs
+RUN node /usr/local/libexec/mosoo/runtime-image-check.mjs
 
 ENV MOSOO_CLAUDE_CODE_EXECUTABLE=/usr/local/bin/mosoo-claude-code
 ENV MOSOO_ACP_FALLBACK_COMMAND=opencode
