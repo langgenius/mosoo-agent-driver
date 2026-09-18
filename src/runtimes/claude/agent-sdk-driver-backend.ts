@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 
 import { query, startup } from "@anthropic-ai/claude-agent-sdk";
-import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import {
@@ -44,14 +44,19 @@ import {
 import { buildClaudeRecoveryPrompt } from "./agent-sdk-recovery-context";
 import { readClaudeNativeResumeSessionId, requireClaudeNativeSessionId } from "./agent-sdk-resume";
 import { drainClaudeTasks } from "./agent-sdk-tasks";
+import { ClaudeStreamingQuery } from "./agent-sdk-streaming-query";
+import { waitForClaudeTranscript } from "./agent-sdk-transcript";
 
 interface ActiveClaudeTurn {
   abortController: AbortController;
+  readonly context: AgentDriverContext;
   cancelReason: string | null;
+  permissionDrainTask: Promise<void> | null;
   permissionTasks: Set<Promise<unknown>>;
   processTasks: Set<Promise<void>>;
   query: Query | null;
   queryCloseTask: Promise<void> | null;
+  stream: ClaudeStreamingQuery | null;
   runId: RunId;
   runSignal: AbortSignal | null;
   readonly settled: ReturnType<typeof Promise.withResolvers<void>>;
@@ -62,12 +67,14 @@ interface ClaudeAgentSdkDriverBackendDependencies {
   readonly createQueryOptions: typeof createClaudeQueryOptions;
   readonly query: typeof query;
   readonly startup: typeof startup;
+  readonly waitForTranscript: typeof waitForClaudeTranscript;
 }
 
 const DEFAULT_DEPENDENCIES: ClaudeAgentSdkDriverBackendDependencies = {
   createQueryOptions: createClaudeQueryOptions,
   query,
   startup,
+  waitForTranscript: waitForClaudeTranscript,
 };
 
 const CLAUDE_QUERY_RETURN_TIMEOUT_MS = 2_500;
@@ -92,6 +99,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #pendingProcessTasks = new Set<Promise<void>>();
   readonly #prewarm: ClaudeAgentSdkPrewarm;
   #activeTurn: ActiveClaudeTurn | null = null;
+  #idleTurn: ActiveClaudeTurn | null = null;
   #nativeSessionId: string | null = null;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
@@ -200,21 +208,27 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       this.#nativeSessionId === null ? this.#payload.execution.session.recoveryMessages : [];
     const promptText = buildClaudeRecoveryPrompt(recoveryMessages, input.text);
 
-    const { abortController, permissionTasks, processTasks, warmQuery } = this.#prewarm.take();
+    const idleTurn = this.#idleTurn;
+    this.#idleTurn = null;
+    const { abortController, permissionTasks, processTasks, warmQuery } =
+      idleTurn === null ? this.#prewarm.take() : { ...idleTurn, warmQuery: null };
     const activeTurn: ActiveClaudeTurn = {
       abortController,
+      context,
       cancelReason: null,
+      permissionDrainTask: null,
       permissionTasks,
       processTasks,
-      query: null,
+      query: idleTurn?.query ?? null,
       queryCloseTask: null,
+      stream: idleTurn?.stream ?? null,
       runId,
       runSignal: signal ?? null,
       settled: Promise.withResolvers<void>(),
       state: "running",
     };
     this.#activeTurn = activeTurn;
-    const turnSignal =
+    let turnSignal =
       activeTurn.runSignal === null
         ? activeTurn.abortController.signal
         : AbortSignal.any([activeTurn.abortController.signal, activeTurn.runSignal]);
@@ -241,21 +255,77 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
       }
 
-      let activeQuery: Query;
+      let activeQuery: AsyncIterator<SDKMessage>;
 
       try {
-        if (warmQuery !== null) {
-          activeQuery = warmQuery.query(promptText);
+        if (
+          activeTurn.stream !== null &&
+          (!activeTurn.stream.reusable || idleTurn?.context !== context)
+        ) {
+          // An idle EOF/crash is recoverable through the last durable native cursor.
+          await this.#closeQuery(context, activeTurn, "session.exited");
+          if (isTurnCancelled(activeTurn) || this.#stopRequested) {
+            throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
+          }
+          Object.assign(activeTurn, {
+            abortController: new AbortController(),
+            permissionDrainTask: null,
+            permissionTasks: new Set<Promise<unknown>>(),
+            processTasks: new Set<Promise<void>>(),
+            query: null,
+            queryCloseTask: null,
+            stream: null,
+          });
+          turnSignal =
+            signal === undefined
+              ? activeTurn.abortController.signal
+              : AbortSignal.any([activeTurn.abortController.signal, signal]);
+        }
+        const streamInput = this.#canReuseQuery();
+        const createQuery = (create: (prompt: string | AsyncIterable<SDKUserMessage>) => Query) => {
+          if (!streamInput) {
+            activeTurn.query = create(promptText);
+            return activeTurn.query;
+          }
+          activeTurn.stream = new ClaudeStreamingQuery({
+            createQuery: create,
+            onFailure: (error) => {
+              context.logger.debug("driver.claude.session.reader_failed", {
+                message: toErrorMessage(error, "Claude session reader failed."),
+              });
+              activeTurn.abortController.abort(error);
+            },
+            onIdleMessage: async (message) => {
+              if (message.type === "conversation_reset") {
+                await this.#replaceNativeSessionId(
+                  context,
+                  message.session_id,
+                  message.new_conversation_id,
+                  true,
+                );
+              } else {
+                context.logger.debug("driver.claude.session.idle_message", { type: message.type });
+              }
+            },
+          });
+          activeTurn.processTasks.add(activeTurn.stream.finished);
+          activeTurn.query = activeTurn.stream.query;
+          return activeTurn.stream.submit(promptText);
+        };
+        if (activeTurn.stream !== null) {
+          activeQuery = activeTurn.stream.submit(promptText);
+        } else if (warmQuery !== null) {
+          activeQuery = createQuery((prompt) => warmQuery.query(prompt));
         } else {
           const optionsStartedAtMs = Date.now();
           const queryOptions = await raceWithAbort(
             this.#dependencies.createQueryOptions({
-              abortController,
+              abortController: activeTurn.abortController,
               context,
               nativeSessionId: this.#nativeSessionId,
               payload: this.#payload,
-              permissionTasks,
-              processTasks,
+              permissionTasks: activeTurn.permissionTasks,
+              processTasks: activeTurn.processTasks,
               publicToolCallId: (nativeToolCallId) =>
                 toRuntimePublicId(nativeToolCallId, "claude-tool"),
             }),
@@ -267,13 +337,14 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
             throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
           }
 
-          activeQuery = this.#dependencies.query({
-            options: queryOptions,
-            prompt: promptText,
-          });
+          activeQuery = createQuery((prompt) =>
+            this.#dependencies.query({
+              options: queryOptions,
+              prompt,
+            }),
+          );
         }
 
-        activeTurn.query = activeQuery;
         if (isTurnCancelled(activeTurn)) {
           await this.#closeQuery(context, activeTurn, turnCancellationReason(activeTurn));
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
@@ -309,6 +380,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       const queryCreateMs = Date.now() - queryStartedAtMs;
       context.logger.info("driver.claude.prompt.sending", {
         nativeSessionIdPresent: Boolean(this.#nativeSessionId),
+        queryReused: idleTurn !== null && activeTurn.stream === idleTurn.stream,
         recoveryMessageCount: recoveryMessages.length,
         textLength: promptText.length,
       });
@@ -403,7 +475,51 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         throw new Error("Claude Agent SDK query ended before a result frame.");
       }
 
-      await this.#closeQuery(context, activeTurn, "provider.result");
+      activeTurn.stream?.throwIfFailed();
+      if (activeTurn.stream?.reusable && preparedResult.terminal.kind === "run.completed") {
+        activeTurn.permissionDrainTask = drainClaudeTasks(activeTurn.permissionTasks);
+        await activeTurn.permissionDrainTask;
+        const persisted = await this.#dependencies
+          .waitForTranscript(
+            resolveClaudeConfigDir(this.#payload),
+            activeTurn.stream.transcriptCursor,
+            turnSignal,
+          )
+          .catch((error: unknown) => {
+            // Cancellation after result selection closes/flushes the query but
+            // retains that result, as on the original one-shot path.
+            if (
+              activeTurn.queryCloseTask !== null &&
+              activeTurn.abortController.signal.aborted &&
+              !isTurnCancelled(activeTurn)
+            )
+              return false;
+            throw error;
+          });
+        if (!persisted) {
+          context.logger.debug("driver.claude.session.transcript_unconfirmed", {});
+          activeTurn.stream.closeInput();
+          if (activeTurn.queryCloseTask === null) {
+            // EOF flushes the CLI transcript. Do not kill the process before
+            // that graceful drain when persistence could not be confirmed.
+            const drained = await settlePromiseWithTimeout(activeTurn.stream.finished, {
+              label: "Claude transcript drain",
+              timeoutMs: CLAUDE_QUERY_RETURN_TIMEOUT_MS,
+            });
+            if (drained.status !== "completed") throw drained.error;
+            activeTurn.stream.throwIfFailed();
+          }
+        }
+      }
+      if (
+        !activeTurn.stream?.reusable ||
+        preparedResult.terminal.kind !== "run.completed" ||
+        activeTurn.queryCloseTask !== null ||
+        activeTurn.abortController.signal.aborted ||
+        this.#stopRequested
+      ) {
+        await this.#closeQuery(context, activeTurn, "provider.result");
+      }
       terminalOutcome = await this.#messageTranslator.publishPreparedResult(
         context,
         preparedResult,
@@ -447,10 +563,23 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       );
       throw error;
     } finally {
+      const retainQuery =
+        terminalOutcome?.kind === "run.completed" &&
+        activeTurn.stream?.reusable === true &&
+        activeTurn.queryCloseTask === null &&
+        !activeTurn.abortController.signal.aborted &&
+        !this.#stopRequested;
       try {
-        await this.#closeQuery(context, activeTurn, "turn.finished");
+        if (retainQuery) {
+          this.#idleTurn = activeTurn;
+          activeTurn.stream?.releaseTurn();
+        } else {
+          await this.#closeQuery(context, activeTurn, "turn.finished");
+        }
       } finally {
-        this.#retainProcessTasks(activeTurn);
+        if (!retainQuery) {
+          this.#retainProcessTasks(activeTurn);
+        }
         if (this.#activeTurn === activeTurn) {
           this.#activeTurn = null;
         }
@@ -513,6 +642,19 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const activeTurn = this.#activeTurn;
     const prewarmStop = this.#prewarm.stop(context, reason, signal);
+    const idleTurn = this.#idleTurn;
+    const idleCleanup =
+      idleTurn === null
+        ? Promise.resolve()
+        : raceWithAbort(
+            this.#closeQuery(context, idleTurn, reason).finally(() => {
+              this.#retainProcessTasks(idleTurn);
+              if (this.#idleTurn === idleTurn) {
+                this.#idleTurn = null;
+              }
+            }),
+            signal,
+          );
     const activeCleanup =
       activeTurn === null
         ? Promise.resolve()
@@ -529,10 +671,11 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
             })(),
             signal,
           );
-    const [activeResult, prewarmResult, pendingResult] = await Promise.allSettled([
+    const [activeResult, prewarmResult, pendingResult, idleResult] = await Promise.allSettled([
       activeCleanup,
       prewarmStop,
       raceWithAbort(drainClaudeTasks(this.#pendingProcessTasks), signal),
+      idleCleanup,
     ]);
 
     if (activeResult.status === "rejected") {
@@ -546,6 +689,19 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     if (pendingResult.status === "rejected") {
       throw pendingResult.reason;
     }
+    if (idleResult.status === "rejected") {
+      throw idleResult.reason;
+    }
+  }
+
+  #canReuseQuery(): boolean {
+    // These SDK limits belong to a query/process. Keep the existing per-Run budgets.
+    const options = this.#payload.execution.providerOptions;
+    return (
+      options["maxBudgetUsd"] === undefined &&
+      options["maxTurns"] === undefined &&
+      options["taskBudget"] === undefined
+    );
   }
 
   #retainProcessTasks(turn: ActiveClaudeTurn): void {
@@ -582,6 +738,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     context: AgentDriverContext,
     previousSessionId: string,
     nextSessionId: string,
+    sessionScoped = false,
   ): Promise<void> {
     requireClaudeNativeSessionId(previousSessionId);
     requireClaudeNativeSessionId(nextSessionId);
@@ -597,7 +754,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     const retainedSessionId = this.#nativeSessionId;
     this.#nativeSessionId = nextSessionId;
     try {
-      await this.#publishNativeResumeRef(context, nextSessionId);
+      await this.#publishNativeResumeRef(context, nextSessionId, sessionScoped);
     } catch (error) {
       if (this.#nativeSessionId === nextSessionId) {
         this.#nativeSessionId = retainedSessionId;
@@ -612,6 +769,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     reason: string,
   ): Promise<void> {
     if (turn.queryCloseTask === null) {
+      turn.stream?.closeInput();
       const query = turn.query;
       turn.queryCloseTask = (async () => {
         if (query !== null) {
@@ -643,7 +801,15 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           }
         }
 
-        await drainClaudeTasks(turn.permissionTasks, turn.processTasks);
+        const cleanup = await Promise.allSettled([
+          turn.permissionDrainTask,
+          drainClaudeTasks(turn.permissionTasks, turn.processTasks),
+        ]);
+        for (const result of cleanup) {
+          if (result.status === "rejected") {
+            throw result.reason;
+          }
+        }
       })();
     }
 
@@ -653,10 +819,12 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   async #publishNativeResumeRef(
     context: AgentDriverContext,
     nativeSessionId: string,
+    sessionScoped = false,
   ): Promise<void> {
     await this.#push(context, "driver.claude.native_resume_ref.updated", [
       {
         kind: "runtime.resume.updated",
+        ...(sessionScoped ? { runId: null } : {}),
         payload: {
           resumePointer: nativeSessionId,
           threadId: null,

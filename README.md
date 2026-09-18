@@ -85,6 +85,14 @@ The Contract is the vendor-neutral state and control boundary between the host a
 
 Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qualified ISO 8601 strings with UTC as the default.
 
+Claude keeps a streaming-input query alive between successful turns without tool activity. This avoids restarting the native CLI and reloading its session on each follow-up. The retained process belongs to one Driver session and is reaped on stop; it adds one resident CLI while the session is idle. SDK cumulative usage is converted to per-Run increments, and idle process failure falls back to native session resume on the next input.
+
+Tool turns still drain the SDK to EOF and join process-tree cleanup before their terminal event, preserving background-command and trailing resource-event handling. Cancellation and failures also recycle the process. Explicit `maxBudgetUsd`, `maxTurns`, or `taskBudget` options retain the single-query path so their existing per-Run limits are unchanged.
+
+Before publishing a reusable turn's completion, the Driver confirms its final assistant record is present in the local transcript so a host checkpoint includes the new conversation. The check reads at most 64 KiB per poll for up to one second; unsupported transcript layouts, oversized records, or unconfirmed writes fall back to closing and draining the query. This confirmation happens after streamed text, preserving first-text latency.
+
+On Linux, `AGENT_DRIVER_NATIVE_CLAUDE=1 bun test tests/claude-agent-sdk-native-session.test.ts` exercises the real native Claude binary against a loopback model fixture, including process reuse, Bash execution, cancellation cleanup, and resume. It requires no provider credentials and prints one-shot/persistent first-text timings; those local timings exclude real model and network latency. Set `MOSOO_CLAUDE_CODE_EXECUTABLE` when using a separately installed native binary.
+
 ## Quick Start
 
 `@mosoo/agent-driver` targets [Bun](https://bun.sh), with [Vite+](https://viteplus.dev) as the development toolchain and command entry point.

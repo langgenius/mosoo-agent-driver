@@ -135,13 +135,22 @@ function createHarness(
   const events: DriverEventInput[] = [];
   let currentRunId: RunId | null = null;
   let seq = 0;
-  const payload =
+  const basePayload =
     payloadOverride ??
     ({
       ...bootPayload,
       runtime: "claude-agent-sdk",
       runtimeTransport: "claude-agent-sdk",
     } as DriverStartInput);
+  // Exercise the one-shot lifecycle retained for explicit per-Run budgets.
+  // Persistent input/reader ownership is covered in the streaming backend suite.
+  const payload = {
+    ...basePayload,
+    execution: {
+      ...basePayload.execution,
+      providerOptions: { ...basePayload.execution.providerOptions, maxBudgetUsd: 1 },
+    },
+  };
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => currentRunId,
@@ -1508,6 +1517,11 @@ describe("Claude Agent SDK driver backend", () => {
       const backend = new ClaudeAgentSdkDriverBackend(
         {
           ...bootPayload,
+          execution: {
+            ...bootPayload.execution,
+            // Only the budgeted one-shot path waits for cleanup on successful results.
+            providerOptions: window === "query cleanup" ? { maxBudgetUsd: 1 } : {},
+          },
           runtime: "claude-agent-sdk",
           runtimeTransport: "claude-agent-sdk",
         } as DriverStartInput,
