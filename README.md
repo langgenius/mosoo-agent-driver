@@ -173,6 +173,9 @@ No package installation occurs when selecting a profile at runtime.
 The build and PR checks run `scripts/runtime-image-check.mjs` inside every profile
 to verify the chosen CLI, absence of unrelated runtime packages, and shared tools.
 PR checks also install and execute a real npm and pip package in every image.
+They run the selected native CLI through a real shell tool round trip against a
+deterministic loopback model fixture with external networking disabled. This
+checks executable behavior, not model quality or production TTFT.
 
 The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 

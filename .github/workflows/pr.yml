@@ -72,4 +72,7 @@ jobs:
               /usr/local/libexec/mosoo/runtime-image-check.mjs
             podman run --pull=never --rm --entrypoint node "agent-driver:$runtime" \
               /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke
+            podman run --pull=never --rm --network none \
+              -v "$PWD/scripts:/checks:ro" --entrypoint node "agent-driver:$runtime" \
+              /checks/runtime-image-tools-smoke.mjs
           done
