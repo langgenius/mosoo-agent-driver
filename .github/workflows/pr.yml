@@ -65,7 +65,7 @@ jobs:
       - name: Build and test runtime images
         run: |
           set -euo pipefail
-          for runtime in all claude openai opencode; do
+          for runtime in all $(node -e "for (const image of require('./runtime-images.json')) console.log(image.profile)"); do
             buildah build --http-proxy=false --platform linux/amd64 \
               --build-arg "RUNTIME=$runtime" -t "agent-driver:$runtime" .
             podman run --pull=never --rm --entrypoint node "agent-driver:$runtime" \

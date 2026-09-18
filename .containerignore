@@ -1,6 +1,7 @@
 *
 !Containerfile
 !environment-package-managers.json
+!runtime-images.json
 !scripts/
 !scripts/environment-package-manager-check.mjs
 !scripts/runtime-image-check.mjs

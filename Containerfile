@@ -32,6 +32,7 @@ RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 # default preserves existing consumers; new single-runtime subjects select a
 # profile at build time, never install a runtime on the task startup path.
 ARG RUNTIME=all
+COPY runtime-images.json /etc/mosoo/runtime-images.json
 RUN set -eu; \
     case "$RUNTIME" in all|claude|openai|opencode) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = claude ]; then \

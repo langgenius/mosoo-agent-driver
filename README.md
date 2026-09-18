@@ -177,6 +177,16 @@ They run the selected native CLI through a real shell tool round trip against a
 deterministic loopback model fixture with external networking disabled. This
 checks executable behavior, not model quality or production TTFT.
 
+When integrating a runtime, add its backend and protocol entry together with an
+entry in `runtime-images.json`, its Containerfile installation, and a native
+tool fixture in `scripts/runtime-image-tools-smoke.mjs`. The manifest drives
+the CI image loop and in-image presence checks; the unit gate requires exact
+coverage of both admitted runtimes and executable backends. A new profile must
+build alone and in `all`, omit unrelated CLIs, keep shared tools, and return a
+real shell result to the model fixture. Hosts add their runtime-to-namespace
+mapping, DO exports, bindings, and additive migrations in the same integration.
+Existing workspace bindings remain immutable.
+
 The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 
 ## Boundaries
