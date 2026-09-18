@@ -160,6 +160,33 @@ vp run clean
 
 `vp run build:image` uses Buildah to produce a local linux/amd64 `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
+Single-runtime hosts build the same Containerfile with `--build-arg RUNTIME=claude`,
+`openai`, or `opencode`. These profiles preinstall only the selected native CLI;
+the default `all` preserves existing consumers and the published all-runtime image.
+Bun, Node, Python, npm, and pip remain available in every profile. For Cloudflare
+Wrangler builds, set `image_vars = { RUNTIME = "claude" }` (or the matching profile)
+on the container class. Pin the chosen class with the workspace identity so
+restore and teardown cannot accidentally select a different Durable Object.
+No package installation occurs when selecting a profile at runtime.
+
+`/etc/mosoo/runtime` and the `ai.mosoo.runtime` image label identify the build.
+The build and PR checks run `scripts/runtime-image-check.mjs` inside every profile
+to verify the chosen CLI, absence of unrelated runtime packages, and shared tools.
+PR checks also install and execute a real npm and pip package in every image.
+They run the selected native CLI through a real shell tool round trip against a
+deterministic loopback model fixture with external networking disabled. This
+checks executable behavior, not model quality or production TTFT.
+
+When integrating a runtime, add its backend and protocol entry together with an
+entry in `runtime-images.json`, its Containerfile installation, and a native
+tool fixture in `scripts/runtime-image-tools-smoke.mjs`. The manifest drives
+the CI image loop and in-image presence checks; the unit gate requires exact
+coverage of both admitted runtimes and executable backends. A new profile must
+build alone and in `all`, omit unrelated CLIs, keep shared tools, and return a
+real shell result to the model fixture. Hosts add their runtime-to-namespace
+mapping, DO exports, bindings, and additive migrations in the same integration.
+Existing workspace bindings remain immutable.
+
 The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
 
 ## Boundaries

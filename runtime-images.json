@@ -1,0 +1,23 @@
+[
+  {
+    "runtimeId": "claude-agent-sdk",
+    "profile": "claude",
+    "command": "mosoo-claude-code",
+    "package": "@anthropic-ai/claude-agent-sdk-linux-x64",
+    "probe": ["--version"]
+  },
+  {
+    "runtimeId": "openai-runtime",
+    "profile": "openai",
+    "command": "codex",
+    "package": "@openai/codex",
+    "probe": ["app-server", "--help"]
+  },
+  {
+    "runtimeId": "acp-fallback",
+    "profile": "opencode",
+    "command": "opencode",
+    "package": "opencode-linux-x64-baseline",
+    "probe": ["acp", "--help"]
+  }
+]
