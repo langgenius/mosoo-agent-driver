@@ -237,7 +237,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       );
       const setup = await withAcpStartupStage(
         "ACP session setup",
-        () => this.#setupSession(signal),
+        () => this.#setupSession(context, signal),
         signal,
       );
 
@@ -572,7 +572,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
     }
   }
 
-  async #setupSession(signal: AbortSignal): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
+  async #setupSession(
+    context: AgentDriverContext,
+    signal: AbortSignal,
+  ): Promise<Awaited<ReturnType<typeof setupAcpSession>>> {
     const hostSnapshot = this.#requireHostSnapshot();
     signal.throwIfAborted();
     const setup = await raceWithAbort(
@@ -588,6 +591,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     );
     signal.throwIfAborted();
     this.#nativeSessionId = setup.sessionId;
+    await raceWithAbort(this.#clientRequests.applySetupDeferredUpdates(context), signal);
     await raceWithAbort(this.#clientRequests.drainUpdates(), signal);
 
     return setup;

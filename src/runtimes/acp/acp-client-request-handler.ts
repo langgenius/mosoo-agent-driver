@@ -29,6 +29,8 @@ import { AcpSessionUpdateInbox, type AcpSessionUpdateScope } from "./acp-session
 import { AcpTerminalManager } from "./acp-terminal-manager";
 import { isRecord, raceWithAbort, readNonEmptyString, stringifyForDisplay } from "./acp-types";
 
+const MAX_SETUP_DEFERRED_UPDATES = 1_024;
+
 interface AcpClientRequestHandlerOptions {
   readonly allowedRoots: readonly string[];
   readonly cwd: string;
@@ -45,6 +47,10 @@ export class AcpClientRequestHandler {
   readonly #isCancelling: () => boolean;
   readonly #nativeSessionId: () => string | null;
   readonly #push: AcpClientRequestHandlerOptions["push"];
+  #setupDeferredUpdates: {
+    readonly notification: SessionNotification;
+    readonly scope: AcpSessionUpdateScope;
+  }[] = [];
   #stopping = false;
   readonly #updateInbox: AcpSessionUpdateInbox;
   readonly #terminalManager: AcpTerminalManager;
@@ -183,6 +189,27 @@ export class AcpClientRequestHandler {
     await this.#updateInbox.drain();
   }
 
+  async applySetupDeferredUpdates(context: AgentDriverContext): Promise<void> {
+    while (this.#setupDeferredUpdates.length > 0) {
+      const deferred = this.#setupDeferredUpdates;
+      this.#setupDeferredUpdates = [];
+
+      for (const entry of deferred) {
+        const record = isRecord(entry.notification) ? entry.notification : null;
+        const sessionId = readNonEmptyString(record, "sessionId");
+
+        if (sessionId === null || sessionId !== this.#nativeSessionId()) {
+          context.logger.warn("driver.acp.session.update.setup_mismatch_dropped", {
+            expectedSessionPresent: this.#nativeSessionId() !== null,
+          });
+          continue;
+        }
+
+        await this.#applyUpdate(context, entry.notification, entry.scope);
+      }
+    }
+  }
+
   async withSessionReplay<T>(operation: () => Promise<T>): Promise<T> {
     return this.#updateInbox.withReplay(operation);
   }
@@ -237,6 +264,19 @@ export class AcpClientRequestHandler {
     params: SessionNotification,
     scope: AcpSessionUpdateScope,
   ): Promise<void> {
+    // Some ACP agents (the OpenClaw Gateway bridge) notify session/update for
+    // a newly created session before the session/new response arrives. No
+    // session id is registered yet, so hold those updates instead of failing
+    // the transport; setup applies them right after the id registers.
+    if (this.#nativeSessionId() === null) {
+      if (this.#setupDeferredUpdates.length >= MAX_SETUP_DEFERRED_UPDATES) {
+        throw new Error("ACP session update queue limit exceeded.");
+      }
+
+      this.#setupDeferredUpdates.push({ notification: params, scope });
+      return;
+    }
+
     this.#assertSession("session/update", params);
 
     if (scope.suppressed && shouldIgnoreReplay(params)) {

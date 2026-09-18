@@ -15,7 +15,7 @@ export type AcpAgentProcess = ChildProcessByStdio<Writable, Readable, Readable>;
 
 const ACP_AGENT_EXIT_TIMEOUT_MS = 1_500;
 const ACP_AGENT_FORCE_KILL_TIMEOUT_MS = 500;
-const agentProcessCloseTasks = new WeakMap<AcpAgentProcess, Promise<void>>();
+const agentProcessExitTasks = new WeakMap<AcpAgentProcess, Promise<void>>();
 
 export async function startAcpAgentProcess(
   context: AgentDriverContext,
@@ -52,15 +52,19 @@ export async function startAcpAgentProcess(
   });
   const onAbort = () => killProcessGroup(agentProcess, "SIGKILL");
   signal.addEventListener("abort", onAbort, { once: true });
-  agentProcessCloseTasks.set(
-    agentProcess,
-    new Promise<void>((resolve) =>
-      agentProcess.once("close", () => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }),
-    ),
-  );
+  // Stdio "close" is not a reliable exit signal: the ACP transport keeps the
+  // child's stdout locked behind web-stream readers, so "close" can stay
+  // pending after the process itself is gone. Observe "exit" as well.
+  const exited = Promise.withResolvers<void>();
+  const onExit = () => {
+    agentProcess.off("exit", onExit);
+    agentProcess.off("close", onExit);
+    signal.removeEventListener("abort", onAbort);
+    exited.resolve();
+  };
+  agentProcess.once("exit", onExit);
+  agentProcess.once("close", onExit);
+  agentProcessExitTasks.set(agentProcess, exited.promise);
 
   agentProcess.stderr.setEncoding("utf8");
   agentProcess.stderr.on("data", (chunk: string) => {
@@ -144,13 +148,17 @@ async function waitForChildProcessExit(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const closed = agentProcessCloseTasks.get(process);
-
-  if (closed === undefined) {
-    return process.exitCode !== null || process.signalCode !== null;
+  if (process.exitCode !== null || process.signalCode !== null) {
+    return true;
   }
 
-  const result = await settlePromiseWithTimeout(closed, {
+  const exited = agentProcessExitTasks.get(process);
+
+  if (exited === undefined) {
+    return false;
+  }
+
+  const result = await settlePromiseWithTimeout(exited, {
     label: "ACP agent process exit",
     ...(signal === undefined ? {} : { signal }),
     timeoutMs,
@@ -161,7 +169,7 @@ async function waitForChildProcessExit(
   }
 
   if (result.status === "timed_out") {
-    return false;
+    return process.exitCode !== null || process.signalCode !== null;
   }
 
   throw result.error;
