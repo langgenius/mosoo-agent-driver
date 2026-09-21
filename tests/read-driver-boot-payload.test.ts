@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { readDriverBootPayload } from "../src/boot/read-driver-boot-payload";
 import { parseDriverBootPayload } from "../src/protocol/boot";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import { parseDriverHelloInput } from "../src/protocol/orpc";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
@@ -62,7 +63,7 @@ describe("readDriverBootPayload", () => {
     },
   );
 
-  test.each([1, 2, 3])("rejects protocol %s during the Driver handshake", (version) => {
+  test.each([1, 2, 3, 4])("rejects protocol %s during the Driver handshake", (version) => {
     expect(() =>
       parseDriverHelloInput({
         capabilities: [],
@@ -72,7 +73,41 @@ describe("readDriverBootPayload", () => {
         runtime: "openai-runtime",
         startedAt: "now",
       }),
-    ).toThrow("protocolVersion must be 4");
+    ).toThrow("protocolVersion must be 5");
+  });
+
+  test("preserves an explicit absent Agent preset through boot and host integration", () => {
+    const parsed = parseDriverBootPayload({
+      ...payload,
+      execution: {
+        ...payload.execution,
+        configRevision: {
+          ...payload.execution.configRevision,
+          agentId: null,
+          deploymentVersionId: null,
+          deploymentVersionNumber: null,
+        },
+      },
+    });
+    expect(parsed.execution.configRevision.agentId).toBeNull();
+    const hostSnapshot = createDriverHostIntegrationSnapshotFromBootExecution(parsed.execution);
+    expect(hostSnapshot.configRevision.agentId).toBeNull();
+  });
+
+  test("rejects a deployment revision attached to an absent Agent preset", () => {
+    expect(() =>
+      parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          configRevision: {
+            ...payload.execution.configRevision,
+            agentId: null,
+            deploymentVersionNumber: 1,
+          },
+        },
+      }),
+    ).toThrow("deployment revision requires an Agent preset");
   });
 
   test("reads the boot payload from a file and removes it", async () => {
