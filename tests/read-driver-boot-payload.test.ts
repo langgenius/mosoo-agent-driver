@@ -62,7 +62,7 @@ describe("readDriverBootPayload", () => {
     },
   );
 
-  test.each([1, 2])("rejects protocol %s during the Driver handshake", (version) => {
+  test.each([1, 2, 3])("rejects protocol %s during the Driver handshake", (version) => {
     expect(() =>
       parseDriverHelloInput({
         capabilities: [],
@@ -72,7 +72,7 @@ describe("readDriverBootPayload", () => {
         runtime: "openai-runtime",
         startedAt: "now",
       }),
-    ).toThrow("protocolVersion must be 3");
+    ).toThrow("protocolVersion must be 4");
   });
 
   test("reads the boot payload from a file and removes it", async () => {
