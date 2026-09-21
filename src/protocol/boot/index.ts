@@ -44,11 +44,11 @@ export type {
 } from "./host-snapshot";
 
 /**
- * Version 2 requires the durable external-tool-effect RPCs. Refusing an older
- * Driver is safer than letting it invoke an MCP tool without the persistence
- * fence during a rolling deployment.
+ * Version 3 also enforces the host's native-continuation requirement. Older
+ * Drivers must not silently replace checkpointed native state during a rolling
+ * deployment. Version 2 introduced the durable external-tool-effect RPCs.
  */
-export const DRIVER_PROTOCOL_VERSION = 2;
+export const DRIVER_PROTOCOL_VERSION = 3;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";
@@ -164,6 +164,8 @@ export interface DriverExecutionSessionSpec {
   readonly cwd: string;
   readonly mcpServers: DriverBootMcpServer[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
+  /** Never replace an existing native context with a new conversation. */
+  readonly nativeResumeRequired?: boolean | undefined;
   readonly recoveryMessages: DriverRecoveryMessage[];
 }
 
@@ -446,6 +448,10 @@ function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
       readBootMcpServer,
     ),
     nativeResumeRef: readNativeRuntimeRef(record["nativeResumeRef"]),
+    nativeResumeRequired:
+      record["nativeResumeRequired"] === undefined
+        ? false
+        : readBoolean(record["nativeResumeRequired"], "execution.session.nativeResumeRequired"),
     recoveryMessages,
   };
 }

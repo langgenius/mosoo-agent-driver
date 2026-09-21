@@ -1,10 +1,8 @@
 import type { DriverRecoveryMessage } from "../../protocol/boot";
 
-// A Claude Agent SDK session lives inside the provider process; after a
-// sandbox or driver restart there is no native rollout to resume, so the
-// platform sends a bounded window of prior platform conversation instead.
-// The replay is wrapped in an explicit block so the model reads it as prior
-// context rather than as new instructions to execute.
+// Only hosts without a native reference use this bounded text fallback.
+// Checkpointed Claude transcripts resume natively; this replay is not equivalent
+// to preserving that state. Delimit it as prior context, not new instructions.
 export function buildClaudeRecoveryPrompt(
   recoveryMessages: readonly DriverRecoveryMessage[],
   text: string,

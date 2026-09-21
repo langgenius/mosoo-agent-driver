@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { readDriverBootPayload } from "../src/boot/read-driver-boot-payload";
+import { parseDriverBootPayload } from "../src/protocol/boot";
+import { parseDriverHelloInput } from "../src/protocol/orpc";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   DRIVER_BOOT_PAYLOAD_ENV_NAME,
   DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME,
@@ -28,6 +31,50 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
+  test.each([undefined, false, true])(
+    "preserves the host native continuation requirement: %s",
+    (required) => {
+      const parsed = parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: { ...payload.execution.session, nativeResumeRequired: required },
+        },
+      });
+      expect(
+        createDriverStartInputFromBootPayload(parsed).execution.session.nativeResumeRequired,
+      ).toBe(required ?? false);
+    },
+  );
+
+  test.each([null, "false", 0])(
+    "rejects an invalid native continuation requirement: %s",
+    (required) => {
+      expect(() =>
+        parseDriverBootPayload({
+          ...payload,
+          execution: {
+            ...payload.execution,
+            session: { ...payload.execution.session, nativeResumeRequired: required },
+          },
+        }),
+      ).toThrow("nativeResumeRequired must be a boolean");
+    },
+  );
+
+  test.each([1, 2])("rejects protocol %s during the Driver handshake", (version) => {
+    expect(() =>
+      parseDriverHelloInput({
+        capabilities: [],
+        driverVersion: "legacy-test",
+        pid: 1,
+        protocolVersion: version,
+        runtime: "openai-runtime",
+        startedAt: "now",
+      }),
+    ).toThrow("protocolVersion must be 3");
+  });
+
   test("reads the boot payload from a file and removes it", async () => {
     const dir = await mkdtemp(join(tmpdir(), "g-driver-boot-"));
     const payloadPath = join(dir, "payload.json");

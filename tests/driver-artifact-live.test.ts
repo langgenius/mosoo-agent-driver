@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   DriverArtifactTestController,
   expectedDriverCapabilities,
@@ -897,7 +898,7 @@ function createBootPayload(input: {
       skills: [],
     },
     heartbeatIntervalMs: 60_000,
-    protocolVersion: 2,
+    protocolVersion: DRIVER_PROTOCOL_VERSION,
     runtime: runtimeCase.runtime,
     runtimeTransport: runtimeCase.transport,
     sandboxId: createTestId(),

@@ -20,6 +20,8 @@ const originalExecutable = process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"];
 const temporaryDirectories: string[] = [];
 
 interface CancellationHarnessOptions {
+  readonly freshSession?: boolean;
+  readonly nativeResumeRequired?: boolean;
   readonly backgroundTerminalCleanFailure?: "error" | "timeout";
   readonly emitInterruptedTurnOnStart?: boolean;
   readonly failCancellationRequest?: boolean;
@@ -209,12 +211,16 @@ process.stdin.on("data", (chunk) => {
           sessionOrganizationPath: directory,
         },
         cwd: directory,
-        nativeResumeRef: {
-          kind: "openai_thread_id",
-          runtimeId: "openai-runtime",
-          value: "stale-thread",
-        },
+        nativeResumeRef:
+          cancellationOptions.freshSession === true
+            ? null
+            : {
+                kind: "openai_thread_id",
+                runtimeId: "openai-runtime",
+                value: "stale-thread",
+              },
         recoveryMessages,
+        nativeResumeRequired: cancellationOptions.nativeResumeRequired,
       },
     },
   });
@@ -312,6 +318,108 @@ function createCancellationHarness(options: CancellationHarnessOptions) {
 }
 
 describe("OpenAI app-server startup", () => {
+  test("creates the first native context for a strict Session without a prior reference", async () => {
+    const harness = await createHarness(
+      null,
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      {
+        freshSession: true,
+        nativeResumeRequired: true,
+      },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods).toContain("thread/start");
+      expect(methods).not.toContain("thread/resume");
+      expect(methods).not.toContain("thread/inject_items");
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("retains the required native context after cancellation replaces the provider process", async () => {
+    const resumeError = "no rollout found for thread id fresh-thread";
+    const harness = await createHarness(
+      null,
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      {
+        backgroundTerminalCleanFailure: "error",
+        nativeResumeRequired: true,
+        restartResumeError: resumeError,
+      },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      await harness.backend.cancelActiveTurn(harness.context, "idle cancellation");
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "Continue" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow(resumeError);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods.filter((method) => method === "thread/resume")).toHaveLength(2);
+      expect(methods).not.toContain("thread/start");
+      expect(methods).not.toContain("thread/inject_items");
+      expect(methods).not.toContain("turn/start");
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
+  test.each([
+    "no rollout found for thread id stale-thread",
+    "failed to read thread: rollout at /tmp/committed-rollout.jsonl is empty",
+  ])("does not replace required native state when resume fails: %s", async (resumeError) => {
+    const harness = await createHarness(
+      resumeError,
+      [
+        { content: "Only the latest question survives the replay limit", role: "user" },
+        { content: "Only the latest answer survives the replay limit", role: "assistant" },
+      ],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      { nativeResumeRequired: true },
+    );
+
+    try {
+      await expect(
+        harness.backend.start(harness.context, new AbortController().signal),
+      ).rejects.toThrow(resumeError);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods).toContain("thread/resume");
+      expect(methods).not.toContain("thread/start");
+      expect(methods).not.toContain("thread/inject_items");
+      expect(methods).not.toContain("turn/start");
+      expect(harness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
   test("resumes a native thread that replays a previous turn before its response", async () => {
     const harness = await createHarness(
       null,
@@ -321,7 +429,7 @@ describe("OpenAI app-server startup", () => {
       false,
       "full_access",
       false,
-      { replayTurnDuringResume: true },
+      { replayTurnDuringResume: true, nativeResumeRequired: true },
     );
     try {
       await harness.backend.start(harness.context, new AbortController().signal);

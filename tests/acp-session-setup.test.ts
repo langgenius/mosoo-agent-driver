@@ -1,11 +1,19 @@
+import { describe, expect, test } from "bun:test";
+
 import { methods as acpMethods, RequestError } from "@agentclientprotocol/sdk";
 import type { AgentCapabilities, ClientContext } from "@agentclientprotocol/sdk";
-import { describe, expect, test } from "bun:test";
 
 import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
 
 const EXISTING_SESSION_ID = "native-session-existing";
+const strictStartInput = {
+  ...driverStartInput,
+  execution: {
+    ...driverStartInput.execution,
+    session: { ...driverStartInput.execution.session, nativeResumeRequired: true },
+  },
+};
 
 function withAdditionalDirectories(directories: readonly string[]): typeof driverStartInput {
   return {
@@ -54,6 +62,43 @@ function setupInput(input: {
 }
 
 describe("ACP session setup", () => {
+  test("creates the first native context for a strict Session without a prior reference", async () => {
+    const { connection, requests } = createRecordingConnection();
+    const result = await setupAcpSession(
+      setupInput({
+        agentCapabilities: {},
+        connection,
+        currentSessionId: null,
+        payload: strictStartInput,
+        replaySession: async (operation) => operation(),
+      }),
+    );
+    expect(result.mode).toBe("created");
+    expect(requests.map((request) => request.method)).toEqual([acpMethods.agent.session.new]);
+  });
+
+  test("does not replace required native state when the provider cannot restore", async () => {
+    const { connection, requests } = createRecordingConnection();
+    await expect(
+      setupAcpSession(
+        setupInput({
+          agentCapabilities: {},
+          connection,
+          currentSessionId: EXISTING_SESSION_ID,
+          payload: {
+            ...driverStartInput,
+            execution: {
+              ...driverStartInput.execution,
+              session: { ...driverStartInput.execution.session, nativeResumeRequired: true },
+            },
+          },
+          replaySession: async (operation) => operation(),
+        }),
+      ),
+    ).rejects.toThrow("does not support restoring the required native session");
+    expect(requests).toEqual([]);
+  });
+
   test("drops additional directories when the agent does not advertise support", async () => {
     const { connection, requests } = createRecordingConnection();
 

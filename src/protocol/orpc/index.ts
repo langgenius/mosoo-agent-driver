@@ -8,6 +8,7 @@ import type {
   RuntimeCommandStatus,
 } from "../../runtime-command";
 import type { DriverBootPayload } from "../boot";
+import { DRIVER_PROTOCOL_VERSION } from "../boot";
 import { parseDriverEventEnvelope, type DriverEventEnvelope } from "../events";
 import { isSupportedDriverRuntime } from "../runtime";
 import type { DriverRuntime } from "../runtime";
@@ -287,8 +288,8 @@ function readProtocolVersion(
 ): DriverBootPayload["protocolVersion"] {
   const value = record["protocolVersion"];
 
-  if (value !== 2) {
-    throw new TypeError("protocolVersion must be 2.");
+  if (value !== DRIVER_PROTOCOL_VERSION) {
+    throw new TypeError(`protocolVersion must be ${DRIVER_PROTOCOL_VERSION}.`);
   }
 
   return value;

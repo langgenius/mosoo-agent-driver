@@ -50,12 +50,15 @@ describe("driver permission policy", () => {
     expect(() => parseDriverBootPayload(raw)).toThrow(/permissionPolicy/);
   });
 
-  test("reader rejects the legacy Driver protocol before it can run external tools", () => {
-    const legacyPayload: Record<string, unknown> = structuredClone(driverBootPayload);
-    legacyPayload["protocolVersion"] = 1;
+  test.each([1, 2])(
+    "reader rejects legacy Driver protocol %s before it can run work",
+    (version) => {
+      const legacyPayload: Record<string, unknown> = structuredClone(driverBootPayload);
+      legacyPayload["protocolVersion"] = version;
 
-    expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 2/);
-  });
+      expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 3/);
+    },
+  );
 
   test("isDriverFullAccess reflects the payload", () => {
     expect(isDriverFullAccess(startInputWithPolicy("full_access"))).toBe(true);

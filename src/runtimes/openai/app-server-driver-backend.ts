@@ -346,7 +346,10 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
         ),
       );
     } catch (error) {
-      if (!isUnmaterializedRollout(error, resumeThreadId)) {
+      if (
+        this.#payload.execution.session.nativeResumeRequired === true ||
+        !isUnmaterializedRollout(error, resumeThreadId)
+      ) {
         throw error;
       }
     }

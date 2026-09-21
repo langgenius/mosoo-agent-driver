@@ -21,6 +21,7 @@ export interface DriverExecutionSessionInput {
   readonly homePath: string;
   readonly mcpServers: DriverBootMcpServer[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
+  readonly nativeResumeRequired?: boolean | undefined;
   readonly recoveryMessages: DriverRecoveryMessage[];
   readonly sharedRootPath: string;
 }
@@ -59,6 +60,7 @@ export function createDriverExecutionInputFromBootExecution(
       homePath: execution.session.context.homePath,
       mcpServers: execution.session.mcpServers,
       nativeResumeRef: execution.session.nativeResumeRef,
+      nativeResumeRequired: execution.session.nativeResumeRequired ?? false,
       recoveryMessages: execution.session.recoveryMessages,
       sharedRootPath: execution.session.context.sessionOrganizationPath,
     },
