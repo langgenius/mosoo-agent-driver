@@ -1,26 +1,27 @@
-import { describe, expect, test } from "bun:test";
-import type { ClientContext } from "@agentclientprotocol/sdk";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ClientContext } from "@agentclientprotocol/sdk";
+
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
-import { createBufferedSinkLogger } from "../src/observability";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
+import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverBootPayload } from "../src/protocol/boot";
-import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { DriverEventInput } from "../src/protocol/events";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
 import type { RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
+import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
 import { AcpTurnController } from "../src/runtimes/acp/acp-turn-controller";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
@@ -1317,6 +1318,18 @@ describe("ACP driver backend lifecycle", () => {
 
   test("returns ACP request-cancelled for a nested terminal RPC when the turn is cancelled", async () => {
     const harness = await createHarness();
+    // The child log precedes RPC delivery. Cancel only after the host enters
+    // the pending request; observing the log alone races the request ingress.
+    const entered = Promise.withResolvers<void>();
+    const originalWait = AcpClientRequestHandler.prototype.waitForTerminalExit;
+    const waitSpy = spyOn(
+      AcpClientRequestHandler.prototype,
+      "waitForTerminalExit",
+    ).mockImplementation(function (this: AcpClientRequestHandler, ...args) {
+      const result = originalWait.apply(this, args);
+      entered.resolve();
+      return result;
+    });
 
     try {
       const input = harness.backend.handleInput(
@@ -1326,14 +1339,7 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
 
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        if ((await harness.methods()).includes("terminal/wait_for_exit")) {
-          break;
-        }
-        await Bun.sleep(5);
-      }
-
-      expect(await harness.methods()).toContain("terminal/wait_for_exit");
+      await entered.promise;
       await harness.backend.cancelActiveTurn(harness.context, "test cancellation");
       await expect(input).rejects.toThrow("cancelled");
 
@@ -1351,6 +1357,7 @@ describe("ACP driver backend lifecycle", () => {
         }),
       );
     } finally {
+      waitSpy.mockRestore();
       await harness.destroy();
     }
   });

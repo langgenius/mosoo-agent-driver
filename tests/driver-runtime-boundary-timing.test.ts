@@ -151,7 +151,7 @@ describe("driver runtime boundary", () => {
       await entered.promise;
       const outcome = await settlePromiseWithTimeout(run, {
         label: "accepted ACK fail-stop",
-        timeoutMs: 1_500,
+        timeoutMs: 7_500,
       });
 
       expect(outcome.status).toBe("failed");
@@ -177,7 +177,60 @@ describe("driver runtime boundary", () => {
       await Bun.sleep(0);
       await logger.destroy();
     },
+    10_000,
   );
+
+  test("retries a committed receipt with a lost response without executing input twice", async () => {
+    const backend = createBackend();
+    const runtimeState = new DriverRuntimeStateMachine("ready");
+    const command: RuntimeCommand = {
+      commandId: "accepted-response-lost",
+      input: { text: "execute once" },
+      kind: "input.start",
+      requestId: "request-response-lost",
+      runId: DRIVER_TEST_IDS.runId,
+    };
+    const socket = new FakeDriverRuntimeIo([command]);
+    const recordUpdate = socket.commandUpdate.bind(socket);
+    const lost = Promise.withResolvers<void>();
+    let acceptedAttempts = 0;
+    let firstSignal: AbortSignal | undefined;
+    socket.commandUpdate = async (update, signal) => {
+      await recordUpdate(update, signal);
+      if (update.status === "accepted") {
+        acceptedAttempts += 1;
+        if (acceptedAttempts === 1) {
+          firstSignal = signal;
+          // The server committed the receipt; only its response is lost.
+          await lost.promise;
+        } else {
+          // Also cover a healthy response slower than the former 1s limit.
+          await Bun.sleep(1_100);
+        }
+      }
+    };
+    const { dispatcher, logger } = createDispatcher({
+      backend,
+      isShuttingDown: () => socket.updates.some((update) => update.status === "completed"),
+      runtimeState,
+    });
+    try {
+      await dispatcher.run(socket, logger);
+      expect(acceptedAttempts).toBe(2);
+      expect(firstSignal?.aborted).toBe(true);
+      expect(backend.handledInputs).toHaveLength(1);
+      expect(socket.failedRuns).toEqual([]);
+      expect(socket.updates.filter((update) => update.status === "completed")).toHaveLength(1);
+      expect(socket.updates.filter((update) => update.status === "accepted")).toEqual([
+        { commandId: command.commandId, status: "accepted" },
+        { commandId: command.commandId, status: "accepted" },
+      ]);
+    } finally {
+      lost.reject(new Error("late lost receipt"));
+      await Bun.sleep(0);
+      await logger.destroy();
+    }
+  });
 
   test("keeps MCP commands explicit at the API boundary", async () => {
     const backend = createBackend();
@@ -432,7 +485,7 @@ describe("driver runtime boundary", () => {
     runtimeState.enter("stopping");
     updateResult.reject(new Error("shutdown abort"));
 
-    await expect(run).resolves.toBeUndefined();
+    expect(await run).toBeUndefined();
     await logger.destroy();
     expect(socket.failedRuns).toEqual([]);
     expect(socket.pushedEvents).toEqual([]);
