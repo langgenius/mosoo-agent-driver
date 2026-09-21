@@ -40,7 +40,7 @@ await rpc("/driver/hello", {
   capabilities: [],
   driverVersion: "test",
   pid: process.pid,
-  protocolVersion: payload.protocolVersion,
+  protocolVersion: ${DRIVER_PROTOCOL_VERSION},
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
