@@ -11,6 +11,7 @@ import type { DriverRuntimeIo } from "./driver-runtime-io";
 
 const MAX_TRACKED_COMMANDS = 1_024;
 const COMMAND_UPDATE_TIMEOUT_MS = 1_000;
+const ACCEPTED_UPDATE_MAX_ATTEMPTS = 3;
 const RUN_TERMINAL_UPDATE_ATTEMPT_TIMEOUT_MS = 250;
 const TERMINAL_UPDATE_MAX_ATTEMPTS = 3;
 
@@ -140,23 +141,37 @@ export class DriverCommandDelivery {
     tracked: TrackedCommand,
   ): Promise<void> {
     const task = tracked.delivery.then(async () => {
-      const controller = new AbortController();
-      const signal = AbortSignal.any([this.#shutdownSignal, controller.signal]);
-      const delivery = await settlePromiseWithTimeout(
-        sendCommandUpdate(runtimeContext, command, { status: "accepted" }, signal),
-        {
-          label: `Driver command ${command.commandId} accepted status delivery`,
-          signal: this.#shutdownSignal,
-          timeoutMs: COMMAND_UPDATE_TIMEOUT_MS,
-        },
-      );
+      // A timeout can mean the API committed the receipt but its response was
+      // lost. Repeat only the idempotent status update, never the command or
+      // its tool effects. Bound waits to 1s + 2s + 4s and keep shutdown prompt.
+      for (let attempt = 1; attempt <= ACCEPTED_UPDATE_MAX_ATTEMPTS; attempt += 1) {
+        this.#shutdownSignal.throwIfAborted();
+        const controller = new AbortController();
+        const signal = AbortSignal.any([this.#shutdownSignal, controller.signal]);
+        const delivery = await settlePromiseWithTimeout(
+          sendCommandUpdate(runtimeContext, command, { status: "accepted" }, signal),
+          {
+            label: `Driver command ${command.commandId} accepted status delivery`,
+            signal: this.#shutdownSignal,
+            timeoutMs: COMMAND_UPDATE_TIMEOUT_MS * 2 ** (attempt - 1),
+          },
+        );
 
-      if (delivery.status === "completed") {
-        return;
+        if (delivery.status === "completed") {
+          return;
+        }
+
+        controller.abort(delivery.error);
+        if (delivery.status !== "timed_out" || attempt === ACCEPTED_UPDATE_MAX_ATTEMPTS) {
+          throw delivery.error;
+        }
+        runtimeContext.logger.warn("driver.runtime.command.accepted-status.retrying", {
+          attempt,
+          commandId: command.commandId,
+          commandKind: command.kind,
+          message: delivery.error.message,
+        });
       }
-
-      controller.abort(delivery.error);
-      throw delivery.error;
     });
     tracked.delivery = task;
     return task;
