@@ -43,6 +43,54 @@ function requireEvent(events: readonly DriverEventInput[], kind: string): Driver
 }
 
 describe("ACP runtime event translation", () => {
+  test("keeps an ordinary assistant safety explanation as a successful end_turn", () => {
+    const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    const text =
+      "The content you provided or machine outputted is blocked. I can explain the policy safely.";
+    state.translateUpdate({
+      update: {
+        content: { text, type: "text" },
+        messageId: "native-explanation",
+        sessionUpdate: "agent_message_chunk",
+      },
+    });
+
+    const events = state.completePrompt("end_turn", null);
+    expect(eventPayload(requireEvent(events, "run.completed"))).toMatchObject({
+      finalMessageText: text,
+      stopReason: "end_turn",
+    });
+    expect(events.some((event) => event.kind === "run.failed")).toBe(false);
+  });
+
+  test("a refusal closes unfinished tools as failed without changing settled tools or reporting success", () => {
+    const state = new AcpTurnEventState();
+    state.begin({ messageId: "message-1", runId: RUN_ID, sessionId: "session-1" });
+    for (const [toolCallId, status] of [
+      ["settled", "completed"],
+      ["pending", "in_progress"],
+    ] as const) {
+      state.translateUpdate({
+        update: { kind: "execute", sessionUpdate: "tool_call", status, toolCallId },
+      });
+    }
+
+    const events = state.completePrompt("refusal", null);
+    expect(events.filter((event) => event.kind === "run.completed")).toEqual([]);
+    expect(eventPayload(requireEvent(events, "run.failed"))).toMatchObject({
+      error: { code: "acp.refused", details: { stopReason: "refusal" }, retryable: false },
+      recoverable: false,
+    });
+    expect(events.filter((event) => event.kind === "tool.call.updated")).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({ status: "failed", toolCallId: "pending" }),
+      }),
+    ]);
+    expect(state.activeRunId()).toBeNull();
+    expect(state.failPrompt({ code: "late", message: "late" })).toEqual([]);
+  });
+
   test("keeps native assistant messages separate across tools and projects only the final one", () => {
     const state = new AcpTurnEventState();
 

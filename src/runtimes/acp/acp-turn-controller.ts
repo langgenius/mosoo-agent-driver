@@ -17,6 +17,7 @@ import { raceWithAbort } from "../../utils/async";
 import type { AcpClientRequestHandler } from "./acp-client-request-handler";
 import { toRequestMeta } from "./acp-configuration";
 import { AcpTurnEventState, toPromptStartEvents } from "./acp-event-translator";
+import { toAcpPromptError } from "./acp-prompt-error";
 
 interface ActiveAcpTurn {
   readonly cancellation: AbortController;
@@ -344,12 +345,11 @@ export class AcpTurnController {
         throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
       }
 
-      const message = error instanceof Error ? error.message : "ACP driver backend turn failed.";
       active.terminalStarted = true;
       await this.#push(
         context,
         "driver.acp.prompt.failed",
-        this.events.failPrompt({ code: "acp.turn_failed", message }),
+        this.events.failPrompt(toAcpPromptError(error)),
       );
       throw error;
     } finally {

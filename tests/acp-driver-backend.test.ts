@@ -144,6 +144,18 @@ const handle = (message) => {
       result = {};
       break;
     case "session/prompt":
+      if (message.params.prompt[0]?.text === "content-blocked") {
+        send({
+          error: { code: -32603, message: "Internal error: The content you provided or machine outputted is blocked." },
+          id: message.id,
+          jsonrpc: "2.0",
+        });
+        return;
+      }
+      if (message.params.prompt[0]?.text === "refusal") {
+        result = { stopReason: "refusal" };
+        break;
+      }
       if (message.params.prompt[0]?.text === "crash") {
         process.exit(17);
       }
@@ -494,6 +506,44 @@ async function createHarness(
 }
 
 describe("ACP driver backend lifecycle", () => {
+  test.each([
+    ["content-blocked", "acp.content_blocked"],
+    ["refusal", "acp.refused"],
+  ])("settles %s once without retrying and accepts a later explicit input", async (text, code) => {
+    const harness = await createHarness();
+
+    try {
+      await expect(
+        harness.backend.handleInput(harness.context, { text }, DRIVER_TEST_IDS.runId as RunId),
+      ).rejects.toThrow();
+      expect(harness.events.filter((event) => event.kind === "run.failed")).toEqual([
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            error: expect.objectContaining({ code, retryable: false }),
+            recoverable: false,
+          }),
+        }),
+      ]);
+      expect(harness.events.some((event) => event.kind === "run.completed")).toBe(false);
+      expect(
+        (await harness.methods()).filter((method) => method === "session/prompt"),
+      ).toHaveLength(1);
+      expect(harness.lifecycleFailures).toEqual([]);
+
+      await harness.backend.handleInput(
+        harness.context,
+        { text: "hello" },
+        "01KXN3PND0KDGQQ0N74GWZFNWQ" as RunId,
+      );
+      expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+      expect(
+        (await harness.methods()).filter((method) => method === "session/prompt"),
+      ).toHaveLength(2);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
   test("uses OpenCode native instructions without a hidden bootstrap prompt", async () => {
     const harness = await createHarness({ openCodeInstructions: true });
 
