@@ -70,7 +70,6 @@ export const driverBootPayload = {
           type: "agent",
         },
         sandboxId: DRIVER_TEST_IDS.sandboxId,
-        sandboxKind: "cattle",
         sandboxSessionId: DRIVER_TEST_IDS.sandboxSessionId,
         sandboxSubjectId: DRIVER_TEST_IDS.sessionId,
         sandboxSubjectKind: "session",

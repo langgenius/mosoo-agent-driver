@@ -21,7 +21,6 @@ export interface DriverExecutionSessionContext {
   readonly homePath: string;
   readonly origin: DriverOrigin;
   readonly sandboxId: SandboxId;
-  readonly sandboxKind: string;
   readonly sandboxSessionId: SandboxSessionId;
   readonly sandboxSubjectId: DriverId;
   readonly sandboxSubjectKind: string;
@@ -102,7 +101,6 @@ export function readExecutionSessionContext(value: unknown): DriverExecutionSess
     homePath: readNonEmptyString(record, "homePath", "execution.session.context"),
     origin: readOrigin(record["origin"]),
     sandboxId: parseId(record["sandboxId"], "Driver execution sandbox ID") as SandboxId,
-    sandboxKind: readNonEmptyString(record, "sandboxKind", "execution.session.context"),
     sandboxSessionId: parseId(
       record["sandboxSessionId"],
       "Driver execution sandbox session ID",

@@ -32,6 +32,29 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
+  test.each([undefined, "pet", "cattle"])(
+    "does not require or propagate the retired sandbox marker: %s",
+    (legacyKind) => {
+      const parsed = parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: {
+            ...payload.execution.session,
+            context: { ...payload.execution.session.context, sandboxKind: legacyKind },
+          },
+        },
+      });
+      expect(parsed.execution.session.context).not.toHaveProperty("sandboxKind");
+      expect(parsed.execution.session.context.sandboxSubjectKind).toBe(
+        payload.execution.session.context.sandboxSubjectKind,
+      );
+      expect(parsed.execution.session.context.sandboxSubjectId).toBe(
+        payload.execution.session.context.sandboxSubjectId,
+      );
+    },
+  );
+
   test.each([undefined, false, true])(
     "preserves the host native continuation requirement: %s",
     (required) => {
@@ -63,7 +86,7 @@ describe("readDriverBootPayload", () => {
     },
   );
 
-  test.each([1, 2, 3, 4])("rejects protocol %s during the Driver handshake", (version) => {
+  test.each([1, 2, 3, 4, 5])("rejects protocol %s during the Driver handshake", (version) => {
     expect(() =>
       parseDriverHelloInput({
         capabilities: [],
@@ -73,7 +96,7 @@ describe("readDriverBootPayload", () => {
         runtime: "openai-runtime",
         startedAt: "now",
       }),
-    ).toThrow("protocolVersion must be 5");
+    ).toThrow("protocolVersion must be 6");
   });
 
   test("preserves an explicit absent Agent preset through boot and host integration", () => {

@@ -883,7 +883,6 @@ function createBootPayload(input: {
             type: "agent",
           },
           sandboxId: createTestId(),
-          sandboxKind: "cattle",
           sandboxSessionId: createTestId(),
           sandboxSubjectId: input.sessionId,
           sandboxSubjectKind: "session",

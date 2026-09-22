@@ -44,13 +44,14 @@ export type {
 } from "./host-snapshot";
 
 /**
+ * Version 6 removes the required legacy sandboxKind marker from boot context.
  * Version 5 accepts explicit absence of an Agent preset in host provenance.
  * Version 4 introduced the host's native-continuation requirement. Older
  * Drivers must not silently replace checkpointed native state during a rolling
  * deployment. Version 3 is already used by the upstream SDK boundary migration;
  * this host backport must not be mistaken for that protocol.
  */
-export const DRIVER_PROTOCOL_VERSION = 5;
+export const DRIVER_PROTOCOL_VERSION = 6;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";

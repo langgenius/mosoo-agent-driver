@@ -50,13 +50,13 @@ describe("driver permission policy", () => {
     expect(() => parseDriverBootPayload(raw)).toThrow(/permissionPolicy/);
   });
 
-  test.each([1, 2, 3, 4])(
+  test.each([1, 2, 3, 4, 5])(
     "reader rejects legacy Driver protocol %s before it can run work",
     (version) => {
       const legacyPayload: Record<string, unknown> = structuredClone(driverBootPayload);
       legacyPayload["protocolVersion"] = version;
 
-      expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 5/);
+      expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 6/);
     },
   );
 
