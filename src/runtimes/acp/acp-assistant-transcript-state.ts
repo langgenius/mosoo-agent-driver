@@ -5,6 +5,7 @@ import type { RunId } from "../../protocol/id";
 import { RuntimeAssistantMessageIdIndex } from "../runtime-turn-transcript";
 import { toPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
+import type { AcpPromptError } from "./acp-prompt-error";
 import {
   normalizePromptUsage,
   summarizeContentBlock,
@@ -97,6 +98,22 @@ export class AcpAssistantTranscriptState {
     const events: DriverEventInput[] = [];
     const runId = this.#requireRunId();
 
+    if (stopReason === "refusal") {
+      const usagePayload = normalizePromptUsage(usage);
+      if (usagePayload !== null) {
+        events.push({ kind: "usage.updated", payload: usagePayload, runId });
+      }
+      return [
+        ...events,
+        ...this.failPrompt({
+          code: "acp.refused",
+          details: { stopReason },
+          message: "The agent refused to continue. This run will not be retried automatically.",
+          recoverable: false,
+        }),
+      ];
+    }
+
     events.push(...this.#promoteThought());
     events.push(...this.#finishMessage());
 
@@ -181,7 +198,7 @@ export class AcpAssistantTranscriptState {
     return events;
   }
 
-  failPrompt(error: { code: string; message: string; recoverable?: boolean }): DriverEventInput[] {
+  failPrompt(error: AcpPromptError): DriverEventInput[] {
     const runId = this.#runId;
 
     if (runId === null) {
@@ -218,7 +235,9 @@ export class AcpAssistantTranscriptState {
       payload: {
         error: {
           code: error.code,
+          ...(error.details === undefined ? {} : { details: error.details }),
           message: error.message,
+          retryable: error.recoverable ?? false,
         },
         recoverable: error.recoverable ?? false,
       },
