@@ -38,16 +38,21 @@ afterEach(async () => {
 async function waitForPid(path: string): Promise<number> {
   const deadline = Date.now() + 3_000;
 
-  while (!existsSync(path)) {
+  while (true) {
+    if (existsSync(path)) {
+      const contents = await readFile(path, "utf8");
+      // Shell redirection creates the file before echo publishes the PID record.
+      if (/^[1-9]\d*\n$/.test(contents)) {
+        const pid = Number(contents);
+        trackProcess(pid);
+        return pid;
+      }
+    }
     if (Date.now() >= deadline) {
       throw new Error(`Timed out waiting for ${path}.`);
     }
     await Bun.sleep(20);
   }
-
-  const pid = Number.parseInt(await readFile(path, "utf8"), 10);
-  trackProcess(pid);
-  return pid;
 }
 
 function readProcessState(pid: number): { startTime: string; state: string } | null {
@@ -416,13 +421,19 @@ describe.skipIf(process.platform !== "linux")("Claude Agent SDK process supervis
     expect(processTasks.size).toBe(0);
   });
 
-  test("kills the isolated Claude session when its driver is SIGKILLed", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "claude-process-supervision-"));
-    directories.add(directory);
-    const shellPidPath = join(directory, "shell.pid");
-    const workerPidPath = join(directory, "worker.pid");
-    const nestedCommand = `echo $$ > ${shellPidPath}; sleep 30 & echo $! > ${workerPidPath}; wait`;
-    const helperSource = String.raw`
+  test.each([0, 50])(
+    "kills the isolated Claude session when its driver is SIGKILLed (%i ms PID write delay)",
+    async (pidWriteDelayMs) => {
+      const directory = await mkdtemp(join(tmpdir(), "claude-process-supervision-"));
+      directories.add(directory);
+      const shellPidPath = join(directory, "shell.pid");
+      const workerPidPath = join(directory, "worker.pid");
+      const publishShellPid =
+        pidWriteDelayMs === 0
+          ? `echo $$ > ${shellPidPath}`
+          : `exec 3> ${shellPidPath}; sleep ${pidWriteDelayMs / 1_000}; echo $$ >&3; exec 3>&-`;
+      const nestedCommand = `${publishShellPid}; sleep 30 & echo $! > ${workerPidPath}; wait`;
+      const helperSource = String.raw`
 import { spawnClaudeCodeProcess } from "./src/runtimes/claude/agent-sdk-process.ts";
 const controller = new AbortController();
 spawnClaudeCodeProcess({
@@ -434,24 +445,25 @@ spawnClaudeCodeProcess({
 }, () => {}, controller.signal);
 setInterval(() => {}, 1_000);
 `;
-    const helper = spawn(process.execPath, ["-e", helperSource], {
-      cwd: process.cwd(),
-      detached: true,
-      stdio: "ignore",
-    });
-    const helperPid = helper.pid;
-    expect(helperPid).toBeDefined();
-    trackProcess(helperPid!);
+      const helper = spawn(process.execPath, ["-e", helperSource], {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: "ignore",
+      });
+      const helperPid = helper.pid;
+      expect(helperPid).toBeDefined();
+      trackProcess(helperPid!);
 
-    const [shellPid, workerPid] = await Promise.all([
-      waitForPid(shellPidPath),
-      waitForPid(workerPidPath),
-    ]);
-    expect(isRunning(shellPid)).toBe(true);
-    expect(isRunning(workerPid)).toBe(true);
+      const [shellPid, workerPid] = await Promise.all([
+        waitForPid(shellPidPath),
+        waitForPid(workerPidPath),
+      ]);
+      expect(isRunning(shellPid)).toBe(true);
+      expect(isRunning(workerPid)).toBe(true);
 
-    process.kill(-helperPid!, "SIGKILL");
-    await Promise.all([expectExited(shellPid), expectExited(workerPid)]);
-    await expectExited(helperPid!);
-  });
+      process.kill(-helperPid!, "SIGKILL");
+      await Promise.all([expectExited(shellPid), expectExited(workerPid)]);
+      await expectExited(helperPid!);
+    },
+  );
 });
