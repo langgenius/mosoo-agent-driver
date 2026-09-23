@@ -25,7 +25,7 @@ export async function finishClaudeResult(options: FinishClaudeResultOptions): Pr
     await projection.updateUsage(runId, event, cause, usage);
   }
 
-  if (message.subtype === "success") {
+  if (message.subtype === "success" && !message.is_error) {
     const hasMessageText = projection
       .items(runId)
       .some(
@@ -98,7 +98,7 @@ export async function finishClaudeResult(options: FinishClaudeResultOptions): Pr
   const cancelled =
     message.terminal_reason === "aborted_streaming" || message.terminal_reason === "aborted_tools";
 
-  if (isLimit(message)) {
+  if (message.subtype !== "success" && isLimit(message)) {
     await projection.finishRun({
       activeItemStatus: "cancelled",
       cause,
@@ -112,12 +112,15 @@ export async function finishClaudeResult(options: FinishClaudeResultOptions): Pr
   }
 
   const error = {
-    code: `anthropic.${message.subtype}`,
+    code:
+      message.subtype === "success" ? "anthropic.provider_error" : `anthropic.${message.subtype}`,
     ...(message.terminal_reason === undefined
       ? {}
       : { details: { terminalReason: message.terminal_reason } }),
-    message: message.errors.join("\n") || "Agent SDK run failed.",
-    retryable: isRetryable(message),
+    message:
+      (message.subtype === "success" ? message.result : message.errors.join("\n")) ||
+      "Agent SDK run failed.",
+    retryable: message.subtype !== "success" && isRetryable(message),
   } satisfies ProtocolError;
   await projection.finishRun({
     cause,

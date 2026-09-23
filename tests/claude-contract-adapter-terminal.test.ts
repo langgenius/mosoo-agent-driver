@@ -173,6 +173,41 @@ function permissionBytes(
 }
 
 describe("Claude Contract adapter", () => {
+  test("fails an error-marked success frame without publishing its text as a successful final answer", async () => {
+    const harness = createHarness();
+    await registerRun(harness.adapter);
+    await harness.adapter.handleMessage(
+      sdkMessage({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Credit balance is too low",
+        stop_reason: "end_turn",
+        session_id: "native-session-1",
+        uuid: "billing-error-result",
+        modelUsage: {},
+        num_turns: 1,
+        permission_denials: [],
+        total_cost_usd: 0,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      }),
+      RUN_ID,
+    );
+    expect(harness.snapshot().runs[0]).toMatchObject({
+      status: "failed",
+      error: {
+        code: "anthropic.provider_error",
+        message: "Credit balance is too low",
+        retryable: false,
+      },
+    });
+    expect(
+      harness
+        .snapshot()
+        .items.filter((item) => item.kind === "message" && item.status === "completed"),
+    ).toEqual([]);
+  });
+
   test("retries the exact cancelled snapshot after an unknown Authority outcome", async () => {
     const controller = new AbortController();
     const firstAbort = Promise.withResolvers<void>();
