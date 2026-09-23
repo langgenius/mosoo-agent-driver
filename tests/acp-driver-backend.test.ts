@@ -43,7 +43,14 @@ let updateSent = false;
 let pendingPromptId = null;
 let pendingProviderCancelPromptId = null;
 let pendingEndTurnPromptId = null;
+let nestedResponsePending = false;
+let nestedCancellationPending = false;
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+const completeCancellation = () => {
+  send({ id: pendingPromptId, jsonrpc: "2.0", result: { stopReason: "cancelled" } });
+  pendingPromptId = null;
+  nestedCancellationPending = false;
+};
 const requestClient = (message) => {
   appendFileSync(logPath, message.method + "\n");
   send(message);
@@ -68,6 +75,8 @@ const handle = (message) => {
       }
     } else if (message.id === "nested-wait") {
       appendFileSync(responsePath, JSON.stringify(message) + "\n");
+      nestedResponsePending = false;
+      if (nestedCancellationPending) completeCancellation();
     }
     return;
   }
@@ -82,8 +91,13 @@ const handle = (message) => {
       appendFileSync(latePidPath, String(child.pid) + "\n");
       child.unref();
     }
-    send({ id: pendingPromptId, jsonrpc: "2.0", result: { stopReason: "cancelled" } });
-    pendingPromptId = null;
+    // The nested-response test must observe the reply before ending its prompt.
+    // An immediate terminal lets the host recycle this peer before its log runs.
+    if (nestedResponsePending) {
+      nestedCancellationPending = true;
+      return;
+    }
+    completeCancellation();
     return;
   }
   if (!("id" in message)) return;
@@ -224,6 +238,7 @@ const handle = (message) => {
       }
       if (message.params.prompt[0]?.text === "nested-cancel") {
         pendingPromptId = message.id;
+        nestedResponsePending = true;
         requestClient({
           id: "nested-create",
           jsonrpc: "2.0",
