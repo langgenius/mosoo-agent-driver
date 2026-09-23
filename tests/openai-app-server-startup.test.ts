@@ -3,29 +3,32 @@ import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
-import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { settlePromiseWithTimeout } from "../src/utils/async";
+import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 const originalExecutable = process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"];
 const temporaryDirectories: string[] = [];
 
 interface CancellationHarnessOptions {
+  readonly freshSession?: boolean;
+  readonly nativeResumeRequired?: boolean;
   readonly backgroundTerminalCleanFailure?: "error" | "timeout";
   readonly emitInterruptedTurnOnStart?: boolean;
   readonly failCancellationRequest?: boolean;
   readonly failInitialThreadStart?: boolean;
   readonly holdCancellationRequest?: boolean;
   readonly holdRunCancellation?: boolean;
+  readonly replayTurnDuringResume?: boolean;
   readonly restartResumeError?: string;
 }
 
@@ -49,7 +52,7 @@ async function readFirstLaunchPid(processLog: string): Promise<number> {
 }
 
 async function createHarness(
-  resumeErrorMessage: string,
+  resumeErrorMessage: string | null,
   recoveryMessages = [
     { content: "Earlier question", role: "user" as const },
     { content: "Earlier answer", role: "assistant" as const },
@@ -113,7 +116,7 @@ process.stdin.on("data", (chunk) => {
     const resumeError =
       launchNumber > 1 && restartResumeError !== null
         ? restartResumeError
-        : configuredResumeError.startsWith("no rollout found for thread id ")
+        : configuredResumeError?.startsWith("no rollout found for thread id ")
           ? "no rollout found for thread id " + request.params.threadId
           : configuredResumeError;
     const terminalTurn = launchNumber > 1 || turnNumber > 1;
@@ -131,7 +134,9 @@ process.stdin.on("data", (chunk) => {
           ${JSON.stringify(cancellationOptions.failInitialThreadStart ?? false)}
         ? { id: request.id, error: { code: -32600, message: "initial thread start failed" } }
       : request.method === "thread/resume"
-      ? { id: request.id, error: { code: -32600, message: resumeError } }
+      ? resumeError === null
+        ? { id: request.id, result: { thread: { id: "stale-thread" } } }
+        : { id: request.id, error: { code: -32600, message: resumeError } }
       : request.method === "thread/start"
         ? { id: request.id, result: { thread: { id: "fresh-thread" } } }
         : request.method === "turn/start"
@@ -176,6 +181,12 @@ process.stdin.on("data", (chunk) => {
           sendResponse();
         }
       }, 1);
+    } else if (request.method === "thread/resume" && ${JSON.stringify(cancellationOptions.replayTurnDuringResume ?? false)}) {
+      process.stdout.write(JSON.stringify({
+        method: "turn/plan/updated",
+        params: { threadId: "stale-thread", turnId: "previous-turn", plan: [], explanation: null },
+      }) + "\\n");
+      setTimeout(sendResponse, 20);
     } else {
       sendResponse();
     }
@@ -200,16 +211,21 @@ process.stdin.on("data", (chunk) => {
           sessionOrganizationPath: directory,
         },
         cwd: directory,
-        nativeResumeRef: {
-          kind: "openai_thread_id",
-          runtimeId: "openai-runtime",
-          value: "stale-thread",
-        },
+        nativeResumeRef:
+          cancellationOptions.freshSession === true
+            ? null
+            : {
+                kind: "openai_thread_id",
+                runtimeId: "openai-runtime",
+                value: "stale-thread",
+              },
         recoveryMessages,
+        nativeResumeRequired: cancellationOptions.nativeResumeRequired,
       },
     },
   });
   const events: DriverEventInput[] = [];
+  const lifecycleErrors: Error[] = [];
   let cancellationRequestFailures = 0;
   const cancellationRequestEntered = Promise.withResolvers<void>();
   const cancellationRequestGate = Promise.withResolvers<void>();
@@ -223,6 +239,7 @@ process.stdin.on("data", (chunk) => {
     sink: async () => {},
   });
   const context = createAgentDriverContext({
+    lifecycle: { fail: (error) => lifecycleErrors.push(error) },
     eventSink: {
       commandUpdate: async () => {},
       pushEvents: async (input) => {
@@ -275,6 +292,7 @@ process.stdin.on("data", (chunk) => {
     logger,
     payload,
     processLog,
+    lifecycleErrors,
     releaseCancellationRequest: () => cancellationRequestGate.resolve(),
     releaseRunCancellation: () => runCancellationGate.resolve(),
     releaseTurnTiming: () => turnTimingGate.resolve(),
@@ -300,6 +318,136 @@ function createCancellationHarness(options: CancellationHarnessOptions) {
 }
 
 describe("OpenAI app-server startup", () => {
+  test("creates the first native context for a strict Session without a prior reference", async () => {
+    const harness = await createHarness(
+      null,
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      {
+        freshSession: true,
+        nativeResumeRequired: true,
+      },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods).toContain("thread/start");
+      expect(methods).not.toContain("thread/resume");
+      expect(methods).not.toContain("thread/inject_items");
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("retains the required native context after cancellation replaces the provider process", async () => {
+    const resumeError = "no rollout found for thread id fresh-thread";
+    const harness = await createHarness(
+      null,
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      {
+        backgroundTerminalCleanFailure: "error",
+        nativeResumeRequired: true,
+        restartResumeError: resumeError,
+      },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      await harness.backend.cancelActiveTurn(harness.context, "idle cancellation");
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "Continue" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow(resumeError);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods.filter((method) => method === "thread/resume")).toHaveLength(2);
+      expect(methods).not.toContain("thread/start");
+      expect(methods).not.toContain("thread/inject_items");
+      expect(methods).not.toContain("turn/start");
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
+  test.each([
+    "no rollout found for thread id stale-thread",
+    "failed to read thread: rollout at /tmp/committed-rollout.jsonl is empty",
+  ])("does not replace required native state when resume fails: %s", async (resumeError) => {
+    const harness = await createHarness(
+      resumeError,
+      [
+        { content: "Only the latest question survives the replay limit", role: "user" },
+        { content: "Only the latest answer survives the replay limit", role: "assistant" },
+      ],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      { nativeResumeRequired: true },
+    );
+
+    try {
+      await expect(
+        harness.backend.start(harness.context, new AbortController().signal),
+      ).rejects.toThrow(resumeError);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods).toContain("thread/resume");
+      expect(methods).not.toContain("thread/start");
+      expect(methods).not.toContain("thread/inject_items");
+      expect(methods).not.toContain("turn/start");
+      expect(harness.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
+  test("resumes a native thread that replays a previous turn before its response", async () => {
+    const harness = await createHarness(
+      null,
+      [],
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      { replayTurnDuringResume: true, nativeResumeRequired: true },
+    );
+    try {
+      await harness.backend.start(harness.context, new AbortController().signal);
+      expect(harness.lifecycleErrors).toEqual([]);
+      expect(harness.events.some((event) => event.kind.startsWith("run."))).toBe(false);
+      const methods = (await readFile(harness.requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { method?: string }).method);
+      expect(methods).toContain("thread/resume");
+      expect(methods).not.toContain("thread/start");
+      expect(methods).not.toContain("thread/inject_items");
+    } finally {
+      await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
+      await harness.logger.destroy();
+    }
+  });
+
   test("maps supervised permissions to untrusted thread and turn policies", async () => {
     const harness = await createHarness(
       "no rollout found for thread id stale-thread",

@@ -150,6 +150,38 @@ function createHarness(
 }
 
 describe("Claude Agent SDK driver backend", () => {
+  test("fails an SDK success result that explicitly reports a provider error", async () => {
+    delete process.env[PREWARM_ENV];
+    const harness = createHarness({
+      createQueryOptions: async () => ({}),
+      query: () =>
+        fakeQuery([
+          { ...resultMessage(), is_error: true, result: "Credit balance is too low" } as SDKMessage,
+        ]),
+      startup: async () => {
+        throw new Error("prewarm is disabled");
+      },
+    });
+    await harness.backend.handleInput(
+      harness.context,
+      { text: "analyze the file" },
+      DRIVER_TEST_IDS.runId,
+    );
+    await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
+    await harness.logger.destroy();
+    expect(
+      harness.events.filter((event) => ["run.completed", "run.failed"].includes(event.kind)),
+    ).toMatchObject([
+      {
+        kind: "run.failed",
+        payload: {
+          error: { code: "claude.provider_error", message: "Credit balance is too low" },
+          recoverable: false,
+        },
+      },
+    ]);
+  });
+
   test("consumes a ready prewarm for the first turn", async () => {
     process.env[PREWARM_ENV] = "1";
     const startupCalled = Promise.withResolvers<void>();

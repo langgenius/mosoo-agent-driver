@@ -72,6 +72,11 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - `@mosoo/agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
 - `@mosoo/agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.
 
+Boot protocol 6 no longer requires or exposes the retired `sandboxKind` label.
+The host still supplies actual Sandbox/Session ownership, and an Agent preset
+reference is optional. Boot parsing and the control handshake reject earlier
+protocol versions before work begins; deploy the matching host and Driver together.
+
 ## Runtime Contract
 
 The Contract is the vendor-neutral state and control boundary between the host and provider executors.
@@ -167,6 +172,7 @@ The image contract in `environment-package-managers.json` exposes `npm` and `pip
 - The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, permission flow, diagnostics, and host port contracts.
 - Host applications own credential, file, skill, MCP, policy, logging, persistence, and transport implementations.
 - Provider backends depend on Driver contracts and host ports only.
+- Hosts that checkpoint native state set `execution.session.nativeResumeRequired` to preserve native continuation. When a reference exists, missing or unsupported native state must fail instead of creating a replacement conversation. Protocol 6 carries this requirement and permits explicit null Agent provenance for direct Sessions; API and Driver must be updated together. A Session without an Agent cannot claim an Agent deployment revision. Omission retains the generic host's existing best-effort recovery behavior. Bounded role/text replay is not equivalent to a complete native checkpoint.
 - The library root is safe to import and must not start the process runner.
 - The package must not depend on mosoo workspace packages at runtime.
 - mosoo control traffic uses the outbound ORPC WebSocket to `DriverInstance`; the Driver does not expose a sandbox-local control listener.

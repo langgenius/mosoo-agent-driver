@@ -7,7 +7,7 @@ import type {
   SandboxId,
   SandboxSessionId,
 } from "../src/protocol/boot";
-import { DRIVER_CONTROL_PORT_MIN } from "../src/protocol/boot";
+import { DRIVER_CONTROL_PORT_MIN, DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import type { DriverInstanceId, RunId, SessionId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 
@@ -70,7 +70,6 @@ export const driverBootPayload = {
           type: "agent",
         },
         sandboxId: DRIVER_TEST_IDS.sandboxId,
-        sandboxKind: "cattle",
         sandboxSessionId: DRIVER_TEST_IDS.sandboxSessionId,
         sandboxSubjectId: DRIVER_TEST_IDS.sessionId,
         sandboxSubjectKind: "session",
@@ -85,7 +84,7 @@ export const driverBootPayload = {
     skills: [],
   },
   heartbeatIntervalMs: 1_000,
-  protocolVersion: 2,
+  protocolVersion: DRIVER_PROTOCOL_VERSION,
   runtime: "openai-runtime",
   runtimeTransport: "openai-app-server",
   sandboxId: DRIVER_TEST_IDS.sandboxId,

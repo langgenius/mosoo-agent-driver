@@ -469,14 +469,17 @@ export class ClaudeAgentSdkMessageTranslator {
     message: Extract<SDKMessage, { type: "result" }>,
     runId: RunId,
   ): Promise<void> {
-    await this.finishTurn(context, message.subtype === "success" ? "completed" : "failed");
+    // SDK success describes the result frame shape; is_error still carries
+    // provider failures such as an exhausted account balance.
+    const succeeded = message.subtype === "success" && !message.is_error;
+    await this.finishTurn(context, succeeded ? "completed" : "failed");
     await this.#events.pushUsage(
       context,
       isRecord(message.usage) ? message.usage : null,
       message.total_cost_usd,
     );
 
-    if (message.subtype === "success") {
+    if (message.subtype === "success" && !message.is_error) {
       const resultText = isRecord(message) ? readString(message, "result") : null;
       if (resultText !== null && resultText.length > 0 && !this.#state.hasAssistantText(runId)) {
         const messageId = this.#state.assistantMessageId(runId, null);
@@ -504,8 +507,9 @@ export class ClaudeAgentSdkMessageTranslator {
       await this.#events.pushRunError(
         context,
         runId,
-        `claude.${message.subtype}`,
-        message.errors.join("\n") || "Claude Agent SDK turn failed.",
+        message.subtype === "success" ? "claude.provider_error" : `claude.${message.subtype}`,
+        (message.subtype === "success" ? message.result : message.errors.join("\n")) ||
+          "Claude Agent SDK turn failed.",
       );
     } catch (error) {
       throw new ClaudeTerminalWriteError(error);

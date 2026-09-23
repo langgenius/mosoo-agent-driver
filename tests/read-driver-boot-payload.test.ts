@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { readDriverBootPayload } from "../src/boot/read-driver-boot-payload";
+import { parseDriverBootPayload } from "../src/protocol/boot";
+import { createDriverHostIntegrationSnapshotFromBootExecution } from "../src/protocol/host-integration";
+import { parseDriverHelloInput } from "../src/protocol/orpc";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   DRIVER_BOOT_PAYLOAD_ENV_NAME,
   DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME,
@@ -28,6 +32,107 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
+  test.each([undefined, "pet", "cattle"])(
+    "does not require or propagate the retired sandbox marker: %s",
+    (legacyKind) => {
+      const parsed = parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: {
+            ...payload.execution.session,
+            context: { ...payload.execution.session.context, sandboxKind: legacyKind },
+          },
+        },
+      });
+      expect(parsed.execution.session.context).not.toHaveProperty("sandboxKind");
+      expect(parsed.execution.session.context.sandboxSubjectKind).toBe(
+        payload.execution.session.context.sandboxSubjectKind,
+      );
+      expect(parsed.execution.session.context.sandboxSubjectId).toBe(
+        payload.execution.session.context.sandboxSubjectId,
+      );
+    },
+  );
+
+  test.each([undefined, false, true])(
+    "preserves the host native continuation requirement: %s",
+    (required) => {
+      const parsed = parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: { ...payload.execution.session, nativeResumeRequired: required },
+        },
+      });
+      expect(
+        createDriverStartInputFromBootPayload(parsed).execution.session.nativeResumeRequired,
+      ).toBe(required ?? false);
+    },
+  );
+
+  test.each([null, "false", 0])(
+    "rejects an invalid native continuation requirement: %s",
+    (required) => {
+      expect(() =>
+        parseDriverBootPayload({
+          ...payload,
+          execution: {
+            ...payload.execution,
+            session: { ...payload.execution.session, nativeResumeRequired: required },
+          },
+        }),
+      ).toThrow("nativeResumeRequired must be a boolean");
+    },
+  );
+
+  test.each([1, 2, 3, 4, 5])("rejects protocol %s during the Driver handshake", (version) => {
+    expect(() =>
+      parseDriverHelloInput({
+        capabilities: [],
+        driverVersion: "legacy-test",
+        pid: 1,
+        protocolVersion: version,
+        runtime: "openai-runtime",
+        startedAt: "now",
+      }),
+    ).toThrow("protocolVersion must be 6");
+  });
+
+  test("preserves an explicit absent Agent preset through boot and host integration", () => {
+    const parsed = parseDriverBootPayload({
+      ...payload,
+      execution: {
+        ...payload.execution,
+        configRevision: {
+          ...payload.execution.configRevision,
+          agentId: null,
+          deploymentVersionId: null,
+          deploymentVersionNumber: null,
+        },
+      },
+    });
+    expect(parsed.execution.configRevision.agentId).toBeNull();
+    const hostSnapshot = createDriverHostIntegrationSnapshotFromBootExecution(parsed.execution);
+    expect(hostSnapshot.configRevision.agentId).toBeNull();
+  });
+
+  test("rejects a deployment revision attached to an absent Agent preset", () => {
+    expect(() =>
+      parseDriverBootPayload({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          configRevision: {
+            ...payload.execution.configRevision,
+            agentId: null,
+            deploymentVersionNumber: 1,
+          },
+        },
+      }),
+    ).toThrow("deployment revision requires an Agent preset");
+  });
+
   test("reads the boot payload from a file and removes it", async () => {
     const dir = await mkdtemp(join(tmpdir(), "g-driver-boot-"));
     const payloadPath = join(dir, "payload.json");

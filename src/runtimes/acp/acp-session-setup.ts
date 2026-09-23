@@ -142,6 +142,10 @@ export async function setupAcpSession(input: AcpSessionSetupInput): Promise<AcpS
     });
   }
 
+  if (existingSessionId !== null && input.payload.execution.session.nativeResumeRequired === true) {
+    throw new Error("ACP provider does not support restoring the required native session.");
+  }
+
   const result = await input.connection.request(acpMethods.agent.session.new, baseParams);
 
   if (result.sessionId.trim().length === 0) {

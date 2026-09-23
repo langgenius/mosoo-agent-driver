@@ -21,7 +21,6 @@ export interface DriverExecutionSessionContext {
   readonly homePath: string;
   readonly origin: DriverOrigin;
   readonly sandboxId: SandboxId;
-  readonly sandboxKind: string;
   readonly sandboxSessionId: SandboxSessionId;
   readonly sandboxSubjectId: DriverId;
   readonly sandboxSubjectKind: string;
@@ -29,7 +28,7 @@ export interface DriverExecutionSessionContext {
 }
 
 export interface DriverConfigRevision {
-  readonly agentId: AgentId;
+  readonly agentId: AgentId | null;
   readonly deploymentVersionId: AgentDeploymentVersionId | null;
   readonly deploymentVersionNumber: number | null;
   readonly environmentId: EnvironmentId;
@@ -65,8 +64,8 @@ function readOrigin(value: unknown): DriverOrigin {
 export function readConfigRevision(value: unknown): DriverConfigRevision {
   const record = readRecord(value, "execution.configRevision");
 
-  return {
-    agentId: parseId(record["agentId"], "Driver config agent ID") as AgentId,
+  const revision: DriverConfigRevision = {
+    agentId: parseNullableId(record["agentId"], "Driver config agent ID") as AgentId | null,
     deploymentVersionId: parseNullableId(
       record["deploymentVersionId"],
       "Driver config deployment version ID",
@@ -86,6 +85,13 @@ export function readConfigRevision(value: unknown): DriverConfigRevision {
     runId: parseNullableId(record["runId"], "Driver config run ID") as RunId | null,
     sessionId: parseId(record["sessionId"], "Driver config session ID") as SessionId,
   };
+  if (
+    revision.agentId === null &&
+    (revision.deploymentVersionId !== null || revision.deploymentVersionNumber !== null)
+  ) {
+    throw new TypeError("A deployment revision requires an Agent preset.");
+  }
+  return revision;
 }
 
 export function readExecutionSessionContext(value: unknown): DriverExecutionSessionContext {
@@ -95,7 +101,6 @@ export function readExecutionSessionContext(value: unknown): DriverExecutionSess
     homePath: readNonEmptyString(record, "homePath", "execution.session.context"),
     origin: readOrigin(record["origin"]),
     sandboxId: parseId(record["sandboxId"], "Driver execution sandbox ID") as SandboxId,
-    sandboxKind: readNonEmptyString(record, "sandboxKind", "execution.session.context"),
     sandboxSessionId: parseId(
       record["sandboxSessionId"],
       "Driver execution sandbox session ID",

@@ -3,17 +3,18 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import {
-  ForbiddenSecretScanner,
-  DriverArtifactTestController,
-  type DriverArtifactBootPayload,
-} from "./driver-artifact-test-controller";
+import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import {
   parseDriverCommandUpdateInput,
   parseDriverFailureInput,
   parseDriverHelloInput,
   parseDriverLogBatchInput,
 } from "../src/protocol/orpc";
+import {
+  ForbiddenSecretScanner,
+  DriverArtifactTestController,
+  type DriverArtifactBootPayload,
+} from "./driver-artifact-test-controller";
 
 const FORBIDDEN_SECRET_ERROR = "Forbidden secret detected in packed driver traffic or output.";
 const FAKE_DRIVER = String.raw`
@@ -39,7 +40,7 @@ await rpc("/driver/hello", {
   capabilities: [],
   driverVersion: "test",
   pid: process.pid,
-  protocolVersion: 2,
+  protocolVersion: ${DRIVER_PROTOCOL_VERSION},
   runtime: payload.runtime,
   startedAt: new Date().toISOString(),
 });
@@ -260,7 +261,7 @@ describe("driver artifact test controller", () => {
         capabilities: [],
         driverVersion: "test",
         pid: 0,
-        protocolVersion: 2,
+        protocolVersion: DRIVER_PROTOCOL_VERSION,
         runtime: "acp-fallback",
         startedAt: "now",
       }),

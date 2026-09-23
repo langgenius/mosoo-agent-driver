@@ -44,11 +44,14 @@ export type {
 } from "./host-snapshot";
 
 /**
- * Version 2 requires the durable external-tool-effect RPCs. Refusing an older
- * Driver is safer than letting it invoke an MCP tool without the persistence
- * fence during a rolling deployment.
+ * Version 6 removes the required legacy sandboxKind marker from boot context.
+ * Version 5 accepts explicit absence of an Agent preset in host provenance.
+ * Version 4 introduced the host's native-continuation requirement. Older
+ * Drivers must not silently replace checkpointed native state during a rolling
+ * deployment. Version 3 is already used by the upstream SDK boundary migration;
+ * this host backport must not be mistaken for that protocol.
  */
-export const DRIVER_PROTOCOL_VERSION = 2;
+export const DRIVER_PROTOCOL_VERSION = 6;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";
@@ -164,6 +167,8 @@ export interface DriverExecutionSessionSpec {
   readonly cwd: string;
   readonly mcpServers: DriverBootMcpServer[];
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
+  /** Never replace an existing native context with a new conversation. */
+  readonly nativeResumeRequired?: boolean | undefined;
   readonly recoveryMessages: DriverRecoveryMessage[];
 }
 
@@ -446,6 +451,10 @@ function readExecutionSession(value: unknown): DriverExecutionSessionSpec {
       readBootMcpServer,
     ),
     nativeResumeRef: readNativeRuntimeRef(record["nativeResumeRef"]),
+    nativeResumeRequired:
+      record["nativeResumeRequired"] === undefined
+        ? false
+        : readBoolean(record["nativeResumeRequired"], "execution.session.nativeResumeRequired"),
     recoveryMessages,
   };
 }
