@@ -4,6 +4,7 @@ FROM docker.io/cloudflare/sandbox:0.12.6@sha256:862aa35be41b1b56bc27acd66931c8ae
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.211
 ARG OPENAI_RUNTIME_VERSION=0.144.5
 ARG OPENCODE_VERSION=1.18.4
+ARG PI_VERSION=0.99.2
 
 # Install the Python runtime behind writable pip package declarations.
 RUN apt-get update \
@@ -27,7 +28,10 @@ RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 ARG RUNTIME=all
 COPY runtime-images.json /etc/mosoo/runtime-images.json
 RUN set -eu; \
-    case "$RUNTIME" in all|claude|openai|opencode) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
+    case "$RUNTIME" in all|claude|openai|opencode|pi) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
+    if [ "$RUNTIME" = all ] || [ "$RUNTIME" = pi ]; then \
+      npm install -g --ignore-scripts @earendil-works/pi-coding-agent@${PI_VERSION}; \
+    fi; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = claude ]; then \
       npm install -g --ignore-scripts @anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}; \
       ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude /usr/local/bin/mosoo-claude-code; \

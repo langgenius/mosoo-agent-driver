@@ -2,7 +2,7 @@
   "name": "@mosoo/agent-driver",
   "version": "0.1.0",
   "private": false,
-  "description": "Runtime-neutral Agent Driver and AI execution bridge for Claude Agent SDK, Codex app-server, and ACP inside isolated sandboxes.",
+  "description": "Runtime-neutral Agent Driver and AI execution bridge for Claude Agent SDK, Codex app-server, Pi RPC, and ACP inside isolated sandboxes.",
   "homepage": "https://github.com/langgenius/mosoo-agent-driver",
   "bugs": {
     "url": "https://github.com/langgenius/mosoo-agent-driver/issues"
@@ -80,6 +80,8 @@
     "test:live:anthropic": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=anthropic bun test tests/driver-artifact-live.test.ts",
     "test:live:openai": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=openai bun test tests/driver-artifact-live.test.ts",
     "test:live:opencode": "vp run build && AGENT_DRIVER_LIVE=1 AGENT_DRIVER_LIVE_SUITE=opencode bun test tests/driver-artifact-live.test.ts",
+    "test:live:pi": "vp run build && vp run test:live:pi:artifact",
+    "test:live:pi:artifact": "AGENT_DRIVER_PI_LIVE=1 bun test tests/pi-driver-live.test.ts",
     "bench": "bun bench/ttft-bench.ts",
     "build": "vp run build:types && bun build src/bin/driver.ts --target bun --outfile dist/driver.mjs",
     "build:types": "rm -rf dist/types && vp exec tsc -p tsconfig.types.json",
@@ -99,6 +101,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.99.2",
     "@openai/codex-sdk": "0.144.5",
     "@types/bun": "1.3.14",
     "@types/node": "^25.8.0",

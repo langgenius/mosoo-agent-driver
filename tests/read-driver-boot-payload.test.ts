@@ -32,6 +32,27 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
+  test("preserves Pi's native session path through boot and start parsing", () => {
+    const nativeResumeRef = {
+      runtimeId: "pi",
+      kind: "pi_session_path",
+      value: "sessions/restored.jsonl",
+    };
+    const parsed = parseDriverBootPayload({
+      ...payload,
+      runtime: "pi",
+      runtimeTransport: "pi-rpc",
+      execution: {
+        ...payload.execution,
+        session: { ...payload.execution.session, nativeResumeRef },
+      },
+    });
+    expect(parsed.execution.session.nativeResumeRef).toEqual(nativeResumeRef);
+    expect(createDriverStartInputFromBootPayload(parsed).execution.session.nativeResumeRef).toEqual(
+      nativeResumeRef,
+    );
+  });
+
   test.each([undefined, "pet", "cattle"])(
     "does not require or propagate the retired sandbox marker: %s",
     (legacyKind) => {

@@ -1,5 +1,12 @@
 [
   {
+    "runtimeId": "pi",
+    "profile": "pi",
+    "command": "pi",
+    "package": "@earendil-works/pi-coding-agent",
+    "probe": ["--version"]
+  },
+  {
     "runtimeId": "claude-agent-sdk",
     "profile": "claude",
     "command": "mosoo-claude-code",

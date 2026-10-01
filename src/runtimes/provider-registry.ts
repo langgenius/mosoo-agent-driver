@@ -1,11 +1,12 @@
+import type { AgentDriverBackend } from "../core/agent-driver-backend";
 import type { AgentDriverHostPortName } from "../host-ports";
 import type { DriverRuntime, DriverRuntimeTransport } from "../protocol/runtime";
 import type { DriverStartInput } from "../protocol/start";
 import type { DriverCapability } from "../runtime-command";
 import { AcpDriverBackend } from "./acp/acp-driver-backend";
-import type { AgentDriverBackend } from "../core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "./claude/agent-sdk-driver-backend";
 import { OpenAiAppServerDriverBackend } from "./openai/app-server-driver-backend";
+import { PiDriverBackend } from "./pi/pi-driver-backend";
 
 export interface AgentDriverProviderDescriptor {
   readonly capabilities: readonly DriverCapability[];
@@ -75,6 +76,17 @@ const PROVIDERS = [
     id: "acp-fallback",
     requiredHostPorts: [...SHARED_REQUIRED_HOST_PORTS, "file", "host_integration"],
     runtime: "acp-fallback",
+  },
+  {
+    capabilities: [
+      ...TEXT_TOOL_CAPABILITIES,
+      { id: "native_resume", status: "supported", version: 1 },
+      { id: "thinking_stream", status: "supported", version: 1 },
+    ],
+    createBackend: (payload) => new PiDriverBackend(payload),
+    id: "pi-rpc",
+    requiredHostPorts: SHARED_REQUIRED_HOST_PORTS,
+    runtime: "pi",
   },
 ] as const satisfies readonly AgentDriverProviderDescriptor[];
 

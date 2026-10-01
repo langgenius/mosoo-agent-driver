@@ -50,11 +50,12 @@ describe("public API", () => {
     expect(projectDriverEventToCma).toBeFunction();
     expect(pushDriverDiagnosticEvent).toBeFunction();
     expect(parseDriverNativeRuntimeRef).toBeFunction();
-    expect(AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(3);
+    expect(AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(4);
     expect(SUPPORTED_DRIVER_RUNTIMES).toEqual([
       "openai-runtime",
       "claude-agent-sdk",
       "acp-fallback",
+      "pi",
     ]);
   });
 

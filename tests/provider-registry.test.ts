@@ -12,6 +12,7 @@ import { driverBootPayload } from "./driver-boot-payload-fixture";
 
 function startInputFor(transport: DriverRuntimeTransport): DriverStartInput {
   const runtimeByTransport = {
+    "pi-rpc": "pi",
     "acp-fallback": "acp-fallback",
     "claude-agent-sdk": "claude-agent-sdk",
     "openai-app-server": "openai-runtime",
@@ -39,6 +40,7 @@ describe("provider registry", () => {
         id: "acp-fallback",
         runtime: "acp-fallback",
       },
+      { id: "pi-rpc", runtime: "pi" },
     ]);
   });
 
@@ -103,6 +105,7 @@ describe("provider registry", () => {
         id: "acp-fallback",
         requiredHostPorts: ["event_sink", "permission", "mcp", "skill", "file", "host_integration"],
       },
+      { id: "pi-rpc", requiredHostPorts: ["event_sink", "permission", "mcp", "skill"] },
     ]);
   });
 
@@ -123,7 +126,7 @@ describe("provider registry", () => {
     ).toThrow("Runtime claude-agent-sdk does not match transport openai-app-server.");
   });
 
-  test.each(["openai-app-server", "acp-fallback"] as const)(
+  test.each(["openai-app-server", "acp-fallback", "pi-rpc"] as const)(
     "rejects built-in tool restrictions unsupported by %s",
     (transport) => {
       const input = startInputFor(transport);

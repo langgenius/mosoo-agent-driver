@@ -2,18 +2,21 @@ export const SUPPORTED_DRIVER_RUNTIMES = [
   "openai-runtime",
   "claude-agent-sdk",
   "acp-fallback",
+  "pi",
 ] as const;
 
 export const SUPPORTED_DRIVER_RUNTIME_TRANSPORTS = [
   "openai-app-server",
   "claude-agent-sdk",
   "acp-fallback",
+  "pi-rpc",
 ] as const;
 
 export const SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS = [
   "openai_thread_id",
   "claude_session_id",
   "acp_session_id",
+  "pi_session_path",
 ] as const;
 
 export type DriverRuntime = (typeof SUPPORTED_DRIVER_RUNTIMES)[number];
@@ -34,6 +37,12 @@ export function isSupportedDriverRuntimeTransport(value: string): value is Drive
   return (SUPPORTED_DRIVER_RUNTIME_TRANSPORTS as readonly string[]).includes(value);
 }
 
+export function isSupportedDriverNativeRuntimeRefKind(
+  value: string,
+): value is DriverNativeRuntimeRefKind {
+  return (SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS as readonly string[]).includes(value);
+}
+
 export function getExpectedDriverNativeRuntimeRefKind(
   runtimeId: DriverRuntime,
 ): DriverNativeRuntimeRefKind {
@@ -46,6 +55,9 @@ export function getExpectedDriverNativeRuntimeRefKind(
     }
     case "acp-fallback": {
       return "acp_session_id";
+    }
+    case "pi": {
+      return "pi_session_path";
     }
   }
 }

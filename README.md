@@ -52,9 +52,9 @@ The Driver does not open a sandbox-local control listener. In mosoo's production
 
 ## AI Execution Bridge Architecture
 
-Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `@mosoo/agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
+Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, Pi RPC, and ACP-based agents — and each speaks its own event vocabulary. `@mosoo/agent-driver` unifies them at the kernel level so the host integrates **one** protocol for all backends.
 
-- **Kernel-level unification.** Three launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
+- **Kernel-level unification.** Four launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, `pi-rpc`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
 - **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics. Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports. The library is safe to import and never starts the process runner on its own.
 - **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and mosoo does not mount it as a production API.
 - **Typed public entries.** Every public entry ships a matching declaration file under `dist/types`, and the package carries **no** `@mosoo/*` runtime dependencies — it is self-contained and portable.
@@ -76,6 +76,10 @@ Boot protocol 6 no longer requires or exposes the retired `sandboxKind` label.
 The host still supplies actual Sandbox/Session ownership, and an Agent preset
 reference is optional. Boot parsing and the control handshake reject earlier
 protocol versions before work begins; deploy the matching host and Driver together.
+
+Pi uses `@earendil-works/pi-coding-agent@0.99.2` in RPC mode. Its model configuration routes through the host model proxy; native JSONL sessions are stored under the Session home. `tests/pi-driver-backend.test.ts` launches the real Pi process against a deterministic local model endpoint and covers tool permissions, cancellation, MCP, and cold continuation. `tests/pi-driver-artifact.test.ts` also verifies native continuation through the packed Driver's boot parser and control protocol. Pi has a separate opt-in paid-provider artifact suite described below.
+
+Run `bun test tests/pi-driver-backend.test.ts` for the native protocol tests. After `vp run build`, run `bun test tests/pi-driver-artifact.test.ts` to verify the packed Driver boot, outbound control WebSocket, tool execution, canonical events, and shutdown. The artifact test skips when the bundle has not been built.
 
 ## Runtime Contract
 
@@ -191,7 +195,7 @@ The image contract in `environment-package-managers.json` exposes `npm` and `pip
 
 Every live test launches `dist/driver.mjs` as a child process and talks to it only through the production boot payload and control protocol.
 
-The default matrix exercises all three runtime integrations through OpenRouter and does not claim separate certification of each provider's first-party endpoint.
+The default matrix exercises the Claude, OpenAI, and OpenCode runtime integrations through OpenRouter and does not claim separate certification of each provider's first-party endpoint.
 
 The test controller implements the production wire contract locally, so CMA, Durable Object persistence, database recovery, and deployment networking remain system-test responsibilities.
 
@@ -220,6 +224,10 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 - `vp run test:live:anthropic` runs the Anthropic runtime slice.
 - `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
 - `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
+- `vp run test:live:pi` builds the artifact and runs the separate Pi suite with `DEEPSEEK_API_KEY` and the first-party DeepSeek API. `AGENT_DRIVER_PI_LIVE_MODEL` defaults to `deepseek-flash`.
+- `vp run test:live:pi:artifact` runs that suite without rebuilding. `MOSOO_PI_TEST_ARTIFACT` can select a packed artifact; `MOSOO_PI_TEST_CLI` can select the pinned Pi CLI installed in a runtime image.
+
+The Pi suite covers real workspace writes, streaming text and token usage, multi-turn memory, native continuation after a full Driver stop/restart, authenticated MCP, supervised approval/rejection, and (on Linux) cancellation of a native Bash process tree followed by another model turn. Model requests are bounded to 2,048 output tokens and 16 requests per test fixture. Only the local forwarding controller holds the upstream API key; the Driver receives an ephemeral grant. This checks the packed Driver and Pi integration, not the deployed Worker proxy, D1 persistence, or sandbox snapshot restoration. It is gated by `AGENT_DRIVER_PI_LIVE=1` and is not part of the OpenRouter release matrix.
 
 The release workflow extracts the packed NPM archive to `packed/` and blocks image and package publication unless `packed/dist/driver.mjs` passes the complete matrix.
 

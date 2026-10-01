@@ -3,6 +3,7 @@ import type { JsonObject } from "../json";
 import { readJsonObject } from "../json";
 import type { DriverNativeRuntimeRef, DriverRuntime, DriverRuntimeTransport } from "../runtime";
 import {
+  isSupportedDriverNativeRuntimeRefKind,
   isSupportedDriverRuntime,
   isSupportedDriverRuntimeTransport,
   SUPPORTED_DRIVER_NATIVE_RUNTIME_REF_KINDS,
@@ -261,7 +262,7 @@ function readNativeRuntimeRef(value: unknown): DriverNativeRuntimeRef | null {
   const kind = readNonEmptyString(record, "kind", "execution.session.nativeResumeRef");
   const runtimeId = readNonEmptyString(record, "runtimeId", "execution.session.nativeResumeRef");
 
-  if (kind !== "openai_thread_id" && kind !== "claude_session_id" && kind !== "acp_session_id") {
+  if (!isSupportedDriverNativeRuntimeRefKind(kind)) {
     throw new TypeError("execution.session.nativeResumeRef.kind is unsupported.");
   }
 
