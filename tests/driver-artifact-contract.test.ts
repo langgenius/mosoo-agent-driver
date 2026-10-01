@@ -268,7 +268,8 @@ describe("driver artifact contract", () => {
     const typesTsconfig = readText("../tsconfig.types.json");
 
     expect(deps.filter((dependency) => dependency.startsWith("@mosoo/"))).toEqual([]);
-    expect(packageJson.dependencies).not.toHaveProperty("@cfworker/json-schema");
+    // The pinned MCP client imports this optional peer unconditionally in its bundle.
+    expect(packageJson.dependencies).toHaveProperty("@cfworker/json-schema", "^4.1.1");
     expect(packageJson.dependencies).toHaveProperty("fflate");
     expect(packageJson.dependencies).toHaveProperty("vestig");
     expect(tsconfig).not.toContain("../../dev/");
