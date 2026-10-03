@@ -75,4 +75,9 @@ jobs:
             podman run --pull=never --rm --network none \
               -v "$PWD/scripts:/checks:ro" --entrypoint node "agent-driver:$runtime" \
               /checks/runtime-image-tools-smoke.mjs
+            if [[ "$runtime" == pi || "$runtime" == all ]]; then
+              podman run --pull=never --rm --init --network none \
+                -v "$PWD:/driver:ro" -w /driver -e PI_ACP_ARTIFACT_CONTRACT=1 \
+                --entrypoint bun "agent-driver:$runtime" test tests/pi-acp-artifact.test.ts
+            fi
           done

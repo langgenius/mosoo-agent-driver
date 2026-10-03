@@ -1,4 +1,9 @@
 #!/bin/sh
 # Only platform-materialized global resources are admitted. The adapter owns
 # RPC/session arguments; project-local code and prompt discovery stay disabled.
-exec /usr/local/bin/pi --no-extensions --no-approve --no-prompt-templates "$@"
+# Image admission probes the installed version before execution bootstrap exists.
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+  exec "/usr/local/bin/pi" --version
+fi
+. "${PI_CODING_AGENT_DIR:?}/mosoo-skills.sh"
+exec /usr/local/bin/pi --no-extensions --no-approve --no-prompt-templates --no-skills "$@"

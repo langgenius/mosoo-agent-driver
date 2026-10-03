@@ -1,0 +1,144 @@
+diff --git a/dist/index.js b/dist/index.js
+index 64758f027a38a7ecbe7d6e05e88edcc72ee9f193..194eb2673eae83956251deff96457e876a4310a0 100755
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -937,9 +937,22 @@ var PiAcpSession = class {
+     await this.flushEmits();
+   }
+   async settleTurn() {
++    const turn = this.pendingTurn;
++    if (!turn) return;
+     await this.publishContextUsage();
+-    const reason = this.cancelRequested ? "cancelled" : "end_turn";
+-    this.pendingTurn?.resolve(reason);
++    // A duplicate settlement or late RPC rejection must not finish the next turn.
++    if (this.pendingTurn !== turn) return;
++    if (!this.turnQueue.length) {
++      this.emit({
++        sessionUpdate: "session_info_update",
++        _meta: { piAcp: { queueDepth: 0, running: false } }
++      });
++      await this.flushEmits();
++      if (this.pendingTurn !== turn) return;
++    }
++    if (this.cancelRequested) turn.resolve("cancelled");
++    else if (turn.error) turn.reject(turn.error);
++    else turn.resolve(turn.stopReason);
+     this.pendingTurn = null;
+     this.inAgentLoop = false;
+     const next = this.turnQueue.shift();
+@@ -949,11 +962,20 @@ var PiAcpSession = class {
+         content: { type: "text", text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+       });
+       this.startTurn(next);
+-    } else {
+-      this.emit({
+-        sessionUpdate: "session_info_update",
+-        _meta: { piAcp: { queueDepth: 0, running: false } }
+-      });
++    }
++  }
++  recordAssistantOutcome(message) {
++    const turn = this.pendingTurn;
++    if (!turn || message?.role !== "assistant") return;
++    if (message.stopReason === "error") {
++      const detail = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
++      // Keep arbitrary provider fields out of the public ACP error data.
++      const error = new Error((detail || "Pi provider request failed").slice(0, 2048));
++      turn.error = maybeAuthRequiredError(error) ?? RequestError2.internalError({}, error.message);
++      turn.stopReason = "end_turn";
++    } else if (message.stopReason) {
++      turn.error = null;
++      turn.stopReason = message.stopReason === "length" ? "max_tokens" : message.stopReason === "aborted" ? "cancelled" : "end_turn";
+     }
+   }
+   emitBashToolCall(params) {
+@@ -994,26 +1016,30 @@ var PiAcpSession = class {
+   startTurn(t) {
+     this.cancelRequested = false;
+     this.inAgentLoop = false;
+-    this.pendingTurn = { resolve: t.resolve, reject: t.reject };
++    const turn = this.pendingTurn = { resolve: t.resolve, reject: t.reject, error: null, stopReason: "end_turn" };
+     this.emit({
+       sessionUpdate: "session_info_update",
+       _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
+     });
+     this.proc.prompt(t.message, t.images).catch((err) => {
++      if (this.pendingTurn !== turn) return;
++      this.emit({
++        sessionUpdate: "session_info_update",
++        _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
++      });
+       void this.flushEmits().finally(() => {
++        if (this.pendingTurn !== turn) return;
+         const authErr = maybeAuthRequiredError(err);
+-        if (authErr) {
+-          this.pendingTurn?.reject(authErr);
++        if (this.cancelRequested) {
++          turn.resolve("cancelled");
++        } else if (authErr) {
++          turn.reject(authErr);
+         } else {
+-          const reason = this.cancelRequested ? "cancelled" : "error";
+-          this.pendingTurn?.resolve(reason);
++          const message = String(err?.message ?? err ?? "Pi prompt failed").slice(0, 2048);
++          turn.reject(RequestError2.internalError({}, message));
+         }
+         this.pendingTurn = null;
+         this.inAgentLoop = false;
+-        this.emit({
+-          sessionUpdate: "session_info_update",
+-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+-        });
+       });
+       void err;
+     });
+@@ -1021,6 +1047,10 @@ var PiAcpSession = class {
+   handlePiEvent(ev) {
+     const type = String(ev.type ?? "");
+     switch (type) {
++      case "message_end": {
++        this.recordAssistantOutcome(ev.message);
++        break;
++      }
+       case "message_update": {
+         const ame = ev.assistantMessageEvent;
+         if (ame?.type === "text_delta" && typeof ame.delta === "string") {
+@@ -1247,6 +1277,13 @@ var PiAcpSession = class {
+         break;
+       }
+       case "auto_retry_end": {
++        if (ev.success === false) {
++          if (this.pendingTurn && typeof ev.finalError === "string") {
++            this.recordAssistantOutcome({ role: "assistant", stopReason: "error", errorMessage: ev.finalError });
++          }
++          break;
++        }
++        if (ev.success !== true) break;
+         this.emit({
+           sessionUpdate: "agent_message_chunk",
+           content: { type: "text", text: "Retry finished, resuming." }
+@@ -1281,6 +1318,13 @@ var PiAcpSession = class {
+         break;
+       }
+       case "agent_end": {
++        const messages = Array.isArray(ev.messages) ? ev.messages : [];
++        for (let index = messages.length - 1; index >= 0; index -= 1) {
++          if (messages[index]?.role === "assistant") {
++            this.recordAssistantOutcome(messages[index]);
++            break;
++          }
++        }
+         this.inAgentLoop = false;
+         break;
+       }
+@@ -2495,8 +2539,7 @@ ${JSON.stringify(stats, null, 2)}`;
+       }
+     }
+     const result = await session.prompt(message, images);
+-    const stopReason = result === "error" ? session.wasCancelRequested() ? "cancelled" : "end_turn" : result;
+-    return { stopReason };
++    return { stopReason: result };
+   }
+   async cancel(params) {
+     const session = this.sessions.maybeGet(params.sessionId);

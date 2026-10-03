@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
 import images from "../runtime-images.json";
@@ -15,6 +16,8 @@ describe("runtime image coverage", () => {
     expect(workflow).toContain("environment-package-manager-check.mjs smoke");
     expect(workflow).toContain("--network none");
     expect(workflow).toContain("runtime-image-tools-smoke.mjs");
+    expect(workflow).toContain("PI_ACP_ARTIFACT_CONTRACT=1");
+    expect(workflow).toContain("tests/pi-acp-artifact.test.ts");
   });
 
   test("Given main image pins, When adding Pi, Then the pinned base and existing runtimes stay unchanged", () => {
@@ -84,6 +87,26 @@ describe("runtime image coverage", () => {
     expect(new Set(packages.map((entry) => entry.package)).size).toBe(packages.length);
   });
 
+  test("Given the pinned adapter repair, When dependencies or images install it, Then the same source patch is required", () => {
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    const patchPath = manifest.patchedDependencies["pi-acp@0.0.34"];
+    const patchedSource = readFileSync(
+      new URL("../node_modules/pi-acp/dist/index.js", import.meta.url),
+    );
+    expect(patchPath).toBe("patches/pi-acp@0.0.34.patch");
+    expect(readFileSync(new URL(`../${patchPath}`, import.meta.url), "utf8")).toContain(
+      'message.stopReason === "length" ? "max_tokens"',
+    );
+    expect(images.find((image) => image.runtimeId === "pi-acp")?.sourceSha256).toBe(
+      createHash("sha256").update(patchedSource).digest("hex"),
+    );
+    expect(containerfile).toContain(`COPY ${patchPath} /usr/local/libexec/mosoo/pi-acp.patch`);
+    expect(containerfile).toContain('git -C "$pi_acp_package" apply');
+    expect(containerfile).toContain('"$PI_ACP_SOURCE_SHA256" "$pi_acp_package/dist/index.js"');
+    const admittedPaths = readFileSync(new URL("../.containerignore", import.meta.url), "utf8");
+    expect(admittedPaths).toContain(`!${patchPath}`);
+  });
+
   test("checks every profile at build time, including real Pi ACP initialization", () => {
     for (const image of images) {
       expect(containerfile).toContain(`|| [ "$RUNTIME" = ${image.profile} ]; then`);
@@ -101,7 +124,7 @@ describe("runtime image coverage", () => {
   test("runs Pi through the fixed project-resource-disabled launcher", () => {
     const launcher = readFileSync(new URL("../scripts/mosoo-pi", import.meta.url), "utf8");
     expect(launcher).toContain(
-      'exec /usr/local/bin/pi --no-extensions --no-approve --no-prompt-templates "$@"',
+      'exec /usr/local/bin/pi --no-extensions --no-approve --no-prompt-templates --no-skills "$@"',
     );
     expect(containerfile).toContain("COPY scripts/mosoo-pi /usr/local/libexec/mosoo/mosoo-pi");
     expect(containerfile).toContain("/usr/local/bin/mosoo-pi");

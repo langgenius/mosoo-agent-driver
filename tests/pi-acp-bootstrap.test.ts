@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import type { DriverStartInput } from "../src/protocol/start";
 import {
@@ -229,4 +233,67 @@ test("Given Mosoo local Cloudflare provisioning, When proxy uses Docker host ali
   payload.execution.environment.variables.OPENAI_COMPATIBLE_BASE_URL =
     "http://remote.example/api/driver/llm/proxy/credential-fixture";
   expect(() => assertPiConfiguration(payload)).toThrow("Pi requires");
+});
+
+test("Given Host Skill paths with shell metacharacters, When building explicit launch arguments, Then every path remains one literal argument and empty selection clears prior arguments", () => {
+  const paths = [
+    "/tmp/skill with spaces/SKILL.md",
+    "/tmp/skill'quote/SKILL.md",
+    "/tmp/$(exit 7)\nsecond-line/SKILL.md",
+  ];
+  const input = piInput();
+  const skills = paths.map((skillMarkdownPath, index) => ({
+    mountPath: "/tmp/skill",
+    skillMarkdownPath,
+    skillId: `skill-${index}`,
+    skillName: `skill-${index}`,
+    snapshotId: "snapshot",
+  }));
+  const files = buildPiBootstrapFiles(input, skills);
+  const launch = files["mosoo-skills.sh"];
+  expect(launch).toBeDefined();
+  const result = spawnSync(
+    "/bin/sh",
+    ["-c", `${launch}\nprintf '%s\\0' "$@"`, "launcher", "--mode", "rpc"],
+    { encoding: "utf8" },
+  );
+  expect(result.status).toBe(0);
+  expect(result.stdout.split("\0").slice(0, -1)).toEqual([
+    ...paths.flatMap((path) => ["--skill", path]),
+    "--mode",
+    "rpc",
+  ]);
+  expect(buildPiBootstrapFiles(input, [])["mosoo-skills.sh"]).toBe("");
+});
+
+test("Given no bootstrap environment or skill manifest, When probing exactly --version, Then the fixed binary responds while real executions fail closed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mosoo-pi-version-"));
+  try {
+    const binary = join(directory, "pi");
+    await writeFile(binary, '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+    await chmod(binary, 0o755);
+    const source = await readFile(resolve(import.meta.dir, "../scripts/mosoo-pi"), "utf8");
+    const wrapper = join(directory, "mosoo-pi");
+    await writeFile(wrapper, source.replaceAll("/usr/local/bin/pi", binary));
+    await chmod(wrapper, 0o755);
+    const probe = spawnSync(wrapper, ["--version"], { env: {}, encoding: "utf8" });
+    expect(probe.status).toBe(0);
+    expect(probe.stdout).toBe("--version\n");
+    for (const args of [
+      ["--mode", "rpc"],
+      ["--version", "--mode", "rpc"],
+    ]) {
+      const result = spawnSync(wrapper, args, { env: {}, encoding: "utf8" });
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).toBe("");
+    }
+    const absentManifest = spawnSync(wrapper, ["--mode", "rpc"], {
+      env: { PI_CODING_AGENT_DIR: directory },
+      encoding: "utf8",
+    });
+    expect(absentManifest.status).not.toBe(0);
+    expect(absentManifest.stdout).toBe("");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

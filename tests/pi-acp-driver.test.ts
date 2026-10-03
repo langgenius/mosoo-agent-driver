@@ -61,6 +61,15 @@ process.stdin.on("data", (chunk) => {
         } });
         continue;
       }
+      if (["provider-error", "max-tokens"].includes(message.params.prompt[0]?.text)) {
+        send({ jsonrpc: "2.0", method: "session/update", params: {
+          sessionId: "pi-native-session", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PI_PARTIAL_OUTPUT" } },
+        } });
+        if (message.params.prompt[0]?.text === "provider-error") {
+          send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: "Provider HTTP 500 after successful tool", data: { reason: "provider_error" } } });
+        } else send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "max_tokens" } });
+        continue;
+      }
       if (message.params.prompt[0]?.text !== "hello") throw new Error("synthetic bootstrap prompt");
       send({ jsonrpc: "2.0", method: "session/update", params: {
         sessionId: "pi-native-session", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello response" } },
@@ -128,7 +137,7 @@ function createContextHarness({
   };
 }
 
-async function createHarness() {
+async function createHarness(options: { clearOnTerminal?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "pi-acp-driver-"));
   const input = piInput({
     model: "model-1",
@@ -143,7 +152,7 @@ async function createHarness() {
       providerOptions: { pi: { thinkingLevel: "off" } },
     },
   };
-  const state = createContextHarness();
+  const state = createContextHarness(options);
   const context = state.contextFor(payload);
   const launches: Array<{
     command?: string;
@@ -214,6 +223,33 @@ describe.skipIf(process.platform !== "linux")(
         await harness.destroy();
       }
     });
+
+    for (const outcome of ["provider-error", "max-tokens"] as const) {
+      test(`Given partial Pi output and ${outcome}, When the authoritative sink clears the run on terminal, Then one failed terminal retains its classification`, async () => {
+        const harness = await createHarness({ clearOnTerminal: true });
+        try {
+          await harness.backend.start(harness.context, new AbortController().signal);
+          const rejection = await harness.run(outcome).then(
+            () => null,
+            (error: unknown) => error,
+          );
+          const terminals = harness.events.filter((event) =>
+            ["run.completed", "run.cancelled", "run.failed"].includes(event.kind),
+          );
+          expect(terminals.map((event) => event.kind)).toEqual(["run.failed"]);
+          expect(terminals[0]?.runId).toBe(DRIVER_TEST_IDS.runId);
+          expect(JSON.stringify(terminals[0]?.payload)).toMatch(
+            outcome === "provider-error"
+              ? /provider|HTTP 500|ACPRequestError/i
+              : /max_tokens|token|truncat/i,
+          );
+          expect(rejection).toBeInstanceOf(Error);
+          expect(JSON.stringify(harness.events)).toContain("PI_PARTIAL_OUTPUT");
+        } finally {
+          await harness.destroy();
+        }
+      });
+    }
 
     test("Given Pi text-only capabilities, When input references an image attachment, Then reject before prompting the provider", async () => {
       const harness = await createHarness();

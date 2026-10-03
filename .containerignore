@@ -7,5 +7,7 @@
 !scripts/runtime-image-check.mjs
 !scripts/pi-acp-image-check.mjs
 !scripts/mosoo-pi
+!patches/
+!patches/pi-acp@0.0.34.patch
 !dist/
 !dist/driver.mjs

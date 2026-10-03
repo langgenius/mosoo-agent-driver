@@ -90,8 +90,9 @@
     "test:image:environment": "podman run --pull=never --rm --entrypoint node agent-driver:local /usr/local/libexec/mosoo/environment-package-manager-check.mjs smoke",
     "check": "vp check && vp run check:generated && vp run tc && vp run test && vp run test:pi-acp && vp run build && vp run test:artifact:mcp",
     "prepack": "vp run build",
-    "test:pi-acp": "PI_ACP_PINNED_CONTRACT=1 bun test tests/pi-acp-pinned-contract.test.ts tests/pi-acp-driver.test.ts",
-    "test:pi-upgrade": "PI_ACP_UPGRADE_CONTRACT=1 bun test tests/pi-acp-pinned-contract.test.ts"
+    "test:pi-acp": "PI_ACP_PINNED_CONTRACT=1 bun test tests/pi-acp-pinned-contract.test.ts tests/pi-acp-driver.test.ts tests/pi-acp-outcome-contract.test.ts tests/pi-acp-skills-contract.test.ts",
+    "test:pi-upgrade": "PI_ACP_UPGRADE_CONTRACT=1 bun test tests/pi-acp-pinned-contract.test.ts",
+    "test:image:pi": "PI_ACP_ARTIFACT_CONTRACT=1 bun test tests/pi-acp-artifact.test.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
@@ -116,5 +117,8 @@
   "engines": {
     "bun": ">=1.4.0"
   },
-  "packageManager": "bun@1.4.0"
+  "packageManager": "bun@1.4.0",
+  "patchedDependencies": {
+    "pi-acp@0.0.34": "patches/pi-acp@0.0.34.patch"
+  }
 }

@@ -26,6 +26,7 @@
     "command": "/usr/local/bin/pi-acp",
     "package": "pi-acp",
     "version": "0.0.34",
+    "sourceSha256": "5ad1de345d577be83e4e05f112cd702be402b4593e1ae441cc32baa7d864f6ab",
     "gitHead": "b0581c9c1d675e634234674484247008b03d69b4",
     "probe": [],
     "additionalPackages": [

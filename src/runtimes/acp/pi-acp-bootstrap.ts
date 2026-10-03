@@ -134,6 +134,9 @@ export function buildPiBootstrapFiles(
   assertPiConfiguration(payload);
   const model = readPiModelId(payload);
   const thinkingLevel = readPiThinkingLevel(payload);
+  const skillArgs = skills
+    .map((skill) => `--skill '${skill.skillMarkdownPath.replaceAll("'", "'\\''")}'`)
+    .join(" ");
   return {
     "models.json": JSON.stringify({
       providers: {
@@ -168,6 +171,10 @@ export function buildPiBootstrapFiles(
       prompts: [],
       skills: skills.map((skill) => skill.skillMarkdownPath),
     }),
+    // --no-skills disables both discovery and settings.skills in pinned Pi.
+    // Admit Host Skills through explicit CLI paths instead; quote literal paths
+    // so whitespace, newlines and shell syntax cannot become launch arguments.
+    "mosoo-skills.sh": skillArgs ? `set -- ${skillArgs} "$@"\n` : "",
     // Fresh credentials and trust are execution-scoped, not restore state.
     "auth.json": "{}",
     "trust.json": "{}",
@@ -184,7 +191,7 @@ export async function preparePiBootstrap(
   const files = buildPiBootstrapFiles(payload, skills);
   const path = join(payload.execution.session.homePath, "pi-acp", ".pi", "agent");
   // Use Linux descriptor-relative, no-symlink atomic writes.
-  // Sessions and the sibling pi-acp/session-map.json are deliberately untouched.
+  // Sessions and the sibling .pi/pi-acp/session-map.json are deliberately untouched.
   await using directory = await ensureAbsoluteRealDirectory(
     path,
     "Pi runtime configuration",

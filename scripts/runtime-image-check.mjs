@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -36,6 +37,13 @@ for (const runtime of runtimes) {
       // do not necessarily include it in the installed package.json.
     }
     if (selected && entry.package === "pi-acp") {
+      assert.equal(
+        createHash("sha256")
+          .update(readFileSync(`${installed}/dist/index.js`))
+          .digest("hex"),
+        runtime.sourceSha256,
+        "Pi ACP must contain the reviewed terminal-outcome patch",
+      );
       await checkPiAcpImage(entry.command);
       continue;
     }

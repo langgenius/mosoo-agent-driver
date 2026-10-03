@@ -36,6 +36,8 @@ RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 ARG RUNTIME=all
 COPY runtime-images.json /etc/mosoo/runtime-images.json
 COPY scripts/mosoo-pi /usr/local/libexec/mosoo/mosoo-pi
+COPY patches/pi-acp@0.0.34.patch /usr/local/libexec/mosoo/pi-acp.patch
+ARG PI_ACP_SOURCE_SHA256=324aeb8bba1228937e16b1326fb3e014e2a625b2dea549dbcd49b006cd5df6a2
 RUN set -eu; \
     case "$RUNTIME" in all|claude|openai|opencode|pi) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = claude ]; then \
@@ -51,6 +53,9 @@ RUN set -eu; \
     fi; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = pi ]; then \
       npm install -g --ignore-scripts pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_VERSION}; \
+      pi_acp_package="$(npm root -g)/pi-acp"; \
+      printf '%s  %s\n' "$PI_ACP_SOURCE_SHA256" "$pi_acp_package/dist/index.js" | sha256sum -c -; \
+      git -C "$pi_acp_package" apply /usr/local/libexec/mosoo/pi-acp.patch; \
       install -m 755 /usr/local/libexec/mosoo/mosoo-pi /usr/local/bin/mosoo-pi; \
     fi; \
     printf '%s\n' "$RUNTIME" > /etc/mosoo/runtime; \

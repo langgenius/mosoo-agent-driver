@@ -282,6 +282,7 @@ export async function runRuntimeToolsSmoke(
   };
   try {
     if (runtime === "pi") {
+      await writeFile(join(cwd, "mosoo-skills.sh"), "");
       await writeFile(
         join(cwd, "models.json"),
         JSON.stringify({
