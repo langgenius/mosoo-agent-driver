@@ -1104,6 +1104,7 @@ describe("ACP driver backend lifecycle", () => {
     const failure = new Error("committed file.changed failed");
     const reportEntered = Promise.withResolvers<void>();
     const releaseReport = Promise.withResolvers<void>();
+    const responseAccepted = Promise.withResolvers<void>();
     const harness = await createHarness({
       file: {
         reportChanged: async () => {
@@ -1112,6 +1113,14 @@ describe("ACP driver backend lifecycle", () => {
           throw failure;
         },
       },
+    });
+    const originalDrain = AcpClientRequestHandler.prototype.drainTurnFileWrites;
+    const drainSpy = spyOn(
+      AcpClientRequestHandler.prototype,
+      "drainTurnFileWrites",
+    ).mockImplementation(function (this: AcpClientRequestHandler, signal) {
+      responseAccepted.resolve();
+      return originalDrain.call(this, signal);
     });
 
     try {
@@ -1129,6 +1138,9 @@ describe("ACP driver backend lifecycle", () => {
         }),
       ).toMatchObject({ status: "timed_out" });
 
+      // The lifecycle owns transport failure after the prompt response is accepted.
+      // Waiting 50ms alone races the provider's own 50ms response timer.
+      await responseAccepted.promise;
       releaseReport.resolve();
       expect(
         await settlePromiseWithTimeout(input, {
@@ -1175,7 +1187,11 @@ describe("ACP driver backend lifecycle", () => {
       ).resolves.toBeUndefined();
     } finally {
       releaseReport.resolve();
-      await harness.destroy();
+      try {
+        await harness.destroy();
+      } finally {
+        drainSpy.mockRestore();
+      }
     }
   });
 
@@ -1571,6 +1587,12 @@ describe("ACP driver backend lifecycle", () => {
         await waitForAcpTestCondition(
           async () => (await harness.methods()).includes("session/cancel"),
           "ACP session/cancel request",
+        );
+        // The method log precedes spawn; hold cancellation admission until the
+        // fixture has recorded the descendant that recycling must clean up.
+        await waitForAcpTestCondition(
+          () => Bun.file(harness.latePidPath).exists(),
+          "cancelled provider descendant PID",
         );
         gate.release();
         await expect(cancellation).resolves.toBeUndefined();

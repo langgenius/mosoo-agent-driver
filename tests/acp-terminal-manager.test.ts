@@ -1312,6 +1312,9 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
       async (reason, events) => {
         if (reason === "driver.acp.terminal.created") {
           if (createdDraft === undefined) {
+            // Receipt failure may kill the child before its startup script runs.
+            // Confirm the child started before exercising unknown-ACK cleanup.
+            await waitForPidFile(pidPath);
             createdDraft = events[0];
             createdPushes += 1;
             throw new Error("creation receipt lost after commit");

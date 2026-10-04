@@ -544,45 +544,59 @@ describe("DriverEventPublisher", () => {
   test("bounds the whole terminal settlement by one delivery deadline", async () => {
     const acceptedKinds: string[] = [];
     const attempts: DriverEventInput[][] = [];
+    const deliverySignals: Array<AbortSignal | undefined> = [];
+    const terminalEntered = Promise.withResolvers<void>();
     const nativeTimeout = AbortSignal.timeout;
-    AbortSignal.timeout = () => nativeTimeout(100);
+    let deadline = new AbortController();
+    let deadlineCount = 0;
+    let blockTerminal = true;
     const context = createContext({
       pushEvents: async (events, signal) => {
         attempts.push(events);
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(resolve, 40);
-          signal?.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timeout);
-              reject(signal.reason);
-            },
-            { once: true },
-          );
-        });
+        deliverySignals.push(signal);
+        if (events[0]?.kind === "run.completed" && blockTerminal) {
+          terminalEntered.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+          });
+        }
         acceptedKinds.push(...events.map(({ kind }) => kind));
         return acceptEvents(events, (index) => attempts.length + index);
       },
     });
     const publisher = new DriverEventPublisher("openai-runtime", () => "session-ref");
-    let terminal: Promise<void>;
+    const closures = [
+      { ...createEvent("message.completed"), payload: { messageId: "one" } },
+      { ...createEvent("message.completed"), payload: { messageId: "two" } },
+    ];
+    const startTerminal = (reason: string) => {
+      AbortSignal.timeout = () => {
+        deadlineCount += 1;
+        return deadline.signal;
+      };
+      try {
+        return publisher.pushTerminal(
+          context,
+          reason,
+          closures,
+          createRunTerminal("run.completed"),
+        );
+      } finally {
+        AbortSignal.timeout = nativeTimeout;
+      }
+    };
 
+    const terminal = startTerminal("terminal");
+    void terminal.catch(() => {});
     try {
-      terminal = publisher.pushTerminal(
-        context,
-        "terminal",
-        [
-          { ...createEvent("message.completed"), payload: { messageId: "one" } },
-          { ...createEvent("message.completed"), payload: { messageId: "two" } },
-        ],
-        createRunTerminal("run.completed"),
-      );
-    } finally {
-      AbortSignal.timeout = nativeTimeout;
-    }
-
-    try {
-      await expect(terminal).rejects.toThrow();
+      await terminalEntered.promise;
+      // Abort the one shared deadline after both closures are admitted, without
+      // depending on two 40ms timers fitting inside a 100ms scheduling window.
+      deadline.abort(new Error("terminal delivery deadline expired"));
+      await expect(terminal).rejects.toThrow("terminal delivery deadline expired");
+      expect(deadlineCount).toBe(1);
+      expect(deliverySignals).toHaveLength(3);
+      for (const signal of deliverySignals) expect(signal).toBe(deadline.signal);
       expect(kinds(attempts)).toEqual([
         ["message.completed"],
         ["message.completed"],
@@ -590,23 +604,14 @@ describe("DriverEventPublisher", () => {
       ]);
       expect(acceptedKinds).toEqual(["message.completed", "message.completed"]);
 
-      AbortSignal.timeout = () => nativeTimeout(100);
-      try {
-        terminal = publisher.pushTerminal(
-          context,
-          "terminal.retry",
-          [
-            { ...createEvent("message.completed"), payload: { messageId: "one" } },
-            { ...createEvent("message.completed"), payload: { messageId: "two" } },
-          ],
-          createRunTerminal("run.completed"),
-        );
-      } finally {
-        AbortSignal.timeout = nativeTimeout;
-      }
-      await expect(terminal).resolves.toBeUndefined();
+      deadline = new AbortController();
+      blockTerminal = false;
+      await expect(startTerminal("terminal.retry")).resolves.toBeUndefined();
+      expect(deadlineCount).toBe(2);
+      expect(deliverySignals.at(-1)).toBe(deadline.signal);
       expect(acceptedKinds).toEqual(["message.completed", "message.completed", "run.completed"]);
     } finally {
+      deadline.abort(new Error("terminal deadline test cleanup"));
     }
   });
 

@@ -1977,6 +1977,7 @@ setInterval(() => {}, 1000);
   ] as const)("%s the 1024-message queue limit", async (_label, messageCount, rejected) => {
     const firstNotification = Promise.withResolvers<void>();
     const notificationGate = Promise.withResolvers<void>();
+    const producerFlushed = Promise.withResolvers<void>();
     let handled = 0;
     const harness = await createClientHarness(
       (directory) => `
@@ -1998,14 +1999,23 @@ process.stdin.on("data", (chunk) => {
       });
       process.stdout.write(
         Array.from({ length: ${String(messageCount)} }, () => notification).join("\\n") + "\\n",
-        () => writeFileSync(${JSON.stringify(join(directory, "burst-flushed"))}, "flushed"),
+        () => {
+          writeFileSync(${JSON.stringify(join(directory, "burst-flushed"))}, "flushed");
+          process.stdout.write(JSON.stringify({
+            method: "thread/closed", params: { threadId: "burst-fixture" },
+          }) + "\\n");
+        },
       );
     }
   }
 });
 setInterval(() => {}, 1000);
 `,
-      async () => {
+      async (method) => {
+        if (method === "thread/closed") {
+          producerFlushed.resolve();
+          return;
+        }
         handled += 1;
         if (handled === 1) {
           firstNotification.resolve();
@@ -2029,6 +2039,13 @@ setInterval(() => {}, 1000);
         await expect(drain).rejects.toThrow("message queue limit exceeded");
       } else {
         await drain;
+        // Queue drain does not synchronize the child's stdout write callback.
+        await expect(
+          settlePromiseWithTimeout(producerFlushed.promise, {
+            label: "app-server burst flushed notification",
+            timeoutMs: 2_000,
+          }),
+        ).resolves.toMatchObject({ status: "completed" });
         expect(await Bun.file(join(harness.directory, "burst-flushed")).exists()).toBe(true);
       }
       expect(handled).toBe(Math.min(messageCount, 1_024));
