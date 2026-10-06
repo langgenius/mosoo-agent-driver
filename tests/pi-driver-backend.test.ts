@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,6 +112,60 @@ function response(delta: JsonObject, finish = "stop"): Response {
 }
 
 describe("Pi runtime", () => {
+  test("fails a truncated model response instead of reporting successful completion", async () => {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => response({ role: "assistant", content: "Incomplete answer" }, "length"),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const run = harness(await payloadFor(`http://127.0.0.1:${server.port}/v1`));
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await expect(
+      run.backend.handleInput(run.context, { text: "Respond." }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("length");
+    expect(run.events.some((event) => event.kind === "run.completed")).toBe(false);
+    expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+  }, 30_000);
+
+  test("rejects a corrupted native transcript instead of silently omitting saved history", async () => {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => response({ role: "assistant", content: "Remember this answer." }),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const first = harness(payload);
+    await first.backend.start(first.context, AbortSignal.timeout(20_000));
+    await first.backend.handleInput(first.context, { text: "Respond." }, DRIVER_TEST_IDS.runId);
+    const resume = first.events.findLast((event) => event.kind === "runtime.resume.updated")!;
+    if (!isJsonObject(resume.payload) || typeof resume.payload["resumePointer"] !== "string")
+      throw new Error("No Pi resume pointer.");
+    const pointer = resume.payload["resumePointer"];
+    await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
+    await appendFile(join(payload.execution.session.homePath, "pi", pointer), '{"type":"message"');
+    const restored = harness({
+      ...payload,
+      execution: {
+        ...payload.execution,
+        session: {
+          ...payload.execution.session,
+          nativeResumeRef: { kind: "pi_session_path", runtimeId: "pi", value: pointer },
+          nativeResumeRequired: true,
+        },
+      },
+    });
+    await expect(
+      restored.backend.start(restored.context, AbortSignal.timeout(20_000)),
+    ).rejects.toThrow();
+    expect(restored.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+  }, 30_000);
+
   test("uses the native Anthropic request path and proxy grant", async () => {
     const server = Bun.serve({
       hostname: "127.0.0.1",
@@ -369,6 +423,77 @@ describe("Pi runtime", () => {
     },
     45_000,
   );
+
+  test("cancels a pending permission before execution and accepts the next turn", async () => {
+    const permissionRequested = Promise.withResolvers<void>();
+    let calls = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () =>
+        ++calls === 1
+          ? response(
+              {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "pending-write",
+                    type: "function",
+                    function: {
+                      name: "write",
+                      arguments: JSON.stringify({ path: "cancelled.txt", content: "no" }),
+                    },
+                  },
+                ],
+              },
+              "tool_calls",
+            )
+          : response({ role: "assistant", content: "Continued after permission cancellation." }),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const run = harness(payload);
+    let permissionAborted = false;
+    const context = {
+      ...run.context,
+      ports: {
+        ...run.context.ports,
+        permission: {
+          request: async (_request: unknown, signal?: AbortSignal): Promise<"allow_once"> => {
+            if (!signal) throw new Error("Permission must be cancellable.");
+            permissionRequested.resolve();
+            return new Promise((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  permissionAborted = true;
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+            });
+          },
+        },
+      },
+    };
+    await run.backend.start(context, AbortSignal.timeout(20_000));
+    const outcome = run.backend
+      .handleInput(context, { text: "Write cancelled.txt." }, DRIVER_TEST_IDS.runId)
+      .catch((error: unknown) => error);
+    await permissionRequested.promise;
+    await run.backend.cancelActiveTurn(context, "test.permission.cancel");
+    expect(await outcome).toMatchObject({ name: "DriverTurnCancelledError" });
+    expect(permissionAborted).toBe(true);
+    expect(existsSync(join(payload.execution.session.cwd, "cancelled.txt"))).toBe(false);
+    expect(run.events.filter((event) => event.kind === "run.cancelled")).toHaveLength(1);
+    await run.backend.handleInput(context, { text: "Continue." }, DRIVER_TEST_IDS.secondRunId);
+    expect(run.events.find((event) => event.kind === "run.completed")?.payload).toMatchObject({
+      finalMessageText: "Continued after permission cancellation.",
+    });
+  }, 30_000);
 
   test("discovers and calls a real authenticated native MCP tool", async () => {
     let mcpCalls = 0;

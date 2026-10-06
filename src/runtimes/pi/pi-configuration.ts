@@ -115,7 +115,13 @@ export async function preparePiLaunch(payload: DriverStartInput): Promise<PiLaun
     const path = resolvePiSessionPath(home, resume.value);
     // Pi otherwise creates a new session for a missing path. Restore must fail
     // explicitly instead of admitting an empty conversation.
-    const header = JSON.parse((await readFile(path, "utf8")).split("\n")[0]!);
+    // Pi skips malformed JSONL records on restore. Reject damaged snapshots
+    // before launch rather than silently continuing with partial history.
+    const lines = (await readFile(path, "utf8")).split("\n");
+    const header: unknown = JSON.parse(lines[0]!);
+    for (const line of lines.slice(1)) {
+      if (line.trim().length > 0) JSON.parse(line);
+    }
     if (
       !isJsonObject(header) ||
       header["type"] !== "session" ||

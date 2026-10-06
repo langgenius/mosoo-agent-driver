@@ -72,7 +72,7 @@ export class PiEventTranslator {
       const stop = message["stopReason"];
       // A later successful retry clears an earlier transient provider failure.
       this.#failure =
-        stop === "error" || stop === "aborted"
+        stop === "error" || stop === "aborted" || stop === "length"
           ? typeof message["errorMessage"] === "string"
             ? message["errorMessage"]
             : `Pi model stopped: ${stop}.`
