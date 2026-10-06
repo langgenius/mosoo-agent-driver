@@ -72,11 +72,8 @@ function buildSkillCatalogReadme(execution: DriverExecutionInput): string {
 
 export async function writeSkillBootstrapArtifacts(
   execution: DriverExecutionInput,
-): Promise<SkillBootstrapArtifacts | null> {
-  if (execution.skillCatalog.length === 0) {
-    return null;
-  }
-
+): Promise<SkillBootstrapArtifacts> {
+  // An empty selection must replace the catalog retained by a previous run.
   const skillCatalogRoot = getSkillCatalogRoot(execution);
   const manifestPath = join(skillCatalogRoot, "manifest.json");
   const readmePath = join(skillCatalogRoot, "README.md");
