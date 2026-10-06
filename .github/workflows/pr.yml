@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'release/**'
     types:
       - opened
       - reopened
@@ -58,6 +59,9 @@ jobs:
           cache: true
           run-install: |
             - args: ['--frozen-lockfile']
+
+      - name: Build packed Driver for artifact regressions
+        run: vp run build
 
       - name: Check
         run: vp run check
