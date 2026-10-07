@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
 import { createBufferedSinkLogger } from "../src/observability";
 import type { CredentialId, McpServerId } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
@@ -15,7 +16,11 @@ import type { DriverStartInput } from "../src/protocol/start";
 import { preparePiLaunch, resolvePiSessionPath } from "../src/runtimes/pi/pi-configuration";
 import { PiDriverBackend } from "../src/runtimes/pi/pi-driver-backend";
 import { PiEventTranslator } from "../src/runtimes/pi/pi-event-translator";
-import { driverStartInput as bootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
+import {
+  driverStartInput as bootPayload,
+  driverBootPayload,
+  DRIVER_TEST_IDS,
+} from "./driver-boot-payload-fixture";
 
 const cli =
   process.env["MOSOO_PI_TEST_CLI"] ??
@@ -112,6 +117,59 @@ function response(delta: JsonObject, finish = "stop"): Response {
 }
 
 describe("Pi runtime", () => {
+  test("completes empty native Bash output without violating canonical event validation", async () => {
+    let calls = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () =>
+        ++calls === 1
+          ? response(
+              {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "empty-bash",
+                    type: "function",
+                    function: { name: "bash", arguments: JSON.stringify({ command: "true" }) },
+                  },
+                ],
+              },
+              "tool_calls",
+            )
+          : response({ role: "assistant", content: "The empty-output command succeeded." }),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const run = harness(await payloadFor(`http://127.0.0.1:${server.port}/v1`));
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await run.backend.handleInput(run.context, { text: "Run true." }, DRIVER_TEST_IDS.runId);
+    const canonicalEvents = run.events.flatMap((event) =>
+      toDriverEventEnvelopes(
+        { ...driverBootPayload, runtime: "pi", runtimeTransport: "pi-rpc" },
+        event,
+        DRIVER_TEST_IDS.runId,
+      ),
+    );
+    const tools = canonicalEvents
+      .filter(({ event }) => event.kind === "tool.call.updated")
+      .map(({ event }) => event.payload)
+      .filter(isJsonObject);
+    const progress = tools.filter((payload) => payload["status"] === "running");
+    // Native Bash emits an empty progress update in addition to its start.
+    expect(progress.length).toBeGreaterThan(1);
+    for (const payload of progress) expect(payload).not.toHaveProperty("rawOutput");
+    expect(tools.at(-1)).toMatchObject({
+      status: "completed",
+      rawInput: '{"command":"true"}',
+      rawOutput: "(no output)",
+    });
+    expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+    expect(run.events.some((event) => event.kind === "run.failed")).toBe(false);
+  }, 30_000);
+
   test("fails a truncated model response instead of reporting successful completion", async () => {
     const server = Bun.serve({
       hostname: "127.0.0.1",

@@ -155,7 +155,7 @@ export class PiEventTranslator {
             parentMessageId,
             title,
             kind: "tool",
-            rawOutput: outputText,
+            ...(outputText.length > 0 ? { rawOutput: outputText } : {}),
             // Host treats rawInput as an args delta and persists terminal input.
             // Emit the complete native arguments once, when the tool settles.
             ...(type === "tool_execution_end" ? { rawInput: JSON.stringify(args ?? {}) } : {}),

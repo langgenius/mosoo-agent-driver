@@ -1,9 +1,57 @@
 import { describe, expect, test } from "bun:test";
 
+import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
 import { isJsonObject } from "../src/protocol/json";
 import { PiEventTranslator } from "../src/runtimes/pi/pi-event-translator";
+import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
 describe("Pi tool event contract", () => {
+  test.each([
+    { type: "tool_execution_update", isError: false, status: "running" },
+    { type: "tool_execution_end", isError: false, status: "completed" },
+    { type: "tool_execution_end", isError: true, status: "failed" },
+  ])("accepts empty $status output through the Driver uplink", ({ type, isError, status }) => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    translator.translate({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "empty", name: "bash", arguments: { command: "true" } }],
+        stopReason: "toolUse",
+      },
+    });
+    translator.translate({
+      type: "tool_execution_start",
+      toolCallId: "empty",
+      toolName: "bash",
+      args: { command: "true" },
+    });
+    const events = translator.translate({
+      type,
+      toolCallId: "empty",
+      toolName: "bash",
+      isError,
+      result: { content: [{ type: "text", text: "" }] },
+      partialResult: { content: [{ type: "text", text: "" }] },
+    });
+    const canonical = events.flatMap((event) =>
+      toDriverEventEnvelopes(
+        { ...driverBootPayload, runtime: "pi", runtimeTransport: "pi-rpc" },
+        event,
+        DRIVER_TEST_IDS.runId,
+      ),
+    );
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]?.event.payload).toMatchObject({
+      status,
+      parentMessageId: expect.any(String),
+    });
+    expect(canonical[0]?.event.payload).not.toHaveProperty("rawOutput");
+    if (type === "tool_execution_end")
+      expect(canonical[0]?.event.payload).toHaveProperty("rawInput", '{"command":"true"}');
+  });
+
   test("keeps each completed tool attached to its original assistant message", () => {
     const translator = new PiEventTranslator();
     const first = translator.translate({ type: "message_start", message: { role: "assistant" } });
