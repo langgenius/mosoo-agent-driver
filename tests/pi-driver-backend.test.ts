@@ -138,6 +138,18 @@ describe("Pi runtime", () => {
     "self parent",
     "missing message",
     "different workspace",
+    "missing compaction payload",
+    "missing compaction retained entry",
+    "compaction retains another branch",
+    "unknown entry type",
+    "unknown message role",
+    "missing message content",
+    "invalid content block",
+    "missing branch summary",
+    "missing custom message content",
+    "context edit loses content",
+    "missing context edit target",
+    "context edit targets another branch",
   ])(
     "rejects a native transcript with %s instead of silently omitting saved history",
     async (damage) => {
@@ -182,6 +194,84 @@ describe("Pi runtime", () => {
         "duplicate entry ID": JSON.stringify({ ...entry, id: last["id"] }),
         "self parent": JSON.stringify({ ...entry, parentId: entry.id }),
         "missing message": JSON.stringify({ ...entry, type: "message" }),
+        "unknown entry type": JSON.stringify({ ...entry, type: "messgae" }),
+        "unknown message role": JSON.stringify({
+          ...entry,
+          type: "message",
+          message: { role: "usre", content: "Saved content.", timestamp: Date.now() },
+        }),
+        "missing message content": JSON.stringify({
+          ...entry,
+          type: "message",
+          message: { role: "user", timestamp: Date.now() },
+        }),
+        "invalid content block": JSON.stringify({
+          ...entry,
+          type: "message",
+          message: {
+            role: "user",
+            content: [{ type: "txet", text: "Saved content." }],
+            timestamp: Date.now(),
+          },
+        }),
+        "missing branch summary": JSON.stringify({
+          ...entry,
+          type: "branch_summary",
+          fromId: "old-branch",
+        }),
+        "missing custom message content": JSON.stringify({
+          ...entry,
+          type: "custom_message",
+          customType: "test",
+          display: false,
+        }),
+        "context edit loses content": JSON.stringify({
+          ...entry,
+          type: "context_edit",
+          targetId: last["id"],
+          replacement: {},
+        }),
+        "missing context edit target": JSON.stringify({
+          ...entry,
+          type: "context_edit",
+          targetId: "missing-entry",
+          replacement: null,
+        }),
+        "context edit targets another branch": [
+          JSON.stringify({
+            ...entry,
+            type: "custom_message",
+            id: "other-branch",
+            parentId: null,
+            content: "Saved content.",
+            customType: "test",
+            display: false,
+          }),
+          JSON.stringify({
+            ...entry,
+            type: "context_edit",
+            targetId: "other-branch",
+            replacement: null,
+          }),
+        ].join("\n"),
+        "missing compaction payload": JSON.stringify({ ...entry, type: "compaction" }),
+        "missing compaction retained entry": JSON.stringify({
+          ...entry,
+          type: "compaction",
+          summary: "Saved summary.",
+          tokensBefore: 10,
+          firstKeptEntryId: "missing-entry",
+        }),
+        "compaction retains another branch": [
+          JSON.stringify({ ...entry, id: "other-branch", parentId: null }),
+          JSON.stringify({
+            ...entry,
+            type: "compaction",
+            summary: "Saved summary.",
+            tokensBefore: 10,
+            firstKeptEntryId: "other-branch",
+          }),
+        ].join("\n"),
       };
       if (damage === "different workspace") {
         const other = await mkdtemp(join(tmpdir(), "mosoo-pi-other-"));
@@ -648,113 +738,187 @@ describe("Pi runtime", () => {
     expect(persisted).not.toContain("pi-mcp-grant");
   }, 45_000);
 
-  test("runs real Pi tools and resumes the same conversation through a workspace symlink after process reclamation", async () => {
-    const requests: JsonObject[] = [];
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: async (request) => {
-        expect(request.headers.get("authorization")).toBe("Bearer test-proxy-grant");
-        const body: unknown = await request.json();
-        if (!isJsonObject(body)) throw new Error("Invalid mock model request.");
-        requests.push(body);
-        expect(JSON.stringify(body["messages"])).toContain("mosoo-pi-test-instructions");
-        if (requests.length === 1)
-          return response(
-            {
-              role: "assistant",
-              tool_calls: [
-                {
-                  index: 0,
-                  id: "write-proof",
-                  type: "function",
-                  function: {
-                    name: "write",
-                    arguments: JSON.stringify({ path: "proof.txt", content: "pi-proof" }),
+  test.each(["ancestor", "summary-only"])(
+    "runs real Pi tools and cold-resumes through a workspace symlink after %s compaction",
+    async (boundary) => {
+      const requests: JsonObject[] = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: async (request) => {
+          expect(request.headers.get("authorization")).toBe("Bearer test-proxy-grant");
+          const body: unknown = await request.json();
+          if (!isJsonObject(body)) throw new Error("Invalid mock model request.");
+          requests.push(body);
+          expect(JSON.stringify(body["messages"])).toContain("mosoo-pi-test-instructions");
+          if (requests.length === 1)
+            return response(
+              {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "write-proof",
+                    type: "function",
+                    function: {
+                      name: "write",
+                      arguments: JSON.stringify({ path: "proof.txt", content: "pi-proof" }),
+                    },
                   },
-                },
-              ],
-            },
-            "tool_calls",
-          );
-        return response({
-          role: "assistant",
-          content: requests.length === 2 ? "File created.\u2028Complete." : "Remembered pi-proof.",
-        });
-      },
-    });
-    cleanup.push(async () => {
-      await server.stop(true);
-    });
-    const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
-    const alias = `${input.execution.session.cwd}-alias`;
-    await symlink(input.execution.session.cwd, alias, "dir");
-    cleanup.push(() => rm(alias));
-    const payload = {
-      ...input,
-      execution: {
-        ...input.execution,
-        session: { ...input.execution.session, cwd: alias },
-      },
-    };
-    const first = harness(payload);
-    await first.backend.start(first.context, AbortSignal.timeout(20_000));
-    await first.backend.handleInput(
-      first.context,
-      { text: "Write proof.txt." },
-      DRIVER_TEST_IDS.runId,
-    );
-    expect(await readFile(join(payload.execution.session.cwd, "proof.txt"), "utf8")).toBe(
-      "pi-proof",
-    );
-    expect(first.permissions).toEqual(["write"]);
-    expect(first.events.some((event) => event.kind === "file.change.updated")).toBe(true);
-    expect(first.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
-    const completed = first.events.find((event) => event.kind === "run.completed")!;
-    expect(completed.payload).toMatchObject({ finalMessageText: "File created.\u2028Complete." });
-    const resume = first.events.findLast((event) => event.kind === "runtime.resume.updated")!;
-    if (!isJsonObject(resume.payload) || typeof resume.payload["resumePointer"] !== "string")
-      throw new Error("No Pi resume pointer.");
-    const pointer = resume.payload["resumePointer"];
-    await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
-    const transcript = join(payload.execution.session.homePath, "pi", pointer);
-    const leaf: unknown = JSON.parse(
-      (await readFile(transcript, "utf8")).trim().split("\n").at(-1)!,
-    );
-    if (!isJsonObject(leaf)) throw new Error("No Pi leaf.");
-    // Native metadata and a fork from an earlier entry remain valid: ancestry
-    // is a tree, not a requirement that every entry follows the preceding line.
-    for (const entry of [
-      { type: "custom", id: "unused-branch", customType: "test.marker", data: { proof: true } },
-      { type: "session_info", id: "active-branch", name: "Restored branch" },
-    ]) {
+                ],
+              },
+              "tool_calls",
+            );
+          return response({
+            role: "assistant",
+            content:
+              requests.length === 2 ? "File created.\u2028Complete." : "Remembered pi-proof.",
+          });
+        },
+      });
+      cleanup.push(async () => {
+        await server.stop(true);
+      });
+      const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+      const alias = `${input.execution.session.cwd}-alias`;
+      await symlink(input.execution.session.cwd, alias, "dir");
+      cleanup.push(() => rm(alias));
+      const payload = {
+        ...input,
+        execution: {
+          ...input.execution,
+          session: { ...input.execution.session, cwd: alias },
+        },
+      };
+      const first = harness(payload);
+      await first.backend.start(first.context, AbortSignal.timeout(20_000));
+      await first.backend.handleInput(
+        first.context,
+        { text: "Write proof.txt." },
+        DRIVER_TEST_IDS.runId,
+      );
+      expect(await readFile(join(payload.execution.session.cwd, "proof.txt"), "utf8")).toBe(
+        "pi-proof",
+      );
+      expect(first.permissions).toEqual(["write"]);
+      expect(first.events.some((event) => event.kind === "file.change.updated")).toBe(true);
+      expect(first.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+      const completed = first.events.find((event) => event.kind === "run.completed")!;
+      expect(completed.payload).toMatchObject({ finalMessageText: "File created.\u2028Complete." });
+      const resume = first.events.findLast((event) => event.kind === "runtime.resume.updated")!;
+      if (!isJsonObject(resume.payload) || typeof resume.payload["resumePointer"] !== "string")
+        throw new Error("No Pi resume pointer.");
+      const pointer = resume.payload["resumePointer"];
+      await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
+      const transcript = join(payload.execution.session.homePath, "pi", pointer);
+      const transcriptRecords = (await readFile(transcript, "utf8")).trim().split("\n");
+      const firstEntry: unknown = JSON.parse(transcriptRecords[1]!);
+      const leaf: unknown = JSON.parse(transcriptRecords.at(-1)!);
+      if (!isJsonObject(firstEntry)) throw new Error("No Pi root entry.");
+      if (!isJsonObject(leaf)) throw new Error("No Pi leaf.");
+      // Native metadata and a fork from an earlier entry remain valid: ancestry
+      // is a tree, not a requirement that every entry follows the preceding line.
+      for (const entry of [
+        { type: "custom", id: "unused-branch", customType: "test.marker", data: { proof: true } },
+        { type: "session_info", id: "active-branch", name: "Restored branch" },
+      ]) {
+        await appendFile(
+          transcript,
+          `${JSON.stringify({ ...entry, parentId: leaf["id"], timestamp: new Date().toISOString() })}\n`,
+        );
+      }
       await appendFile(
         transcript,
-        `${JSON.stringify({ ...entry, parentId: leaf["id"], timestamp: new Date().toISOString() })}\n`,
+        `${JSON.stringify({
+          type: "compaction",
+          id: "compacted",
+          parentId: "active-branch",
+          timestamp: new Date().toISOString(),
+          summary: "We wrote proof.txt containing pi-proof.",
+          tokensBefore: 123,
+          firstKeptEntryId: boundary === "ancestor" ? firstEntry["id"] : "compacted",
+        })}\n`,
       );
-    }
-    const second = harness({
-      ...payload,
-      execution: {
-        ...payload.execution,
-        session: {
-          ...payload.execution.session,
-          nativeResumeRef: { kind: "pi_session_path", runtimeId: "pi", value: pointer },
-          nativeResumeRequired: true,
+      const continuationEntries = [
+        {
+          type: "branch_summary",
+          id: "branch-summary",
+          parentId: "compacted",
+          fromId: "historical-branch",
+          summary: "kept-branch-context",
         },
-      },
-    });
-    await second.backend.start(second.context, AbortSignal.timeout(20_000));
-    await second.backend.handleInput(
-      second.context,
-      { text: "What did you write?" },
-      DRIVER_TEST_IDS.secondRunId,
-    );
-    expect(JSON.stringify(requests.at(-1))).toContain("pi-proof");
-    expect(
-      second.events.find((event) => event.kind === "runtime.resume.updated")?.payload,
-    ).toMatchObject({ resumePointer: pointer });
-  }, 60_000);
+        {
+          type: "custom_message",
+          id: "custom-context",
+          parentId: "branch-summary",
+          customType: "test",
+          content: "kept-custom-context",
+          display: false,
+        },
+        {
+          type: "message",
+          id: "editable",
+          parentId: "custom-context",
+          message: { role: "user", content: "obsolete-context", timestamp: Date.now() },
+        },
+        {
+          type: "context_edit",
+          id: "replacement",
+          parentId: "editable",
+          targetId: "editable",
+          replacement: { content: "edited-context" },
+        },
+        {
+          type: "custom_message",
+          id: "deletable",
+          parentId: "replacement",
+          customType: "test",
+          content: "removed-context",
+          display: false,
+        },
+        {
+          type: "context_edit",
+          id: "removal",
+          parentId: "deletable",
+          targetId: "deletable",
+          replacement: null,
+        },
+      ];
+      for (const entry of continuationEntries) {
+        await appendFile(
+          transcript,
+          `${JSON.stringify({ ...entry, timestamp: new Date().toISOString() })}\n`,
+        );
+      }
+      const second = harness({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: {
+            ...payload.execution.session,
+            nativeResumeRef: { kind: "pi_session_path", runtimeId: "pi", value: pointer },
+            nativeResumeRequired: true,
+          },
+        },
+      });
+      await second.backend.start(second.context, AbortSignal.timeout(20_000));
+      await second.backend.handleInput(
+        second.context,
+        { text: "What did you write?" },
+        DRIVER_TEST_IDS.secondRunId,
+      );
+      expect(JSON.stringify(requests.at(-1))).toContain("pi-proof");
+      expect(JSON.stringify(requests.at(-1))).toContain("kept-branch-context");
+      expect(JSON.stringify(requests.at(-1))).toContain("kept-custom-context");
+      expect(JSON.stringify(requests.at(-1))).toContain("edited-context");
+      expect(JSON.stringify(requests.at(-1))).not.toContain("obsolete-context");
+      expect(JSON.stringify(requests.at(-1))).not.toContain("removed-context");
+      expect(
+        second.events.find((event) => event.kind === "runtime.resume.updated")?.payload,
+      ).toMatchObject({ resumePointer: pointer });
+    },
+    60_000,
+  );
 
   test("rejects a tool through the mosoo permission port before it changes a file", async () => {
     let calls = 0;
