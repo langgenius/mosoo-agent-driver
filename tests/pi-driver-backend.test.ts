@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,41 +130,87 @@ describe("Pi runtime", () => {
     expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
   }, 30_000);
 
-  test("rejects a corrupted native transcript instead of silently omitting saved history", async () => {
-    const server = Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () => response({ role: "assistant", content: "Remember this answer." }),
-    });
-    cleanup.push(async () => {
-      await server.stop(true);
-    });
-    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
-    const first = harness(payload);
-    await first.backend.start(first.context, AbortSignal.timeout(20_000));
-    await first.backend.handleInput(first.context, { text: "Respond." }, DRIVER_TEST_IDS.runId);
-    const resume = first.events.findLast((event) => event.kind === "runtime.resume.updated")!;
-    if (!isJsonObject(resume.payload) || typeof resume.payload["resumePointer"] !== "string")
-      throw new Error("No Pi resume pointer.");
-    const pointer = resume.payload["resumePointer"];
-    await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
-    await appendFile(join(payload.execution.session.homePath, "pi", pointer), '{"type":"message"');
-    const restored = harness({
-      ...payload,
-      execution: {
-        ...payload.execution,
-        session: {
-          ...payload.execution.session,
-          nativeResumeRef: { kind: "pi_session_path", runtimeId: "pi", value: pointer },
-          nativeResumeRequired: true,
+  test.each([
+    "truncated JSON",
+    "missing entry fields",
+    "dangling parent",
+    "duplicate entry ID",
+    "self parent",
+    "missing message",
+    "different workspace",
+  ])(
+    "rejects a native transcript with %s instead of silently omitting saved history",
+    async (damage) => {
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () => response({ role: "assistant", content: "Remember this answer." }),
+      });
+      cleanup.push(async () => {
+        await server.stop(true);
+      });
+      const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+      const payload = {
+        ...input,
+        execution: {
+          ...input.execution,
+          session: { ...input.execution.session, cwd: await realpath(input.execution.session.cwd) },
         },
-      },
-    });
-    await expect(
-      restored.backend.start(restored.context, AbortSignal.timeout(20_000)),
-    ).rejects.toThrow();
-    expect(restored.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
-  }, 30_000);
+      };
+      const first = harness(payload);
+      await first.backend.start(first.context, AbortSignal.timeout(20_000));
+      await first.backend.handleInput(first.context, { text: "Respond." }, DRIVER_TEST_IDS.runId);
+      const resume = first.events.findLast((event) => event.kind === "runtime.resume.updated")!;
+      if (!isJsonObject(resume.payload) || typeof resume.payload["resumePointer"] !== "string")
+        throw new Error("No Pi resume pointer.");
+      const pointer = resume.payload["resumePointer"];
+      await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
+      const path = join(payload.execution.session.homePath, "pi", pointer);
+      const records = (await readFile(path, "utf8")).trim().split("\n");
+      const last: unknown = JSON.parse(records.at(-1)!);
+      if (!isJsonObject(last) || typeof last["id"] !== "string") throw new Error("No Pi leaf.");
+      const entry = {
+        type: "session_info",
+        id: "corrupted-entry",
+        parentId: last["id"],
+        timestamp: new Date().toISOString(),
+      };
+      const corruptions: Record<string, string> = {
+        "truncated JSON": '{"type":"message"',
+        "missing entry fields": JSON.stringify({ unexpected: "valid-json" }),
+        "dangling parent": JSON.stringify({ ...entry, parentId: "missing-parent" }),
+        "duplicate entry ID": JSON.stringify({ ...entry, id: last["id"] }),
+        "self parent": JSON.stringify({ ...entry, parentId: entry.id }),
+        "missing message": JSON.stringify({ ...entry, type: "message" }),
+      };
+      if (damage === "different workspace") {
+        const other = await mkdtemp(join(tmpdir(), "mosoo-pi-other-"));
+        cleanup.push(() => rm(other, { recursive: true, force: true }));
+        const header: unknown = JSON.parse(records[0]!);
+        if (!isJsonObject(header)) throw new Error("No Pi header.");
+        records[0] = JSON.stringify({ ...header, cwd: other });
+        await writeFile(path, `${records.join("\n")}\n`);
+      } else {
+        await appendFile(path, `${corruptions[damage]}\n`);
+      }
+      const restored = harness({
+        ...payload,
+        execution: {
+          ...payload.execution,
+          session: {
+            ...payload.execution.session,
+            nativeResumeRef: { kind: "pi_session_path", runtimeId: "pi", value: pointer },
+            nativeResumeRequired: true,
+          },
+        },
+      });
+      await expect(
+        restored.backend.start(restored.context, AbortSignal.timeout(20_000)),
+      ).rejects.toThrow(damage === "truncated JSON" ? SyntaxError : "Pi restored session");
+      expect(restored.events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
+    },
+    30_000,
+  );
 
   test("uses the native Anthropic request path and proxy grant", async () => {
     const server = Bun.serve({
@@ -602,7 +648,7 @@ describe("Pi runtime", () => {
     expect(persisted).not.toContain("pi-mcp-grant");
   }, 45_000);
 
-  test("runs real Pi tools, commits final text, and resumes the same conversation after process reclamation", async () => {
+  test("runs real Pi tools and resumes the same conversation through a workspace symlink after process reclamation", async () => {
     const requests: JsonObject[] = [];
     const server = Bun.serve({
       hostname: "127.0.0.1",
@@ -640,7 +686,17 @@ describe("Pi runtime", () => {
     cleanup.push(async () => {
       await server.stop(true);
     });
-    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const alias = `${input.execution.session.cwd}-alias`;
+    await symlink(input.execution.session.cwd, alias, "dir");
+    cleanup.push(() => rm(alias));
+    const payload = {
+      ...input,
+      execution: {
+        ...input.execution,
+        session: { ...input.execution.session, cwd: alias },
+      },
+    };
     const first = harness(payload);
     await first.backend.start(first.context, AbortSignal.timeout(20_000));
     await first.backend.handleInput(
@@ -661,6 +717,22 @@ describe("Pi runtime", () => {
       throw new Error("No Pi resume pointer.");
     const pointer = resume.payload["resumePointer"];
     await first.backend.stop(first.context, "cold", AbortSignal.timeout(10_000));
+    const transcript = join(payload.execution.session.homePath, "pi", pointer);
+    const leaf: unknown = JSON.parse(
+      (await readFile(transcript, "utf8")).trim().split("\n").at(-1)!,
+    );
+    if (!isJsonObject(leaf)) throw new Error("No Pi leaf.");
+    // Native metadata and a fork from an earlier entry remain valid: ancestry
+    // is a tree, not a requirement that every entry follows the preceding line.
+    for (const entry of [
+      { type: "custom", id: "unused-branch", customType: "test.marker", data: { proof: true } },
+      { type: "session_info", id: "active-branch", name: "Restored branch" },
+    ]) {
+      await appendFile(
+        transcript,
+        `${JSON.stringify({ ...entry, parentId: leaf["id"], timestamp: new Date().toISOString() })}\n`,
+      );
+    }
     const second = harness({
       ...payload,
       execution: {
