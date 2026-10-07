@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { isJsonObject } from "../../protocol/json";
@@ -36,6 +36,47 @@ export function resolvePiSessionPath(home: string, pointer: string): string {
     throw new Error("Pi native resume pointer is outside the Session runtime home.");
   }
   return path;
+}
+
+function readSessionHeader(content: string): { cwd: string } {
+  const records = content.split("\n").filter((line) => line.trim().length > 0);
+  const header: unknown = JSON.parse(records[0]!);
+  if (
+    !isJsonObject(header) ||
+    header["type"] !== "session" ||
+    header["version"] !== 3 ||
+    typeof header["id"] !== "string" ||
+    header["id"].length === 0 ||
+    typeof header["timestamp"] !== "string" ||
+    typeof header["cwd"] !== "string"
+  ) {
+    throw new Error("Pi restored session header is invalid.");
+  }
+  const ids = new Set<string>();
+  for (const line of records.slice(1)) {
+    const entry: unknown = JSON.parse(line);
+    // Pi's append-only tree permits branches and multiple roots, but every
+    // parent must already exist. Invalid IDs otherwise silently replace the
+    // native leaf or lose its ancestors; a cycle can hang native restore.
+    if (
+      !isJsonObject(entry) ||
+      typeof entry["type"] !== "string" ||
+      entry["type"].length === 0 ||
+      entry["type"] === "session" ||
+      typeof entry["id"] !== "string" ||
+      entry["id"].length === 0 ||
+      ids.has(entry["id"]) ||
+      typeof entry["timestamp"] !== "string" ||
+      (entry["parentId"] !== null &&
+        (typeof entry["parentId"] !== "string" || !ids.has(entry["parentId"]))) ||
+      (entry["type"] === "message" &&
+        (!isJsonObject(entry["message"]) || typeof entry["message"]["role"] !== "string"))
+    ) {
+      throw new Error("Pi restored session contains an invalid entry or parent chain.");
+    }
+    ids.add(entry["id"]);
+  }
+  return { cwd: header["cwd"] };
 }
 
 export async function preparePiLaunch(payload: DriverStartInput): Promise<PiLaunchConfiguration> {
@@ -117,16 +158,10 @@ export async function preparePiLaunch(payload: DriverStartInput): Promise<PiLaun
     // explicitly instead of admitting an empty conversation.
     // Pi skips malformed JSONL records on restore. Reject damaged snapshots
     // before launch rather than silently continuing with partial history.
-    const lines = (await readFile(path, "utf8")).split("\n");
-    const header: unknown = JSON.parse(lines[0]!);
-    for (const line of lines.slice(1)) {
-      if (line.trim().length > 0) JSON.parse(line);
-    }
-    if (
-      !isJsonObject(header) ||
-      header["type"] !== "session" ||
-      header["cwd"] !== execution.session.cwd
-    ) {
+    const header = readSessionHeader(await readFile(path, "utf8"));
+    // Pi records process.cwd(), which resolves symlinks (including macOS /var).
+    // Compare directory identity while still rejecting another workspace.
+    if ((await realpath(header.cwd)) !== (await realpath(execution.session.cwd))) {
       throw new Error("Pi restored session header does not match its workspace.");
     }
     args.push("--session", path);
