@@ -802,6 +802,17 @@ describe("Pi runtime", () => {
       );
       expect(first.permissions).toEqual(["write"]);
       expect(first.events.some((event) => event.kind === "file.change.updated")).toBe(true);
+      const toolResult = first.events.find(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          isJsonObject(event.payload) &&
+          event.payload["status"] === "completed",
+      );
+      expect(toolResult?.payload).toMatchObject({
+        parentMessageId: expect.any(String),
+        rawInput: JSON.stringify({ path: "proof.txt", content: "pi-proof" }),
+        rawOutput: expect.stringContaining("proof.txt"),
+      });
       expect(first.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
       const completed = first.events.find((event) => event.kind === "run.completed")!;
       expect(completed.payload).toMatchObject({ finalMessageText: "File created.\u2028Complete." });
