@@ -77,9 +77,11 @@ The host still supplies actual Sandbox/Session ownership, and an Agent preset
 reference is optional. Boot parsing and the control handshake reject earlier
 protocol versions before work begins; deploy the matching host and Driver together.
 
-Pi uses `@earendil-works/pi-coding-agent@0.99.2` in RPC mode. Its model configuration routes through the host model proxy; native JSONL sessions are stored under the Session home. `tests/pi-driver-backend.test.ts` launches the real Pi process against a deterministic local model endpoint and covers tool permissions, cancellation, MCP, and cold continuation. `tests/pi-driver-artifact.test.ts` also verifies native continuation through the packed Driver's boot parser and control protocol. Pi has a separate opt-in paid-provider artifact suite described below.
+Pi uses `@earendil-works/pi-coding-agent@1.1.0` in native RPC mode, retaining Driver protocol 6 and native MCP. Its model configuration routes through the host model proxy; native JSONL sessions are stored under the Session home. `tests/pi-driver-backend.test.ts` launches the real Pi process against a deterministic local model endpoint and covers tool permissions, cancellation, MCP, and cold continuation. `tests/pi-driver-artifact.test.ts` also verifies native continuation through the packed Driver's boot parser and control protocol. Pi has a separate opt-in paid-provider artifact suite described below.
 
 Run `bun test tests/pi-driver-backend.test.ts` for the native protocol tests. After `vp run build`, run `bun test tests/pi-driver-artifact.test.ts` to verify the packed Driver boot, outbound control WebSocket, tool execution, canonical events, and shutdown. The artifact test skips when the bundle has not been built.
+
+To verify upgrade continuation, set `MOSOO_PI_MIGRATION_CLI` to a separately installed Pi 0.99.2 `dist/bundle/cli.js` and run `bun test tests/pi-driver-backend.test.ts -t 'cold-resumes through a workspace symlink'`. The first process writes the old native session; the second uses the pinned Pi 1.1.0 CLI to resume both retained-history and summary-only compaction cases. Both versions share the native v3 JSONL format.
 
 ## Runtime Contract
 

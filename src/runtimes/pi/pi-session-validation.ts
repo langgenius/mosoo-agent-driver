@@ -1,7 +1,7 @@
 import { isJsonObject } from "../../protocol/json";
 import type { JsonObject } from "../../protocol/json";
 
-// Pi 0.99.2's v3 file entries. Extension data uses custom/custom_message;
+// Pi 0.99.2 and 1.1.0 share v3 file entries. Extension data uses custom/custom_message;
 // unknown types and roles are otherwise silently omitted from model context.
 const ENTRY_TYPES = new Set([
   "message",

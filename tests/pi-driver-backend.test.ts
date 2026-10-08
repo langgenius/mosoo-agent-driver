@@ -34,7 +34,12 @@ afterEach(async () => {
   for (const dispose of cleanup.splice(0).toReversed()) await dispose();
 });
 
-function harness(payload: DriverStartInput, decide: "allow_once" | "reject_once" = "allow_once") {
+function harness(
+  payload: DriverStartInput,
+  decide: "allow_once" | "reject_once" = "allow_once",
+  sourceCli = cli,
+  extraArgs: string[] = [],
+) {
   const events: DriverEventInput[] = [];
   const permissions: string[] = [];
   let seq = 0;
@@ -58,7 +63,7 @@ function harness(payload: DriverStartInput, decide: "allow_once" | "reject_once"
   const backend = new PiDriverBackend(payload, {
     prepare: async (input) => {
       const config = await preparePiLaunch(input);
-      return { ...config, command: "node", args: [cli, ...config.args] };
+      return { ...config, command: "node", args: [sourceCli, ...config.args, ...extraArgs] };
     },
   });
   cleanup.push(() => backend.stop(context, "test.cleanup", AbortSignal.timeout(10_000)));
@@ -117,6 +122,30 @@ function response(delta: JsonObject, finish = "stop"): Response {
 }
 
 describe("Pi runtime", () => {
+  test("Given a completed response, When native Pi aborts before settlement, Then the run fails", async () => {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => response({ role: "assistant", content: "Response before native abort." }),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const extension = join(payload.execution.session.homePath, "abort-before-settle.mjs");
+    await writeFile(
+      extension,
+      'export default function (pi) { pi.on("agent_before_settle", (_event, ctx) => { ctx.abort(); }); }',
+    );
+    const run = harness(payload, "allow_once", cli, ["--extension", extension]);
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await expect(
+      run.backend.handleInput(run.context, { text: "Respond once." }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("Pi run was aborted.");
+    expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+    expect(run.events.some((event) => event.kind === "run.completed")).toBe(false);
+  }, 30_000);
+
   test("completes empty native Bash output without violating canonical event validation", async () => {
     let calls = 0;
     const server = Bun.serve({
@@ -186,6 +215,49 @@ describe("Pi runtime", () => {
     ).rejects.toThrow("length");
     expect(run.events.some((event) => event.kind === "run.completed")).toBe(false);
     expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+  }, 30_000);
+
+  test("fails a real provider HTTP error after a native tool instead of completing the run", async () => {
+    let calls = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => {
+        if (++calls > 1) return new Response("provider outage", { status: 500 });
+        return response(
+          {
+            role: "assistant",
+            tool_calls: [
+              {
+                index: 0,
+                id: "write-before-failure",
+                type: "function",
+                function: {
+                  name: "write",
+                  arguments: JSON.stringify({ path: "proof.txt", content: "tool completed" }),
+                },
+              },
+            ],
+          },
+          "tool_calls",
+        );
+      },
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const run = harness(payload);
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await expect(
+      run.backend.handleInput(run.context, { text: "Write proof.txt." }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("provider outage");
+    expect(await readFile(join(payload.execution.session.cwd, "proof.txt"), "utf8")).toBe(
+      "tool completed",
+    );
+    expect(calls).toBe(2);
+    expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+    expect(run.events.some((event) => event.kind === "run.completed")).toBe(false);
   }, 30_000);
 
   test.each([
@@ -848,7 +920,7 @@ describe("Pi runtime", () => {
           session: { ...input.execution.session, cwd: alias },
         },
       };
-      const first = harness(payload);
+      const first = harness(payload, "allow_once", process.env["MOSOO_PI_MIGRATION_CLI"] ?? cli);
       await first.backend.start(first.context, AbortSignal.timeout(20_000));
       await first.backend.handleInput(
         first.context,

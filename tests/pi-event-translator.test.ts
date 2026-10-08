@@ -137,3 +137,20 @@ describe("Pi tool event contract", () => {
     ).toThrow("Pi tool event has no assistant message.");
   });
 });
+
+test("Given a completed message, When Pi settles an aborted run, Then it cannot complete successfully", () => {
+  const translator = new PiEventTranslator();
+  translator.translate({ type: "message_start", message: { role: "assistant" } });
+  translator.translate({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "partial" }],
+      stopReason: "stop",
+    },
+  });
+  translator.translate({ type: "agent_settled", aborted: false });
+  expect(translator.failure).toBeNull();
+  translator.translate({ type: "agent_settled", aborted: true });
+  expect(translator.failure).toBe("Pi run was aborted.");
+});
