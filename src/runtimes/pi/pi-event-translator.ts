@@ -19,6 +19,7 @@ export class PiEventTranslator {
   #failure: string | null = null;
   #final: { id: string; text: string } | null = null;
   readonly #toolArgs = new Map<string, JsonObject>();
+  readonly #toolMessageIds = new Map<string, string>();
 
   get failure(): string | null {
     return this.#failure;
@@ -66,6 +67,18 @@ export class PiEventTranslator {
       if (this.#messageId === null)
         throw new Error("Pi completed an assistant message without starting it.");
       const id = this.#messageId;
+      const content = message["content"];
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (
+            isJsonObject(block) &&
+            block["type"] === "toolCall" &&
+            typeof block["id"] === "string"
+          ) {
+            this.#toolMessageIds.set(block["id"], id);
+          }
+        }
+      }
       const text = textContent(message["content"]);
       this.#final = { id, text };
       this.#messageId = null;
@@ -114,6 +127,8 @@ export class PiEventTranslator {
       const title = record["toolName"];
       if (typeof toolCallId !== "string" || typeof title !== "string")
         throw new Error("Pi tool event has no tool identity.");
+      const parentMessageId = this.#toolMessageIds.get(toolCallId);
+      if (parentMessageId === undefined) throw new Error("Pi tool event has no assistant message.");
       if (type === "tool_execution_start") {
         if (isJsonObject(record["args"])) this.#toolArgs.set(toolCallId, record["args"]);
         return [
@@ -121,24 +136,29 @@ export class PiEventTranslator {
             kind: "tool.call.updated",
             payload: {
               toolCallId,
+              parentMessageId,
               title,
               kind: "tool",
               status: "running",
-              rawInput: JSON.stringify(record["args"] ?? {}),
             },
           },
         ];
       }
       const result = type === "tool_execution_end" ? record["result"] : record["partialResult"];
       const outputText = isJsonObject(result) ? textContent(result["content"]) : "";
+      const args = this.#toolArgs.get(toolCallId);
       const events: DriverEventInput[] = [
         {
           kind: "tool.call.updated",
           payload: {
             toolCallId,
+            parentMessageId,
             title,
             kind: "tool",
-            outputText,
+            ...(outputText.length > 0 ? { rawOutput: outputText } : {}),
+            // Host treats rawInput as an args delta and persists terminal input.
+            // Emit the complete native arguments once, when the tool settles.
+            ...(type === "tool_execution_end" ? { rawInput: JSON.stringify(args ?? {}) } : {}),
             status:
               type === "tool_execution_update"
                 ? "running"
@@ -149,8 +169,8 @@ export class PiEventTranslator {
         },
       ];
       if (type === "tool_execution_end") {
-        const args = this.#toolArgs.get(toolCallId);
         this.#toolArgs.delete(toolCallId);
+        this.#toolMessageIds.delete(toolCallId);
         if (
           record["isError"] !== true &&
           (title === "write" || title === "edit") &&
