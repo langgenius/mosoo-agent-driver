@@ -4,7 +4,7 @@ FROM docker.io/cloudflare/sandbox:0.12.6@sha256:862aa35be41b1b56bc27acd66931c8ae
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.211
 ARG OPENAI_RUNTIME_VERSION=0.144.5
 ARG OPENCODE_VERSION=1.18.4
-ARG PI_VERSION=1.0.4
+ARG PI_VERSION=1.1.0
 
 # Install the Python runtime behind writable pip package declarations.
 RUN apt-get update \

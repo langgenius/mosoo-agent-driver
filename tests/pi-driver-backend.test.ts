@@ -38,6 +38,7 @@ function harness(
   payload: DriverStartInput,
   decide: "allow_once" | "reject_once" = "allow_once",
   sourceCli = cli,
+  extraArgs: string[] = [],
 ) {
   const events: DriverEventInput[] = [];
   const permissions: string[] = [];
@@ -62,7 +63,7 @@ function harness(
   const backend = new PiDriverBackend(payload, {
     prepare: async (input) => {
       const config = await preparePiLaunch(input);
-      return { ...config, command: "node", args: [sourceCli, ...config.args] };
+      return { ...config, command: "node", args: [sourceCli, ...config.args, ...extraArgs] };
     },
   });
   cleanup.push(() => backend.stop(context, "test.cleanup", AbortSignal.timeout(10_000)));
@@ -121,6 +122,30 @@ function response(delta: JsonObject, finish = "stop"): Response {
 }
 
 describe("Pi runtime", () => {
+  test("Given a completed response, When native Pi aborts before settlement, Then the run fails", async () => {
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => response({ role: "assistant", content: "Response before native abort." }),
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const extension = join(payload.execution.session.homePath, "abort-before-settle.mjs");
+    await writeFile(
+      extension,
+      'export default function (pi) { pi.on("agent_before_settle", (_event, ctx) => { ctx.abort(); }); }',
+    );
+    const run = harness(payload, "allow_once", cli, ["--extension", extension]);
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await expect(
+      run.backend.handleInput(run.context, { text: "Respond once." }, DRIVER_TEST_IDS.runId),
+    ).rejects.toThrow("Pi run was aborted.");
+    expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+    expect(run.events.some((event) => event.kind === "run.completed")).toBe(false);
+  }, 30_000);
+
   test("completes empty native Bash output without violating canonical event validation", async () => {
     let calls = 0;
     const server = Bun.serve({
