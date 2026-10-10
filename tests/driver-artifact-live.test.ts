@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
+import { parseRunId } from "../src/protocol/id";
+import { parseNativeCheckpoint, type NativeCheckpoint } from "../src/protocol/native-checkpoint";
 import {
   DriverArtifactTestController,
   expectedDriverCapabilities,
@@ -27,7 +29,7 @@ const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL = "https://openrouter.ai/api";
 const DEFAULT_OPENAI_MODEL = "openai/gpt-5.6-luna";
 const DEFAULT_ANTHROPIC_MODEL = "anthropic/claude-sonnet-5";
-const STALE_RESUME_POINTER = "00000000-0000-4000-8000-000000000000";
+const MISSING_RESUME_POINTER = "00000000-0000-4000-8000-000000000000";
 const DEFAULT_OPENCODE_MODELS = [
   "openrouter/moonshotai/kimi-k3",
   "openrouter/deepseek/deepseek-v4-flash",
@@ -82,17 +84,6 @@ interface LivePaths {
   readonly homePath: string;
   readonly rootPath: string;
   readonly workspacePath: string;
-}
-
-interface NativeResumeRef {
-  readonly kind: LiveRuntimeCase["nativeResumeKind"];
-  readonly runtimeId: LiveRuntimeCase["runtime"];
-  readonly value: string;
-}
-
-interface RecoveryMessage {
-  readonly content: string;
-  readonly role: "assistant" | "user";
 }
 
 interface LiveMcpServer {
@@ -530,6 +521,9 @@ function expectSingleRunLifecycle(
   expect(runEvents.filter((event) => event.kind === "run.started")).toHaveLength(1);
   expect(terminalEvents).toHaveLength(1);
   expect(terminalEvents[0]?.kind).toBe(terminalKind);
+  if (terminalKind === "run.completed") {
+    readCompletedCheckpoint(terminalEvents);
+  }
   const startedIndex = runEvents.findIndex((event) => event.kind === "run.started");
   const terminalIndex = runEvents.indexOf(terminalEvents[0]!);
   expect(startedIndex).toBeLessThan(terminalIndex);
@@ -717,17 +711,15 @@ async function expectQuiescentRunLifecycle(
   expectSingleRunLifecycle(controller.eventsSince(eventIndex), runId, terminalKind, expectations);
 }
 
-function readResumePointer(events: readonly DriverArtifactTestEvent[]): string | null {
-  const resumeIndex = events.findIndex((candidate) => candidate.kind === "runtime.resume.updated");
-  if (resumeIndex < 0) {
-    return null;
+function readCompletedCheckpoint(events: readonly DriverArtifactTestEvent[]): NativeCheckpoint {
+  const event = events.findLast((candidate) => candidate.kind === "run.completed");
+  if (event === undefined) {
+    throw new Error("A completed run is required before native resume.");
   }
-  const firstCompletedIndex = events.findIndex((candidate) => candidate.kind === "run.completed");
-  expect(firstCompletedIndex).toBeGreaterThanOrEqual(0);
-  expect(resumeIndex).toBeLessThan(firstCompletedIndex);
-  const event = events[resumeIndex]!;
-  const pointer = event === undefined ? undefined : payloadRecord(event)["resumePointer"];
-  return typeof pointer === "string" && pointer.length > 0 ? pointer : null;
+  const checkpoint = parseNativeCheckpoint(payloadRecord(event)["checkpoint"]);
+  expect(checkpoint.runId).toBe(event.runId);
+  expect(checkpoint.nativeRef.runtimeId).toBe(event.runtimeId);
+  return checkpoint;
 }
 
 function expectNoHistoricalRunProjections(
@@ -789,10 +781,9 @@ function runtimeEnvironment(runtimeCase: LiveRuntimeCase): Record<string, string
 function createBootPayload(input: {
   readonly driverInstanceId: string;
   readonly mcpServers?: readonly LiveMcpServer[] | undefined;
-  readonly nativeResumeRef: NativeResumeRef | null;
+  readonly nativeCheckpoint: NativeCheckpoint | null;
   readonly paths: LivePaths;
   readonly permissionPolicy?: "full_access" | "supervised" | undefined;
-  readonly recoveryMessages?: readonly RecoveryMessage[] | undefined;
   readonly runtimeCase: LiveRuntimeCase;
   readonly sessionId: string;
 }): DriverArtifactBootPayload {
@@ -842,7 +833,6 @@ function createBootPayload(input: {
             type: "agent",
           },
           sandboxId,
-          sandboxKind: "cattle",
           sandboxSessionId: createTestId(),
           sandboxSubjectId: input.sessionId,
           sandboxSubjectKind: "session",
@@ -850,8 +840,9 @@ function createBootPayload(input: {
         },
         cwd: input.paths.workspacePath,
         mcpServers: input.mcpServers ?? [],
-        nativeResumeRef: input.nativeResumeRef,
-        recoveryMessages: input.recoveryMessages ?? [],
+        nativeCheckpoint: input.nativeCheckpoint,
+        nativeResumeRef: input.nativeCheckpoint?.nativeRef ?? null,
+        recoveryMessages: [],
       },
       skillCatalog: [],
       skills: [],
@@ -889,10 +880,9 @@ async function writeOpenCodeAuth(paths: LivePaths): Promise<void> {
 async function startController(input: {
   readonly heartbeatIntervalMs?: number | undefined;
   readonly mcpServers?: readonly LiveMcpServer[] | undefined;
-  readonly nativeResumeRef?: NativeResumeRef | null;
+  readonly nativeCheckpoint?: NativeCheckpoint | null;
   readonly paths: LivePaths;
   readonly permissionPolicy?: "full_access" | "supervised" | undefined;
-  readonly recoveryMessages?: readonly RecoveryMessage[] | undefined;
   readonly runtimeCase: LiveRuntimeCase;
   readonly sessionId: string;
 }): Promise<DriverArtifactTestController> {
@@ -906,10 +896,9 @@ async function startController(input: {
     bootPayload: createBootPayload({
       driverInstanceId,
       mcpServers: input.mcpServers,
-      nativeResumeRef: input.nativeResumeRef ?? null,
+      nativeCheckpoint: input.nativeCheckpoint ?? null,
       paths: input.paths,
       permissionPolicy: input.permissionPolicy,
-      recoveryMessages: input.recoveryMessages,
       runtimeCase: input.runtimeCase,
       sessionId: input.sessionId,
     }),
@@ -1384,27 +1373,21 @@ async function testResume(runtimeCase: LiveRuntimeCase): Promise<void> {
     const sessionId = createTestId();
     const token = `resume-${createTestId()}`;
     const first = await startController({ paths, runtimeCase, sessionId });
-    let resumePointer: string;
+    let nativeCheckpoint: NativeCheckpoint;
 
     try {
       await runTurn(
         first,
         `Remember this exact token for the next process: ${token}. Reply with exactly stored.`,
       );
-      const pointer = readResumePointer(first.events);
-      expect(pointer).not.toBeNull();
-      resumePointer = pointer!;
+      nativeCheckpoint = readCompletedCheckpoint(first.events);
       await stopController(first);
     } finally {
       await first.dispose();
     }
 
     const resumed = await startController({
-      nativeResumeRef: {
-        kind: runtimeCase.nativeResumeKind,
-        runtimeId: runtimeCase.runtime,
-        value: resumePointer,
-      },
+      nativeCheckpoint,
       paths,
       runtimeCase,
       sessionId,
@@ -1442,16 +1425,14 @@ async function testCrashResume(runtimeCase: LiveRuntimeCase): Promise<void> {
     const token = `crash-resume-${createTestId()}`;
     const first = await startController({ paths, runtimeCase, sessionId });
     let active!: ActiveLongTurn;
-    let resumePointer: string;
+    let nativeCheckpoint: NativeCheckpoint;
 
     try {
       await runTurn(
         first,
         `Remember this exact token across a process crash: ${token}. Reply with exactly stored.`,
       );
-      const pointer = readResumePointer(first.events);
-      expect(pointer).not.toBeNull();
-      resumePointer = pointer!;
+      nativeCheckpoint = readCompletedCheckpoint(first.events);
       active = await beginLongTurn(first, paths);
       const childProcessIds = first.directChildProcessIds();
       const providerOwnerIds = first.providerOwnerIds();
@@ -1483,11 +1464,7 @@ async function testCrashResume(runtimeCase: LiveRuntimeCase): Promise<void> {
     }
 
     const resumed = await startController({
-      nativeResumeRef: {
-        kind: runtimeCase.nativeResumeKind,
-        runtimeId: runtimeCase.runtime,
-        value: resumePointer,
-      },
+      nativeCheckpoint,
       paths,
       runtimeCase,
       sessionId,
@@ -1514,16 +1491,14 @@ async function testProviderCrashResume(runtimeCase: LiveRuntimeCase): Promise<vo
     const token = `provider-crash-resume-${createTestId()}`;
     const first = await startController({ paths, runtimeCase, sessionId });
     let active!: ActiveLongTurn;
-    let resumePointer: string;
+    let nativeCheckpoint: NativeCheckpoint;
 
     try {
       await runTurn(
         first,
         `Remember this exact token across a provider crash: ${token}. Reply with exactly stored. Do not call tools.`,
       );
-      const pointer = readResumePointer(first.events);
-      expect(pointer).not.toBeNull();
-      resumePointer = pointer!;
+      nativeCheckpoint = readCompletedCheckpoint(first.events);
 
       const idleOwnerIds = first.providerOwnerIds();
       const idleRoots = ownedDirectProcessIdentities(first, idleOwnerIds);
@@ -1601,11 +1576,7 @@ async function testProviderCrashResume(runtimeCase: LiveRuntimeCase): Promise<vo
     }
 
     const resumed = await startController({
-      nativeResumeRef: {
-        kind: runtimeCase.nativeResumeKind,
-        runtimeId: runtimeCase.runtime,
-        value: resumePointer,
-      },
+      nativeCheckpoint,
       paths,
       runtimeCase,
       sessionId,
@@ -1626,126 +1597,32 @@ async function testProviderCrashResume(runtimeCase: LiveRuntimeCase): Promise<vo
   });
 }
 
-function expectStaleResumeMessage(message: string): void {
-  const lower = message.toLowerCase();
-  expect(lower).toContain(STALE_RESUME_POINTER);
-  expect(lower).toMatch(
-    /no conversation found|(?:invalid|unknown) (?:conversation|session)|(?:conversation|session)(?: id)?[^\n]{0,240}(?:failed|invalid|not found|unknown|does not exist)/,
-  );
-  expect(lower).not.toMatch(
-    /api.?key|authenticat|credential|enoent|model.*(?:invalid|not found)|quota|rate.?limit|spawn/,
-  );
-  expect(lower).not.toMatch(
-    /\b(?:econn\w*|enotfound|fetch (?:error|failed)|network (?:error|failed)|connection (?:error|failed|refused|reset)|http(?: error| status)?\s*5\d\d|status(?: code|:)?\s*5\d\d|service unavailable|bad gateway|gateway timeout)\b/,
-  );
-  expect(lower).not.toContain("timed out");
-}
-
-function expectStaleResumeFailure(error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  const stderr = Array.from(
-    message.matchAll(/"stderr":\s*("(?:\\.|[^"\\])*")/g),
-    (match) => JSON.parse(match[1]!) as string,
-  ).join("\n");
-  expect(stderr.length).toBeGreaterThan(0);
-  expectStaleResumeMessage(stderr);
-}
-
-function expectStaleResumeRunFailure(
-  event: DriverArtifactTestEvent,
-  runtimeCase: LiveRuntimeCase,
-): void {
-  const error = payloadRecord(event)["error"];
-  expect(error).toEqual(
-    expect.objectContaining({
-      code: runtimeCase.suite === "anthropic" ? "claude.error_during_execution" : "acp.turn_failed",
-      message: expect.any(String),
-      retryable: false,
-    }),
-  );
-  expectStaleResumeMessage(String((error as Record<string, unknown>)["message"]));
-}
-
-async function testStaleResume(runtimeCase: LiveRuntimeCase): Promise<void> {
+async function testMissingNativeCheckpoint(runtimeCase: LiveRuntimeCase): Promise<void> {
   await withLivePaths(async (paths) => {
-    const token = `semantic-recovery-${createTestId()}`;
-    const input = {
-      nativeResumeRef: {
+    const nativeCheckpoint: NativeCheckpoint = {
+      formatVersion: 1,
+      nativeRef: {
         kind: runtimeCase.nativeResumeKind,
         runtimeId: runtimeCase.runtime,
-        value: STALE_RESUME_POINTER,
+        value: MISSING_RESUME_POINTER,
       },
-      paths,
-      recoveryMessages: [
-        {
-          content: `Remember this exact recovery token: ${token}.`,
-          role: "user" as const,
-        },
-        {
-          content: `I will remember the exact recovery token ${token}.`,
-          role: "assistant" as const,
-        },
-      ],
-      runtimeCase,
-      sessionId: createTestId(),
+      runId: parseRunId(createTestId()),
     };
-
-    if (runtimeCase.suite === "openai") {
-      const recovered = await startController(input);
-
-      try {
-        const events = await runTurn(
-          recovered,
-          "Reply with exactly the recovery token from the restored conversation.",
-        );
-        expect(eventText(events)).toContain(token);
-        await stopController(recovered);
-      } finally {
-        await recovered.dispose();
-      }
-      return;
-    }
-
     let controller: DriverArtifactTestController | null = null;
-
     try {
-      try {
-        controller = await startController(input);
-      } catch (error) {
-        expectStaleResumeFailure(error);
-        return;
-      }
-
-      const turn = enqueueTurn(controller, "Reply with exactly stale-resume-should-fail.");
-      const [turnUpdate, failedEvent] = await Promise.all([
-        controller.waitForCommandTerminal(turn.commandId, LIVE_TURN_TIMEOUT_MS),
-        controller.waitForEvent(
-          (event) => event.runId === turn.runId && event.kind === "run.failed",
-          turn.eventIndex,
-          LIVE_TURN_TIMEOUT_MS,
-          "stale resume run failure",
-        ),
-      ]);
-      const failedEvents = controller
-        .eventsSince(turn.eventIndex)
-        .filter((event) => event.runId === turn.runId && event.kind === "run.failed");
-      expect(failedEvents).toHaveLength(1);
-      await expectQuiescentRunLifecycle(controller, turn.eventIndex, turn.runId, "run.failed");
-      expectStaleResumeRunFailure(failedEvent, runtimeCase);
-
-      if (runtimeCase.suite === "anthropic") {
-        expect(turnUpdate.status).toBe("completed");
-        await stopController(controller);
-      } else {
-        expect(turnUpdate.status).toBe("failed");
-        expect(await controller.waitForExit(LIVE_STOP_TIMEOUT_MS)).toMatchObject({
-          code: 1,
-          signal: null,
-        });
-      }
+      controller = await startController({
+        nativeCheckpoint,
+        paths,
+        runtimeCase,
+        sessionId: createTestId(),
+      });
+    } catch (error) {
+      expect(error instanceof Error ? error.message : String(error)).toMatch(/checkpoint|ENOENT/iu);
+      return;
     } finally {
       await controller?.dispose();
     }
+    throw new Error("Driver admitted a session without its native checkpoint bundle.");
   });
 }
 
@@ -2847,7 +2724,7 @@ const lifecycleScenarios = [
   ["native MCP configuration and tool call", testNativeMcp],
   ["native process resume", testResume],
   ["provider crash and native resume", testProviderCrashResume],
-  ["stale native resume", testStaleResume],
+  ["missing native checkpoint fails before admission", testMissingNativeCheckpoint],
   ["run.started ACK-boundary, active, replayed, and idle cancellation", testCancellation],
   ["supervised permission cancellation, rejection, and approval", testSupervisedPermission],
   ["active stop and restart", testActiveStop],

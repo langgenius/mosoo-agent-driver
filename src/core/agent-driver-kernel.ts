@@ -212,15 +212,10 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
 
     try {
       if (
-        this.#terminalState.currentRunId() === null &&
-        this.#terminalState.acknowledgedRunTerminal() === null
+        this.#terminalState.currentRunId() !== null &&
+        this.#terminalState.acknowledgedRunTerminal(runId) === null
       ) {
-        this.#pushTerminalEvent({
-          kind: "run.completed",
-          payload: {
-            stopReason: "end_turn",
-          },
-        });
+        throw new Error("Driver instance completion requires an acknowledged run terminal.");
       }
     } catch (error) {
       if (selection === "selected") {
@@ -676,18 +671,10 @@ export class AgentDriverKernelCore implements AgentDriverKernel, DriverRuntimeIo
       this.#logger.warn("driver.kernel.stop.command_bypassed", {
         message: error instanceof Error ? error.message : "Kernel stop command failed.",
       });
-      let terminalFailure: { error: unknown } | null = null;
-
-      try {
-        await this.completeRun();
-      } catch (error) {
-        terminalFailure = { error };
-      }
       await this.#shutdown(reason);
-
-      if (terminalFailure !== null) {
-        throw terminalFailure.error;
-      }
+      await this.#runTask;
+      this.#throwTerminalCause();
+      await this.completeRun();
     }
 
     await this.#runTask;

@@ -1,6 +1,8 @@
 import type { DriverInstanceId, EventId, RunId, SessionId } from "../id";
+import type { NativeCheckpoint } from "../native-checkpoint";
+import type { DriverNativeRuntimeRef } from "../runtime";
 
-export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-08-29";
+export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-10-10";
 
 export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
@@ -12,6 +14,7 @@ export const RUNTIME_EVENT_KINDS = [
   "catalog.updated",
   "context.added",
   "context.compacted",
+  "context.usage.updated",
   "diagnostic.reported",
   "driver.command.updated",
   "driver.connected",
@@ -71,6 +74,7 @@ export const RUNTIME_EVENT_KINDS = [
   "runtime.resume.updated",
   "runtime.sandbox.released",
   "runtime.sandbox.updated",
+  "runtime.session.reset",
   "runtime.timing.recorded",
   "runtime.transport.updated",
   "search.session.completed",
@@ -123,6 +127,23 @@ export type RuntimeTimingStage =
   | "prewarm";
 
 export type RuntimeEventRecord = Record<string, unknown>;
+
+export interface RuntimeContextUsagePayload {
+  readonly used: number;
+  readonly size: number;
+}
+
+export interface RuntimeRunCompletedPayload extends RuntimeEventRecord {
+  readonly checkpoint: NativeCheckpoint;
+  readonly finalMessageId?: string;
+  readonly stopReason?: string;
+}
+
+export interface RuntimeSessionResetPayload {
+  readonly previousCheckpoint: NativeCheckpoint | null;
+  readonly previousNativeRef: DriverNativeRuntimeRef;
+  readonly newNativeRef: DriverNativeRuntimeRef;
+}
 
 type RuntimeToolCallInput =
   | { readonly rawInput?: undefined; readonly rawInputDelta?: undefined }

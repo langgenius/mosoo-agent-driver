@@ -6,7 +6,7 @@
 
 <strong>A runtime-neutral AI execution bridge for sandboxed coding agents.</strong>
 <br />
-One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Client Protocol (ACP).
+One Agent Driver protocol for Claude Agent SDK, Codex app-server, Agent Client Protocol (ACP), and Pi RPC.
 
 <br />
 <br />
@@ -27,7 +27,9 @@ One Agent Driver protocol for Claude Agent SDK, Codex app-server, and Agent Clie
 It runs inside the sandbox and drives one session from boot to stop.
 The core product is the **Driver Kernel**: runtime-neutral commands, events, host ports, provider backends, and the provider registry.
 
-An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections. It is not a compatibility or conformance claim, and it is not part of mosoo's production API. Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
+An experimental, unsupported Anthropic Managed Agents (CMA)-shaped library adapter is layered on top of the Driver Kernel through projections.
+It is not a compatibility or conformance claim, and it is not part of mosoo's production API.
+Provider backends emit Driver runtime events and consume Driver commands; they do not emit CMA events directly.
 
 ## Current mosoo topology
 
@@ -38,7 +40,7 @@ flowchart LR
     Driver["agent-driver<br/>inside Sandbox"]
     Ingress["API Worker<br/>/api/driver/socket"]
     DriverDO["DriverConnection binding<br/>DriverInstance Durable Object"]
-    Backend["Selected backend<br/>OpenAI app-server / Claude Agent SDK / ACP fallback"]
+    Backend["Selected backend<br/>OpenAI app-server / Claude Agent SDK / ACP fallback / Pi RPC"]
 
     Runtime -->|"writes file and starts process with<br/>MOSOO_DRIVER_BOOT_PAYLOAD_FILE"| Boot
     Boot -->|"read and removed"| Driver
@@ -48,15 +50,25 @@ flowchart LR
     Driver -->|"launches and supervises"| Backend
 ```
 
-The Driver does not open a sandbox-local control listener. In mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input. The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`. The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object. That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
+The Driver does not open a sandbox-local control listener.
+In mosoo's production path, Runtime writes the private boot payload, passes its path in `MOSOO_DRIVER_BOOT_PAYLOAD_FILE`, and starts `agent-driver`; boot configuration is not injected through standard input.
+The Driver reads and removes the file, converts the payload's `controlUrl` to `ws:` or `wss:`, and actively dials `/api/driver/socket`.
+The API Worker routes the upgrade to the `DriverConnection` binding backed by the matching `DriverInstance` Durable Object.
+That object validates and claims the one-time boot token and owns the ORPC command, readiness, heartbeat, event, and log lifecycle.
 
 ## AI Execution Bridge Architecture
 
-Different model vendors ship different agent runtimes — the Claude Agent SDK, OpenAI's app-server protocol, and ACP-based agents — and each speaks its own event vocabulary. `@mosoo/agent-driver` unifies them at the kernel level so the host integrates **one** protocol instead of three.
+Claude Agent SDK, OpenAI's app-server, ACP agents, and Pi RPC each speak their own event vocabulary.
+`@mosoo/agent-driver` gives the host one protocol for all four runtimes.
 
-- **Kernel-level unification.** Three launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, and `acp-fallback` — project onto a single Driver event protocol. The host writes against one set of commands and events regardless of which backend is behind the session. The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
-- **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics. Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports. The library is safe to import and never starts the process runner on its own.
-- **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events. This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and mosoo does not mount it as a production API.
+- **Kernel-level unification.** Four launchable transports — `openai-app-server` (OpenAI runtime), `claude-agent-sdk`, `acp-fallback`, and `pi-rpc` — project onto a single Driver event protocol.
+  The host writes against one set of commands and events regardless of which backend is behind the session.
+  The container currently configures OpenCode as the default ACP process, while the ACP command remains configurable.
+- **Runtime-neutral by design.** The Driver Kernel owns command dispatch, runtime event emission, provider lifecycle, the permission flow, and diagnostics.
+  Hosts own credentials, files, skills, MCP, policy, logging, persistence, and transport through well-defined host ports.
+  The library is safe to import and never starts the process runner on its own.
+- **Experimental Managed Agents-shaped adapter.** The library exports an HTTP handler, thin client, projections, and in-memory store for a subset of Anthropic Managed Agents (CMA)-shaped routes and events.
+  This preview is unsupported: it has no compatibility, conformance, completeness, or stability guarantee, and mosoo does not mount it as a production API.
 - **Typed public entries.** Every public entry ships a matching declaration file under `dist/types`, and the package carries **no** `@mosoo/*` runtime dependencies — it is self-contained and portable.
 
 ## Package Entries
@@ -67,6 +79,7 @@ Different model vendors ship different agent runtimes — the Claude Agent SDK, 
 - `@mosoo/agent-driver/runtime`: runtime-neutral runtime, transport, and native resume contracts.
 - `@mosoo/agent-driver/paths`: sandbox path constants and path normalization helpers shared by host integrations.
 - `@mosoo/agent-driver/events`: canonical driver event envelope contracts.
+- `@mosoo/agent-driver/runtime-events`: runtime event parsing and validation without Node dependencies, for host and browser consumers.
 - `@mosoo/agent-driver/contract`: vendor-neutral Authority, Preview, control, synchronization, and JSON-RPC contracts.
 - `@mosoo/agent-driver/orpc`: Driver-to-`DriverInstance` ORPC wire input/output contracts.
 - `@mosoo/agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
@@ -85,13 +98,53 @@ The Contract is the vendor-neutral state and control boundary between the host a
 
 Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qualified ISO 8601 strings with UTC as the default.
 
-Claude keeps a streaming-input query alive between successful turns without tool activity. This avoids restarting the native CLI and reloading its session on each follow-up. The retained process belongs to one Driver session and is reaped on stop; it adds one resident CLI while the session is idle. SDK cumulative usage is converted to per-Run increments, and idle process failure falls back to native session resume on the next input.
+The process wire uses Boot protocol **7** and event schema **`2026-10-10`**.
+`execution.session.nativeCheckpoint` is required: first use supplies `null` together with a null `nativeResumeRef`; resume supplies a format-1 descriptor containing `runId` and `nativeRef`, with the same reference in both fields.
+A native reference alone cannot authorize recovery.
+Run-scoped commands and terminal RPCs identify their Run explicitly.
 
-Tool turns still drain the SDK to EOF and join process-tree cleanup before their terminal event, preserving background-command and trailing resource-event handling. Cancellation and failures also recycle the process. Explicit `maxBudgetUsd`, `maxTurns`, or `taskBudget` options retain the single-query path so their existing per-Run limits are unchanged.
+Each successful Run exports an immutable, verified native bundle under `.state/native-checkpoints/<runId>` and includes its descriptor in `run.completed`.
+In mosoo, the host backs up that bundle before atomically committing the checkpoint descriptor and canonical completion receipt.
+The next Run waits for terminal acknowledgement, backend settlement, required cleanup, and input-command acknowledgement.
+A cleanup failure blocks handoff while preserving the committed outcome.
+This atomic boundary covers native conversation state; workspace files have no transactional snapshot guarantee, and native restore preserves an existing workspace.
 
-Before publishing a reusable turn's completion, the Driver confirms its final assistant record is present in the local transcript so a host checkpoint includes the new conversation. The check reads at most 64 KiB per poll for up to one second; unsupported transcript layouts, oversized records, or unconfirmed writes fall back to closing and draining the query. This confirmation happens after streamed text, preserving first-text latency.
+A typed `runtime.session.reset` event records the previous checkpoint and native reference plus the new native reference.
+Once the host acknowledges the reset, the previous checkpoint is invalid for cold recovery.
+The live runtime can continue, but restart and cold recovery remain unavailable until a subsequent successful Run commits a new checkpoint.
 
-On Linux, `AGENT_DRIVER_NATIVE_CLAUDE=1 bun test tests/claude-agent-sdk-native-session.test.ts` exercises the real native Claude binary against a loopback model fixture, including process reuse, Bash execution, cancellation cleanup, and resume. It requires no provider credentials and prints one-shot/persistent first-text timings; those local timings exclude real model and network latency. Set `MOSOO_CLAUDE_CODE_EXECUTABLE` when using a separately installed native binary.
+`usage.updated` accumulates reported billable usage across the whole Run, including model calls before and after tools.
+Cost remains unknown when the native runtime does not provide it.
+Context-window occupancy, including `context.usage.updated`, is separate from billable usage totals.
+Reusing a native process does not carry the previous Run's charges into the next Run.
+
+Claude uses the pinned Agent SDK **0.3.295** baseline and retains a streaming-input query between successful text turns without tool activity.
+The retained CLI belongs to one Driver session and is reaped on stop; after an idle process failure, the next input starts a new query and resumes its native session.
+Tool turns drain to EOF and join process cleanup before their terminal event, while cancellation and failure also recycle the query.
+Explicit `maxBudgetUsd`, `maxTurns`, or `taskBudget` options use one query per Run to preserve their budget scope.
+
+Before completing a reusable turn, the Driver verifies the local transcript needed for the checkpoint.
+If persistence cannot be confirmed, it closes and drains the query before exporting the native bundle.
+This verification follows streamed text.
+Claude checkpoints include externalized tool output; restoring those references requires the original absolute native home path.
+When file checkpointing is enabled, recovery also preserves native file-history backups and their permissions and requires the original workspace path.
+
+Host-dispatched `mcp.execute` commands claim a durable effect before execution and settle its result before command completion.
+Retries reuse a recorded result, and an uncertain external outcome remains `unknown` instead of triggering another invocation.
+This prevents automatic replay of an uncertain effect; it does not guarantee exactly-once execution in an external service.
+
+On Linux, the native tests exercise the installed Claude binary and OpenAI app-server against local model fixtures without provider credentials.
+Build the Driver artifact before running the OpenAI test:
+
+```sh
+vp run build
+AGENT_DRIVER_NATIVE_CLAUDE=1 vp exec bun test tests/claude-agent-sdk-native-session.test.ts
+AGENT_DRIVER_NATIVE_OPENAI=1 vp exec bun test tests/openai-native-session.test.ts
+```
+
+The Claude test covers process reuse, tools, cancellation cleanup, and native resume; set `MOSOO_CLAUDE_CODE_EXECUTABLE` to select a separately installed binary.
+The OpenAI test exercises two turns through the Driver artifact and checkpoint recovery in a fresh native home.
+Local fixture timings exclude real model and network latency.
 
 ## Quick Start
 
@@ -103,7 +156,8 @@ Install the package in a Bun project:
 bun add @mosoo/agent-driver
 ```
 
-The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required. Drop the following into `quickstart.test.ts` and run `bun test quickstart.test.ts`:
+The smallest library example wires the experimental CMA-shaped HTTP handler to the in-memory store and talks to it with the bundled client — no network socket required.
+Drop the following into `quickstart.test.ts` and run `bun test quickstart.test.ts`:
 
 ```ts
 import { expect, test } from "bun:test";
@@ -144,13 +198,20 @@ test("create an agent, environment, and session over the CMA surface", async () 
 });
 ```
 
-This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessions` preview routes. It does not establish CMA compatibility, and mosoo does not mount this handler. An embedding application must supply its own authorization, durable store, network server, and Driver command dispatcher.
+This exercises the implemented `/v1/environments`, `/v1/agents`, and `/v1/sessions` preview routes.
+It does not establish CMA compatibility, and mosoo does not mount this handler.
+An embedding application must supply its own authorization, durable store, network server, and Driver command dispatcher.
 
 ### How it is used in mosoo
 
-`@mosoo/agent-driver` is the **runtime kernel of the mosoo agent runtime**. When mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object. The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC. The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
+`@mosoo/agent-driver` is the **runtime kernel of the mosoo agent runtime**.
+When mosoo starts an agent session, it writes the private boot payload, boots this driver inside a sandbox, and waits on the matching `DriverInstance` Durable Object.
+The Driver dials outward, selects a provider backend from the registry, drives the session, and sends its runtime-neutral Driver protocol over ORPC.
+The host supplies credentials, files, skills, MCP, policy, and persistence through host ports.
 
-[mosoo](https://github.com/langgenius/mosoo) and this Driver repository are public. mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter. The reusable Driver library and CLI are distributed as `@mosoo/agent-driver` on npmjs.
+[mosoo](https://github.com/langgenius/mosoo) and this Driver repository are public.
+mosoo exposes its production client contract through the [Public Thread API](https://github.com/langgenius/mosoo/blob/main/docs/prd/public-thread-api-surface.md) under `/api/v1`, not through the experimental CMA-shaped adapter.
+The reusable Driver library and CLI are distributed as `@mosoo/agent-driver` on npmjs.
 
 ## Commands
 
@@ -168,7 +229,15 @@ vp run clean
 
 `vp run build:image` uses Buildah to produce a local linux/amd64 `agent-driver:local` OCI image and installs `dist/driver.mjs` on the image `PATH` as `agent-driver`.
 
-The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes. The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases. `vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
+The image contract in `environment-package-managers.json` exposes `npm` and `pip` to Mosoo Environment writes.
+The image build verifies that each tool is executable, reports a valid version, and resolves through coherent Python/pip aliases.
+`vp run test:image:environment` installs and executes one pinned package through each manager using the same isolated-prefix mode as Mosoo Environment artifacts.
+
+`vp run bench` compares cold start, a subsequent Run in the same Session, and recovery in a new Driver with an empty native home.
+It covers text, long output, tool approval/rejection, and tool cancellation, and writes raw samples plus summaries to `bench/outputs`.
+Metrics include boot and first-text latency, terminal and command settlement latency, shutdown time, checkpoint export/verification and size, stream gaps, and observed native process starts and memory.
+Use `TTFT_RUNTIMES`, `TTFT_SCENARIOS`, and `TTFT_TRIALS` to select the matrix; missing provider credentials or Pi configuration skip that runtime.
+One warmup trial per matrix cell is discarded, and the benchmark records failures alongside successful samples.
 
 ## Boundaries
 
@@ -203,7 +272,9 @@ The Driver fails closed when it finds legacy credentials there and accepts OpenA
 
 Every live test launches `dist/driver.mjs` as a child process and talks to it only through the production boot payload and control protocol.
 
-The default matrix exercises all three runtime integrations through OpenRouter and does not claim separate certification of each provider's first-party endpoint.
+The default artifact matrix exercises OpenAI, Claude, and OpenCode through OpenRouter.
+Pi has separate artifact and live tests in `tests/pi-driver-artifact.test.ts` and `tests/pi-driver-live.test.ts`.
+The OpenRouter matrix does not certify each provider's first-party endpoint.
 
 The test controller implements the production wire contract locally, so CMA, Durable Object persistence, database recovery, and deployment networking remain system-test responsibilities.
 
@@ -233,7 +304,8 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 - `vp run test:live:opencode` runs all configured OpenCode compatibility models plus one representative lifecycle model.
 - `vp run test:live:artifact` tests the artifact path supplied by `AGENT_DRIVER_LIVE_ARTIFACT` without rebuilding it.
 
-The release workflow extracts the packed NPM archive to `packed/`, verifies its declarations, runs the provider-free MCP artifact test, and blocks image and package publication until the same `packed/dist/driver.mjs` passes the complete OpenAI, Claude, and OpenCode live matrix.
+The release workflow extracts the packed NPM archive to `packed/`, verifies its declarations, and runs the local MCP, Codex, and Pi artifact tests.
+Image and package publication require the same `packed/dist/driver.mjs` to pass the OpenAI, Claude, OpenCode, and Pi live tests through OpenRouter.
 
 ## License
 

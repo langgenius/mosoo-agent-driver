@@ -23,7 +23,11 @@ import type {
   McpExternalToolExecutionResult,
   RuntimeCommand,
 } from "../src/runtime-command";
-import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
+import {
+  DRIVER_TEST_IDS,
+  createTestNativeCheckpoint,
+  driverBootPayload,
+} from "./driver-boot-payload-fixture";
 
 export { DRIVER_TEST_IDS };
 
@@ -261,7 +265,10 @@ export function createBackend(): RecordingBackend {
         events: [
           {
             kind: "run.completed",
-            payload: { status: "completed" },
+            payload: {
+              checkpoint: createTestNativeCheckpoint(runId, context.payload.runtime),
+              status: "completed",
+            },
             runId,
             sourceEventId: `test.run.completed:${runId}`,
           },
@@ -287,7 +294,12 @@ export async function settleBackendInput(
     events: [
       {
         kind: `run.${status}`,
-        payload: { status },
+        payload: {
+          ...(status === "completed"
+            ? { checkpoint: createTestNativeCheckpoint(runId, context.payload.runtime) }
+            : {}),
+          status,
+        },
         runId,
         sourceEventId: `test.run.${status}:${runId}`,
       },

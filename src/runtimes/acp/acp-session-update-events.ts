@@ -1,12 +1,10 @@
 import type { DriverEventInput } from "../../protocol/events";
 import { timestampSchema } from "../../contract/common";
 import {
-  ACP_USAGE_CONTRACT,
   isRecord,
   readNonEmptyString,
   readNullableString,
   readNumber,
-  readRecord,
   readString,
   stringifyForDisplay,
 } from "./acp-types";
@@ -295,30 +293,17 @@ export function toModeEvents(update: JsonObject | null): DriverEventInput[] {
 }
 
 export function toUsageEvents(update: JsonObject | null): DriverEventInput[] {
-  const rawUsed = readNumber(update, "used");
-  const rawSize = readNumber(update, "size");
-  const cost = readRecord(update, "cost");
-  const rawCostAmount = readNumber(cost, "amount");
-  const used = rawUsed !== null && Number.isSafeInteger(rawUsed) && rawUsed >= 0 ? rawUsed : null;
-  const size = rawSize !== null && Number.isSafeInteger(rawSize) && rawSize >= 0 ? rawSize : null;
-  const costAmount = rawCostAmount !== null && rawCostAmount >= 0 ? rawCostAmount : null;
-  const costCurrency = readNullableString(cost, "currency");
-
-  if (used === null && size === null && costAmount === null) {
+  const used = readNumber(update, "used");
+  const size = readNumber(update, "size");
+  if (
+    used === null ||
+    size === null ||
+    !Number.isSafeInteger(used) ||
+    used < 0 ||
+    !Number.isSafeInteger(size) ||
+    size < 0
+  ) {
     return [];
   }
-
-  return [
-    {
-      kind: "usage.updated",
-      payload: {
-        ...(costAmount === null ? {} : { costAmount }),
-        ...(costAmount === null || costCurrency === undefined ? {} : { costCurrency }),
-        ...(size === null ? {} : { size }),
-        source: "session_update",
-        usageContract: ACP_USAGE_CONTRACT,
-        ...(used === null ? {} : { used }),
-      },
-    },
-  ];
+  return [{ kind: "context.usage.updated", payload: { used, size } }];
 }

@@ -64,7 +64,6 @@ export const driverExecutionSessionContextSchema = ownObjectSchema({
   homePath: nonEmptyStringSchema,
   origin: driverOriginSchema,
   sandboxId: createDriverIdSchema<SandboxId>(),
-  sandboxKind: nonEmptyStringSchema,
   sandboxSessionId: createDriverIdSchema<SandboxSessionId>(),
   sandboxSubjectId: createDriverIdSchema<DriverId>(),
   sandboxSubjectKind: nonEmptyStringSchema,
@@ -74,13 +73,24 @@ export const driverExecutionSessionContextSchema = ownObjectSchema({
 export type DriverExecutionSessionContext = z.infer<typeof driverExecutionSessionContextSchema>;
 
 export const driverConfigRevisionSchema = ownObjectSchema({
-  agentId: createDriverIdSchema<AgentId>(),
+  agentId: createDriverIdSchema<AgentId>().nullable(),
   deploymentVersionId: createDriverIdSchema<AgentDeploymentVersionId>().nullable(),
   deploymentVersionNumber: z.number().finite().nullable(),
   environmentId: createDriverIdSchema<EnvironmentId>(),
   environmentRevisionId: createDriverIdSchema<EnvironmentRevisionId>(),
   runId: createDriverIdSchema<RunId>().nullable(),
   sessionId: createDriverIdSchema<SessionId>(),
+}).superRefine((revision, context) => {
+  if (
+    revision.agentId === null &&
+    (revision.deploymentVersionId !== null || revision.deploymentVersionNumber !== null)
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "A deployment revision requires an Agent preset.",
+      path: ["agentId"],
+    });
+  }
 });
 
 export type DriverConfigRevision = z.infer<typeof driverConfigRevisionSchema>;

@@ -1,7 +1,15 @@
-import { open, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { setTimeout } from "node:timers/promises";
 
+import { raceWithAbort } from "../../utils/async";
+import {
+  directoryEntryPath,
+  hasErrorCode,
+  openAbsoluteRealDirectory,
+  openRealDirectory,
+  readDirectoryEntriesBounded,
+} from "../atomic-file";
 import { isRecord } from "./agent-sdk-json";
 
 export interface ClaudeTranscriptCursor {
@@ -10,13 +18,15 @@ export interface ClaudeTranscriptCursor {
   readonly contentJson: string;
 }
 
-const TRANSCRIPT_TAIL_BYTES = 64 * 1_024;
+const TRANSCRIPT_CHUNK_BYTES = 64 * 1_024;
+const TRANSCRIPT_RECORD_BYTES = 64 * 1_024;
 const TRANSCRIPT_WAIT_MS = 1_000;
+const LABEL = "Claude transcript";
 
 /**
  * Streaming results precede the CLI's batched transcript write. Before publishing
  * run.completed (which may trigger a sandbox checkpoint), observe the final
- * assistant record on disk. Reads are bounded independently of session length.
+ * assistant record on disk. Scan backwards with bounded memory and a deadline.
  * Unsupported layouts/large records/IO failures fall back to closing the query.
  */
 export async function waitForClaudeTranscript(
@@ -27,74 +37,134 @@ export async function waitForClaudeTranscript(
   if (
     cursor === null ||
     !/^[a-zA-Z0-9_-]+$/.test(cursor.sessionId) ||
-    Buffer.byteLength(cursor.contentJson, "utf8") > TRANSCRIPT_TAIL_BYTES
+    Buffer.byteLength(cursor.contentJson, "utf8") > TRANSCRIPT_RECORD_BYTES
   )
     return false;
-  const projects = join(configDir, "projects");
-  const deadline = performance.now() + TRANSCRIPT_WAIT_MS;
-  let transcriptPath: string | null = null;
-  while (performance.now() < deadline) {
+  const waiting = AbortSignal.any([signal, AbortSignal.timeout(TRANSCRIPT_WAIT_MS)]);
+  try {
+    // The scan retains its handles through delayed I/O and closes them when that I/O settles.
+    return await raceWithAbort(pollTranscript(configDir, cursor, waiting), waiting);
+  } catch {
+    signal.throwIfAborted();
+    return false;
+  }
+}
+
+async function pollTranscript(
+  configDir: string,
+  cursor: ClaudeTranscriptCursor,
+  signal: AbortSignal,
+): Promise<boolean> {
+  let projectName: string | null = null;
+  for (;;) {
     signal.throwIfAborted();
     try {
-      if (transcriptPath === null) {
-        for (const directory of await readdir(projects, { withFileTypes: true })) {
-          if (!directory.isDirectory()) continue;
-          const candidate = join(projects, directory.name, `${cursor.sessionId}.jsonl`);
-          const status = await readTranscriptTail(candidate, cursor);
-          if (status === "persisted") return true;
-          if (status === "pending") {
-            transcriptPath = candidate;
-            break;
-          }
+      await using home = await openAbsoluteRealDirectory(configDir, LABEL);
+      signal.throwIfAborted();
+      await using projects = await openRealDirectory(directoryEntryPath(home, "projects"), LABEL);
+      const names: readonly string[] =
+        projectName === null
+          ? (await readDirectoryEntriesBounded(projects, LABEL, 1_024, signal))
+              .filter((directory) => directory.isDirectory())
+              .map((directory) => directory.name)
+          : [projectName];
+      for (const name of names) {
+        signal.throwIfAborted();
+        await using project = await openRealDirectory(directoryEntryPath(projects, name), LABEL);
+        const status = await readTranscript(
+          directoryEntryPath(project, `${cursor.sessionId}.jsonl`),
+          cursor,
+          signal,
+        );
+        if (status === "persisted") return true;
+        if (status === "pending") {
+          projectName = name;
+          break;
         }
-      } else if ((await readTranscriptTail(transcriptPath, cursor)) === "persisted") {
-        return true;
       }
     } catch (error) {
-      if (!isRecord(error) || error["code"] !== "ENOENT") return false;
+      if (!hasErrorCode(error, "ENOENT")) throw error;
     }
     await setTimeout(20, undefined, { signal });
   }
-  return false;
 }
 
-async function readTranscriptTail(
+async function readTranscript(
   path: string,
   cursor: ClaudeTranscriptCursor,
+  signal: AbortSignal,
 ): Promise<"missing" | "pending" | "persisted"> {
-  const file = await open(path, "r").catch((error: unknown) => {
-    if (isRecord(error) && error["code"] === "ENOENT") return null;
+  const file = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  ).catch((error: unknown) => {
+    if (hasErrorCode(error, "ENOENT")) return null;
     throw error;
   });
   if (file === null) return "missing";
   try {
-    const { size } = await file.stat();
-    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
-    const buffer = Buffer.alloc(Math.min(size, TRANSCRIPT_TAIL_BYTES));
-    const { bytesRead } = await file.read(buffer, 0, buffer.length, start);
-    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
-    // Ignore incomplete first/last records; a partial write is not a checkpoint.
-    if (start > 0) lines.shift();
-    lines.pop();
-    for (const line of lines) {
-      let entry: unknown;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (
-        isRecord(entry) &&
-        entry["type"] === "assistant" &&
-        entry["uuid"] === cursor.messageId &&
-        isRecord(entry["message"]) &&
-        JSON.stringify(entry["message"]["content"]) === cursor.contentJson
-      ) {
-        return "persisted";
-      }
+    signal.throwIfAborted();
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.nlink !== 1 || !Number.isSafeInteger(stat.size)) {
+      throw new Error("Claude transcript must be a regular file.");
     }
-    return "pending";
+    let position = stat.size;
+    let parts: Buffer[] = [];
+    let recordBytes = 0;
+    // The tail is incomplete until a newline is found; oversized records are skipped too.
+    let discard = true;
+    const append = (part: Buffer) => {
+      if (discard) return;
+      recordBytes += part.length;
+      if (recordBytes > TRANSCRIPT_RECORD_BYTES) {
+        parts = [];
+        discard = true;
+      } else {
+        parts.push(part);
+      }
+    };
+    while (position > 0) {
+      signal.throwIfAborted();
+      const start = Math.max(0, position - TRANSCRIPT_CHUNK_BYTES);
+      const buffer = Buffer.alloc(position - start);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, start);
+      signal.throwIfAborted();
+      if (bytesRead !== buffer.length) return "pending";
+      let end = bytesRead;
+      for (let index = bytesRead - 1; index >= 0; index--) {
+        if (buffer[index] !== 0x0a) continue;
+        append(buffer.subarray(index + 1, end));
+        if (!discard && matchesAssistant(parts, recordBytes, cursor)) return "persisted";
+        parts = [];
+        recordBytes = 0;
+        discard = false;
+        end = index;
+      }
+      append(buffer.subarray(0, end));
+      position = start;
+    }
+    return !discard && matchesAssistant(parts, recordBytes, cursor) ? "persisted" : "pending";
   } finally {
     await file.close();
   }
+}
+
+function matchesAssistant(
+  parts: readonly Buffer[],
+  size: number,
+  cursor: ClaudeTranscriptCursor,
+): boolean {
+  let entry: unknown;
+  try {
+    entry = JSON.parse(Buffer.concat(parts.toReversed(), size).toString("utf8"));
+  } catch {
+    return false;
+  }
+  return (
+    isRecord(entry) &&
+    entry["type"] === "assistant" &&
+    entry["uuid"] === cursor.messageId &&
+    isRecord(entry["message"]) &&
+    JSON.stringify(entry["message"]["content"]) === cursor.contentJson
+  );
 }

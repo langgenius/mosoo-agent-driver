@@ -82,7 +82,7 @@ function diagnosticEvent(payload: Record<string, unknown> = { message: "ok" }) {
     origin: "driver",
     payload,
     runId: DRIVER_TEST_IDS.runId,
-    schemaVersion: "2026-08-29",
+    schemaVersion: "2026-10-10",
     sessionId: DRIVER_TEST_IDS.sessionId,
     visibility: "owner_debug",
   };
@@ -96,7 +96,7 @@ function textFieldAtJsonSize<Value>(targetBytes: number, create: (text: string) 
   return value;
 }
 
-describe("Driver RPC wire v3", () => {
+describe("Driver RPC wire v7", () => {
   const rpc = driverRuntimeRpcSchemas.driver;
 
   test("omits explicit undefined capability details", () => {
@@ -109,7 +109,7 @@ describe("Driver RPC wire v3", () => {
     expect(Object.hasOwn(parsed.capabilities[0]!, "details")).toBeFalse();
   });
 
-  test.each([2, 4] as const)("rejects protocol version %d", (protocolVersion) => {
+  test.each([1, 2, 3, 4, 5, 6] as const)("rejects protocol version %d", (protocolVersion) => {
     expect(rpc.hello.input.safeParse(helloInput({ protocolVersion })).success).toBeFalse();
   });
 

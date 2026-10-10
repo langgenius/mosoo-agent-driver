@@ -1,10 +1,13 @@
 import { jsonValueSchema } from "../../contract/common";
 import { z } from "zod";
 import type { DriverInstanceId, EventId, SessionId, RunId } from "../id";
+import { nativeRuntimeRefsEqual, parseNativeCheckpoint } from "../native-checkpoint";
+import { parseDriverNativeRuntimeRef } from "../runtime";
 import {
   RUNTIME_EVENT_KINDS,
   RUNTIME_EVENT_SCHEMA_VERSION,
   type RuntimeEventActor,
+  type RuntimeContextUsagePayload,
   type RuntimeEventBuildContext,
   type RuntimeEventDelivery,
   type RuntimeEventDraft,
@@ -16,6 +19,7 @@ import {
   type RuntimeEventOrigin,
   type RuntimeEventRecord,
   type RuntimeEventVisibility,
+  type RuntimeSessionResetPayload,
   type RuntimeTimingPath,
   type RuntimeTimingPayload,
   type RuntimeTimingPhase,
@@ -268,6 +272,7 @@ export function parseRuntimeEventEnvelope(value: unknown): RuntimeEventEnvelope 
       delivery,
       kind,
       ...(runId === undefined ? {} : { runId }),
+      ...(runtimeId === undefined ? {} : { runtimeId }),
       sessionId,
       ...(traceId === undefined ? {} : { traceId }),
       visibility,
@@ -410,6 +415,7 @@ function admitRuntimeEventPayload(
     readonly driverInstanceId?: DriverInstanceId | undefined;
     readonly kind: RuntimeEventKind;
     readonly runId?: RunId | undefined;
+    readonly runtimeId?: string | undefined;
     readonly sessionId: SessionId;
     readonly traceId?: string | undefined;
     readonly visibility: RuntimeEventVisibility;
@@ -429,6 +435,20 @@ function admitRuntimeEventPayload(
   }
 
   switch (context.kind) {
+    case "context.usage.updated": {
+      const record = requirePayloadRecord(context.kind, canonicalPayload);
+      requireExactKeys(record, new Set(["used", "size"]), "Runtime context usage payload");
+      for (const field of ["used", "size"]) {
+        const value = record[field];
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+          throw new Error(`Runtime context usage ${field} must be a non-negative safe integer.`);
+        }
+      }
+      return {
+        used: record["used"] as number,
+        size: record["size"] as number,
+      } satisfies RuntimeContextUsagePayload;
+    }
     case "agent.task.updated": {
       const record = requirePayloadRecord(context.kind, canonicalPayload);
       requireString(record, "taskId", context.kind);
@@ -626,6 +646,48 @@ function admitRuntimeEventPayload(
     case "runtime.timing.recorded": {
       return readTimingPayload(context, canonicalPayload);
     }
+    case "runtime.session.reset": {
+      if (context.runId !== undefined) {
+        throw new Error("Runtime event runtime.session.reset must be scoped to the session.");
+      }
+      if (context.driverInstanceId === undefined || context.runtimeId === undefined) {
+        throw new Error("Runtime event runtime.session.reset requires driver and runtime IDs.");
+      }
+      if (context.delivery !== "lossless") {
+        throw new Error("Runtime event runtime.session.reset must be lossless.");
+      }
+      const record = requirePayloadRecord(context.kind, canonicalPayload);
+      requireExactKeys(
+        record,
+        new Set(["previousCheckpoint", "previousNativeRef", "newNativeRef"]),
+        "Runtime event runtime.session.reset payload",
+      );
+      const previousCheckpoint =
+        record["previousCheckpoint"] === null
+          ? null
+          : parseNativeCheckpoint(record["previousCheckpoint"]);
+      const previousNativeRef = parseDriverNativeRuntimeRef(record["previousNativeRef"]);
+      const newNativeRef = parseDriverNativeRuntimeRef(record["newNativeRef"]);
+      if (
+        previousNativeRef.runtimeId !== context.runtimeId ||
+        newNativeRef.runtimeId !== context.runtimeId
+      ) {
+        throw new Error("Runtime event runtime.session.reset refs must match the event runtime.");
+      }
+      if (
+        previousCheckpoint !== null &&
+        !nativeRuntimeRefsEqual(previousCheckpoint.nativeRef, previousNativeRef)
+      ) {
+        throw new Error(
+          "Runtime event runtime.session.reset checkpoint must match the previous ref.",
+        );
+      }
+      return {
+        previousCheckpoint,
+        previousNativeRef,
+        newNativeRef,
+      } satisfies RuntimeSessionResetPayload;
+    }
     case "tool.call.updated": {
       const record = requirePayloadRecord(context.kind, canonicalPayload);
       requireEnumValue(record, "status", toolStatuses, context.kind);
@@ -669,6 +731,7 @@ function readRunPayload(
   context: {
     readonly kind: RuntimeEventKind;
     readonly runId?: RunId | undefined;
+    readonly runtimeId?: string | undefined;
     readonly traceId?: string | undefined;
   },
   payload: unknown,
@@ -708,6 +771,17 @@ function readRunPayload(
   }
 
   const admitted = omitPayloadIdentity(record);
+
+  if (context.kind === "run.completed") {
+    const checkpoint = parseNativeCheckpoint(record["checkpoint"]);
+    if (checkpoint.runId !== context.runId) {
+      throw new Error("Runtime event run.completed checkpoint must match the event run.");
+    }
+    if (checkpoint.nativeRef.runtimeId !== context.runtimeId) {
+      throw new Error("Runtime event run.completed checkpoint must match the event runtime.");
+    }
+    admitted["checkpoint"] = checkpoint;
+  }
 
   if ("run" in record && record["run"] !== undefined) {
     admitted["run"] = readRunView(context, record["run"]);

@@ -2,8 +2,8 @@ import { isDeepStrictEqual } from "node:util";
 
 import { projectDriverEventToCma } from "../../projections/cma";
 import { createDriverId } from "../../protocol/id";
-import { parseRuntimeEventEnvelope } from "../../runtime-events";
-import type { RuntimeEventEnvelope } from "../../runtime-events";
+import { parseRuntimeEventEnvelope } from "../../protocol/events/runtime-events";
+import type { RuntimeEventEnvelope } from "../../protocol/events/runtime-events";
 import type {
   CmaAgentRecord,
   CmaClaimInboundEventInput,

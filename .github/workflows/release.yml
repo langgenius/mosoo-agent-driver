@@ -95,6 +95,9 @@ jobs:
         env:
           AGENT_DRIVER_LIVE: "1"
           AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
+          AGENT_DRIVER_NATIVE_OPENAI: "1"
+          MOSOO_OPENAI_TEST_ARTIFACT: packed/dist/driver.mjs
+          MOSOO_PI_TEST_ARTIFACT: packed/dist/driver.mjs
         run: |
           set -euo pipefail
 
@@ -110,11 +113,14 @@ jobs:
           declarations=(packed/dist/types/**/*.d.ts)
           vp exec tsc --ignoreConfig --noEmit --moduleResolution Bundler --module ESNext --target ESNext "${declarations[@]}"
           bun test tests/driver-artifact-mcp.test.ts
+          bun test tests/openai-native-session.test.ts tests/pi-driver-artifact.test.ts
 
       - name: Test packed driver live matrix
         timeout-minutes: 180
         env:
           AGENT_DRIVER_LIVE_ARTIFACT: packed/dist/driver.mjs
+          AGENT_DRIVER_PI_LIVE: "1"
+          MOSOO_PI_TEST_ARTIFACT: packed/dist/driver.mjs
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set -euo pipefail
@@ -125,6 +131,7 @@ jobs:
           fi
 
           vp run test:live:artifact
+          bun test tests/pi-driver-live.test.ts
 
       - id: image
         name: Build image

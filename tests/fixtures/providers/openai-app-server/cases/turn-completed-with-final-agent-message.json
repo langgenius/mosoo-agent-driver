@@ -84,6 +84,15 @@
         "turnId": "turn-1"
       },
       "payload": {
+        "checkpoint": {
+          "formatVersion": 1,
+          "nativeRef": {
+            "kind": "openai_thread_id",
+            "runtimeId": "openai-runtime",
+            "value": "thread-1"
+          },
+          "runId": "<driver-id-2>"
+        },
         "finalMessageId": "<driver-id>",
         "stopReason": "end_turn"
       },

@@ -1622,7 +1622,7 @@ describe("driver runtime boundary", () => {
               reason: "test.stop",
             };
       const socket = new FakeDriverRuntimeIo(
-        [first, next],
+        kind === "input" ? [first, next, structuredClone(next)] : [first, next],
         kind === "mcp" ? DRIVER_TEST_IDS.runId : undefined,
       );
       const recordUpdate = socket.commandUpdate.bind(socket);
@@ -1648,7 +1648,12 @@ describe("driver runtime boundary", () => {
       const runtimeState = new DriverRuntimeStateMachine("ready");
       const { dispatcher, logger } = createDispatcher({
         backend,
-        isShuttingDown: () => socket.isDrained(),
+        isShuttingDown: () =>
+          socket.isDrained() &&
+          (kind !== "input" ||
+            socket.updates.some(
+              (update) => update.commandId === next.commandId && update.status === "completed",
+            )),
         mcpExecute: async (command) => {
           sideEffects += 1;
           return {
@@ -1669,11 +1674,11 @@ describe("driver runtime boundary", () => {
 
       expect(outcome.status).toBe("completed");
       expect(terminalAttempts).toBe(1);
-      expect(sideEffects).toBe(1);
+      expect(sideEffects).toBe(kind === "input" ? 2 : 1);
       expect(socket.updates).toContainEqual(
         expect.objectContaining({
           commandId: next.commandId,
-          status: kind === "input" ? "failed" : "completed",
+          status: "completed",
         }),
       );
     },

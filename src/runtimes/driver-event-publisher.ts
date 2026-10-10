@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { summarizeDriverEventBatch } from "../observability/driver-debug";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
+import { parseNativeCheckpoint, type NativeCheckpoint } from "../protocol/native-checkpoint";
 import type { DriverEventReceipt } from "../protocol/orpc";
 import type { DriverRuntime } from "../protocol/runtime";
 import { raceWithAbort } from "../utils/async";
@@ -24,14 +25,21 @@ import {
   terminalDriverEventRetryKey,
   type QueuedDriverEvent,
 } from "./driver-event-admission";
+import {
+  pinNativeCheckpointRoot,
+  pruneNativeCheckpoints,
+  type NativeCheckpointRoot,
+} from "./native-checkpoint";
 interface TerminalSettlement {
   readonly acceptedSourceEventIds: Set<string>;
   readonly activeRunId: RunId;
   readonly cancellationSignal: AbortSignal | null;
+  readonly checkpoint: NativeCheckpoint | null;
   readonly events: readonly DriverEventInput[];
   readonly key: string;
   signal: AbortSignal;
   nextIndex: number;
+  cleanupComplete: boolean;
   rejection: unknown | null;
   task: Promise<void> | null;
 }
@@ -98,6 +106,18 @@ export class DriverCompletedTerminalSupersededError extends Error {
   }
 }
 
+export class DriverNativeCheckpointCleanupError extends Error {
+  readonly checkpoint: NativeCheckpoint | null;
+  readonly runId: RunId;
+
+  constructor(runId: RunId, checkpoint: NativeCheckpoint | null, cause: unknown) {
+    super("Native checkpoint cleanup failed after terminal acknowledgement.", { cause });
+    this.name = "DriverNativeCheckpointCleanupError";
+    this.checkpoint = checkpoint;
+    this.runId = runId;
+  }
+}
+
 function deliveryCause(error: unknown): unknown {
   return error instanceof QueuedPushDeliveryError ? error.deliveryCause : error;
 }
@@ -106,6 +126,8 @@ export class DriverEventPublisher {
   readonly #getSessionRef: () => string | null;
   readonly #runtime: DriverRuntime;
   #acceptedInFlightSourceEventIds = new Set<string>();
+  #checkpointRootTask: Promise<NativeCheckpointRoot> | null = null;
+  #committedCheckpoint: NativeCheckpoint | null | undefined;
   #drainTask: Promise<void> | null = null;
   #eventSettlements = new Map<string, EventSettlement>();
   #inFlightEvents: readonly QueuedDriverEvent[] | null = null;
@@ -128,6 +150,49 @@ export class DriverEventPublisher {
   constructor(runtime: DriverRuntime, getSessionRef: () => string | null) {
     this.#getSessionRef = getSessionRef;
     this.#runtime = runtime;
+  }
+
+  async initializeNativeCheckpointRoot(
+    context: AgentDriverContext,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    signal?.throwIfAborted();
+    this.#checkpointRootTask ??= pinNativeCheckpointRoot(
+      context.payload.execution.session.cwd,
+      signal,
+    );
+    await (signal === undefined
+      ? this.#checkpointRootTask
+      : raceWithAbort(this.#checkpointRootTask, signal));
+  }
+
+  async finishTerminalCleanup(context: AgentDriverContext, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const settlement = this.#terminalSettlement;
+    if (
+      settlement === null ||
+      settlement.cleanupComplete ||
+      settlement.nextIndex < settlement.events.length
+    ) {
+      return;
+    }
+
+    if (settlement.task !== null) {
+      const task = settlement.task;
+      // A stop may join the original attempt while its filesystem cleanup is
+      // still running. Keep the failed attempt owned, then retry only cleanup.
+      await (signal === undefined ? task : raceWithAbort(task, signal)).catch((error: unknown) => {
+        if (signal?.aborted) throw error;
+      });
+    }
+    if (settlement.cleanupComplete) return;
+    signal?.throwIfAborted();
+    let task = settlement.task;
+    if (task === null) {
+      settlement.signal = AbortSignal.timeout(DRIVER_EVENT_DELIVERY_TIMEOUT_MS);
+      task = this.#startTerminalSettlement(context, "driver.native_checkpoint.cleanup", settlement);
+    }
+    await (signal === undefined ? task : raceWithAbort(task, signal));
   }
 
   async push(
@@ -164,7 +229,7 @@ export class DriverEventPublisher {
     await this.#terminalSettlement?.task;
 
     const settlement = this.#terminalSettlement;
-    if (settlement !== null && settlement.nextIndex < settlement.events.length) {
+    if (settlement !== null && !settlement.cleanupComplete) {
       throw new Error("Driver event run terminal settlement slot is full.");
     }
 
@@ -218,7 +283,7 @@ export class DriverEventPublisher {
     if (
       settlement !== null &&
       settlement !== terminalSettlement &&
-      settlement.nextIndex >= settlement.events.length &&
+      settlement.cleanupComplete &&
       currentRunId !== settlement.activeRunId
     ) {
       this.#terminalSettlement = null;
@@ -426,6 +491,18 @@ export class DriverEventPublisher {
     }
 
     preflightDriverEventPush(settlementEvents, targetRunId);
+    const checkpoint =
+      terminal.kind === "run.completed"
+        ? parseNativeCheckpoint(
+            (terminal.payload as { checkpoint?: unknown } | null | undefined)?.checkpoint,
+          )
+        : null;
+    if (
+      checkpoint !== null &&
+      (checkpoint.runId !== targetRunId || checkpoint.nativeRef.runtimeId !== this.#runtime)
+    ) {
+      throw new Error("Driver completed checkpoint must match the terminal run and runtime.");
+    }
     const scopedEvents = settlementEvents.map((event) => scopeDriverEvent(event, targetRunId));
     const key = terminalSettlementKey(scopedEvents);
     const current = this.#terminalSettlement;
@@ -440,7 +517,7 @@ export class DriverEventPublisher {
         return this.#startTerminalSettlement(context, reason, current);
       }
 
-      const settled = current.nextIndex >= current.events.length;
+      const settled = current.cleanupComplete;
       const activeRunChanged = activeRunId !== current.activeRunId;
       if (!settled || !activeRunChanged) {
         throw new Error("Driver event run terminal settlement slot is full.");
@@ -522,6 +599,8 @@ export class DriverEventPublisher {
       ),
       activeRunId,
       cancellationSignal: cancellationSignal ?? null,
+      checkpoint,
+      cleanupComplete: false,
       events,
       key,
       nextIndex: 0,
@@ -627,6 +706,25 @@ export class DriverEventPublisher {
         );
       }
     }
+
+    this.#committedCheckpoint ??= context.payload.execution.session.nativeCheckpoint;
+    if (settlement.checkpoint !== null) {
+      this.#committedCheckpoint = settlement.checkpoint;
+    }
+    // Keep the acknowledged terminal reserved until cleanup succeeds. A retry then
+    // repeats only cleanup, while a failure prevents the next run from being admitted.
+    try {
+      if (this.#checkpointRootTask !== null) {
+        await pruneNativeCheckpoints(await this.#checkpointRootTask, this.#committedCheckpoint);
+      }
+    } catch (error) {
+      throw new DriverNativeCheckpointCleanupError(
+        settlement.activeRunId,
+        this.#committedCheckpoint,
+        error,
+      );
+    }
+    settlement.cleanupComplete = true;
   }
 
   #enqueue(entry: QueuedPush): void {

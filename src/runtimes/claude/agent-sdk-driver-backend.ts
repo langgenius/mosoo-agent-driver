@@ -16,6 +16,7 @@ import {
 } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
+import type { NativeCheckpoint } from "../../protocol/native-checkpoint";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
@@ -24,10 +25,11 @@ import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-dr
 import {
   DriverCompletedTerminalSupersededError,
   DriverEventPublisher,
+  DriverNativeCheckpointCleanupError,
 } from "../driver-event-publisher";
-import { toRuntimePublicId } from "../runtime-public-id";
+import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
 import { computeRuntimeBootstrapDigest, writeSkillBootstrapArtifacts } from "../skill-bootstrap";
-import { readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
+import { isRecord, readProcessEnvString, toErrorMessage } from "./agent-sdk-json";
 import { ClaudeDurableEventTooLargeError } from "./agent-sdk-event-writer";
 import { ClaudeAgentSdkPrewarm } from "./agent-sdk-prewarm";
 import {
@@ -46,6 +48,11 @@ import { readClaudeNativeResumeSessionId, requireClaudeNativeSessionId } from ".
 import { drainClaudeTasks } from "./agent-sdk-tasks";
 import { ClaudeStreamingQuery } from "./agent-sdk-streaming-query";
 import { waitForClaudeTranscript } from "./agent-sdk-transcript";
+import type { ClaudeTranscriptCursor } from "./agent-sdk-transcript";
+import {
+  createClaudeNativeCheckpoint,
+  restoreClaudeNativeCheckpoint,
+} from "./agent-sdk-checkpoint";
 
 interface ActiveClaudeTurn {
   abortController: AbortController;
@@ -64,16 +71,20 @@ interface ActiveClaudeTurn {
 }
 
 interface ClaudeAgentSdkDriverBackendDependencies {
+  readonly createNativeCheckpoint: typeof createClaudeNativeCheckpoint;
   readonly createQueryOptions: typeof createClaudeQueryOptions;
   readonly query: typeof query;
   readonly startup: typeof startup;
+  readonly restoreNativeCheckpoint: typeof restoreClaudeNativeCheckpoint;
   readonly waitForTranscript: typeof waitForClaudeTranscript;
 }
 
 const DEFAULT_DEPENDENCIES: ClaudeAgentSdkDriverBackendDependencies = {
+  createNativeCheckpoint: createClaudeNativeCheckpoint,
   createQueryOptions: createClaudeQueryOptions,
   query,
   startup,
+  restoreNativeCheckpoint: restoreClaudeNativeCheckpoint,
   waitForTranscript: waitForClaudeTranscript,
 };
 
@@ -97,10 +108,14 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   readonly #messageTranslator: ClaudeAgentSdkMessageTranslator;
   readonly #payload: DriverStartInput;
   readonly #pendingProcessTasks = new Set<Promise<void>>();
+  readonly #pendingControlStreams = new Set<ClaudeStreamingQuery>();
+  readonly #pendingTerminalReleases = new Set<ClaudeStreamingQuery>();
   readonly #prewarm: ClaudeAgentSdkPrewarm;
   #activeTurn: ActiveClaudeTurn | null = null;
   #idleTurn: ActiveClaudeTurn | null = null;
   #nativeSessionId: string | null = null;
+  #committedCheckpoint: NativeCheckpoint | null;
+  #pendingReset: DriverEventInput | null = null;
   #stopRequested = false;
   #stopTask: Promise<void> | null = null;
 
@@ -110,6 +125,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
   ) {
     this.#dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies };
     this.#payload = payload;
+    this.#committedCheckpoint = payload.execution.session.nativeCheckpoint;
     this.#nativeSessionId = readClaudeNativeResumeSessionId(payload);
     this.#prewarm = new ClaudeAgentSdkPrewarm({
       createQueryOptions: this.#dependencies.createQueryOptions,
@@ -133,8 +149,17 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       },
       recordNativeSessionId: async (context, sessionId) =>
         this.#recordNativeSessionId(context, sessionId),
-      replaceNativeSessionId: async (context, previousSessionId, nextSessionId) =>
-        this.#replaceNativeSessionId(context, previousSessionId, nextSessionId),
+      replaceNativeSessionId: async (context, previousSessionId, nextSessionId, messageId) =>
+        this.#replaceNativeSessionId(
+          context,
+          previousSessionId,
+          nextSessionId,
+          createRuntimeSourceEventId(
+            "claude.session.reset",
+            this.#payload.execution.run.sessionId,
+            messageId,
+          ),
+        ),
       sessionId: payload.execution.run.sessionId,
     });
   }
@@ -145,6 +170,8 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       throw new Error("Claude Agent SDK backend cannot restart after stopping.");
     }
 
+    await this.#eventPublisher.initializeNativeCheckpointRoot(context, signal);
+    await this.#dependencies.restoreNativeCheckpoint(this.#payload, signal);
     const materializedSkills = await context.ports.skill.materialize(
       this.#payload.execution,
       signal,
@@ -199,15 +226,6 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       throw new Error("Claude Agent SDK backend has stopped.");
     }
 
-    this.#messageTranslator.resetTurnMessageState();
-
-    // With no native session to resume, every query starts a fresh provider
-    // session, so the bounded platform-history replay must ride the prompt of
-    // whichever turn first establishes one.
-    const recoveryMessages =
-      this.#nativeSessionId === null ? this.#payload.execution.session.recoveryMessages : [];
-    const promptText = buildClaudeRecoveryPrompt(recoveryMessages, input.text);
-
     const idleTurn = this.#idleTurn;
     this.#idleTurn = null;
     const { abortController, permissionTasks, processTasks, warmQuery } =
@@ -239,8 +257,18 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
 
     let preparedResult: ClaudePreparedResult | null = null;
     let terminalOutcome: ClaudeTerminalOutcome | null = null;
+    let terminalAcknowledged = false;
+    const transcriptCursors = new Map<string, ClaudeTranscriptCursor>();
 
     try {
+      await this.#flushSessionControls(context);
+      this.#messageTranslator.resetTurnMessageState();
+
+      // Replay platform history only until a native session has been established.
+      const recoveryMessages =
+        this.#nativeSessionId === null ? this.#payload.execution.session.recoveryMessages : [];
+      const promptText = buildClaudeRecoveryPrompt(recoveryMessages, input.text);
+
       await this.#push(context, "driver.claude.turn.started", [
         {
           kind: "run.started",
@@ -258,12 +286,17 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       let activeQuery: AsyncIterator<SDKMessage>;
 
       try {
+        await activeTurn.stream?.flushControls();
+        if (isTurnCancelled(activeTurn) || this.#stopRequested) {
+          throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
+        }
         if (
           activeTurn.stream !== null &&
           (!activeTurn.stream.reusable || idleTurn?.context !== context)
         ) {
           // An idle EOF/crash is recoverable through the last durable native cursor.
           await this.#closeQuery(context, activeTurn, "session.exited");
+          await activeTurn.stream.flushControls();
           if (isTurnCancelled(activeTurn) || this.#stopRequested) {
             throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
           }
@@ -281,14 +314,10 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
               ? activeTurn.abortController.signal
               : AbortSignal.any([activeTurn.abortController.signal, signal]);
         }
-        const streamInput = this.#canReuseQuery();
-        const createQuery = (create: (prompt: string | AsyncIterable<SDKUserMessage>) => Query) => {
-          if (!streamInput) {
-            activeTurn.query = create(promptText);
-            return activeTurn.query;
-          }
+        const createQuery = (create: (prompt: AsyncIterable<SDKUserMessage>) => Query) => {
           activeTurn.stream = new ClaudeStreamingQuery({
             createQuery: create,
+            reuse: this.#canReuseQuery(),
             onFailure: (error) => {
               context.logger.debug("driver.claude.session.reader_failed", {
                 message: toErrorMessage(error, "Claude session reader failed."),
@@ -301,13 +330,18 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
                   context,
                   message.session_id,
                   message.new_conversation_id,
-                  true,
+                  createRuntimeSourceEventId(
+                    "claude.session.reset",
+                    this.#payload.execution.run.sessionId,
+                    message.uuid,
+                  ),
                 );
               } else {
                 context.logger.debug("driver.claude.session.idle_message", { type: message.type });
               }
             },
           });
+          this.#pendingControlStreams.add(activeTurn.stream);
           activeTurn.processTasks.add(activeTurn.stream.finished);
           activeTurn.query = activeTurn.stream.query;
           return activeTurn.stream.submit(promptText);
@@ -410,6 +444,16 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
           break;
         }
         const message = iteration.value;
+
+        if (message.type === "conversation_reset") {
+          transcriptCursors.clear();
+        } else if (message.type === "assistant") {
+          transcriptCursors.set(message.uuid, {
+            sessionId: message.session_id,
+            messageId: message.uuid,
+            contentJson: JSON.stringify(message.message.content),
+          });
+        }
 
         if (isTurnCancelled(activeTurn)) {
           throw new DriverTurnCancelledError("Claude Agent SDK turn was cancelled.");
@@ -520,16 +564,65 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
       ) {
         await this.#closeQuery(context, activeTurn, "provider.result");
       }
+      let checkpoint: NativeCheckpoint | null = null;
+      if (preparedResult.terminal.kind === "run.completed") {
+        const terminalPayload = preparedResult.terminal.payload;
+        if (!isRecord(terminalPayload)) {
+          throw new Error("Claude completion requires an object payload.");
+        }
+        if (this.#nativeSessionId === null) {
+          throw new Error("Claude completion requires a native session.");
+        }
+        const checkpointStartedAt = Date.now();
+        checkpoint = await this.#dependencies.createNativeCheckpoint({
+          payload: this.#payload,
+          runId,
+          sessionId: this.#nativeSessionId,
+          expectedTranscriptCursors: [...transcriptCursors.values()],
+          signal: activeTurn.runSignal ?? new AbortController().signal,
+        });
+        // The host requires this Run's cursor even when the native session ID is unchanged.
+        await this.#publishNativeResumeRef(context, this.#nativeSessionId);
+        preparedResult = {
+          ...preparedResult,
+          terminal: {
+            ...preparedResult.terminal,
+            payload: { ...terminalPayload, checkpoint },
+          },
+        };
+        await this.#push(context, "driver.claude.native_checkpoint.created", [
+          createTimingEvent({
+            phases: [createTimingPhase("native.checkpoint", toDurationMs(checkpointStartedAt))],
+            path: "unknown",
+            runId,
+            sessionId: this.#payload.execution.run.sessionId,
+            stage: "driver_turn",
+            startedAt: new Date(checkpointStartedAt).toISOString(),
+          }),
+        ]);
+      }
       terminalOutcome = await this.#messageTranslator.publishPreparedResult(
         context,
         preparedResult,
       );
+      terminalAcknowledged = true;
+      if (checkpoint !== null) {
+        this.#committedCheckpoint = checkpoint;
+      }
     } catch (error) {
       if (!runStarted) {
         throw error;
       }
 
       if (error instanceof ClaudeTerminalWriteError) {
+        if (error.cause instanceof DriverNativeCheckpointCleanupError) {
+          terminalAcknowledged = true;
+          this.#committedCheckpoint = error.cause.checkpoint;
+          if (activeTurn.stream !== null) {
+            this.#pendingTerminalReleases.add(activeTurn.stream);
+          }
+          throw error.cause;
+        }
         const replaceableCompletion =
           error.terminalKind === "run.completed" &&
           (error.cause === activeTurn.runSignal?.reason ||
@@ -544,6 +637,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         const cancellationReason = turnCancellationReason(activeTurn);
         await this.#closeQuery(context, activeTurn, cancellationReason);
         await this.#messageTranslator.cancelTurn(context, runId, cancellationReason);
+        terminalAcknowledged = true;
         throw new DriverTurnCancelledError(cancellationReason);
       }
 
@@ -561,29 +655,40 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         error instanceof ClaudeDurableEventTooLargeError ? error.code : "claude.turn_failed",
         message,
       );
+      terminalAcknowledged = true;
       throw error;
     } finally {
-      const retainQuery =
-        terminalOutcome?.kind === "run.completed" &&
-        activeTurn.stream?.reusable === true &&
-        activeTurn.queryCloseTask === null &&
-        !activeTurn.abortController.signal.aborted &&
-        !this.#stopRequested;
+      let retainQuery = false;
       try {
+        if (
+          terminalAcknowledged &&
+          (activeTurn.stream === null || !this.#pendingTerminalReleases.has(activeTurn.stream))
+        ) {
+          await activeTurn.stream?.releaseTurn();
+        }
+        retainQuery =
+          terminalOutcome?.kind === "run.completed" &&
+          activeTurn.stream?.reusable === true &&
+          activeTurn.queryCloseTask === null &&
+          !activeTurn.abortController.signal.aborted &&
+          !this.#stopRequested;
         if (retainQuery) {
           this.#idleTurn = activeTurn;
-          activeTurn.stream?.releaseTurn();
-        } else {
-          await this.#closeQuery(context, activeTurn, "turn.finished");
         }
       } finally {
-        if (!retainQuery) {
-          this.#retainProcessTasks(activeTurn);
+        try {
+          if (!retainQuery) {
+            await this.#closeQuery(context, activeTurn, "turn.finished");
+          }
+        } finally {
+          if (!retainQuery) {
+            this.#retainProcessTasks(activeTurn);
+          }
+          if (this.#activeTurn === activeTurn) {
+            this.#activeTurn = null;
+          }
+          activeTurn.settled.resolve();
         }
-        if (this.#activeTurn === activeTurn) {
-          this.#activeTurn = null;
-        }
-        activeTurn.settled.resolve();
       }
     }
 
@@ -692,10 +797,26 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     if (idleResult.status === "rejected") {
       throw idleResult.reason;
     }
+    await raceWithAbort(this.#flushSessionControls(context), signal);
+  }
+
+  async #flushSessionControls(context: AgentDriverContext): Promise<void> {
+    await this.#eventPublisher.finishTerminalCleanup(context);
+    for (const stream of this.#pendingTerminalReleases) {
+      await stream.releaseTurn();
+      this.#pendingTerminalReleases.delete(stream);
+    }
+    await this.#flushPendingReset(context);
+    for (const stream of this.#pendingControlStreams) {
+      await stream.flushControls();
+      if (!stream.reusable && !stream.hasPendingControls) {
+        this.#pendingControlStreams.delete(stream);
+      }
+    }
   }
 
   #canReuseQuery(): boolean {
-    // These SDK limits belong to a query/process. Keep the existing per-Run budgets.
+    // maxBudgetUsd spans messages; retain one query per Run for all explicit budgets.
     const options = this.#payload.execution.providerOptions;
     return (
       options["maxBudgetUsd"] === undefined &&
@@ -738,29 +859,58 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     context: AgentDriverContext,
     previousSessionId: string,
     nextSessionId: string,
-    sessionScoped = false,
+    sourceEventId: string,
   ): Promise<void> {
     requireClaudeNativeSessionId(previousSessionId);
     requireClaudeNativeSessionId(nextSessionId);
 
-    if (this.#nativeSessionId === nextSessionId) {
+    if (this.#nativeSessionId === nextSessionId && this.#pendingReset === null) {
       return;
     }
 
-    if (this.#nativeSessionId !== null && this.#nativeSessionId !== previousSessionId) {
+    if (
+      this.#nativeSessionId !== null &&
+      this.#nativeSessionId !== previousSessionId &&
+      this.#nativeSessionId !== nextSessionId
+    ) {
       throw new Error("Claude conversation reset belongs to a different native session.");
     }
 
-    const retainedSessionId = this.#nativeSessionId;
-    this.#nativeSessionId = nextSessionId;
-    try {
-      await this.#publishNativeResumeRef(context, nextSessionId, sessionScoped);
-    } catch (error) {
-      if (this.#nativeSessionId === nextSessionId) {
-        this.#nativeSessionId = retainedSessionId;
-      }
-      throw error;
+    if (this.#pendingReset !== null && this.#pendingReset.sourceEventId !== sourceEventId) {
+      throw new Error("Claude session reset is awaiting durable acknowledgement.");
     }
+    this.#pendingReset ??= {
+      kind: "runtime.session.reset",
+      sourceEventId,
+      payload: {
+        previousCheckpoint: this.#committedCheckpoint,
+        previousNativeRef: {
+          kind: "claude_session_id",
+          runtimeId: this.runtime,
+          value: previousSessionId,
+        },
+        newNativeRef: {
+          kind: "claude_session_id",
+          runtimeId: this.runtime,
+          value: nextSessionId,
+        },
+      },
+      visibility: "owner_debug",
+    };
+    // Native identity changes immediately; a rejected receipt must retain the same reset event.
+    this.#nativeSessionId = nextSessionId;
+    await this.#flushPendingReset(context);
+  }
+
+  async #flushPendingReset(context: AgentDriverContext): Promise<void> {
+    if (this.#pendingReset === null) {
+      return;
+    }
+    await this.#eventPublisher.pushSession(context, "driver.claude.session.reset", [
+      this.#pendingReset,
+    ]);
+    this.#committedCheckpoint = null;
+    this.#pendingReset = null;
   }
 
   async #closeQuery(
@@ -820,18 +970,28 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
     context: AgentDriverContext,
     nativeSessionId: string,
     sessionScoped = false,
+    sourceEventId?: string,
   ): Promise<void> {
-    await this.#push(context, "driver.claude.native_resume_ref.updated", [
+    const events: DriverEventInput[] = [
       {
         kind: "runtime.resume.updated",
-        ...(sessionScoped ? { runId: null } : {}),
+        ...(sourceEventId === undefined ? {} : { sourceEventId }),
         payload: {
           resumePointer: nativeSessionId,
           threadId: null,
         },
         visibility: "owner_debug",
       },
-    ]);
+    ];
+    if (sessionScoped) {
+      await this.#eventPublisher.pushSession(
+        context,
+        "driver.claude.native_resume_ref.updated",
+        events,
+      );
+    } else {
+      await this.#push(context, "driver.claude.native_resume_ref.updated", events);
+    }
   }
 
   #push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void> {

@@ -68,7 +68,7 @@ function messageEvent(
     occurredAt: "2026-01-01T00:00:01.000Z",
     origin: "driver",
     payload,
-    schemaVersion: "2026-08-29",
+    schemaVersion: "2026-10-10",
     sessionId,
     visibility: "participant",
   });

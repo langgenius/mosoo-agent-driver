@@ -9,6 +9,8 @@ import type {
 } from "../src/protocol/boot";
 import { DRIVER_CONTROL_PORT_MIN, DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
 import type { DriverInstanceId, RunId, SessionId } from "../src/protocol/id";
+import type { NativeCheckpoint } from "../src/protocol/native-checkpoint";
+import { getExpectedDriverNativeRuntimeRefKind, type DriverRuntime } from "../src/protocol/runtime";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 
 export const DRIVER_TEST_IDS = {
@@ -70,7 +72,6 @@ export const driverBootPayload = {
           type: "agent",
         },
         sandboxId: DRIVER_TEST_IDS.sandboxId,
-        sandboxKind: "cattle",
         sandboxSessionId: DRIVER_TEST_IDS.sandboxSessionId,
         sandboxSubjectId: DRIVER_TEST_IDS.sessionId,
         sandboxSubjectKind: "session",
@@ -78,6 +79,7 @@ export const driverBootPayload = {
       },
       cwd: "/tmp/organization",
       mcpServers: [],
+      nativeCheckpoint: null,
       nativeResumeRef: null,
       recoveryMessages: [],
     },
@@ -93,3 +95,18 @@ export const driverBootPayload = {
 } satisfies DriverBootPayload;
 
 export const driverStartInput = createDriverStartInputFromBootPayload(driverBootPayload);
+
+export function createTestNativeCheckpoint(
+  runId: RunId,
+  runtimeId: DriverRuntime = "openai-runtime",
+): NativeCheckpoint {
+  return {
+    formatVersion: 1,
+    nativeRef: {
+      kind: getExpectedDriverNativeRuntimeRefKind(runtimeId),
+      runtimeId,
+      value: `test-native-${runId}`,
+    },
+    runId,
+  };
+}

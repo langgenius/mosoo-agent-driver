@@ -18,10 +18,7 @@ import {
   stringifyForDisplay,
 } from "./agent-sdk-json";
 import type { JsonObject } from "./agent-sdk-json";
-import {
-  aggregateClaudeModelUsage,
-  toClaudeFilesPersistedEvents,
-} from "./agent-sdk-message-events";
+import { toClaudeFilesPersistedEvents } from "./agent-sdk-message-events";
 import {
   claudeAssistantOutcome,
   claudePermissionDenialAdvisory,
@@ -33,6 +30,7 @@ import {
   isClaudeResultSuccessful,
 } from "./agent-sdk-outcomes";
 import { ClaudeAgentSdkMessageState, readClaudeSdkSessionId } from "./agent-sdk-message-state";
+import { ClaudeRunUsage } from "./agent-sdk-session-usage";
 import {
   claudeBackgroundTasksClosedEvent,
   projectClaudeBackgroundTasksSnapshot,
@@ -54,6 +52,7 @@ interface ClaudeMessageTranslatorOptions {
     context: AgentDriverContext,
     previousSessionId: string,
     nextSessionId: string,
+    resetMessageId: string,
   ): Promise<void>;
 }
 
@@ -86,6 +85,8 @@ export class ClaudeAgentSdkMessageTranslator {
   readonly #options: ClaudeMessageTranslatorOptions;
   readonly #permissionDenialAdvisories = new Map<string, ClaudePermissionDenialAdvisory>();
   readonly #state: ClaudeAgentSdkMessageState;
+  readonly #usage = new ClaudeRunUsage();
+  #publishedUsage: string | null = null;
   #turnClosureCommitted = false;
 
   constructor(options: ClaudeMessageTranslatorOptions) {
@@ -95,6 +96,12 @@ export class ClaudeAgentSdkMessageTranslator {
   }
 
   resetTurnMessageState(): void {
+    this.#resetMessageState();
+    this.#usage.reset();
+    this.#publishedUsage = null;
+  }
+
+  #resetMessageState(): void {
     this.#state.reset();
     this.#events.resetTurnState();
     this.#permissionDenialAdvisories.clear();
@@ -281,6 +288,12 @@ export class ClaudeAgentSdkMessageTranslator {
     message: Extract<SDKMessage, { type: "assistant" }>,
     runId: RunId,
   ): Promise<void> {
+    await this.#updateResponseUsage(
+      context,
+      this.#state.streamScopeKey(runId, message),
+      readString(readRecord(message, "message"), "id"),
+      readRecord(readRecord(message, "message"), "usage"),
+    );
     await this.#retractWireItems(context, message.supersedes ?? []);
     const outcome = claudeAssistantOutcome(message);
     const messageId = this.#state.assistantMessageId(
@@ -402,6 +415,13 @@ export class ClaudeAgentSdkMessageTranslator {
         this.#state.setStreamingNativeMessageId(streamScopeKey, nativeMessageId);
       }
 
+      await this.#updateResponseUsage(
+        context,
+        streamScopeKey,
+        nativeMessageId,
+        readRecord(readRecord(event, "message"), "usage"),
+      );
+
       await this.#events.ensureMessageStarted(
         context,
         this.#state.assistantMessageId(runId, nativeMessageId),
@@ -453,10 +473,45 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     if (eventType === "message_delta") {
-      const delta = readRecord(event, "delta");
-      const usage = readRecord(event, "usage");
-      await this.#events.pushUsage(context, usage ?? delta, null);
+      await this.#updateResponseUsage(
+        context,
+        streamScopeKey,
+        this.#state.confirmedStreamingNativeMessageId(streamScopeKey),
+        readRecord(event, "usage"),
+      );
     }
+  }
+
+  async #updateResponseUsage(
+    context: AgentDriverContext,
+    scope: string,
+    nativeMessageId: string | null | undefined,
+    usage: JsonObject | null,
+  ): Promise<void> {
+    if (usage === null) return;
+    if (!nativeMessageId) {
+      await this.#events.pushRawDiagnostic(
+        context,
+        "driver.claude.usage.unattributed",
+        {},
+        {
+          message:
+            "Claude response usage has no native message ID; awaiting an authoritative total.",
+          severity: "warn",
+        },
+      );
+      return;
+    }
+    this.#usage.updateResponse(JSON.stringify([scope, nativeMessageId]), usage);
+    await this.#publishUsage(context);
+  }
+
+  async #publishUsage(context: AgentDriverContext): Promise<void> {
+    const snapshot = this.#usage.snapshot();
+    const key = JSON.stringify(snapshot);
+    if (key === this.#publishedUsage) return;
+    await this.#events.pushUsage(context, snapshot.usage, snapshot.cost);
+    this.#publishedUsage = key;
   }
 
   async #handleContentBlockStart(
@@ -859,9 +914,11 @@ export class ClaudeAgentSdkMessageTranslator {
       context,
       message.session_id,
       message.new_conversation_id,
+      message.uuid,
     );
     if (!preserveOpenTurn) {
-      this.resetTurnMessageState();
+      this.#resetMessageState();
+      this.#usage.startEpoch();
     }
     await this.#events.pushSessionInfoUpdated(context, true);
   }
@@ -923,11 +980,8 @@ export class ClaudeAgentSdkMessageTranslator {
       this.#permissionDenialAdvisories.delete(`${runId}:${toolCallId}`);
     }
 
-    await this.#events.pushUsage(
-      context,
-      aggregateClaudeModelUsage(message.modelUsage),
-      message.total_cost_usd,
-    );
+    this.#usage.updateResult(message);
+    await this.#publishUsage(context);
     const prepareResult = (
       toolStatus: "cancelled" | "completed" | "failed",
       terminal: ClaudeTerminalOutcome,

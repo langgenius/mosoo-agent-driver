@@ -230,6 +230,11 @@ export class ClaudeAgentSdkMessageState {
     return this.#streamingNativeMessageIds.get(scope)?.nativeId;
   }
 
+  confirmedStreamingNativeMessageId(scope: string): string | undefined {
+    const anchor = this.#streamingNativeMessageIds.get(scope);
+    return anchor?.confirmed ? anchor.nativeId : undefined;
+  }
+
   /**
    * Resolves the native key for a streamed content frame. The Anthropic wire
    * carries one message per scope between message boundaries, so the first

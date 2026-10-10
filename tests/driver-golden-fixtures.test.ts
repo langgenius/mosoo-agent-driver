@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { DriverCommandDelivery } from "../src/core/driver-command-delivery";
 import type { EventId } from "../src/protocol/id";
 import { parseDriverEventEnvelope } from "../src/protocol/events";
+import type { NativeCheckpoint } from "../src/protocol/native-checkpoint";
 import {
   DURABLE_RUN_ERROR_MAX_UTF8_BYTES,
   RUNTIME_COMMAND_MAX_UTF8_BYTES,
@@ -18,6 +19,11 @@ import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
 const occurredAt = "2026-05-26T00:00:00.000Z";
 const eventId = "01J0000000000000000000000G" as EventId;
+const checkpoint = {
+  formatVersion: 1,
+  nativeRef: { kind: "openai_thread_id", runtimeId: "openai-runtime", value: "thread-1" },
+  runId: DRIVER_TEST_IDS.runId,
+} satisfies NativeCheckpoint;
 
 const commandFixtures = [
   "input-start",
@@ -369,20 +375,20 @@ describe("Driver golden fixtures", () => {
   });
 
   test("owns the completed-run final message reference schema", () => {
-    const context = createRuntimeEventContext();
+    const context = { ...createRuntimeEventContext(), runtimeId: checkpoint.nativeRef.runtimeId };
 
-    for (const payload of [{ finalMessageId: "message-1" }, {}]) {
+    for (const payload of [{ checkpoint, finalMessageId: "message-1" }, { checkpoint }]) {
       expect(ingestRuntimeEventInput(context, { kind: "run.completed", payload })).toMatchObject({
         status: "accepted",
       });
     }
 
     for (const payload of [
-      { finalMessageId: "" },
-      { finalMessageId: null },
-      { finalMessageId: 1 },
-      { finalMessageId: "message-1", finalMessageText: "answer" },
-      { finalMessageText: "answer" },
+      { checkpoint, finalMessageId: "" },
+      { checkpoint, finalMessageId: null },
+      { checkpoint, finalMessageId: 1 },
+      { checkpoint, finalMessageId: "message-1", finalMessageText: "answer" },
+      { checkpoint, finalMessageText: "answer" },
     ]) {
       expect(ingestRuntimeEventInput(context, { kind: "run.completed", payload })).toMatchObject({
         status: "rejected",
@@ -401,8 +407,10 @@ describe("Driver golden fixtures", () => {
     ["run.steered", "waiting_input", "completed"],
     ["run.waiting", "waiting_input", "completed"],
   ] as const)("requires %s to agree with payload run.status", (kind, status, inconsistent) => {
+    const context = { ...createRuntimeEventContext(), runtimeId: checkpoint.nativeRef.runtimeId };
     const error = { code: "test.failed", details: {}, message: "failed", retryable: false };
     const payload = {
+      ...(kind === "run.completed" ? { checkpoint } : {}),
       ...(kind === "run.failed" ? { error, recoverable: false } : {}),
       run: {
         completedAt: null,
@@ -412,11 +420,11 @@ describe("Driver golden fixtures", () => {
       },
     };
 
-    expect(ingestRuntimeEventInput(createRuntimeEventContext(), { kind, payload })).toMatchObject({
+    expect(ingestRuntimeEventInput(context, { kind, payload })).toMatchObject({
       status: "accepted",
     });
     expect(
-      ingestRuntimeEventInput(createRuntimeEventContext(), {
+      ingestRuntimeEventInput(context, {
         kind,
         payload: { ...payload, run: { ...payload.run, status: inconsistent } },
       }),
@@ -437,18 +445,20 @@ describe("Driver golden fixtures", () => {
     ["run.steered", "waiting_input", "completed"],
     ["run.waiting", "waiting_input", "completed"],
   ] as const)("requires %s to agree with payload status", (kind, status, inconsistent) => {
+    const context = { ...createRuntimeEventContext(), runtimeId: checkpoint.nativeRef.runtimeId };
     const error = { code: "test.failed", details: {}, message: "failed", retryable: false };
     const payload = {
+      ...(kind === "run.completed" ? { checkpoint } : {}),
       ...(kind === "run.failed" ? { error, recoverable: false } : {}),
       ...(kind === "run.started" ? { startedAt: occurredAt } : {}),
       status,
     };
 
-    expect(ingestRuntimeEventInput(createRuntimeEventContext(), { kind, payload })).toMatchObject({
+    expect(ingestRuntimeEventInput(context, { kind, payload })).toMatchObject({
       status: "accepted",
     });
     expect(
-      ingestRuntimeEventInput(createRuntimeEventContext(), {
+      ingestRuntimeEventInput(context, {
         kind,
         payload: { ...payload, status: inconsistent },
       }),

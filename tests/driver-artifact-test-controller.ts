@@ -18,6 +18,8 @@ import {
   parseDriverLogBatchInput,
   parseDriverNextCommandInput,
   parseDriverReadyInput,
+  type DriverCompletionInput,
+  type DriverEventBatchInput,
   type DriverEventReceipt,
   type DriverLogEntry,
 } from "../src/protocol/orpc";
@@ -73,11 +75,15 @@ export interface DriverArtifactBootPayload extends Record<string, unknown> {
 interface DriverArtifactTestControllerOptions {
   readonly artifactPath: string;
   readonly bootPayload: DriverArtifactBootPayload;
+  readonly completeRun?: ((input: DriverCompletionInput) => Promise<void>) | undefined;
   readonly env?: NodeJS.ProcessEnv;
   readonly expectedCapabilities?: readonly DriverCapability[] | undefined;
   readonly forbiddenSecrets?: readonly string[] | undefined;
   readonly heartbeatIntervalMs?: number | undefined;
   readonly organizationPath: string;
+  readonly pushEvents?:
+    | ((input: DriverEventBatchInput) => Promise<{ accepted: DriverEventReceipt[] }>)
+    | undefined;
   readonly rootPath: string;
   readonly secret?: string | undefined;
   readonly startTimeoutMs: number;
@@ -318,6 +324,7 @@ function readSameUserLinuxIdentity(pid: number): LinuxProcessIdentity | null {
 export class DriverArtifactTestController {
   readonly #bootPayload: DriverArtifactBootPayload;
   readonly #commands: DriverArtifactTestCommand[] = [];
+  readonly #completeRun: DriverArtifactTestControllerOptions["completeRun"];
   readonly #commandUpdates: DriverCommandUpdate[] = [];
   readonly #eventIngressGates = new Set<EventIngressGateState>();
   readonly #eventIngressObservers = new Set<(event: DriverArtifactTestEvent) => void>();
@@ -330,6 +337,7 @@ export class DriverArtifactTestController {
   readonly #logs: DriverLogEntry[] = [];
   readonly #knownRunIds = new Set<string>();
   readonly #organizationPath: string;
+  readonly #pushEvents: DriverArtifactTestControllerOptions["pushEvents"];
   readonly #runTerminalIngressObservers = new Set<(terminal: DriverRunTerminal) => void>();
   readonly #runTerminals: DriverRunTerminal[] = [];
   readonly #runtimeId: string;
@@ -353,12 +361,14 @@ export class DriverArtifactTestController {
 
   private constructor(options: DriverArtifactTestControllerOptions) {
     this.#bootPayload = structuredClone(options.bootPayload);
+    this.#completeRun = options.completeRun;
     this.#expectedCapabilities =
       options.expectedCapabilities === undefined
         ? undefined
         : structuredClone(options.expectedCapabilities);
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? 60_000;
     this.#organizationPath = options.organizationPath;
+    this.#pushEvents = options.pushEvents;
     this.#runtimeId = options.bootPayload.runtime;
     this.#forbiddenSecrets = [
       ...new Set([options.secret, ...(options.forbiddenSecrets ?? [])].filter(Boolean)),
@@ -1014,6 +1024,11 @@ export class DriverArtifactTestController {
           return receipt;
         });
         await Promise.all(ingressWaits);
+        if (this.#pushEvents !== undefined) {
+          const output = await this.#pushEvents(batch);
+          for (const receipt of output.accepted) this.#eventReceipts.set(receipt.eventId, receipt);
+          return output;
+        }
         return { accepted };
       }
       case "/driver/pushLogs": {
@@ -1106,6 +1121,7 @@ export class DriverArtifactTestController {
         if (this.#runTerminals.length > 0) {
           throw new Error("Driver emitted more than one control-plane run terminal.");
         }
+        await this.#completeRun?.(completion);
         const terminal = { runId: completion.runId, status: "completed" } as const;
         this.#runTerminals.push(terminal);
         for (const observer of this.#runTerminalIngressObservers) {

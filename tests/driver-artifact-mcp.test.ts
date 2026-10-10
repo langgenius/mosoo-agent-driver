@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -19,6 +19,12 @@ const RECOVERY_RUN_ID = "01J00000000000000000000030";
 const TEST_TIMEOUT_MS = 45_000;
 
 const FAKE_ACP_AGENT = String.raw`
+const { Database } = require("bun:sqlite");
+const { mkdirSync } = require("node:fs");
+const { dirname } = require("node:path");
+mkdirSync(dirname(process.env.OPENCODE_DB), { recursive: true });
+const nativeDb = new Database(process.env.OPENCODE_DB);
+nativeDb.exec("CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, parent_id TEXT); CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); INSERT OR IGNORE INTO session VALUES ('artifact-acp-session', NULL)");
 let buffer = "";
 let pendingPromptId;
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
@@ -167,9 +173,11 @@ artifactTest(
     const rootPath = await mkdtemp(join(tmpdir(), "mosoo-driver-artifact-mcp-"));
     const homePath = join(rootPath, "home");
     const workspacePath = join(rootPath, "workspace");
+    const command = join(rootPath, "opencode");
     await Promise.all([
       mkdir(homePath, { recursive: true }),
       mkdir(workspacePath, { recursive: true }),
+      symlink(process.execPath, command),
     ]);
 
     const methods: string[] = [];
@@ -398,7 +406,7 @@ artifactTest(
         bootPayload,
         env: {
           MOSOO_ACP_FALLBACK_ARGS: JSON.stringify(["-e", FAKE_ACP_AGENT]),
-          MOSOO_ACP_FALLBACK_COMMAND: process.execPath,
+          MOSOO_ACP_FALLBACK_COMMAND: command,
         },
         expectedCapabilities: expectedDriverCapabilities(bootPayload.runtime),
         organizationPath: workspacePath,

@@ -65,6 +65,9 @@ jobs:
       - name: Test native Claude session lifecycle
         run: AGENT_DRIVER_NATIVE_CLAUDE=1 vp exec bun test tests/claude-agent-sdk-native-session.test.ts
 
+      - name: Test native Codex and Pi session lifecycle
+        run: AGENT_DRIVER_NATIVE_OPENAI=1 vp exec bun test tests/openai-native-session.test.ts tests/pi-driver-artifact.test.ts
+
       - name: Build image
         run: buildah build --http-proxy=false --platform linux/amd64 -t agent-driver:local .
 

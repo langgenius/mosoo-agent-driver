@@ -2,6 +2,11 @@ import { z } from "zod";
 import { parseTraceparent } from "vestig";
 
 import type { DriverInstanceId } from "../id";
+import {
+  nativeRuntimeRefsEqual,
+  parseNativeCheckpoint,
+  type NativeCheckpoint,
+} from "../native-checkpoint";
 import type { JsonObject } from "../json";
 import { readJsonObject } from "../json";
 import type { DriverNativeRuntimeRef } from "../runtime";
@@ -42,15 +47,16 @@ export type {
 } from "./host-snapshot";
 
 /**
- * Version 3 requires the durable external-tool-effect RPCs. Refusing an older
- * Driver is safer than letting it invoke an MCP tool without the persistence
- * fence during a rolling deployment.
+ * Version 7 binds native continuation to a checkpoint and requires the durable
+ * external-tool-effect RPCs shared by the host and every runtime.
  */
-export const DRIVER_PROTOCOL_VERSION = 3;
+export const DRIVER_PROTOCOL_VERSION = 7;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";
 export const DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD_FILE";
+
+export * from "../native-checkpoint";
 
 export {
   isSupportedDriverRuntime,
@@ -73,6 +79,7 @@ const runtimeTransportByRuntime = {
   "acp-fallback": "acp-fallback",
   "claude-agent-sdk": "claude-agent-sdk",
   "openai-runtime": "openai-app-server",
+  pi: "pi-rpc",
 } as const;
 const controlUrlSchema = z
   .url()
@@ -271,8 +278,35 @@ const driverExecutionSessionSpecSchema = ownObjectSchema({
   context: driverExecutionSessionContextSchema,
   cwd: nonEmptyStringSchema,
   mcpServers: ownArraySchema(driverBootMcpServerSchema),
+  nativeCheckpoint: z.unknown().transform((value, context): NativeCheckpoint | null => {
+    if (value === null) return null;
+    try {
+      return parseNativeCheckpoint(value);
+    } catch (error) {
+      context.addIssue({
+        code: "custom",
+        message: error instanceof Error ? error.message : "must be a valid native checkpoint",
+      });
+      return z.NEVER;
+    }
+  }),
   nativeResumeRef: driverNativeRuntimeRefSchema.nullable(),
   recoveryMessages: ownArraySchema(driverRecoveryMessageSchema).default([]),
+}).superRefine((session, context) => {
+  const checkpoint = session.nativeCheckpoint;
+  const reference = session.nativeResumeRef;
+  if (
+    (checkpoint === null) !== (reference === null) ||
+    (checkpoint !== null &&
+      reference !== null &&
+      !nativeRuntimeRefsEqual(checkpoint.nativeRef, reference))
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "Native checkpoint and native resume ref must describe the same native session.",
+      path: ["nativeCheckpoint"],
+    });
+  }
 });
 
 export type DriverExecutionSessionSpec = z.infer<typeof driverExecutionSessionSpecSchema>;

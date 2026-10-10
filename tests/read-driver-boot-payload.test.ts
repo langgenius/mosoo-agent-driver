@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { readDriverBootPayload } from "../src/boot/read-driver-boot-payload";
+import { parseDriverHelloInput } from "../src/protocol/orpc";
+import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
   DRIVER_BOOT_PAYLOAD_ENV_NAME,
   DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME,
 } from "../src/runtimes/child-process-env";
-import { driverBootPayload as payload } from "./driver-boot-payload-fixture";
+import { DRIVER_TEST_IDS, driverBootPayload as payload } from "./driver-boot-payload-fixture";
 
 const envPayloadValue = process.env[DRIVER_BOOT_PAYLOAD_ENV_NAME];
 const envPayloadFileValue = process.env[DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME];
@@ -28,6 +30,47 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
+  test.each([1, 2, 3, 4, 5, 6])(
+    "rejects protocol %s during the Driver handshake",
+    (protocolVersion) => {
+      expect(() =>
+        parseDriverHelloInput({
+          capabilities: [],
+          driverVersion: "legacy-test",
+          pid: 1,
+          protocolVersion,
+          runtime: "openai-runtime",
+          startedAt: "now",
+        }),
+      ).toThrow("protocolVersion must be 7");
+    },
+  );
+
+  test("preserves a Pi checkpoint from the environment through start conversion", async () => {
+    const nativeRef = {
+      kind: "pi_session_path",
+      runtimeId: "pi",
+      value: "sessions/restored.jsonl",
+    };
+    const nativeCheckpoint = { formatVersion: 1, nativeRef, runId: DRIVER_TEST_IDS.secondRunId };
+    process.env[DRIVER_BOOT_PAYLOAD_ENV_NAME] = JSON.stringify({
+      ...payload,
+      runtime: "pi",
+      runtimeTransport: "pi-rpc",
+      execution: {
+        ...payload.execution,
+        session: { ...payload.execution.session, nativeCheckpoint, nativeResumeRef: nativeRef },
+      },
+    });
+
+    const parsed = await readDriverBootPayload();
+    const start = createDriverStartInputFromBootPayload(parsed);
+
+    expect(start.execution.session.nativeCheckpoint).toEqual(nativeCheckpoint);
+    expect(start.execution.session.nativeResumeRef).toEqual(nativeRef);
+    expect(start.execution.run.runId).toBe(DRIVER_TEST_IDS.runId);
+  });
+
   test("reads the boot payload from a file and removes it", async () => {
     const dir = await mkdtemp(join(tmpdir(), "g-driver-boot-"));
     const payloadPath = join(dir, "payload.json");

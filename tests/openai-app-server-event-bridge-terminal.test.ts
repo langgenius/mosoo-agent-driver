@@ -120,6 +120,11 @@ function createPublisherHarness(
   });
   const publisher = new DriverEventPublisher("openai-runtime", () => threadId);
   const bridge = new OpenAiAppServerEventBridge({
+    prepareCheckpoint: async (_context, runId) => ({
+      formatVersion: 1,
+      nativeRef: { kind: "openai_thread_id", runtimeId: "openai-runtime", value: threadId },
+      runId,
+    }),
     push: (pushContext, reason, events) => publisher.push(pushContext, reason, events),
     pushSession: (pushContext, reason, events) =>
       publisher.pushSession(pushContext, reason, events),

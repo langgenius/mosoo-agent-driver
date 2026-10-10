@@ -5,6 +5,17 @@ import { parseDriverNativeRuntimeRef } from "../src/protocol/runtime";
 import { mergeProviderOptions } from "../src/runtimes/provider-options";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
+const nativeRef = {
+  kind: "openai_thread_id",
+  runtimeId: "openai-runtime",
+  value: "thread-1",
+} as const;
+const nativeCheckpoint = {
+  formatVersion: 1,
+  nativeRef,
+  runId: DRIVER_TEST_IDS.secondRunId,
+} as const;
+
 describe("Driver boot schema", () => {
   test("uses the runtime parser for native refs and ignores inherited fields", () => {
     const parsed = parseDriverNativeRuntimeRef({
@@ -61,6 +72,122 @@ describe("Driver boot schema", () => {
     expect(parsed).not.toHaveProperty("unknownRootField");
     expect(parsed.execution).not.toHaveProperty("unknownExecutionField");
   });
+
+  test("accepts a new session without a native checkpoint", () => {
+    const parsed = parseDriverBootPayload(driverBootPayload);
+
+    expect(parsed.protocolVersion).toBe(7);
+    expect(parsed.execution.session.nativeCheckpoint).toBeNull();
+    expect(parsed.execution.session.nativeResumeRef).toBeNull();
+  });
+
+  test.each([
+    ["openai-runtime", "openai-app-server", "openai_thread_id", "thread-1"],
+    ["claude-agent-sdk", "claude-agent-sdk", "claude_session_id", "session-1"],
+    ["acp-fallback", "acp-fallback", "acp_session_id", "session-1"],
+    ["pi", "pi-rpc", "pi_session_path", "sessions/restored.jsonl"],
+  ])(
+    "accepts a committed checkpoint from a previous %s run",
+    (runtime, runtimeTransport, kind, value) => {
+      const reference = { kind, runtimeId: runtime, value };
+      const checkpoint = { ...nativeCheckpoint, nativeRef: reference };
+      const parsed = parseDriverBootPayload({
+        ...driverBootPayload,
+        runtime,
+        runtimeTransport,
+        execution: {
+          ...driverBootPayload.execution,
+          session: {
+            ...driverBootPayload.execution.session,
+            nativeCheckpoint: checkpoint,
+            nativeResumeRef: reference,
+          },
+        },
+      });
+
+      expect(parsed.execution.session.nativeCheckpoint).toEqual(checkpoint);
+      expect(parsed.execution.session.nativeResumeRef).toEqual(reference);
+      expect(parsed.execution.configRevision.runId).toBe(DRIVER_TEST_IDS.runId);
+    },
+  );
+
+  test.each([
+    { nativeCheckpoint: undefined, nativeResumeRef: null },
+    { nativeCheckpoint: null, nativeResumeRef: nativeRef },
+    { nativeCheckpoint, nativeResumeRef: null },
+    { nativeCheckpoint, nativeResumeRef: { ...nativeRef, value: "another-thread" } },
+    {
+      nativeCheckpoint: {
+        ...nativeCheckpoint,
+        nativeRef: { kind: "claude_session_id", runtimeId: "claude-agent-sdk", value: "thread-1" },
+      },
+      nativeResumeRef: nativeRef,
+    },
+    {
+      nativeCheckpoint: { ...nativeCheckpoint, path: "../../outside" },
+      nativeResumeRef: nativeRef,
+    },
+  ])("rejects an absent, unpaired, or mismatched checkpoint: %p", (session) => {
+    expect(() =>
+      parseDriverBootPayload({
+        ...driverBootPayload,
+        execution: {
+          ...driverBootPayload.execution,
+          session: { ...driverBootPayload.execution.session, ...session },
+        },
+      }),
+    ).toThrow(TypeError);
+  });
+
+  test("accepts an explicitly absent Agent preset", () => {
+    const parsed = parseDriverBootPayload({
+      ...driverBootPayload,
+      execution: {
+        ...driverBootPayload.execution,
+        configRevision: { ...driverBootPayload.execution.configRevision, agentId: null },
+      },
+    });
+
+    expect(parsed.execution.configRevision.agentId).toBeNull();
+  });
+
+  test.each([{ deploymentVersionId: DRIVER_TEST_IDS.agentId }, { deploymentVersionNumber: 1 }])(
+    "rejects a deployment revision without an Agent preset: %p",
+    (revision) => {
+      expect(() =>
+        parseDriverBootPayload({
+          ...driverBootPayload,
+          execution: {
+            ...driverBootPayload.execution,
+            configRevision: {
+              ...driverBootPayload.execution.configRevision,
+              ...revision,
+              agentId: null,
+            },
+          },
+        }),
+      ).toThrow(TypeError);
+    },
+  );
+
+  test.each([undefined, "pet", "cattle"])(
+    "discards the retired sandbox marker: %p",
+    (sandboxKind) => {
+      const parsed = parseDriverBootPayload({
+        ...driverBootPayload,
+        execution: {
+          ...driverBootPayload.execution,
+          session: {
+            ...driverBootPayload.execution.session,
+            context: { ...driverBootPayload.execution.session.context, sandboxKind },
+          },
+        },
+      });
+
+      expect(parsed.execution.session.context).not.toHaveProperty("sandboxKind");
+      expect(parsed.execution.session.context.sandboxSubjectId).toBe(DRIVER_TEST_IDS.sessionId);
+    },
+  );
 
   test("requires the native resume kind to match its runtime", () => {
     expect(() =>

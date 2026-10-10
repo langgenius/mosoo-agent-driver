@@ -46,7 +46,7 @@ export default defineConfig({
         rules: {
           "no-restricted-imports": restrictImports(
             "(^|/)(infrastructure|stores|surfaces)(/|$)",
-            "(^|/)runtimes/(acp|claude|openai)(/|$)",
+            "(^|/)runtimes/(acp|claude|openai|pi)(/|$)",
           ),
         },
       },
@@ -55,6 +55,7 @@ export default defineConfig({
           "src/runtimes/acp/**/*.ts",
           "src/runtimes/claude/**/*.ts",
           "src/runtimes/openai/**/*.ts",
+          "src/runtimes/pi/**/*.ts",
         ],
         rules: {
           "no-restricted-imports": restrictImports("(^|/)(infrastructure|stores|surfaces)(/|$)"),

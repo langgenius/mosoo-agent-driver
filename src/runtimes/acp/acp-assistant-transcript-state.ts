@@ -419,7 +419,7 @@ export class AcpAssistantTranscriptState {
       }
 
       const parentStart = this.#ensureToolParentMessage(translation.targetItemId);
-      this.#tools.patch({
+      const projected = this.#tools.patch({
         status: toRuntimeToolStatus(readString(translation.toolCall, "status")),
         toolCallId: translation.targetItemId,
         update: translation.toolCall,
@@ -432,7 +432,9 @@ export class AcpAssistantTranscriptState {
           title: translation.request.title,
           toolCallId: translation.targetItemId,
         }),
-        ...translation.events,
+        ...translation.events.map((event) =>
+          event.kind === "tool.call.updated" ? { ...event, payload: projected.payload } : event,
+        ),
       ];
       this.#assertRetainedTurnState();
 

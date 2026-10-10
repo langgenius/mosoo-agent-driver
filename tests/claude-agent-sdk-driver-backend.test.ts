@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type {
   Options as ClaudeQueryOptions,
   Query,
   SDKMessage,
+  SDKUserMessage,
   WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 
@@ -28,17 +33,21 @@ import {
 
 const PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 const previousPrewarm = process.env[PREWARM_ENV];
+const temporaryDirectories: string[] = [];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-afterEach(() => {
+afterEach(async () => {
   if (previousPrewarm === undefined) {
     delete process.env[PREWARM_ENV];
   } else {
     process.env[PREWARM_ENV] = previousPrewarm;
   }
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
 });
 
 function resultMessage(sessionId = "native-session-1"): SDKMessage {
@@ -111,7 +120,11 @@ function fakeQuery(
 
   return Object.assign(iterator, {
     close: closeOnce,
+    initializationResult: async () => ({}),
     interrupt,
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+      session: { total_cost_usd: 0, model_usage: {} },
+    }),
     async return(value?: void) {
       closeOnce();
       cleanupTask ??= cleanup();
@@ -132,6 +145,8 @@ function createHarness(
   beforePush?: (events: readonly DriverEventInput[]) => Promise<void> | void,
   payloadOverride?: DriverStartInput,
 ) {
+  const cwd = mkdtempSync(join(tmpdir(), "claude-backend-"));
+  temporaryDirectories.push(cwd);
   const events: DriverEventInput[] = [];
   let currentRunId: RunId | null = null;
   let seq = 0;
@@ -149,6 +164,7 @@ function createHarness(
     execution: {
       ...basePayload.execution,
       providerOptions: { ...basePayload.execution.providerOptions, maxBudgetUsd: 1 },
+      session: { ...basePayload.execution.session, cwd },
     },
   };
   const context = createAgentDriverContext({
@@ -183,7 +199,19 @@ function createHarness(
     permission: { request: async () => "allow_once" },
     ports: { skill: { materialize: async () => [] } },
   });
-  const backend = new ClaudeAgentSdkDriverBackend(payload, dependencies);
+  const backend = new ClaudeAgentSdkDriverBackend(payload, {
+    createNativeCheckpoint: async ({ runId, sessionId }) => ({
+      formatVersion: 1,
+      runId,
+      nativeRef: {
+        kind: "claude_session_id",
+        runtimeId: "claude-agent-sdk",
+        value: sessionId,
+      },
+    }),
+    restoreNativeCheckpoint: async () => {},
+    ...dependencies,
+  });
   const handleInput = backend.handleInput.bind(backend);
   backend.handleInput = async (inputContext, input, runId, signal) => {
     currentRunId ??= runId;
@@ -278,10 +306,16 @@ describe("Claude Agent SDK driver backend", () => {
         startupCalled.resolve();
         return {
           close: () => {},
-          query: (prompt) => {
-            prompts.push(String(prompt));
-            return fakeQuery([resultMessage()]);
-          },
+          query: (prompt) =>
+            fakeQuery(
+              (async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                  prompts.push(String(message.message.content));
+                  break;
+                }
+                yield resultMessage();
+              })(),
+            ),
           async [Symbol.asyncDispose]() {},
         };
       },
@@ -979,7 +1013,11 @@ describe("Claude Agent SDK driver backend", () => {
       close() {
         closeCalls += 1;
       },
+      initializationResult: async () => ({}),
       async interrupt() {},
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+        session: { total_cost_usd: 0, model_usage: {} },
+      }),
       async next() {
         if (outerMessagePending) {
           outerMessagePending = false;
@@ -1526,6 +1564,16 @@ describe("Claude Agent SDK driver backend", () => {
           runtimeTransport: "claude-agent-sdk",
         } as DriverStartInput,
         {
+          createNativeCheckpoint: async ({ runId, sessionId }) => ({
+            formatVersion: 1,
+            runId,
+            nativeRef: {
+              kind: "claude_session_id",
+              runtimeId: "claude-agent-sdk",
+              value: sessionId,
+            },
+          }),
+          restoreNativeCheckpoint: async () => {},
           createQueryOptions: async () => ({}),
           query: () =>
             fakeQuery(
@@ -1887,18 +1935,38 @@ describe("Claude Agent SDK driver backend", () => {
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
 
     expect(optionSessionIds).toEqual([null, "native-session-1"]);
-    expect(
-      harness.events.flatMap((event) => {
-        if (
-          event.kind !== "runtime.resume.updated" ||
-          !isRecord(event.payload) ||
-          typeof event.payload["resumePointer"] !== "string"
-        ) {
-          return [];
-        }
-        return [event.payload["resumePointer"]];
-      }),
-    ).toEqual(["native-session-1", "native-session-2"]);
+    expect(harness.events.filter((event) => event.kind === "runtime.resume.updated")).toMatchObject(
+      [
+        { runId: DRIVER_TEST_IDS.runId, payload: { resumePointer: "native-session-1" } },
+        { runId: DRIVER_TEST_IDS.runId, payload: { resumePointer: "native-session-1" } },
+        { runId: DRIVER_TEST_IDS.secondRunId, payload: { resumePointer: "native-session-2" } },
+      ],
+    );
+    expect(harness.events.filter((event) => event.kind === "runtime.session.reset")).toMatchObject([
+      {
+        payload: {
+          previousCheckpoint: {
+            formatVersion: 1,
+            runId: DRIVER_TEST_IDS.runId,
+            nativeRef: {
+              kind: "claude_session_id",
+              runtimeId: "claude-agent-sdk",
+              value: "native-session-1",
+            },
+          },
+          previousNativeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: "native-session-1",
+          },
+          newNativeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: "native-session-2",
+          },
+        },
+      },
+    ]);
     expect(harness.events.some(({ kind }) => kind === "message.cancelled")).toBe(true);
     expect(harness.events.filter(({ kind }) => kind === "run.completed")).toHaveLength(2);
   });
@@ -2070,13 +2138,14 @@ describe("Claude Agent SDK driver backend", () => {
 
     const resetIndex = harness.events.findIndex(
       (event) =>
-        event.kind === "runtime.resume.updated" &&
+        event.kind === "runtime.session.reset" &&
         isRecord(event.payload) &&
-        event.payload["resumePointer"] === "native-session-2",
+        isRecord(event.payload["newNativeRef"]) &&
+        event.payload["newNativeRef"]["value"] === "native-session-2",
     );
     const terminalIndex = harness.events.findIndex((event) => event.kind === "run.completed");
-    expect(resetIndex).toBeGreaterThanOrEqual(0);
-    expect(terminalIndex).toBeGreaterThan(resetIndex);
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(resetIndex).toBeGreaterThan(terminalIndex);
     expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
     expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
     expect(
@@ -2123,10 +2192,16 @@ describe("Claude Agent SDK driver backend", () => {
       {
         createQueryOptions: async (input) =>
           ({ abortController: input.abortController }) as ClaudeQueryOptions,
-        query: (input) => {
-          prompts.push(String(input.prompt));
-          return fakeQuery([resultMessage()]);
-        },
+        query: (input) =>
+          fakeQuery(
+            (async function* () {
+              for await (const message of input.prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(String(message.message.content));
+                break;
+              }
+              yield resultMessage();
+            })(),
+          ),
         startup: async () => {
           throw new Error("prewarm is disabled");
         },
@@ -2166,10 +2241,16 @@ describe("Claude Agent SDK driver backend", () => {
       {
         createQueryOptions: async (input) =>
           ({ abortController: input.abortController }) as ClaudeQueryOptions,
-        query: (input) => {
-          prompts.push(String(input.prompt));
-          return fakeQuery([resultMessage()]);
-        },
+        query: (input) =>
+          fakeQuery(
+            (async function* () {
+              for await (const message of input.prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(String(message.message.content));
+                break;
+              }
+              yield resultMessage();
+            })(),
+          ),
         startup: async () => {
           throw new Error("prewarm is disabled");
         },

@@ -11,6 +11,11 @@ export {
   RUNTIME_EVENT_SCHEMA_VERSION,
   toRuntimeEventInput,
 } from "./runtime-events";
+export type {
+  RuntimeContextUsagePayload,
+  RuntimeRunCompletedPayload,
+  RuntimeSessionResetPayload,
+} from "./runtime-event-types";
 
 export type DriverEvent = RuntimeEventEnvelope;
 type DriverEventInputDraft = Omit<RuntimeEventInputDraft, "runId"> & {

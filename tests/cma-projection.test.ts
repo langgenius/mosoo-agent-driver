@@ -247,11 +247,21 @@ describe("CMA projection", () => {
       createId: () => createDriverId() as EventId,
       occurredAt: "2026-08-13T00:00:00.000Z",
       runId,
+      runtimeId: "openai-runtime",
       sessionId: createDriverId() as SessionId,
     } as const;
     const event = {
       kind: "run.completed" as const,
       payload: {
+        checkpoint: {
+          formatVersion: 1,
+          nativeRef: {
+            kind: "openai_thread_id",
+            runtimeId: "openai-runtime",
+            value: "thread-1",
+          },
+          runId,
+        },
         stopReason: "end_turn",
         structuredOutput: { answer: 42, citations: ["source-1"] },
       },

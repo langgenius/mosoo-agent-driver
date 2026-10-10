@@ -1,9 +1,10 @@
-import { createORPCClient } from "@orpc/client";
+import { createORPCClient, ORPCError } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
 
 import {
   assertDriverEventReceiptPrefix,
   assertIsolatedRunTerminalBatch,
+  DriverEventRejectedError,
 } from "../../core/driver-runtime-io";
 import type { DriverRuntimeIo } from "../../core/driver-runtime-io";
 import type { DriverRunTerminalBarrier } from "../../core/driver-runtime-io";
@@ -82,6 +83,17 @@ function toWebSocketCloseReason(reason: string): string {
   return reason.slice(0, read);
 }
 
+function isTerminalConflict(error: unknown, runId: RunId): error is ORPCError<string, unknown> {
+  return (
+    error instanceof ORPCError &&
+    error.code === "terminal_conflict" &&
+    typeof error.data === "object" &&
+    error.data !== null &&
+    "runId" in error.data &&
+    error.data.runId === runId
+  );
+}
+
 export class DriverInstanceSocket {
   #activeRunTicket: DriverRunTicket | null = null;
   #client: DriverRuntimeClient | null = null;
@@ -93,6 +105,7 @@ export class DriverInstanceSocket {
   #instanceTerminalTask: Promise<void> | null = null;
   #runEventTerminalTask: RunEventTerminalTask | null = null;
   #runTerminalBarrier: DriverRunTerminalBarrier | null = null;
+  #terminalRejection: Error | null = null;
   readonly #terminalState = new DriverTerminalStateMachine();
   private readonly handlers: DriverInstanceSocketHandlers;
   private readonly payload: DriverBootPayload;
@@ -104,6 +117,9 @@ export class DriverInstanceSocket {
   }
 
   async connect(): Promise<void> {
+    if (this.#terminalRejection !== null) {
+      throw this.#terminalRejection;
+    }
     if (this.#connectAbortController !== null || this.#client !== null) {
       throw new Error("Driver instance socket has already started connecting.");
     }
@@ -131,7 +147,11 @@ export class DriverInstanceSocket {
     );
 
     socket.addEventListener("close", (event) => {
-      if (generation !== this.#connectionGeneration || this.#socket !== socket) {
+      if (
+        this.#terminalRejection !== null ||
+        generation !== this.#connectionGeneration ||
+        this.#socket !== socket
+      ) {
         return;
       }
 
@@ -169,6 +189,9 @@ export class DriverInstanceSocket {
   }
 
   beginRun(runId: RunId): DriverRunTicket {
+    if (this.#terminalRejection !== null) {
+      throw this.#terminalRejection;
+    }
     const ticket = this.#terminalState.beginRun(runId);
     this.#activeRunTicket = ticket;
     return ticket;
@@ -333,6 +356,9 @@ export class DriverInstanceSocket {
     events: DriverEventInput[];
     signal?: AbortSignal;
   }): Promise<DriverEventBatchOutput> {
+    if (this.#terminalRejection !== null) {
+      throw this.#terminalRejection;
+    }
     input.signal?.throwIfAborted();
     const ownedInput = { ...input, events: structuredClone(input.events) };
     assertIsolatedRunTerminalBatch(ownedInput.events);
@@ -535,15 +561,26 @@ export class DriverInstanceSocket {
       let remaining = events.slice(index, index + maxBatchSize);
 
       while (remaining.length > 0) {
-        const result = driverRuntimeRpcSchemas.driver.pushEvents.output.parse(
-          await client.driver.pushEvents(
-            {
-              driverInstanceId: this.payload.driverInstanceId,
-              events: remaining,
-            },
-            rpcOptions,
-          ),
-        );
+        let result: DriverEventBatchOutput;
+        try {
+          result = driverRuntimeRpcSchemas.driver.pushEvents.output.parse(
+            await client.driver.pushEvents(
+              {
+                driverInstanceId: this.payload.driverInstanceId,
+                events: remaining,
+              },
+              rpcOptions,
+            ),
+          );
+        } catch (error) {
+          const terminal = prepared.terminal;
+          if (terminal !== null && isTerminalConflict(error, terminal.runId)) {
+            throw this.#fenceTerminalConflict(
+              new DriverEventRejectedError(terminal.sourceEventId, error),
+            );
+          }
+          throw error;
+        }
         this.#assertConnection(client, generation, "event delivery");
         this.#assertRunTicket(prepared);
 
@@ -633,6 +670,9 @@ export class DriverInstanceSocket {
     error?: DriverFailureInput["error"],
     signal?: AbortSignal,
   ): Promise<void> {
+    if (this.#terminalRejection !== null) {
+      return Promise.reject(this.#terminalRejection);
+    }
     if (status === "failed" && error === undefined) {
       return Promise.reject(new Error("Failed run terminal requires an error."));
     }
@@ -670,24 +710,31 @@ export class DriverInstanceSocket {
       this.#assertInstanceTerminal(terminal);
       const options = this.#rpcOptions(signal);
 
-      if (terminal.status === "completed") {
-        driverRuntimeRpcSchemas.driver.completeRun.output.parse(
-          await client.driver.completeRun(
-            { driverInstanceId: this.payload.driverInstanceId, runId: terminal.runId },
-            options,
-          ),
-        );
-      } else {
-        driverRuntimeRpcSchemas.driver.failRun.output.parse(
-          await client.driver.failRun(
-            {
-              driverInstanceId: this.payload.driverInstanceId,
-              error: structuredClone(terminal.error),
-              runId: terminal.runId,
-            },
-            options,
-          ),
-        );
+      try {
+        if (terminal.status === "completed") {
+          driverRuntimeRpcSchemas.driver.completeRun.output.parse(
+            await client.driver.completeRun(
+              { driverInstanceId: this.payload.driverInstanceId, runId: terminal.runId },
+              options,
+            ),
+          );
+        } else {
+          driverRuntimeRpcSchemas.driver.failRun.output.parse(
+            await client.driver.failRun(
+              {
+                driverInstanceId: this.payload.driverInstanceId,
+                error: structuredClone(terminal.error),
+                runId: terminal.runId,
+              },
+              options,
+            ),
+          );
+        }
+      } catch (error) {
+        if (isTerminalConflict(error, terminal.runId)) {
+          throw this.#fenceTerminalConflict(error);
+        }
+        throw error;
       }
 
       this.#assertConnection(client, generation, "run terminal delivery");
@@ -714,6 +761,15 @@ export class DriverInstanceSocket {
     if (generation !== this.#connectionGeneration || client !== this.#client) {
       throw new Error(`Driver socket connection changed during ${operation}.`);
     }
+  }
+
+  #fenceTerminalConflict(error: Error): Error {
+    if (this.#terminalRejection === null) {
+      this.#terminalRejection = error;
+      this.close(1011, "driver.terminal_conflict");
+      this.handlers.onClose(1011, "driver.terminal_conflict");
+    }
+    return this.#terminalRejection;
   }
 
   #assertRunTicket(prepared: PreparedEventPush): void {

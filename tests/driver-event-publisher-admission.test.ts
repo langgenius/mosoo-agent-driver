@@ -14,11 +14,16 @@ import {
   DriverCompletedTerminalSupersededError,
   DriverEventPublisher,
 } from "../src/runtimes/driver-event-publisher";
-import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
+import {
+  createTestNativeCheckpoint,
+  DRIVER_TEST_IDS,
+  driverBootPayload,
+} from "./driver-boot-payload-fixture";
 import { createContext, createDelta, createEvent, kinds } from "./driver-event-publisher-fixture";
 
 function createRunTerminal(
   kind: "run.cancelled" | "run.completed" | "run.failed",
+  runId = DRIVER_TEST_IDS.runId,
 ): DriverEventInput {
   return {
     kind,
@@ -27,8 +32,8 @@ function createRunTerminal(
         ? { error: { code: "runtime_failed", message: "failed", retryable: false } }
         : kind === "run.cancelled"
           ? { requestedBy: "user", stopReason: "cancelled" }
-          : {},
-    runId: DRIVER_TEST_IDS.runId,
+          : { checkpoint: createTestNativeCheckpoint(runId) },
+    runId,
   };
 }
 
@@ -993,8 +998,7 @@ describe("DriverEventPublisher", () => {
     ).rejects.toThrow("terminal settlement slot is full");
     expect(() =>
       publisher.pushTerminal(context, "next-run", [], {
-        ...terminal,
-        runId: DRIVER_TEST_IDS.secondRunId,
+        ...createRunTerminal("run.completed", DRIVER_TEST_IDS.secondRunId),
       }),
     ).toThrow("terminal settlement slot is full");
 
@@ -1686,8 +1690,7 @@ describe("DriverEventPublisher", () => {
     await publisher.push(context, "session.event", [createEvent("message.started")]);
     activeRunId = DRIVER_TEST_IDS.secondRunId;
     await publisher.pushTerminal(context, "terminal.two", [], {
-      ...createRunTerminal("run.completed"),
-      runId: DRIVER_TEST_IDS.secondRunId,
+      ...createRunTerminal("run.completed", DRIVER_TEST_IDS.secondRunId),
     });
 
     expect(attempts.map(([event]) => [event?.kind, event?.runId ?? null])).toEqual([
