@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DRIVER_PROTOCOL_VERSION } from "../src/protocol/boot";
+import { PROCESS_TREE_OWNER_ENV } from "../src/runtimes/child-process";
 import {
   ForbiddenSecretScanner,
   DriverArtifactTestController,
@@ -60,11 +62,27 @@ if (process.env.TEST_MODE === "log") {
     }],
   });
 }
+if (process.env.TEST_MODE === "process-inspection") {
+  const child = Bun.spawn([process.execPath, "--eval", "setInterval(() => {}, 1_000)"], {
+    env: { ...process.env, ${PROCESS_TREE_OWNER_ENV}: "controller-test-owner" },
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  process.once("SIGTERM", async () => {
+    child.kill();
+    await child.exited;
+    process.exit(0);
+  });
+}
 await rpc("/driver/ready", {
   at: process.env.TEST_MODE === "raw" ? process.env.TEST_SECRET : new Date().toISOString(),
   driverInstanceId: payload.driverInstanceId,
   pid: process.pid,
 });
+if (process.env.TEST_MODE === "process-inspection") {
+  await new Promise(() => {});
+}
 if (process.env.TEST_MODE === "terminal") {
   await rpc("/driver/commandUpdate", {
     commandId: "command-1",
@@ -102,6 +120,85 @@ afterEach(async () => {
 });
 
 describe("driver artifact test controller", () => {
+  test.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+    "ignores older protected processes and rejects unreadable current owner candidates",
+    async () => {
+      const spawnProtectedProcess = () =>
+        Bun.spawn(
+          [
+            process.execPath,
+            "--eval",
+            String.raw`
+import { dlopen } from "bun:ffi";
+const libc = dlopen("libc.so.6", {
+  prctl: { args: ["i32", "u64", "u64", "u64", "u64"], returns: "i32" },
+});
+if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) throw new Error("prctl failed");
+libc.close();
+console.log("ready");
+setInterval(() => {}, 1_000);
+`,
+          ],
+          {
+            env: { ...process.env, [PROCESS_TREE_OWNER_ENV]: "controller-test-owner" },
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "inherit",
+          },
+        );
+      const olderProcess = spawnProtectedProcess();
+      let newerProcess: ReturnType<typeof spawnProtectedProcess> | undefined;
+      let controller: DriverArtifactTestController | undefined;
+      try {
+        expect(await olderProcess.stdout.getReader().read()).toMatchObject({ done: false });
+        expect(() => readFileSync(`/proc/${olderProcess.pid}/environ`)).toThrow();
+        await Bun.sleep(100);
+        temporaryRoot = await mkdtemp(join(tmpdir(), "driver-controller-test-"));
+        const organizationPath = join(temporaryRoot, "workspace");
+        const artifactPath = join(temporaryRoot, "fake-driver.ts");
+        await mkdir(organizationPath);
+        await writeFile(artifactPath, FAKE_DRIVER);
+        controller = await DriverArtifactTestController.start({
+          artifactPath,
+          bootPayload: {
+            bootToken: "boot-token",
+            driverInstanceId: "driver-test",
+            execution: { configRevision: { sessionId: "session-test" } },
+            runtime: "acp-fallback",
+          },
+          env: { TEST_MODE: "process-inspection" },
+          organizationPath,
+          rootPath: temporaryRoot,
+          startTimeoutMs: 2_000,
+        });
+        const ownerIds = controller.providerOwnerIds();
+        expect(ownerIds).toEqual(["controller-test-owner"]);
+        const providerPids = controller.providerProcessIdsForOwners(ownerIds);
+        expect(providerPids).toHaveLength(1);
+        expect(controller.markedProcessIds(PROCESS_TREE_OWNER_ENV, ownerIds[0]!)).toEqual(
+          providerPids,
+        );
+
+        newerProcess = spawnProtectedProcess();
+        expect(await newerProcess.stdout.getReader().read()).toMatchObject({ done: false });
+        const error = `Could not inspect /proc/${newerProcess.pid}/environ for a live process.`;
+        expect(() => controller!.providerProcessIdsForOwners(ownerIds)).toThrow(error);
+        expect(() => controller!.markedProcessIds(PROCESS_TREE_OWNER_ENV, ownerIds[0]!)).toThrow(
+          error,
+        );
+        newerProcess.kill();
+        await newerProcess.exited;
+        await controller.dispose();
+        expect(controller.providerProcessIdsForOwners(ownerIds)).toEqual([]);
+        expect(controller.markedProcessIds(PROCESS_TREE_OWNER_ENV, ownerIds[0]!)).toEqual([]);
+      } finally {
+        olderProcess.kill();
+        newerProcess?.kill();
+        await Promise.all([olderProcess.exited, newerProcess?.exited, controller?.dispose()]);
+      }
+    },
+  );
+
   test("returns an accepted terminal after the driver exits", async () => {
     temporaryRoot = await mkdtemp(join(tmpdir(), "driver-controller-test-"));
     const organizationPath = join(temporaryRoot, "workspace");

@@ -309,9 +309,20 @@ function readProcessEnvironmentVariable(
   return value.length > 0 ? value : null;
 }
 
-function readSameUserLinuxIdentity(pid: number): LinuxProcessIdentity | null {
+function readSameUserLinuxIdentity(
+  pid: number,
+  earliestStartTime: number | null,
+): LinuxProcessIdentity | null {
+  if (earliestStartTime === null) {
+    throw new Error("Packed driver process start time is unavailable.");
+  }
   const identity = readLinuxProcessIdentity(pid);
-  if (identity === null || identity.state === "Z" || identity.state === "X") {
+  if (
+    identity === null ||
+    identity.state === "Z" ||
+    identity.state === "X" ||
+    Number(identity.startTime) < earliestStartTime
+  ) {
     return null;
   }
   const currentUid = process.getuid?.();
@@ -346,6 +357,7 @@ export class DriverArtifactTestController {
   readonly #stderrSecretScanner: ForbiddenSecretScanner;
   readonly #stdoutSecretScanner: ForbiddenSecretScanner;
   #child: ChildProcess | null = null;
+  #driverStartTime: number | null = null;
   #exitPromise: Promise<DriverExit> | null = null;
   #exitResult: DriverExit | null = null;
   #forbiddenSecretDetected = false;
@@ -520,7 +532,7 @@ export class DriverArtifactTestController {
     return [
       ...new Set(
         this.directChildProcessIds().flatMap((pid) => {
-          const identity = readSameUserLinuxIdentity(pid);
+          const identity = readSameUserLinuxIdentity(pid, this.#driverStartTime);
           if (identity === null) {
             return [];
           }
@@ -542,7 +554,7 @@ export class DriverArtifactTestController {
       if (!Number.isSafeInteger(pid) || pid < 1) {
         return [];
       }
-      const identity = readSameUserLinuxIdentity(pid);
+      const identity = readSameUserLinuxIdentity(pid, this.#driverStartTime);
       if (identity === null) {
         return [];
       }
@@ -562,7 +574,7 @@ export class DriverArtifactTestController {
         return [];
       }
 
-      const identity = readSameUserLinuxIdentity(pid);
+      const identity = readSameUserLinuxIdentity(pid, this.#driverStartTime);
       if (identity === null) {
         return [];
       }
@@ -838,6 +850,10 @@ export class DriverArtifactTestController {
         this.#stderrSecretScanner,
       );
     });
+    if (process.platform === "linux") {
+      const identity = child.pid === undefined ? null : readLinuxProcessIdentity(child.pid);
+      this.#driverStartTime = identity === null ? null : Number(identity.startTime);
+    }
   }
 
   #appendOutput(current: string, chunk: string, scanner: ForbiddenSecretScanner): string {
