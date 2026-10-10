@@ -76,7 +76,7 @@ describe("Driver boot schema", () => {
   test("accepts a new session without a native checkpoint", () => {
     const parsed = parseDriverBootPayload(driverBootPayload);
 
-    expect(parsed.protocolVersion).toBe(7);
+    expect(parsed.protocolVersion).toBe(8);
     expect(parsed.execution.session.nativeCheckpoint).toBeNull();
     expect(parsed.execution.session.nativeResumeRef).toBeNull();
   });

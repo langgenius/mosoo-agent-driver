@@ -24,6 +24,8 @@ import {
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { readNativeCheckpoint } from "../native-checkpoint";
 import { writeNativeRuntimeSystemPrompt } from "../skill-bootstrap";
+import { restorePiNativeOutputs } from "./pi-checkpoint";
+import { PI_MODEL_CONFIGURATION_SOURCE } from "./pi-model-configuration";
 import { readPiSessionHeader } from "./pi-session-validation";
 
 export const PI_CONFIG_ENV = "MOSOO_PI_CONFIG_CONTENT";
@@ -31,7 +33,9 @@ export const PI_PROXY_GRANT_ENV = "MOSOO_PI_PROXY_GRANT";
 
 // The extension asks through RPC before any tool execution. The Driver owns
 // the decision, including cancellation of an outstanding permission request.
-const PERMISSION_EXTENSION = `export default function (pi) {
+const PERMISSION_EXTENSION = `${PI_MODEL_CONFIGURATION_SOURCE}
+export default function (pi) {
+  configurePiModel(pi);
   pi.on("tool_call", async (event, ctx) => {
     const allowed = await ctx.ui.confirm("mosoo.tool_permission", JSON.stringify({
       toolCallId: event.toolCallId, toolName: event.toolName, input: event.input
@@ -46,6 +50,40 @@ export interface PiLaunchConfiguration {
   readonly cwd: string;
   readonly env: Record<string, string>;
   readonly home: string;
+}
+
+export function readPiModelConfiguration(payload: DriverStartInput) {
+  const execution = payload.execution;
+  const variables = execution.environment.variables;
+  const content = variables[PI_CONFIG_ENV];
+  const config: unknown = content === undefined ? null : JSON.parse(content);
+  if (!isJsonObject(config) || !variables[PI_PROXY_GRANT_ENV]) {
+    throw new Error("Pi requires a control-plane model configuration and proxy grant.");
+  }
+  const providers = config["providers"];
+  if (!isJsonObject(providers) || Object.keys(providers).length !== 1) {
+    throw new Error("Pi requires exactly one configured model provider.");
+  }
+  const [provider, definition] = Object.entries(providers)[0]!;
+  const prefix = `${execution.provider}/`;
+  const model = execution.model.startsWith(prefix)
+    ? execution.model.slice(prefix.length)
+    : execution.model;
+  if (
+    provider.trim() === "" ||
+    !isJsonObject(definition) ||
+    !Array.isArray(definition["models"]) ||
+    definition["models"].length !== 1 ||
+    !isJsonObject(definition["models"][0]) ||
+    definition["models"][0]["id"] !== model
+  ) {
+    throw new Error("Pi model configuration does not match the frozen execution model.");
+  }
+  const thinkingLevel = execution.providerOptions["thinkingLevel"];
+  if (thinkingLevel !== undefined && typeof thinkingLevel !== "string") {
+    throw new Error("Pi thinkingLevel must be a string.");
+  }
+  return { config, model, provider, thinkingLevel };
 }
 
 export function resolvePiSessionPath(home: string, pointer: string): string {
@@ -123,16 +161,18 @@ export async function preparePiLaunch(
   const home = resolve(execution.session.homePath, "pi");
   const sessions = join(home, "sessions");
   const variables = execution.environment.variables;
-  const content = variables[PI_CONFIG_ENV];
-  const config: unknown = content === undefined ? null : JSON.parse(content);
-  if (!isJsonObject(config) || !variables[PI_PROXY_GRANT_ENV]) {
-    throw new Error("Pi requires a control-plane model configuration and proxy grant.");
-  }
+  const { config, model, provider } = readPiModelConfiguration(payload);
   await using homeDirectory = await ensureAbsoluteRealDirectory(home, "Pi runtime home", signal);
   await using sessionsDirectory = await ensureRealDirectoryAt(
     homeDirectory,
     "sessions",
     "Pi sessions",
+    signal,
+  );
+  await using temporaryDirectory = await ensureRealDirectoryAt(
+    homeDirectory,
+    "tmp",
+    "Pi native output directory",
     signal,
   );
   await cleanupAtomicWriteTemporaryFiles(
@@ -189,16 +229,12 @@ export async function preparePiLaunch(
   if (!Array.isArray(prefix) || !prefix.every((arg) => typeof arg === "string")) {
     throw new Error("MOSOO_PI_ARGS must be a JSON string array.");
   }
-  const modelPrefix = `${execution.provider}/`;
-  const model = execution.model.startsWith(modelPrefix)
-    ? execution.model.slice(modelPrefix.length)
-    : execution.model;
   const args = [
     ...prefix,
     "--mode",
     "rpc",
     "--provider",
-    "mosoo",
+    provider,
     "--model",
     model,
     "--session-dir",
@@ -226,10 +262,7 @@ export async function preparePiLaunch(
     }
     const path = resolvePiSessionPath(home, resume.value);
     const restored = await readNativeCheckpoint({ cwd: execution.session.cwd, checkpoint, signal });
-    if (
-      restored.manifest.files.length !== 1 ||
-      restored.manifest.files[0]?.path !== "session.jsonl"
-    ) {
+    if (!restored.manifest.files.some((file) => file.path === "session.jsonl")) {
       throw new Error("Pi durable checkpoint must contain its native session.jsonl file.");
     }
     const content = new TextDecoder("utf-8", { fatal: true }).decode(
@@ -240,6 +273,7 @@ export async function preparePiLaunch(
     if ((await realpath(header.cwd)) !== (await realpath(execution.session.cwd))) {
       throw new Error("Pi restored session header does not match its workspace.");
     }
+    await restorePiNativeOutputs({ home, saved: restored, content, signal });
     await using parent = await openRelativeRealDirectory(
       sessionsDirectory,
       dirname(relative(sessions, path)),
@@ -274,6 +308,11 @@ export async function preparePiLaunch(
   signal.throwIfAborted();
   await assertDirectoryIdentity(homeDirectory, home, "Pi runtime home");
   await assertDirectoryIdentity(sessionsDirectory, sessions, "Pi sessions");
+  await assertDirectoryIdentity(
+    temporaryDirectory,
+    join(home, "tmp"),
+    "Pi native output directory",
+  );
   return {
     args,
     command: process.env["MOSOO_PI_EXECUTABLE"] ?? "pi",
@@ -284,6 +323,9 @@ export async function preparePiLaunch(
       ...variables,
       ...mcpEnv,
       HOME: execution.session.homePath,
+      TMPDIR: join(home, "tmp"),
+      TEMP: join(home, "tmp"),
+      TMP: join(home, "tmp"),
       PI_CODING_AGENT_DIR: home,
       PI_OFFLINE: "1",
     }),

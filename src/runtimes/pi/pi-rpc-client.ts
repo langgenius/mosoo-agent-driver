@@ -16,6 +16,10 @@ import {
 } from "../child-process";
 import type { PiLaunchConfiguration } from "./pi-configuration";
 
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_PENDING_EVENT_BYTES = 32 * 1024 * 1024;
+const MAX_PENDING_EVENTS = 1024;
+
 export interface PiRpcPort {
   request(type: string, fields?: JsonObject, signal?: AbortSignal): Promise<JsonObject>;
   send(record: JsonObject): Promise<void>;
@@ -32,6 +36,8 @@ export class PiRpcClient implements PiRpcPort {
   readonly #bound;
   readonly #watchdog;
   #buffer = "";
+  #pendingEventBytes = 0;
+  #pendingEventCount = 0;
   #stopped = false;
   #stopTask: Promise<void> | null = null;
 
@@ -126,17 +132,18 @@ export class PiRpcClient implements PiRpcPort {
   #read(chunk: string): void {
     if (this.#stopped) return;
     this.#buffer += chunk;
-    if (Buffer.byteLength(this.#buffer) > 16 * 1024 * 1024) {
-      this.#fail(new Error("Pi RPC frame exceeds the transport limit."));
-      return;
-    }
     // Split strictly on LF: U+2028 and U+2029 are valid JSON string content.
     let newline;
     while ((newline = this.#buffer.indexOf("\n")) !== -1) {
       if (this.#stopped) return;
-      const line = this.#buffer.slice(0, newline).trim();
+      const line = this.#buffer.slice(0, newline);
       this.#buffer = this.#buffer.slice(newline + 1);
-      if (line === "") continue;
+      const bytes = Buffer.byteLength(line);
+      if (bytes > MAX_FRAME_BYTES) {
+        this.#fail(new Error("Pi RPC frame exceeds the transport limit."));
+        return;
+      }
+      if (line.trim() === "") continue;
       try {
         const record: unknown = JSON.parse(line);
         if (!isJsonObject(record) || typeof record["type"] !== "string")
@@ -155,14 +162,33 @@ export class PiRpcClient implements PiRpcPort {
               );
           }
         } else {
-          void this.#onRecord(record).catch((error: unknown) =>
-            this.#fail(error instanceof Error ? error : new Error("Pi event handling failed.")),
-          );
+          if (
+            this.#pendingEventCount >= MAX_PENDING_EVENTS ||
+            bytes > MAX_PENDING_EVENT_BYTES - this.#pendingEventBytes
+          ) {
+            this.#fail(new Error("Pi RPC event queue limit exceeded."));
+            return;
+          }
+          this.#pendingEventCount++;
+          this.#pendingEventBytes += bytes;
+          // Count processing and queued events, including independent permission requests.
+          void Promise.resolve()
+            .then(() => this.#onRecord(record))
+            .catch((error: unknown) =>
+              this.#fail(error instanceof Error ? error : new Error("Pi event handling failed.")),
+            )
+            .finally(() => {
+              this.#pendingEventCount--;
+              this.#pendingEventBytes -= bytes;
+            });
         }
       } catch (error) {
         this.#fail(error instanceof Error ? error : new Error("Invalid Pi RPC frame."));
         return;
       }
+    }
+    if (Buffer.byteLength(this.#buffer) > MAX_FRAME_BYTES) {
+      this.#fail(new Error("Pi RPC frame exceeds the transport limit."));
     }
   }
 
@@ -171,7 +197,10 @@ export class PiRpcClient implements PiRpcPort {
     this.#pending.clear();
     if (!this.#stopped) {
       this.#stopped = true;
+      this.#buffer = "";
       this.#onFailure(error);
+      // The backend also joins this cleanup and can retry a failed attempt.
+      void this.stop().catch(() => {});
     }
   }
 

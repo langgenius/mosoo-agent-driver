@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
+import type { DriverEventInput } from "../src/protocol/events";
 import { isJsonObject } from "../src/protocol/json";
 import type { JsonObject } from "../src/protocol/json";
 import { PiEventTranslator } from "../src/runtimes/pi/pi-event-translator";
@@ -13,6 +14,224 @@ function completeAssistant(translator: PiEventTranslator, usage: JsonObject) {
     message: { role: "assistant", content: [], stopReason: "stop", usage },
   });
 }
+
+function thinkingUpdate(translator: PiEventTranslator, update: JsonObject) {
+  return translator.translate({ type: "message_update", assistantMessageEvent: update });
+}
+
+function finishThinking(translator: PiEventTranslator, thinking: string, stopReason = "stop") {
+  return translator.translate({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "thinking", thinking }], stopReason },
+  });
+}
+
+function thoughtText(events: DriverEventInput[]): string {
+  return events
+    .flatMap((event) => {
+      const text = isJsonObject(event.payload) ? event.payload["contentDelta"] : undefined;
+      return event.kind === "thought.delta" && typeof text === "string" ? [text] : [];
+    })
+    .join("");
+}
+
+describe("Pi thinking delivery", () => {
+  test.each(["thinking_end", "message_end"])("preserves final-only content from %s", (source) => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    const events =
+      source === "thinking_end"
+        ? thinkingUpdate(translator, { type: source, contentIndex: 0, content: "A summary." })
+        : finishThinking(translator, "A summary.");
+    expect(
+      events.filter((event) => event.kind.startsWith("thought.")).map((event) => event.kind),
+    ).toEqual(["thought.started", "thought.delta", "thought.completed"]);
+    expect(thoughtText(events)).toBe("A summary.");
+    expect(events.find((event) => event.kind === "thought.delta")?.delivery).toBe("lossless");
+    if (source === "thinking_end")
+      expect(finishThinking(translator, "A summary.").map((event) => event.kind)).toEqual([
+        "message.completed",
+      ]);
+    expect(translator.closeOpenItems()).toEqual([]);
+  });
+
+  test.each(["thinking_end", "message_end"])(
+    "reconciles missing tail at %s without duplicating streamed text",
+    (source) => {
+      const translator = new PiEventTranslator();
+      translator.translate({ type: "message_start", message: { role: "assistant" } });
+      const events = thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 });
+      events.push(
+        ...thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "First " }),
+      );
+      if (source === "thinking_end")
+        events.push(
+          ...thinkingUpdate(translator, {
+            type: source,
+            contentIndex: 0,
+            content: "First second.",
+          }),
+        );
+      events.push(...finishThinking(translator, "First second."));
+      expect(thoughtText(events)).toBe("First second.");
+      expect(events.filter((event) => event.kind === "thought.started")).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "thought.completed")).toHaveLength(1);
+      expect(
+        events
+          .filter((event) => event.kind === "thought.delta")
+          .every((event) => event.delivery === "lossless"),
+      ).toBe(true);
+      expect(translator.closeOpenItems()).toEqual([]);
+    },
+  );
+
+  test("ignores duplicate starts and ends and validates the final message", () => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 });
+    expect(thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 })).toEqual([]);
+    thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "summary" });
+    expect(
+      thinkingUpdate(translator, { type: "thinking_end", contentIndex: 0, content: "summary" }).map(
+        (event) => event.kind,
+      ),
+    ).toEqual(["thought.completed"]);
+    expect(
+      thinkingUpdate(translator, { type: "thinking_end", contentIndex: 0, content: "summary" }),
+    ).toEqual([]);
+    expect(finishThinking(translator, "summary").map((event) => event.kind)).toEqual([
+      "message.completed",
+    ]);
+  });
+
+  test.each(["thinking_end", "message_end"])(
+    "rejects conflicting %s content without exposing it in the error",
+    (source) => {
+      const translator = new PiEventTranslator();
+      translator.translate({ type: "message_start", message: { role: "assistant" } });
+      thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "accepted" });
+      expect(() =>
+        source === "thinking_end"
+          ? thinkingUpdate(translator, {
+              type: source,
+              contentIndex: 0,
+              content: "conflicting private text",
+            })
+          : finishThinking(translator, "conflicting private text"),
+      ).toThrow("Pi final thinking content does not match the delivered prefix.");
+      expect(translator.closeOpenItems(true).map((event) => event.kind)).toEqual([
+        "thought.cancelled",
+        "message.completed",
+      ]);
+    },
+  );
+
+  test("chunks large final thinking within canonical event limits without splitting unicode", () => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    const text = '\u0000"\\😀'.repeat(100_000);
+    const events = finishThinking(translator, text);
+    const deltas = events.filter((event) => event.kind === "thought.delta");
+    expect(deltas.length).toBeGreaterThan(1);
+    expect(thoughtText(events)).toBe(text);
+    for (const event of deltas) {
+      expect(event.delivery).toBe("lossless");
+      if (!isJsonObject(event.payload)) throw new Error("Missing thought payload.");
+      const content = event.payload["contentDelta"];
+      if (typeof content !== "string") throw new Error("Missing thought text.");
+      expect(content.isWellFormed()).toBe(true);
+      const canonical = toDriverEventEnvelopes(
+        { ...driverBootPayload, runtime: "pi", runtimeTransport: "pi-rpc" },
+        event,
+        DRIVER_TEST_IDS.runId,
+      );
+      expect(Buffer.byteLength(JSON.stringify(canonical), "utf8")).toBeLessThan(1_024 * 1_024);
+    }
+  });
+
+  test.each(["cleanup", "message_end"])("cancels incomplete thinking once on %s", (source) => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    const events = thinkingUpdate(translator, {
+      type: "thinking_delta",
+      contentIndex: 0,
+      delta: "partial",
+    });
+    expect(
+      thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "" }),
+    ).toEqual([]);
+    events.push(
+      ...(source === "cleanup"
+        ? translator.closeOpenItems(true)
+        : finishThinking(translator, "partial", "aborted")),
+    );
+    expect(
+      events.filter((event) => event.kind.startsWith("thought.")).map((event) => event.kind),
+    ).toEqual(["thought.started", "thought.delta", "thought.cancelled"]);
+    expect(translator.closeOpenItems(true)).toEqual([]);
+  });
+
+  test("bounds retained thinking across blocks and releases it after the message", () => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    const delta = "x".repeat(1_024 * 1_024);
+    for (let contentIndex = 0; contentIndex < 16; contentIndex++)
+      thinkingUpdate(translator, { type: "thinking_delta", contentIndex, delta });
+    expect(() =>
+      thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "x" }),
+    ).toThrow("Pi assistant message exceeds the thinking content byte limit.");
+    translator.translate({
+      type: "message_end",
+      message: { role: "assistant", content: [], stopReason: "stop" },
+    });
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    expect(
+      thoughtText(thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta })),
+    ).toBe(delta);
+  });
+
+  test("bounds empty thinking blocks before they can accumulate indefinitely", () => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    for (let contentIndex = 0; contentIndex < 1_000; contentIndex++)
+      thinkingUpdate(translator, { type: "thinking_start", contentIndex });
+    expect(() =>
+      thinkingUpdate(translator, { type: "thinking_start", contentIndex: 1_000 }),
+    ).toThrow("Pi assistant message exceeds the thinking block limit.");
+    translator.closeOpenItems(true);
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    expect(thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 })).toHaveLength(1);
+  });
+
+  test("keeps separate thought blocks at their native content indexes and ignores signatures", () => {
+    const translator = new PiEventTranslator();
+    translator.translate({ type: "message_start", message: { role: "assistant" } });
+    const streamed = thinkingUpdate(translator, {
+      type: "thinking_delta",
+      contentIndex: 2,
+      delta: "second",
+    });
+    const completed = translator.translate({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "first", thinkingSignature: "hidden-one" },
+          { type: "text", text: "answer" },
+          { type: "thinking", thinking: "second", thinkingSignature: "hidden-two" },
+          { type: "thinking", thinkingSignature: "hidden-three" },
+        ],
+        stopReason: "stop",
+      },
+    });
+    expect(thoughtText(completed)).toBe("first");
+    expect(completed.filter((event) => event.kind === "thought.completed")).toHaveLength(2);
+    expect(completed.findLast((event) => event.kind === "thought.completed")?.payload).toEqual(
+      streamed[0]?.payload,
+    );
+    expect(JSON.stringify([...streamed, ...completed])).not.toContain("hidden-");
+  });
+});
 
 describe("Pi Run usage", () => {
   test("accumulates assistant responses and successful compaction once per Run", () => {

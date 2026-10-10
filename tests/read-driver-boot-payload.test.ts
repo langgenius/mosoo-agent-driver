@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 describe("readDriverBootPayload", () => {
-  test.each([1, 2, 3, 4, 5, 6])(
+  test.each([1, 2, 3, 4, 5, 6, 7])(
     "rejects protocol %s during the Driver handshake",
     (protocolVersion) => {
       expect(() =>
@@ -42,7 +42,7 @@ describe("readDriverBootPayload", () => {
           runtime: "openai-runtime",
           startedAt: "now",
         }),
-      ).toThrow("protocolVersion must be 7");
+      ).toThrow("protocolVersion must be 8");
     },
   );
 

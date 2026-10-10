@@ -145,8 +145,16 @@ test("launch preserves native model, instruction, permission and active MCP wiri
     },
   );
 
+  const models = JSON.parse(payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"]!);
+  models.providers.deepseek = models.providers.mosoo;
+  delete models.providers.mosoo;
+  payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"] = JSON.stringify(models);
+
   const config = await preparePiLaunch(payload);
   expect(config.cwd).toBe(payload.execution.session.cwd);
+  expect(
+    config.args.slice(config.args.indexOf("--provider"), config.args.indexOf("--provider") + 2),
+  ).toEqual(["--provider", "deepseek"]);
   expect(
     config.args.slice(config.args.indexOf("--model"), config.args.indexOf("--model") + 2),
   ).toEqual(["--model", "pi-test"]);
@@ -172,9 +180,29 @@ test("launch preserves native model, instruction, permission and active MCP wiri
   expect(config.env["PATH"]?.startsWith("/runtime/bin:")).toBe(true);
   expect(config.env["HOME"]).toBe(payload.execution.session.homePath);
   expect(config.env["PI_CODING_AGENT_DIR"]).toBe(config.home);
+  for (const variable of ["TMPDIR", "TEMP", "TMP"]) {
+    expect(config.env[variable]).toBe(join(config.home, "tmp"));
+  }
   expect(config.env[DRIVER_BOOT_PAYLOAD_ENV_NAME]).toBeUndefined();
   expect(config.env[DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME]).toBeUndefined();
 });
+
+test.each(["missing provider", "multiple providers", "different model", "multiple models"])(
+  "rejects %s before publishing Pi configuration",
+  async (invalid) => {
+    const payload = await payloadFor();
+    const config = JSON.parse(payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"]!);
+    if (invalid === "missing provider") config.providers = {};
+    if (invalid === "multiple providers") config.providers.other = config.providers.mosoo;
+    if (invalid === "different model") config.providers.mosoo.models[0].id = "another-model";
+    if (invalid === "multiple models") config.providers.mosoo.models.push({ id: "another-model" });
+    payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"] = JSON.stringify(config);
+    await expect(preparePiLaunch(payload)).rejects.toThrow("Pi");
+    await expect(
+      stat(join(payload.execution.session.homePath, "pi", "models.json")),
+    ).rejects.toThrow();
+  },
+);
 
 test("atomic configuration writes replace symlinks without modifying their targets", async () => {
   const payload = await payloadFor();

@@ -106,7 +106,7 @@
     "zod": "4.5.4"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.99.2",
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "@openai/codex": "0.152.0",
     "@types/bun": "1.4.0",
     "@types/node": "^26.3.0",

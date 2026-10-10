@@ -277,7 +277,7 @@ export async function readDirectoryEntriesBounded(
 export async function writeFileAtomically(
   directory: FileHandle,
   name: string,
-  contents: string,
+  contents: string | Uint8Array,
   mode: number,
   signal: AbortSignal,
 ): Promise<void> {
