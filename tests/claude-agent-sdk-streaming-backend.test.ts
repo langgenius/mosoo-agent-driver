@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
@@ -15,8 +18,12 @@ import { bootPayload, DRIVER_TEST_IDS } from "./driver-runtime-boundary-fixtures
 
 const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const stops: (() => Promise<void>)[] = [];
+const directories: string[] = [];
 afterEach(async () => {
   await Promise.all(stops.splice(0).map((stop) => stop()));
+  await Promise.all(
+    directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
 });
 
 function result(prompt?: SDKUserMessage, count = 1): SDKMessage {
@@ -61,7 +68,7 @@ function reset(previousSessionId: string, nextSessionId: string): SDKMessage {
 
 type OptionsInput = Parameters<typeof createClaudeQueryOptions>[0];
 
-function harness(
+async function harness(
   options: {
     respond?: (prompt: SDKUserMessage, turn: number) => AsyncIterable<SDKMessage>;
     prepare?: (input: OptionsInput) => Promise<void> | void;
@@ -73,6 +80,8 @@ function harness(
     providerOptions?: DriverStartInput["execution"]["providerOptions"];
   } = {},
 ) {
+  const directory = await mkdtemp(join(tmpdir(), "claude-streaming-backend-"));
+  directories.push(directory);
   const events: DriverEventInput[] = [];
   const prompts: SDKUserMessage[] = [];
   const preparations: OptionsInput[] = [];
@@ -83,7 +92,16 @@ function harness(
   let closes = 0;
   const payload = {
     ...bootPayload,
-    execution: { ...bootPayload.execution, providerOptions: options.providerOptions ?? {} },
+    execution: {
+      ...bootPayload.execution,
+      providerOptions: options.providerOptions ?? {},
+      session: {
+        ...bootPayload.execution.session,
+        cwd: directory,
+        homePath: join(directory, "home"),
+        sharedRootPath: directory,
+      },
+    },
     runtime: "claude-agent-sdk",
     runtimeTransport: "claude-agent-sdk",
   } as DriverStartInput;
@@ -170,6 +188,7 @@ function harness(
   });
   const stop = () => backend.stop(context, "test.stop", new AbortController().signal);
   stops.push(stop);
+  await backend.start(context, new AbortController().signal);
   return {
     backend,
     context,
@@ -200,7 +219,7 @@ describe("Claude persistent query", () => {
     const initialized = Promise.withResolvers<void>();
     const baseline = Promise.withResolvers<unknown>();
     let baselineReads = 0;
-    const h = harness({
+    const h = await harness({
       initialize: () => initialized.promise,
       readBaseline: () => {
         baselineReads += 1;
@@ -226,7 +245,7 @@ describe("Claude persistent query", () => {
 
   test("subtracts restored native usage before publishing a new process's first Run", async () => {
     const previous = result(undefined, 4) as Extract<SDKMessage, { type: "result" }>;
-    const h = harness({
+    const h = await harness({
       readBaseline: async () => ({
         session: { total_cost_usd: previous.total_cost_usd, model_usage: previous.modelUsage },
       }),
@@ -247,7 +266,7 @@ describe("Claude persistent query", () => {
     "%s keeps a separate process and initializes its baseline for every Run",
     async (option) => {
       let initializations = 0;
-      const h = harness({
+      const h = await harness({
         initialize: async () => {
           initializations += 1;
         },
@@ -267,7 +286,7 @@ describe("Claude persistent query", () => {
   test.each(["initialization", "usage", "malformed"])(
     "a failed %s baseline closes the process without submitting business input",
     async (failure) => {
-      const h = harness({
+      const h = await harness({
         initialize: async () => {
           if (failure === "initialization") throw new Error("native initialization failed");
         },
@@ -289,7 +308,7 @@ describe("Claude persistent query", () => {
   test("cancellation during the baseline gate cannot release a delayed business input", async () => {
     const baseline = Promise.withResolvers<unknown>();
     const reading = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       readBaseline: () => {
         reading.resolve();
         return baseline.promise;
@@ -309,7 +328,7 @@ describe("Claude persistent query", () => {
 
   test("stop during the transcript wait closes the process and preserves the selected result", async () => {
     const waiting = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       waitForTranscript: (signal) =>
         new Promise((_resolve, reject) => {
           signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -330,7 +349,7 @@ describe("Claude persistent query", () => {
   test("does not publish completion or accept another input before transcript persistence", async () => {
     const persistence = Promise.withResolvers<boolean>();
     const waiting = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       waitForTranscript: () => {
         waiting.resolve();
         return persistence.promise;
@@ -349,7 +368,7 @@ describe("Claude persistent query", () => {
   });
 
   test("unconfirmed transcript persistence drains and recycles the query before completion", async () => {
-    const h = harness({
+    const h = await harness({
       waitForTranscript: async () => false,
       beforePush: (events) => {
         if (events.some((event) => event.kind === "run.completed")) {
@@ -364,7 +383,7 @@ describe("Claude persistent query", () => {
   });
 
   test("reuses one process and reports only each Run's incremental usage", async () => {
-    const h = harness();
+    const h = await harness();
     await h.run(DRIVER_TEST_IDS.runId);
     await h.run(DRIVER_TEST_IDS.secondRunId);
     expect(h.creates).toBe(1);
@@ -397,7 +416,7 @@ describe("Claude persistent query", () => {
 
   test("keeps process cleanup owned while idle and joins it on stop", async () => {
     const cleanup = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ processTasks }) => {
         processTasks?.add(cleanup.promise);
       },
@@ -418,7 +437,7 @@ describe("Claude persistent query", () => {
   test("retains failed idle cleanup for a later stop retry", async () => {
     const cleanup = Promise.withResolvers<void>();
     let retries = 0;
-    const h = harness({
+    const h = await harness({
       prepare: ({ processTasks }) => {
         processTasks?.add(cleanup.promise);
         registerClaudeTaskRetry(cleanup.promise, async () => {
@@ -436,7 +455,7 @@ describe("Claude persistent query", () => {
 
   test("cancels a reused process once and resumes the same native session", async () => {
     const entered = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt, turn) {
         if (turn === 2) {
           entered.resolve();
@@ -461,7 +480,7 @@ describe("Claude persistent query", () => {
 
   test("waits for permission callbacks before completing and admitting another Run", async () => {
     const permission = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ permissionTasks }) => {
         permissionTasks?.add(permission.promise);
       },
@@ -481,7 +500,7 @@ describe("Claude persistent query", () => {
 
   test("recycles tool turns, drains trailing resource events, and waits for process cleanup", async () => {
     const cleanup = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ processTasks }) => {
         processTasks?.add(cleanup.promise);
       },
@@ -537,7 +556,7 @@ describe("Claude persistent query", () => {
   });
 
   test("rejects a result correlated to another input", async () => {
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt) {
         yield { ...result(prompt), user_message_uuid: "another-input" } as SDKMessage;
       },
@@ -549,7 +568,7 @@ describe("Claude persistent query", () => {
 
   test("a timed-out idle stop retains cleanup ownership until a later stop joins it", async () => {
     const cleanup = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ processTasks }) => {
         processTasks?.add(cleanup.promise);
       },
@@ -569,7 +588,7 @@ describe("Claude persistent query", () => {
 
   test("an idle reader failure recycles the process before the next prompt", async () => {
     const failIdle = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt, turn) {
         yield result(prompt);
         if (turn === 1) {
@@ -589,7 +608,7 @@ describe("Claude persistent query", () => {
 
   test("session cancellation while input is idle cannot leak a completed Run signal into the next one", async () => {
     const previousRun = new AbortController();
-    const h = harness();
+    const h = await harness();
     await h.run(DRIVER_TEST_IDS.runId, previousRun.signal);
     previousRun.abort("previous Run released");
     await h.run(DRIVER_TEST_IDS.secondRunId);
@@ -599,7 +618,7 @@ describe("Claude persistent query", () => {
 
   test("a failed permission callback cannot publish a terminal on the retained path", async () => {
     const permission = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ permissionTasks }) => {
         permissionTasks?.add(permission.promise);
       },
@@ -620,7 +639,7 @@ describe("Claude persistent query", () => {
   test("stop during permission settlement waits for process cleanup before the terminal", async () => {
     const permission = Promise.withResolvers<void>();
     const processExit = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       prepare: ({ permissionTasks, processTasks }) => {
         permissionTasks?.add(permission.promise);
         processTasks?.add(processExit.promise);
@@ -640,7 +659,7 @@ describe("Claude persistent query", () => {
 
   test("unsolicited results after completion dispose the idle process without another terminal", async () => {
     const sendUnsolicited = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt, turn) {
         yield result(prompt);
         if (turn === 1) {
@@ -661,7 +680,7 @@ describe("Claude persistent query", () => {
   test("an idle conversation reset waits for the preceding terminal and resets usage", async () => {
     const terminalStarted = Promise.withResolvers<void>();
     const deliverTerminal = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       beforePush: async (events) => {
         if (
           events.some(
@@ -723,7 +742,7 @@ describe("Claude persistent query", () => {
     const reachedEof = Promise.withResolvers<void>();
     const terminalStarted = Promise.withResolvers<void>();
     const acknowledgeTerminal = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       waitForTranscript: async () => false,
       respond: async function* (prompt, turn) {
         yield { ...result(prompt), session_id: `native-session-${turn}` } as SDKMessage;
@@ -756,7 +775,7 @@ describe("Claude persistent query", () => {
   });
 
   test("a tool result keeps its trailing reset behind the terminal ACK", async () => {
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt) {
         yield {
           message: {
@@ -786,7 +805,7 @@ describe("Claude persistent query", () => {
   test("stop waits for a reset emitted during EOF drain to be acknowledged", async () => {
     const resetStarted = Promise.withResolvers<void>();
     const acknowledgeReset = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       afterInput: async function* () {
         yield reset("native-session-1", "native-session-2");
       },
@@ -819,7 +838,7 @@ describe("Claude persistent query", () => {
     const emitResets = Promise.withResolvers<void>();
     const resetStarted = Promise.withResolvers<void>();
     const acknowledgeReset = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt, turn) {
         yield {
           ...result(prompt),
@@ -874,7 +893,7 @@ describe("Claude persistent query", () => {
     const acknowledgeStart = Promise.withResolvers<void>();
     const resetStarted = Promise.withResolvers<void>();
     const acknowledgeReset = Promise.withResolvers<void>();
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt, turn) {
         yield { ...result(prompt), session_id: `native-session-${turn}` } as SDKMessage;
         if (turn === 1) {
@@ -916,7 +935,7 @@ describe("Claude persistent query", () => {
   test("a failed idle reset retains its event identity for stop to retry", async () => {
     const emitReset = Promise.withResolvers<void>();
     const resetAttempts: (string | undefined)[] = [];
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt) {
         yield result(prompt);
         await emitReset.promise;
@@ -945,7 +964,7 @@ describe("Claude persistent query", () => {
 
   test("reset delivery failure after completion cannot publish a second terminal", async () => {
     let resetAttempts = 0;
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt) {
         yield result(prompt);
         yield reset("native-session-1", "native-session-2");
@@ -970,7 +989,7 @@ describe("Claude persistent query", () => {
   });
 
   test("an empty background-task snapshot does not disable reuse", async () => {
-    const h = harness({
+    const h = await harness({
       respond: async function* (prompt) {
         yield {
           session_id: "native-session-1",

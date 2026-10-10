@@ -810,9 +810,9 @@ async function createCheckpointCleanupHarness() {
     ports: { skill: { materialize: async () => [] } },
   });
   const backend = new ClaudeAgentSdkDriverBackend(startInput, {
-    createNativeCheckpoint: async ({ runId: checkpointRunId, sessionId, signal }) =>
+    createNativeCheckpoint: async ({ root, runId: checkpointRunId, sessionId, signal }) =>
       createNativeCheckpoint({
-        cwd,
+        root,
         runId: checkpointRunId,
         nativeRef: { runtimeId: "claude-agent-sdk", kind: "claude_session_id", value: sessionId },
         signal,

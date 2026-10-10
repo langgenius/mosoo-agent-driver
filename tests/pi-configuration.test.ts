@@ -22,7 +22,7 @@ import {
   DRIVER_BOOT_PAYLOAD_ENV_NAME,
   DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME,
 } from "../src/runtimes/child-process-env";
-import { createNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { createNativeCheckpoint, pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import {
   preparePiLaunch,
   readPiSessionFile,
@@ -98,7 +98,7 @@ async function withCheckpoint(
 ): Promise<DriverStartInput> {
   const restored = resume(payload, pointer);
   await createNativeCheckpoint({
-    cwd: payload.execution.session.cwd,
+    root: await pinNativeCheckpointRoot(payload.execution.session.cwd),
     runId: DRIVER_TEST_IDS.runId,
     nativeRef: restored.execution.session.nativeResumeRef!,
     signal: new AbortController().signal,

@@ -575,6 +575,7 @@ export class ClaudeAgentSdkDriverBackend implements AgentDriverBackend {
         }
         const checkpointStartedAt = Date.now();
         checkpoint = await this.#dependencies.createNativeCheckpoint({
+          root: await this.#eventPublisher.getNativeCheckpointRoot(),
           payload: this.#payload,
           runId,
           sessionId: this.#nativeSessionId,

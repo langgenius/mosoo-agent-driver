@@ -252,7 +252,7 @@ export async function removeNativeCheckpointDirectory(
 }
 
 export async function createNativeCheckpoint(input: {
-  cwd: string;
+  root: NativeCheckpointRoot;
   runId: RunId;
   nativeRef: DriverNativeRuntimeRef;
   signal: AbortSignal;
@@ -264,8 +264,27 @@ export async function createNativeCheckpoint(input: {
     nativeRef: input.nativeRef,
   });
   input.signal.throwIfAborted();
-  const cwd = await realpath(input.cwd);
-  await using parent = await openCheckpointParent(cwd, checkpoint, true, input.signal);
+  await using root = await openAbsoluteRealDirectory(input.root.path, CHECKPOINT_LABEL);
+  const identity = await root.stat({ bigint: true });
+  if (identity.dev !== input.root.dev || identity.ino !== input.root.ino) {
+    throw new Error(`${CHECKPOINT_LABEL} root changed after startup: ${input.root.path}.`);
+  }
+  const parentRelativePath = dirname(getNativeCheckpointRelativePath(checkpoint.runId));
+  await using parent = await openRelativeRealDirectory(
+    root,
+    parentRelativePath,
+    CHECKPOINT_LABEL,
+    true,
+    input.signal,
+  );
+  const assertPublicationRoot = async () => {
+    await assertDirectoryIdentity(root, input.root.path, CHECKPOINT_LABEL);
+    await assertDirectoryIdentity(
+      parent,
+      resolve(input.root.path, parentRelativePath),
+      CHECKPOINT_LABEL,
+    );
+  };
   try {
     await using existingIgnore = await open(
       directoryEntryPath(parent, CHECKPOINT_GIT_IGNORE_NAME),
@@ -293,6 +312,7 @@ export async function createNativeCheckpoint(input: {
   if (existing !== null) {
     await validateCheckpoint(existing, checkpoint, input.signal);
     await parent.sync();
+    await assertPublicationRoot();
     return checkpoint;
   }
 
@@ -319,11 +339,7 @@ export async function createNativeCheckpoint(input: {
       input.signal,
     );
     await assertDirectoryIdentity(staging, temporaryPath, CHECKPOINT_LABEL);
-    await assertDirectoryIdentity(
-      parent,
-      resolve(cwd, dirname(getNativeCheckpointRelativePath(checkpoint.runId))),
-      CHECKPOINT_LABEL,
-    );
+    await assertPublicationRoot();
     input.signal.throwIfAborted();
     try {
       await rename(temporaryPath, destination);
@@ -358,6 +374,7 @@ export async function createNativeCheckpoint(input: {
   if (failure !== undefined) {
     throw failure.error;
   }
+  await assertPublicationRoot();
   return checkpoint;
 }
 

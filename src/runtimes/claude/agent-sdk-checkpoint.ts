@@ -32,6 +32,7 @@ import {
   readNativeCheckpoint,
   readNativeCheckpointSourceFile,
   removeNativeCheckpointDirectory,
+  type NativeCheckpointRoot,
 } from "../native-checkpoint";
 import { isRecord } from "./agent-sdk-json";
 import { resolveClaudeConfigDir } from "./agent-sdk-query-options";
@@ -384,6 +385,7 @@ async function validateSavedSession(
 }
 
 export async function createClaudeNativeCheckpoint(input: {
+  root: NativeCheckpointRoot;
   payload: DriverStartInput;
   runId: RunId;
   sessionId: string;
@@ -393,7 +395,7 @@ export async function createClaudeNativeCheckpoint(input: {
   const sessionId = sessionPathId(input.sessionId);
   const expected = expectedMessages(sessionId, input.expectedTranscriptCursors);
   const checkpoint = await createNativeCheckpoint({
-    cwd: input.payload.execution.session.cwd,
+    root: input.root,
     runId: input.runId,
     nativeRef: { runtimeId: "claude-agent-sdk", kind: "claude_session_id", value: sessionId },
     signal: input.signal,
@@ -536,7 +538,7 @@ export async function createClaudeNativeCheckpoint(input: {
   });
   // A retry must validate the first sealed copy, including after a concurrent creator won.
   const saved = await readNativeCheckpoint({
-    cwd: input.payload.execution.session.cwd,
+    cwd: input.root.path,
     checkpoint,
     signal: input.signal,
   });

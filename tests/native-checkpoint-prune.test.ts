@@ -37,7 +37,7 @@ async function fixture() {
 async function bundle(cwd: string, runId = DRIVER_TEST_IDS.runId) {
   const checkpoint = createTestNativeCheckpoint(runId);
   await createNativeCheckpoint({
-    cwd,
+    root: await pinNativeCheckpointRoot(cwd),
     ...checkpoint,
     signal: new AbortController().signal,
     write: async (directory) => {

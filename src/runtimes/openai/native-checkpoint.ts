@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rename, unlink } from "node:fs/promises";
+import { mkdir, open, rename } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
@@ -27,6 +27,7 @@ import {
   readNativeCheckpoint,
   readNativeCheckpointSourceFile,
   removeNativeCheckpointDirectory,
+  type NativeCheckpointRoot,
 } from "../native-checkpoint";
 
 const LABEL = "OpenAI native checkpoint";
@@ -92,6 +93,7 @@ async function writeSnapshotFile(
 
 export async function createOpenAiNativeCheckpoint(input: {
   payload: DriverStartInput;
+  root: NativeCheckpointRoot;
   runId: RunId;
   threadId: string;
   turnId: string;
@@ -99,7 +101,7 @@ export async function createOpenAiNativeCheckpoint(input: {
 }): Promise<NativeCheckpoint> {
   const { session } = input.payload.execution;
   return createNativeCheckpoint({
-    cwd: session.cwd,
+    root: input.root,
     runId: input.runId,
     nativeRef: { runtimeId: "openai-runtime", kind: "openai_thread_id", value: input.threadId },
     signal: input.signal,
@@ -186,6 +188,11 @@ export async function restoreOpenAiNativeCheckpoint(
   const stagePath = directoryEntryPath(home, stageName);
   await mkdir(stagePath, { mode: 0o700 });
   await using stage = await openRealDirectory(stagePath, LABEL);
+  const moves: { from: string; to: string }[] = [];
+  async function move(from: string, to: string): Promise<void> {
+    await rename(from, to);
+    moves.push({ from, to });
+  }
   let failure: unknown;
   try {
     for (const name of DIRECTORIES) {
@@ -221,7 +228,12 @@ export async function restoreOpenAiNativeCheckpoint(
       MAX_NATIVE_CHECKPOINT_ENTRIES,
       signal,
     )) {
-      if (SQLITE_PROJECTION.test(entry.name)) await unlink(directoryEntryPath(home, entry.name));
+      if (SQLITE_PROJECTION.test(entry.name)) {
+        await move(
+          directoryEntryPath(home, entry.name),
+          directoryEntryPath(stage, `${entry.name}.previous`),
+        );
+      }
     }
     for (const name of DIRECTORIES) {
       signal.throwIfAborted();
@@ -229,14 +241,36 @@ export async function restoreOpenAiNativeCheckpoint(
       await using previous = await openOptionalRealDirectory(destination, LABEL);
       if (previous !== null) {
         await assertDirectoryIdentity(previous, destination, LABEL);
-        await rename(destination, directoryEntryPath(stage, `${name}.previous`));
+        await move(destination, directoryEntryPath(stage, `${name}.previous`));
       }
-      await rename(directoryEntryPath(stage, name), destination);
+      await move(directoryEntryPath(stage, name), destination);
       await home.sync();
     }
     await assertDirectoryIdentity(home, resolve(session.homePath), LABEL);
+    signal.throwIfAborted();
   } catch (error) {
     failure = error;
+    const rollbackErrors: unknown[] = [];
+    for (const { from, to } of moves.toReversed()) {
+      try {
+        await rename(to, from);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    if (moves.length > 0) {
+      for (const directory of [stage, home]) {
+        try {
+          await directory.sync();
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      // Keep the staging directory because it may contain the only remaining original data.
+      throw new AggregateError([error, ...rollbackErrors], `${LABEL} restore rollback failed.`);
+    }
   }
   try {
     await removeNativeCheckpointDirectory(stage, stagePath);

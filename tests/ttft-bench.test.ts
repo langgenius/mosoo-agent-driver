@@ -8,7 +8,7 @@ import type { AgentDriverKernel } from "../src/core/agent-driver-kernel";
 import { AsyncValueQueue } from "../src/core/async-value-queue";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, parseRunId } from "../src/protocol/id";
-import { createNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { createNativeCheckpoint, pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 
 const scenario: Scenario = {
   id: "test",
@@ -25,6 +25,7 @@ afterEach(async () => {
 test("benchmark filters Run identities, waits for settlement, and validates each checkpoint", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "ttft-check-"));
   roots.push(cwd);
+  const root = await pinNativeCheckpointRoot(cwd);
   const events = new AsyncValueQueue<DriverEventInput>("bench test", 20);
   const identities: string[] = [];
   const kernel: AgentDriverKernel = {
@@ -37,7 +38,7 @@ test("benchmark filters Run identities, waits for settlement, and validates each
       const runId = parseRunId(command.runId);
       identities.push(runId, command.commandId, command.requestId!);
       const checkpoint = await createNativeCheckpoint({
-        cwd,
+        root,
         runId,
         nativeRef: { runtimeId: "openai-runtime", kind: "openai_thread_id", value: "native-test" },
         signal: new AbortController().signal,

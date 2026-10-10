@@ -128,8 +128,9 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   #turnStartInFlight = false;
   #turnStartRunId: RunId | null = null;
   readonly #events = new OpenAiAppServerEventBridge({
-    prepareCheckpoint: (_context, runId, turnId, signal) =>
+    prepareCheckpoint: async (_context, runId, turnId, signal) =>
       createOpenAiNativeCheckpoint({
+        root: await this.#eventPublisher.getNativeCheckpointRoot(),
         payload: this.#payload,
         runId,
         threadId: this.#requireThreadId(),
@@ -1068,6 +1069,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           this.#client = null;
         }
       }
+      await this.#eventPublisher.finishTerminalCleanup(context, signal);
     }
   }
 

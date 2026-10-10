@@ -14,7 +14,11 @@ import {
   DriverEventPublisher,
   DriverNativeCheckpointCleanupError,
 } from "../src/runtimes/driver-event-publisher";
-import { createNativeCheckpoint, readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import {
+  createNativeCheckpoint,
+  pinNativeCheckpointRoot,
+  readNativeCheckpoint,
+} from "../src/runtimes/native-checkpoint";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 const roots: string[] = [];
@@ -24,7 +28,7 @@ afterEach(async () => {
 
 async function checkpoint(cwd: string, runId: RunId): Promise<NativeCheckpoint> {
   return createNativeCheckpoint({
-    cwd,
+    root: await pinNativeCheckpointRoot(cwd),
     nativeRef: { kind: "openai_thread_id", runtimeId: "openai-runtime", value: "thread-1" },
     runId,
     signal: new AbortController().signal,
@@ -115,6 +119,38 @@ function incompleteTerminal(kind: "run.cancelled" | "run.failed", runId: RunId):
 }
 
 describe("DriverEventPublisher checkpoint retention", () => {
+  test("requires startup initialization before exposing the checkpoint root", async () => {
+    const publisher = new DriverEventPublisher("openai-runtime", () => null);
+    await expect(publisher.getNativeCheckpointRoot()).rejects.toThrow("not been initialized");
+  });
+
+  test("creates and acknowledges checkpoints in the same pinned root after an alias changes", async () => {
+    const f = await fixture(async () => {}, true);
+    const outside = await mkdtemp(join(tmpdir(), "publisher-checkpoints-outside-"));
+    roots.push(outside);
+    await rm(f.configuredCwd);
+    await symlink(outside, f.configuredCwd);
+    const candidate = await createNativeCheckpoint({
+      root: await f.publisher.getNativeCheckpointRoot(),
+      nativeRef: f.candidate.nativeRef,
+      runId: DRIVER_TEST_IDS.thirdRunId,
+      signal: new AbortController().signal,
+      write: (directory) => writeFile(join(directory, "session.jsonl"), "pinned history\n"),
+    });
+    f.state.activeRunId = candidate.runId;
+
+    await f.publisher.pushTerminal(f.context, "complete", [], {
+      kind: "run.completed",
+      payload: { checkpoint: candidate },
+      runId: candidate.runId,
+    });
+
+    expect(await f.list()).toEqual([candidate.runId]);
+    expect(await readdir(outside)).toEqual([]);
+    const saved = await readNativeCheckpoint({ cwd: f.cwd, checkpoint: candidate });
+    expect((await saved.readFile("session.jsonl")).toString()).toBe("pinned history\n");
+  });
+
   test("prunes checkpoints through a cwd alias pinned before model work", async () => {
     const f = await fixture(async () => {}, true);
 

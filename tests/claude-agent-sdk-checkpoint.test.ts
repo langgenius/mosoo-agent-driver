@@ -20,7 +20,7 @@ import {
   getNativeCheckpointRelativePath,
   type NativeCheckpoint,
 } from "../src/protocol/native-checkpoint";
-import { readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { pinNativeCheckpointRoot, readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
 import {
   createClaudeNativeCheckpoint,
   restoreClaudeNativeCheckpoint,
@@ -41,6 +41,7 @@ async function fixture() {
   const sessionId = "631c3e00-9bc3-4400-ad66-e70f326a028e";
   const projectPath = join(home, "projects", project);
   await mkdir(cwd);
+  const checkpointRoot = await pinNativeCheckpointRoot(cwd);
   await mkdir(projectPath, { recursive: true });
   const content = [{ type: "text", text: "saved answer" }];
   const message = {
@@ -72,6 +73,7 @@ async function fixture() {
   const create = () =>
     createClaudeNativeCheckpoint({
       payload,
+      root: checkpointRoot,
       runId: DRIVER_TEST_IDS.runId,
       sessionId,
       expectedTranscriptCursors: cursors,
@@ -159,6 +161,40 @@ test("exports all acknowledged assistants and restores the sealed native session
   expect(await readFile(join(f.home, ".credentials.json"), "utf8")).toBe("private authentication");
   expect(await readFile(join(f.cwd, "work.txt"), "utf8")).toBe("current workspace");
   expect(await readFile(join(agent, "agent-child.meta.json"), "utf8")).toContain("fixture-worker");
+});
+
+test("creates and validates a checkpoint in the pinned workspace after its cwd alias changes", async () => {
+  const f = await fixture();
+  const alias = join(f.root, "workspace-alias");
+  const elsewhere = join(f.root, "elsewhere");
+  await mkdir(elsewhere);
+  await symlink(f.cwd, alias);
+  const payload = {
+    ...f.payload,
+    execution: {
+      ...f.payload.execution,
+      session: { ...f.payload.execution.session, cwd: alias },
+    },
+  };
+  const root = await pinNativeCheckpointRoot(alias);
+  await rm(alias);
+  await symlink(elsewhere, alias);
+
+  const checkpoint = await createClaudeNativeCheckpoint({
+    root,
+    payload,
+    runId: DRIVER_TEST_IDS.runId,
+    sessionId: f.sessionId,
+    expectedTranscriptCursors: f.cursors,
+    signal: new AbortController().signal,
+  });
+  const saved = await readNativeCheckpoint({ cwd: f.cwd, checkpoint });
+
+  expect(saved.directory).toBe(join(f.cwd, getNativeCheckpointRelativePath(checkpoint.runId)));
+  expect((await saved.readFile(`projects/${f.project}/${f.sessionId}.jsonl`)).toString()).toBe(
+    f.transcript,
+  );
+  expect(await readdir(elsewhere)).toEqual([]);
 });
 
 test("restores tool results to their original native home after that home is removed", async () => {

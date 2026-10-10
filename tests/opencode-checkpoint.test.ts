@@ -1,12 +1,21 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { RunId } from "../src/protocol/id";
-import { readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import {
+  MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH,
+  MAX_NATIVE_CHECKPOINT_ENTRIES,
+  MAX_NATIVE_CHECKPOINT_FILE_BYTES,
+} from "../src/protocol/native-checkpoint";
+import {
+  createNativeCheckpoint,
+  pinNativeCheckpointRoot,
+  readNativeCheckpoint,
+} from "../src/runtimes/native-checkpoint";
 import {
   exportOpenCodeCheckpoint,
   readOpenCodeUsage,
@@ -54,6 +63,7 @@ async function fixture() {
   };
   return {
     cwd,
+    root: await pinNativeCheckpointRoot(cwd),
     dataPath,
     database,
     step,
@@ -79,7 +89,8 @@ describe("OpenCode native checkpoints", () => {
       state.step("subagent-1", 11, 4, 0.04);
       state.step("unrelated", 900, 900, 100);
       await mkdir(join(state.dataPath, "tool-output"));
-      await writeFile(join(state.dataPath, "tool-output", "tool-1"), "complete tool output");
+      const toolOutput = "complete tool output\n".repeat(8192);
+      await writeFile(join(state.dataPath, "tool-output", "tool-1"), toolOutput);
       await mkdir(join(state.dataPath, "plans"));
       await writeFile(join(state.dataPath, "plans", "plan-1.md"), "native plan");
       await mkdir(join(state.dataPath, "storage", "session_diff"), { recursive: true });
@@ -133,9 +144,7 @@ describe("OpenCode native checkpoints", () => {
         data: '{"native":"metadata"}',
       });
       expect(restored.query("SELECT count(*) AS count FROM part").get()).toEqual({ count: 6 });
-      expect(await readFile(join(restoredPath, "tool-output", "tool-1"), "utf8")).toBe(
-        "complete tool output",
-      );
+      expect(await readFile(join(restoredPath, "tool-output", "tool-1"), "utf8")).toBe(toolOutput);
       expect(await readFile(join(restoredPath, "plans", "plan-1.md"), "utf8")).toBe("native plan");
       expect(
         await readFile(join(restoredPath, "storage", "session_diff", "session-1.json"), "utf8"),
@@ -227,4 +236,90 @@ describe("OpenCode native checkpoints", () => {
       await state.destroy();
     }
   });
+
+  test("rejects unsupported checkpoint paths before replacing existing native state", async () => {
+    const state = await fixture();
+    try {
+      const checkpoint = await createNativeCheckpoint({
+        root: state.root,
+        runId,
+        nativeRef: { runtimeId: "acp-fallback", kind: "acp_session_id", value: "session-1" },
+        signal: signal(),
+        write: async (directory) => {
+          state.database.query("VACUUM INTO ?").run(join(directory, "opencode.db"));
+          await writeFile(join(directory, "auth.json"), "unsupported record");
+        },
+      });
+      const destination = join(state.cwd, "existing-native");
+      const preserved = [
+        "opencode.db",
+        "opencode.db-wal",
+        "opencode.db-shm",
+        "opencode.db-journal",
+        "snapshot/current",
+        "tool-output/current",
+        "plans/current",
+        "storage/current",
+      ];
+      await mkdir(destination);
+      for (const name of ["snapshot", "tool-output", "plans", "storage"]) {
+        await mkdir(join(destination, name));
+      }
+      for (const path of preserved) await writeFile(join(destination, path), `original ${path}`);
+      await expect(
+        restoreOpenCodeCheckpoint({
+          cwd: state.cwd,
+          dataPath: destination,
+          checkpoint,
+          signal: signal(),
+        }),
+      ).rejects.toThrow("unsupported file");
+      for (const path of preserved) {
+        expect(await readFile(join(destination, path), "utf8")).toBe(`original ${path}`);
+      }
+    } finally {
+      await state.destroy();
+    }
+  });
+
+  test.each(["file size", "entry count", "directory depth"] as const)(
+    "bounds native metadata %s before sealing the checkpoint",
+    async (limit) => {
+      const state = await fixture();
+      try {
+        const metadata = join(state.dataPath, "tool-output");
+        await mkdir(metadata);
+        if (limit === "file size") {
+          await using file = await open(join(metadata, "oversized"), "wx");
+          await file.truncate(MAX_NATIVE_CHECKPOINT_FILE_BYTES + 1);
+        } else if (limit === "entry count") {
+          for (let start = 0; start < MAX_NATIVE_CHECKPOINT_ENTRIES; start += 100) {
+            await Promise.all(
+              Array.from({ length: 100 }, (_, index) =>
+                mkdir(join(metadata, `entry-${start + index}`)),
+              ),
+            );
+          }
+        } else {
+          await mkdir(
+            join(metadata, ...Array<string>(MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH).fill("d")),
+            {
+              recursive: true,
+            },
+          );
+        }
+        await expect(
+          exportOpenCodeCheckpoint({
+            ...state,
+            runId,
+            sessionId: "session-1",
+            baseline: readOpenCodeUsage(state.dataPath, "session-1"),
+            signal: signal(),
+          }),
+        ).rejects.toThrow("OpenCode native metadata");
+      } finally {
+        await state.destroy();
+      }
+    },
+  );
 });

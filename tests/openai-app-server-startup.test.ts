@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client"
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
 import { createOpenAiNativeCheckpoint } from "../src/runtimes/openai/native-checkpoint";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import { pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -505,6 +506,7 @@ process.stdin.on("data", (chunk) => {
         .join(""),
     );
     const checkpoint = await createOpenAiNativeCheckpoint({
+      root: await pinNativeCheckpointRoot(payload.execution.session.cwd),
       payload,
       runId: createDriverId() as RunId,
       threadId,
@@ -2211,6 +2213,49 @@ describe("OpenAI app-server startup", () => {
     },
     10_000,
   );
+
+  test("stop retries checkpoint cleanup after completion ACK without another terminal", async () => {
+    const harness = await createCancellationHarness({
+      terminalNotificationBeforeTurnStartResponse: true,
+    });
+    const directory = join(harness.payload.execution.session.cwd, ".state", "native-checkpoints");
+    const retained = `${directory}.retained`;
+    const sink = harness.context.ports.eventSink;
+    const pushEvents = sink.pushEvents.bind(sink);
+    const push = spyOn(sink, "pushEvents").mockImplementation(async (input) => {
+      const receipt = await pushEvents(input);
+      if (input.events.some((event) => event.kind === "run.completed")) {
+        await rename(directory, retained);
+        await writeFile(directory, "blocks checkpoint cleanup");
+      }
+      return receipt;
+    });
+
+    try {
+      await harness.backend.start(harness.context, AbortSignal.timeout(2_000));
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow("Native checkpoint cleanup failed after terminal acknowledgement.");
+      await expect(
+        harness.backend.stop(harness.context, "stop", AbortSignal.timeout(2_000)),
+      ).rejects.toMatchObject({ name: "DriverNativeCheckpointCleanupError" });
+      const providerPid = await readFirstLaunchPid(harness.processLog);
+      expect(() => process.kill(providerPid, 0)).toThrow();
+      await rm(directory);
+      await rename(retained, directory);
+      await harness.backend.stop(harness.context, "retry cleanup", AbortSignal.timeout(2_000));
+      expect(
+        harness.events
+          .filter((event) => ["run.failed", "run.completed", "run.cancelled"].includes(event.kind))
+          .map((event) => event.kind),
+      ).toEqual(["run.completed"]);
+    } finally {
+      push.mockRestore();
+      await harness.backend
+        .stop(harness.context, "test complete", AbortSignal.timeout(2_000))
+        .catch(() => {});
+    }
+  });
 
   test("retains a client whose process stop fails so shutdown can retry", async () => {
     const harness = await createCancellationHarness({});

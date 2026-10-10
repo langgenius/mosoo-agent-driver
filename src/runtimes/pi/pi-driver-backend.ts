@@ -464,7 +464,8 @@ export class PiDriverBackend implements AgentDriverBackend {
     }
     const content = await readPiSessionFile(this.#home, this.#pointer, turn.controller.signal);
     const header = readPiSessionHeader(content);
-    if ((await realpath(header.cwd)) !== (await realpath(this.#payload.execution.session.cwd))) {
+    const root = await this.#publisher.getNativeCheckpointRoot();
+    if ((await realpath(header.cwd)) !== root.path) {
       throw new Error("Pi transcript belongs to another workspace.");
     }
     const lastAssistant = content
@@ -485,7 +486,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       throw new Error("Pi transcript does not contain the completed native assistant message.");
     }
     return createNativeCheckpoint({
-      cwd: this.#payload.execution.session.cwd,
+      root,
       runId: turn.runId,
       nativeRef: { runtimeId: "pi", kind: "pi_session_path", value: this.#pointer },
       signal: turn.controller.signal,

@@ -530,7 +530,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     }
     if (baseline === null) throw new Error("OpenCode run usage baseline is missing.");
     const { checkpoint, usage } = await exportOpenCodeCheckpoint({
-      cwd: this.#payload.execution.session.cwd,
+      root: await this.#eventPublisher.getNativeCheckpointRoot(),
       dataPath: openCodeDataPath(this.#payload.execution.session.homePath),
       runId,
       sessionId: this.#requireSessionId(),
@@ -774,6 +774,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
       });
     }
 
+    const checkpointCleanup = await settlePromiseWithTimeout(
+      this.#eventPublisher.finishTerminalCleanup(context, signal),
+      {
+        label: "ACP native checkpoint cleanup",
+        signal,
+        timeoutMs: this.#remainingStopMs(deadline),
+      },
+    );
+
     if (processFailure !== null) {
       throw processFailure.error;
     }
@@ -788,6 +797,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     if (terminalCleanup.status !== "completed") {
       throw terminalCleanup.error;
+    }
+
+    if (checkpointCleanup.status !== "completed") {
+      throw checkpointCleanup.error;
     }
   }
 

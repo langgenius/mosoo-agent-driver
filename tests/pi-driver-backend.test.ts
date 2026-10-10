@@ -14,7 +14,7 @@ import { isJsonObject } from "../src/protocol/json";
 import type { JsonObject } from "../src/protocol/json";
 import type { DriverStartInput } from "../src/protocol/start";
 import type { RunId } from "../src/protocol/id";
-import { createNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { createNativeCheckpoint, pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { preparePiLaunch, resolvePiSessionPath } from "../src/runtimes/pi/pi-configuration";
 import { PiDriverBackend } from "../src/runtimes/pi/pi-driver-backend";
 import { PiEventTranslator } from "../src/runtimes/pi/pi-event-translator";
@@ -404,7 +404,7 @@ describe("Pi runtime", () => {
       }
       const nativeRef = { kind: "pi_session_path", runtimeId: "pi", value: pointer } as const;
       const checkpoint = await createNativeCheckpoint({
-        cwd: payload.execution.session.cwd,
+        root: await pinNativeCheckpointRoot(payload.execution.session.cwd),
         runId: DRIVER_TEST_IDS.thirdRunId,
         nativeRef,
         signal: AbortSignal.timeout(10_000),
@@ -1021,7 +1021,7 @@ describe("Pi runtime", () => {
       }
       const nativeRef = { kind: "pi_session_path", runtimeId: "pi", value: pointer } as const;
       const checkpoint = await createNativeCheckpoint({
-        cwd: payload.execution.session.cwd,
+        root: await pinNativeCheckpointRoot(payload.execution.session.cwd),
         runId: DRIVER_TEST_IDS.thirdRunId,
         nativeRef,
         signal: AbortSignal.timeout(10_000),

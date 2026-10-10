@@ -6,8 +6,14 @@ import { mkdir, open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { RunId } from "../../protocol/id";
-import type { NativeCheckpoint } from "../../protocol/native-checkpoint";
+import {
+  MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH,
+  MAX_NATIVE_CHECKPOINT_ENTRIES,
+  MAX_NATIVE_CHECKPOINT_FILE_BYTES,
+  type NativeCheckpoint,
+} from "../../protocol/native-checkpoint";
 import { createNativeCheckpoint, readNativeCheckpoint } from "../native-checkpoint";
+import type { NativeCheckpointRoot } from "../native-checkpoint";
 import {
   directoryEntryPath,
   ensureAbsoluteRealDirectory,
@@ -16,6 +22,7 @@ import {
   openRealDirectory,
   openedDirectoryPath,
   openRelativeRealDirectory,
+  readDirectoryEntriesBounded,
 } from "../atomic-file";
 
 export interface OpenCodeUsage {
@@ -122,17 +129,33 @@ async function copyMetadata(
   source: string,
   destination: string,
   signal: AbortSignal,
+  budget: { remainingEntries: number },
+  depth = 1,
 ): Promise<void> {
   await using directory = await openOptionalRealDirectory(source, "OpenCode native metadata");
   if (directory === null) return;
+  if (depth > MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH) {
+    throw new Error("OpenCode native metadata has too many directory levels.");
+  }
+  if (budget.remainingEntries-- <= 0) {
+    throw new Error("OpenCode native metadata contains too many entries.");
+  }
   await mkdir(destination, { recursive: true, mode: 0o700 });
-  for (const entry of await readdir(openedDirectoryPath(directory), { withFileTypes: true })) {
+  for (const entry of await readDirectoryEntriesBounded(
+    directory,
+    "OpenCode native metadata",
+    budget.remainingEntries,
+    signal,
+  )) {
     signal.throwIfAborted();
     const from = directoryEntryPath(directory, entry.name);
     const to = join(destination, entry.name);
     if (entry.isDirectory()) {
-      await copyMetadata(from, to, signal);
+      await copyMetadata(from, to, signal, budget, depth + 1);
     } else {
+      if (budget.remainingEntries-- <= 0) {
+        throw new Error("OpenCode native metadata contains too many entries.");
+      }
       await using file = await open(
         from,
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -141,16 +164,39 @@ async function copyMetadata(
       if (!before.isFile() || before.nlink !== 1n) {
         throw new Error("OpenCode native metadata contains a non-regular file.");
       }
-      const bytes = await file.readFile();
+      if (before.size > BigInt(MAX_NATIVE_CHECKPOINT_FILE_BYTES)) {
+        throw new Error("OpenCode native metadata file exceeds its size limit.");
+      }
+      const size = Number(before.size);
+      const buffer = Buffer.alloc(Math.min(size + 1, 64 * 1_024));
+      let offset = 0;
+      await using output = await open(to, "wx", 0o600);
+      while (offset <= size) {
+        signal.throwIfAborted();
+        const { bytesRead } = await file.read(
+          buffer,
+          0,
+          Math.min(buffer.length, size + 1 - offset),
+          offset,
+        );
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+        if (offset > size) {
+          throw new Error("OpenCode native metadata grew during checkpoint export.");
+        }
+        await output.writeFile(buffer.subarray(0, bytesRead), { signal });
+      }
       const after = await file.stat({ bigint: true });
       if (
+        offset !== size ||
         before.size !== after.size ||
         before.mtimeNs !== after.mtimeNs ||
-        before.ctimeNs !== after.ctimeNs
+        before.ctimeNs !== after.ctimeNs ||
+        before.mode !== after.mode ||
+        after.nlink !== 1n
       ) {
         throw new Error("OpenCode native metadata changed during checkpoint export.");
       }
-      await writeFile(to, bytes, { flag: "wx", mode: 0o600, signal });
     }
   }
 }
@@ -284,7 +330,7 @@ async function exportSnapshots(
 }
 
 export async function exportOpenCodeCheckpoint(input: {
-  cwd: string;
+  root: NativeCheckpointRoot;
   dataPath: string;
   runId: RunId;
   sessionId: string;
@@ -292,7 +338,7 @@ export async function exportOpenCodeCheckpoint(input: {
   signal: AbortSignal;
 }): Promise<{ checkpoint: NativeCheckpoint; usage: OpenCodeUsage }> {
   const checkpoint = await createNativeCheckpoint({
-    cwd: input.cwd,
+    root: input.root,
     runId: input.runId,
     nativeRef: { runtimeId: "acp-fallback", kind: "acp_session_id", value: input.sessionId },
     signal: input.signal,
@@ -309,18 +355,25 @@ export async function exportOpenCodeCheckpoint(input: {
       database.query("VACUUM INTO ?").run(join(directory, "opencode.db"));
       using snapshot = new Database(join(directory, "opencode.db"), { readonly: true });
       databaseUsage(snapshot, input.sessionId);
-      await exportSnapshots(openedDirectoryPath(nativeRoot), directory, snapshot, input.signal);
+      // Reserve entries for the database and manifest before copying metadata.
+      const budget = { remainingEntries: MAX_NATIVE_CHECKPOINT_ENTRIES - 2 };
       for (const name of FILE_METADATA_DIRECTORIES) {
         await copyMetadata(
           directoryEntryPath(nativeRoot, name),
           join(directory, name),
           input.signal,
+          budget,
         );
       }
+      await exportSnapshots(openedDirectoryPath(nativeRoot), directory, snapshot, input.signal);
     },
   });
   // Use the sealed snapshot on retries, even if the live process has advanced.
-  const saved = await readNativeCheckpoint({ cwd: input.cwd, checkpoint, signal: input.signal });
+  const saved = await readNativeCheckpoint({
+    cwd: input.root.path,
+    checkpoint,
+    signal: input.signal,
+  });
   using database = Database.deserialize(await saved.readFile("opencode.db"), { readonly: true });
   return {
     checkpoint,
@@ -335,6 +388,15 @@ export async function restoreOpenCodeCheckpoint(input: {
   signal: AbortSignal;
 }): Promise<void> {
   const saved = await readNativeCheckpoint(input);
+  for (const file of saved.manifest.files) {
+    if (
+      file.path !== "opencode.db" &&
+      !file.path.startsWith("snapshot/") &&
+      !FILE_METADATA_DIRECTORIES.some((name) => file.path.startsWith(`${name}/`))
+    ) {
+      throw new Error("OpenCode native checkpoint contains an unsupported file.");
+    }
+  }
   const bytes = await saved.readFile("opencode.db");
   using database = Database.deserialize(bytes, { readonly: true });
   databaseUsage(database, input.checkpoint.nativeRef.value);
@@ -352,13 +414,6 @@ export async function restoreOpenCodeCheckpoint(input: {
   }
   for (const file of saved.manifest.files) {
     input.signal.throwIfAborted();
-    if (
-      file.path !== "opencode.db" &&
-      !file.path.startsWith("snapshot/") &&
-      !FILE_METADATA_DIRECTORIES.some((name) => file.path.startsWith(`${name}/`))
-    ) {
-      throw new Error("OpenCode native checkpoint contains an unsupported file.");
-    }
     const segments = file.path.split("/");
     const name = segments.pop()!;
     await using parent = await openRelativeRealDirectory(

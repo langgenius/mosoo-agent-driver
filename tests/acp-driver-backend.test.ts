@@ -1,7 +1,16 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ClientContext } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1046,6 +1055,58 @@ describe("ACP driver backend lifecycle", () => {
         expect(events.indexOf(usage[0]!)).toBeLessThan(events.indexOf(terminal!));
       }
     } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("retries acknowledged checkpoint cleanup during stop without repeating the terminal", async () => {
+    const harness = await createHarness();
+    const directory = join(
+      harness.context.payload.execution.session.cwd,
+      ".state/native-checkpoints",
+    );
+    const retainedDirectory = `${directory}.retained`;
+    let releaseTerminal = () => {};
+
+    try {
+      await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
+      const gate = harness.blockNext("run.completed");
+      releaseTerminal = gate.release;
+      const turn = harness.backend.handleInput(
+        harness.context,
+        { text: "second" },
+        DRIVER_TEST_IDS.secondRunId,
+      );
+      void turn.catch(() => {});
+      await gate.entered;
+      await rename(directory, retainedDirectory);
+      await writeFile(directory, "block checkpoint cleanup");
+      gate.release();
+
+      await expect(turn).rejects.toThrow("Native checkpoint cleanup failed");
+      // The provider's close update also fails while the publisher cleanup slot is reserved.
+      await expect(
+        harness.backend.stop(harness.context, "blocked cleanup", new AbortController().signal),
+      ).rejects.toThrow("terminal settlement slot is full");
+      expect((await readdir(retainedDirectory)).sort()).toEqual([
+        ".gitignore",
+        DRIVER_TEST_IDS.runId,
+        DRIVER_TEST_IDS.secondRunId,
+      ]);
+
+      await rm(directory);
+      await rename(retainedDirectory, directory);
+      await expect(
+        harness.backend.stop(harness.context, "retry cleanup", new AbortController().signal),
+      ).rejects.toThrow("terminal settlement slot is full");
+      expect((await readdir(directory)).sort()).toEqual([
+        ".gitignore",
+        DRIVER_TEST_IDS.secondRunId,
+      ]);
+      expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(2);
+      expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
+    } finally {
+      releaseTerminal();
       await harness.destroy();
     }
   });

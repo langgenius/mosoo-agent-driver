@@ -1,6 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 import {
   createDriverStartInputFromBootPayload,
@@ -10,7 +12,11 @@ import {
   getNativeCheckpointRelativePath,
   type NativeCheckpoint,
 } from "../src/protocol/native-checkpoint";
-import { createNativeCheckpoint, readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import {
+  createNativeCheckpoint,
+  pinNativeCheckpointRoot,
+  readNativeCheckpoint,
+} from "../src/runtimes/native-checkpoint";
 import {
   createOpenAiNativeCheckpoint,
   restoreOpenAiNativeCheckpoint,
@@ -58,7 +64,16 @@ async function fixture(contents = rollout()) {
       },
     },
   });
-  return { cwd, homePath, payload, runId: DRIVER_TEST_IDS.runId, threadId, turnId, signal };
+  return {
+    cwd,
+    root: await pinNativeCheckpointRoot(cwd),
+    homePath,
+    payload,
+    runId: DRIVER_TEST_IDS.runId,
+    threadId,
+    turnId,
+    signal,
+  };
 }
 
 function resumePayload(payload: DriverStartInput, nativeCheckpoint: NativeCheckpoint | null) {
@@ -169,4 +184,134 @@ test("rejects a symlinked restore destination without changing its target", asyn
     restoreOpenAiNativeCheckpoint(resumePayload(input.payload, checkpoint), signal),
   ).rejects.toThrow("real directory");
   expect(await readFile(join(outside, "marker"), "utf8")).toBe("preserved");
+});
+
+test.each(["rename failure", "abort", "sync failure"])(
+  "preserves the complete previous native home after a restore %s",
+  async (failureKind) => {
+    const input = await fixture();
+    const checkpoint = await createOpenAiNativeCheckpoint(input);
+    const directories = ["sessions", "archived_sessions", "memories", "memories_extensions"];
+    for (const name of directories) {
+      await mkdir(join(input.homePath, name), { recursive: true });
+      await writeFile(join(input.homePath, name, "previous"), `previous ${name}`);
+    }
+    await writeFile(join(input.homePath, historyPath), "previous rollout");
+    const projections = ["state_5.sqlite", "thread_history_1.sqlite-wal"];
+    for (const name of projections) await writeFile(join(input.homePath, name), name);
+    const controller = new AbortController();
+    const failure = new Error(`Injected restore ${failureKind}`);
+    const rename = fs.rename;
+    let installed = false;
+    let failed = false;
+    const renameSpy = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (
+        failureKind === "rename failure" &&
+        !failed &&
+        typeof from === "string" &&
+        typeof to === "string" &&
+        basename(from) === "memories" &&
+        basename(to) === "memories"
+      ) {
+        failed = true;
+        throw failure;
+      }
+      await rename(from, to);
+      if (
+        !installed &&
+        typeof from === "string" &&
+        typeof to === "string" &&
+        basename(from) === "sessions" &&
+        basename(to) === "sessions"
+      ) {
+        installed = true;
+        if (failureKind === "abort") controller.abort(failure);
+      }
+    });
+    await using home = await fs.open(input.homePath, "r");
+    const homeStats = await home.stat();
+    const prototype = Object.getPrototypeOf(home) as FileHandle;
+    const sync = prototype.sync;
+    const syncSpy = spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      if (failureKind === "sync failure" && installed && !failed) {
+        const stats = await this.stat();
+        if (stats.dev === homeStats.dev && stats.ino === homeStats.ino) {
+          failed = true;
+          throw failure;
+        }
+      }
+      await sync.call(this);
+    });
+    try {
+      await expect(
+        restoreOpenAiNativeCheckpoint(resumePayload(input.payload, checkpoint), controller.signal),
+      ).rejects.toThrow(failure.message);
+      expect(installed).toBe(true);
+      expect(await readFile(join(input.homePath, historyPath), "utf8")).toBe("previous rollout");
+      for (const name of directories) {
+        expect(await readFile(join(input.homePath, name, "previous"), "utf8")).toBe(
+          `previous ${name}`,
+        );
+      }
+      for (const name of projections) {
+        expect(await readFile(join(input.homePath, name), "utf8")).toBe(name);
+      }
+      expect((await readdir(input.homePath)).sort()).toEqual(
+        [...directories, ...projections].sort(),
+      );
+    } finally {
+      renameSpy.mockRestore();
+      syncSpy.mockRestore();
+    }
+  },
+);
+
+test("retains original native files when restoring the previous home also fails", async () => {
+  const input = await fixture();
+  const checkpoint = await createOpenAiNativeCheckpoint(input);
+  await writeFile(join(input.homePath, historyPath), "previous rollout");
+  const rename = fs.rename;
+  let installationFailed = false;
+  let rollbackFailed = false;
+  const renameSpy = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+    if (typeof from === "string" && typeof to === "string") {
+      if (basename(from) === "memories" && basename(to) === "memories") {
+        installationFailed = true;
+        throw new Error("Injected installation failure");
+      }
+      if (installationFailed && basename(from) === "sessions" && basename(to) === "sessions") {
+        rollbackFailed = true;
+        throw new Error("Injected rollback failure");
+      }
+    }
+    await rename(from, to);
+  });
+  try {
+    const failure = await restoreOpenAiNativeCheckpoint(
+      resumePayload(input.payload, checkpoint),
+      signal,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors.map((error: Error) => error.message)).toEqual(
+      expect.arrayContaining(["Injected installation failure", "Injected rollback failure"]),
+    );
+    expect(rollbackFailed).toBe(true);
+    const retainedStage = (await readdir(input.homePath)).find((name) =>
+      name.startsWith(".checkpoint-restore-"),
+    );
+    expect(retainedStage).toBeDefined();
+    expect(
+      await readFile(
+        join(
+          input.homePath,
+          retainedStage!,
+          "sessions.previous",
+          historyPath.slice("sessions/".length),
+        ),
+        "utf8",
+      ),
+    ).toBe("previous rollout");
+  } finally {
+    renameSpy.mockRestore();
+  }
 });

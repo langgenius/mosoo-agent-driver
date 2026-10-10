@@ -166,6 +166,13 @@ export class DriverEventPublisher {
       : raceWithAbort(this.#checkpointRootTask, signal));
   }
 
+  async getNativeCheckpointRoot(): Promise<NativeCheckpointRoot> {
+    if (this.#checkpointRootTask === null) {
+      throw new Error("Native checkpoint root has not been initialized.");
+    }
+    return this.#checkpointRootTask;
+  }
+
   async finishTerminalCleanup(context: AgentDriverContext, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     const settlement = this.#terminalSettlement;

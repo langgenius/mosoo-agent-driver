@@ -10,6 +10,7 @@ import {
   open,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -27,6 +28,7 @@ import {
 } from "../src/protocol/native-checkpoint";
 import {
   createNativeCheckpoint,
+  pinNativeCheckpointRoot,
   readNativeCheckpoint,
   readNativeCheckpointSourceFile,
 } from "../src/runtimes/native-checkpoint";
@@ -46,7 +48,8 @@ async function fixture() {
   roots.push(cwd);
   const signal = new AbortController().signal;
   const directory = join(cwd, getNativeCheckpointRelativePath(checkpoint.runId));
-  return { cwd, directory, signal, ...checkpoint };
+  const root = await pinNativeCheckpointRoot(cwd);
+  return { cwd, root, directory, signal, ...checkpoint };
 }
 
 async function publish(input: Awaited<ReturnType<typeof fixture>>) {
@@ -249,13 +252,120 @@ test("resolves a trusted cwd alias once and keeps restore anchored when the alia
   await mkdir(workspace);
   await mkdir(elsewhere);
   await symlink(workspace, alias);
-  await publish({ ...input, cwd: alias });
+  await publish({ ...input, cwd: alias, root: await pinNativeCheckpointRoot(alias) });
   const saved = await readNativeCheckpoint({ cwd: alias, checkpoint });
   await rm(alias);
   await symlink(elsewhere, alias);
   expect((await saved.readFile("history/session.jsonl")).toString()).toBe("saved history\n");
   expect(saved.directory).toBe(join(workspace, getNativeCheckpointRelativePath(checkpoint.runId)));
 });
+
+test("publishes in the pinned workspace after its configured alias changes", async () => {
+  const input = await fixture();
+  const workspace = join(input.cwd, "workspace");
+  const elsewhere = join(input.cwd, "elsewhere");
+  const alias = join(input.cwd, "alias");
+  await mkdir(workspace);
+  await mkdir(elsewhere);
+  await symlink(workspace, alias);
+  const root = await pinNativeCheckpointRoot(alias);
+  await rm(alias);
+  await symlink(elsewhere, alias);
+
+  expect(await publish({ ...input, root })).toEqual(checkpoint);
+  const saved = await readNativeCheckpoint({ cwd: workspace, checkpoint });
+  expect((await saved.readFile("history/session.jsonl")).toString()).toBe("saved history\n");
+  expect(await readdir(elsewhere)).toEqual([]);
+});
+
+test.each(["symlink", "directory"])(
+  "rejects a pinned workspace replaced by a %s before writing",
+  async (replacement) => {
+    const input = await fixture();
+    const moved = `${input.cwd}.moved`;
+    roots.push(moved);
+    await rename(input.cwd, moved);
+    if (replacement === "symlink") await symlink(moved, input.cwd);
+    else await mkdir(input.cwd);
+
+    await expect(publish(input)).rejects.toThrow();
+    expect(await readdir(moved)).toEqual([]);
+    expect(await readdir(input.cwd)).toEqual([]);
+  },
+);
+
+test("cleans staging in the original workspace when its root changes during export", async () => {
+  const input = await fixture();
+  const moved = `${input.cwd}.moved`;
+  roots.push(moved);
+
+  await expect(
+    createNativeCheckpoint({
+      ...input,
+      write: async (stage) => {
+        await rename(input.cwd, moved);
+        await mkdir(input.cwd);
+        await writeFile(join(stage, "session.jsonl"), "unfinished");
+      },
+    }),
+  ).rejects.toThrow("changed while managed files were being written");
+
+  expect(await readdir(input.cwd)).toEqual([]);
+  expect(await readdir(join(moved, ".state/native-checkpoints"))).toEqual([".gitignore"]);
+});
+
+test.each([
+  { location: "root", reuse: false },
+  { location: "root", reuse: true },
+  { location: "parent", reuse: false },
+  { location: "parent", reuse: true },
+])(
+  "rejects $location replacement during the final sync (reuse=$reuse)",
+  async ({ location, reuse }) => {
+    const input = await fixture();
+    if (reuse) await publish(input);
+    const parentPath = dirname(input.directory);
+    await mkdir(parentPath, { recursive: true });
+    await using parent = await open(parentPath, "r");
+    const parentIdentity = await parent.stat();
+    const target = location === "root" ? input.cwd : parentPath;
+    const moved = `${target}.moved`;
+    if (location === "root") roots.push(moved);
+    const prototype = Object.getPrototypeOf(parent) as FileHandle;
+    const originalSync = prototype.sync;
+    let syncs = 0;
+    let swapped = false;
+    const sync = spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      const identity = await this.stat();
+      if (
+        !swapped &&
+        identity.ino === parentIdentity.ino &&
+        identity.dev === parentIdentity.dev &&
+        existsSync(input.directory) &&
+        ++syncs === (reuse ? 2 : 1)
+      ) {
+        swapped = true;
+        await rename(target, moved);
+        await mkdir(target);
+      }
+      await originalSync.call(this);
+    });
+    try {
+      await expect(publish(input)).rejects.toThrow(
+        "changed while managed files were being written",
+      );
+      expect(swapped).toBe(true);
+      expect(await readdir(target)).toEqual([]);
+      const savedParent = location === "root" ? join(moved, ".state/native-checkpoints") : moved;
+      expect(
+        await readFile(join(savedParent, checkpoint.runId, "history/session.jsonl"), "utf8"),
+      ).toBe("saved history\n");
+      expect((await readdir(savedParent)).sort()).toEqual([".gitignore", checkpoint.runId]);
+    } finally {
+      sync.mockRestore();
+    }
+  },
+);
 
 test("aborted exports remove only their staging directory", async () => {
   const input = await fixture();
@@ -318,6 +428,63 @@ test("concurrent exports reuse the first complete checkpoint", async () => {
     checkpoint.runId,
   ]);
 });
+
+test.each(["root", "parent"])(
+  "rejects %s replacement during a concurrent loser's staging cleanup",
+  async (location) => {
+    const input = await fixture();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const pending = createNativeCheckpoint({
+      ...input,
+      write: async (stage) => {
+        await writeFile(join(stage, "losing-payload"), "discarded");
+        entered.resolve();
+        await release.promise;
+      },
+    });
+    await entered.promise;
+    await publish(input);
+    const parentPath = dirname(input.directory);
+    await using parent = await open(parentPath, "r");
+    const parentIdentity = await parent.stat();
+    const target = location === "root" ? input.cwd : parentPath;
+    const moved = `${target}.moved`;
+    if (location === "root") roots.push(moved);
+    const prototype = Object.getPrototypeOf(parent) as FileHandle;
+    const originalSync = prototype.sync;
+    let swapped = false;
+    const sync = spyOn(prototype, "sync").mockImplementation(async function (this: FileHandle) {
+      const identity = await this.stat();
+      if (
+        !swapped &&
+        identity.ino === parentIdentity.ino &&
+        identity.dev === parentIdentity.dev &&
+        !(await readdir(parentPath)).some((name) => name.endsWith(".tmp"))
+      ) {
+        swapped = true;
+        await rename(target, moved);
+        await mkdir(target);
+      }
+      await originalSync.call(this);
+    });
+    try {
+      release.resolve();
+      await expect(pending).rejects.toThrow("changed while managed files were being written");
+      expect(swapped).toBe(true);
+      expect(await readdir(target)).toEqual([]);
+      const savedParent = location === "root" ? join(moved, ".state/native-checkpoints") : moved;
+      expect((await readdir(savedParent)).sort()).toEqual([".gitignore", checkpoint.runId]);
+      expect(
+        await readFile(join(savedParent, checkpoint.runId, "history/session.jsonl"), "utf8"),
+      ).toBe("saved history\n");
+    } finally {
+      release.resolve();
+      await pending.catch(() => {});
+      sync.mockRestore();
+    }
+  },
+);
 
 test("a failure after rename preserves the published checkpoint for retry", async () => {
   const input = await fixture();
