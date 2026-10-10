@@ -1,5 +1,5 @@
-import { realpath, writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { realpath } from "node:fs/promises";
+import { relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
@@ -18,13 +18,16 @@ import {
   DriverCompletedTerminalSupersededError,
   DriverEventPublisher,
 } from "../driver-event-publisher";
-import { createNativeCheckpoint } from "../native-checkpoint";
 import { writeSkillBootstrapArtifacts } from "../skill-bootstrap";
+import { createPiNativeCheckpoint } from "./pi-checkpoint";
 import { preparePiLaunch, readPiSessionFile, resolvePiSessionPath } from "./pi-configuration";
 import { PiEventTranslator } from "./pi-event-translator";
 import { PiRpcClient } from "./pi-rpc-client";
 import type { PiRpcPort } from "./pi-rpc-client";
 import { readPiSessionHeader } from "./pi-session-validation";
+
+const MAX_PENDING_EVENT_BYTES = 32 * 1024 * 1024;
+const MAX_PENDING_EVENTS = 1024;
 
 interface ActiveTurn {
   readonly controller: AbortController;
@@ -36,7 +39,7 @@ interface ActiveTurn {
   cancellation: Promise<void> | null;
   cancellationPublished: boolean;
   terminal: "completed" | "other" | null;
-  dispatched: boolean;
+  admission: Promise<JsonObject> | null;
   nativeMessage: JsonObject | null;
 }
 
@@ -44,7 +47,7 @@ export interface PiBackendDependencies {
   readonly prepare: typeof preparePiLaunch;
   readonly createClient: (
     config: Awaited<ReturnType<typeof preparePiLaunch>>,
-    onRecord: (record: JsonObject) => Promise<void>,
+    onRecord: (record: JsonObject, bytes: number) => Promise<void>,
     onFailure: (error: Error) => void,
   ) => PiRpcPort;
 }
@@ -63,6 +66,8 @@ export class PiDriverBackend implements AgentDriverBackend {
   #stopTask: Promise<void> | null = null;
   #failure: Error | null = null;
   #permissionTasks = new Set<Promise<void>>();
+  #pendingEventBytes = 0;
+  #pendingEventCount = 0;
 
   constructor(payload: DriverStartInput, dependencies: Partial<PiBackendDependencies> = {}) {
     this.#payload = payload;
@@ -86,7 +91,7 @@ export class PiDriverBackend implements AgentDriverBackend {
     this.#home = config.home;
     this.#client = this.#dependencies.createClient(
       config,
-      (record) => this.#receive(context, record),
+      (record, bytes) => this.#receive(context, record, bytes),
       (error) => {
         this.#failure = error;
         if (this.#turn !== null) {
@@ -98,14 +103,25 @@ export class PiDriverBackend implements AgentDriverBackend {
     try {
       const state = await this.#client.request("get_state", {}, signal);
       const model = state["model"];
-      const prefix = `${this.#payload.execution.provider}/`;
-      const expectedModel = this.#payload.execution.model.startsWith(prefix)
-        ? this.#payload.execution.model.slice(prefix.length)
-        : this.#payload.execution.model;
-      if (!isJsonObject(model) || model["provider"] !== "mosoo" || model["id"] !== expectedModel)
+      const expected = config.modelConfiguration;
+      if (
+        !isJsonObject(model) ||
+        model["provider"] !== expected.provider ||
+        model["id"] !== expected.model
+      )
         throw new Error(
           "Pi started with a different model than the frozen execution configuration.",
         );
+      if (expected.thinkingLevel !== undefined) {
+        const available = await this.#client.request("get_available_thinking_levels", {}, signal);
+        if (
+          !Array.isArray(available["levels"]) ||
+          !available["levels"].includes(expected.thinkingLevel)
+        ) {
+          throw new Error("Pi thinkingLevel is not supported by the selected model.");
+        }
+        await this.#client.request("set_thinking_level", { level: expected.thinkingLevel }, signal);
+      }
       await this.#rememberSession(context, state);
     } catch (error) {
       await this.#client.stop();
@@ -133,7 +149,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       cancellation: null,
       cancellationPublished: false,
       terminal: null,
-      dispatched: false,
+      admission: null,
       nativeMessage: null,
     };
     // Attach a rejection handler before dispatch: process failure can arrive
@@ -157,8 +173,8 @@ export class PiDriverBackend implements AgentDriverBackend {
       started = true;
       if (signal?.aborted) abort();
       if (turn.cancelled !== null) throw new DriverTurnCancelledError(turn.cancelled);
-      turn.dispatched = true;
-      const response = await client.request("prompt", { message: input.text });
+      turn.admission = client.request("prompt", { message: input.text });
+      const response = await turn.admission;
       if (response["disposition"] !== "started")
         throw new Error("Pi did not start the admitted prompt.");
       await turn.settled.promise;
@@ -228,7 +244,7 @@ export class PiDriverBackend implements AgentDriverBackend {
             await this.#publisher.pushTerminal(
               context,
               "driver.pi.cancelled",
-              [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems()],
+              [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems(true)],
               {
                 kind: "run.cancelled",
                 runId,
@@ -264,7 +280,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       await this.#publisher.pushTerminal(
         context,
         "driver.pi.failed",
-        [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems()],
+        [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems(true)],
         {
           kind: "run.failed",
           runId,
@@ -290,21 +306,25 @@ export class PiDriverBackend implements AgentDriverBackend {
   async cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void> {
     const turn = this.#turn;
     if (turn === null || turn.terminal === "other") return;
-    if (turn.cancellation !== null) return turn.cancellation;
+    if (turn.cancellation !== null) return;
     turn.cancelled = reason;
     turn.controller.abort(new DriverTurnCancelledError(reason));
     if (turn.terminal === "completed") {
       turn.cancellation = Promise.resolve();
       return;
     }
-    if (!turn.dispatched) {
+    const admission = turn.admission;
+    if (admission === null) {
       turn.settled.resolve();
       turn.cancellation = this.#publishCancellation(context, turn);
-      return turn.cancellation;
+      void turn.cancellation.catch((error: unknown) => turn.settled.reject(error));
+      return;
     }
     const cancel = (async () => {
       try {
         const signal = AbortSignal.timeout(5_000);
+        // Pi cannot abort a prompt until its asynchronous preflight has admitted it.
+        await raceWithAbort(admission, signal);
         await this.#client?.request("abort", {}, signal);
         await raceWithAbort(turn.settled.promise, signal);
       } catch (error) {
@@ -334,7 +354,7 @@ export class PiDriverBackend implements AgentDriverBackend {
         if (failed?.status === "rejected") throw failed.reason;
       },
     );
-    await turn.cancellation;
+    void turn.cancellation.catch((error: unknown) => turn.settled.reject(error));
   }
 
   stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void> {
@@ -360,35 +380,57 @@ export class PiDriverBackend implements AgentDriverBackend {
     return raceWithAbort(this.#stopTask, signal);
   }
 
-  async #receive(context: AgentDriverContext, record: JsonObject): Promise<void> {
-    if (record["type"] === "extension_ui_request") {
-      const task = this.#permission(context, record);
-      this.#permissionTasks.add(task);
-      try {
-        await task;
-      } finally {
-        this.#permissionTasks.delete(task);
-      }
-      return;
+  async #receive(context: AgentDriverContext, record: JsonObject, bytes: number): Promise<void> {
+    if (this.#failure !== null) throw this.#failure;
+    if (
+      this.#pendingEventCount >= MAX_PENDING_EVENTS ||
+      bytes > MAX_PENDING_EVENT_BYTES - this.#pendingEventBytes
+    ) {
+      throw new Error("Pi event queue limit exceeded.");
     }
-    const turn = this.#turn;
-    if (turn === null) return;
-    this.#events = this.#events.then(async () => {
-      if (this.#turn !== turn) return;
-      await this.#push(
-        context,
-        turn.translator
-          .translate(record)
-          .map((event) => Object.assign(event, { runId: turn.runId })),
-      );
-      if (record["type"] === "message_end" && isJsonObject(record["message"])) {
-        if (record["message"]["role"] === "assistant") {
-          turn.nativeMessage = structuredClone(record["message"]);
+    this.#pendingEventCount++;
+    this.#pendingEventBytes += bytes;
+    try {
+      if (record["type"] === "extension_ui_request") {
+        const task = this.#permission(context, record);
+        this.#permissionTasks.add(task);
+        try {
+          await task;
+        } finally {
+          this.#permissionTasks.delete(task);
+        }
+        return;
+      }
+      const turn = this.#turn;
+      if (turn === null) return;
+      this.#events = this.#events.then(async () => {
+        if (this.#failure !== null) throw this.#failure;
+        if (this.#turn !== turn) return;
+        await this.#push(
+          context,
+          turn.translator
+            .translate(record)
+            .map((event) => Object.assign(event, { runId: turn.runId })),
+        );
+        if (record["type"] === "message_end" && isJsonObject(record["message"])) {
+          if (record["message"]["role"] === "assistant") {
+            turn.nativeMessage = structuredClone(record["message"]);
+          }
+        }
+      });
+      // Native settlement must not wait for Host receipts; handleInput drains both.
+      if (record["type"] === "agent_settled") {
+        if (record["aborted"] === true && turn.cancelled === null) {
+          turn.settled.reject(new Error("Pi aborted the native turn."));
+        } else {
+          turn.settled.resolve();
         }
       }
-      if (record["type"] === "agent_settled") turn.settled.resolve();
-    });
-    await this.#events;
+      await this.#events;
+    } finally {
+      this.#pendingEventCount--;
+      this.#pendingEventBytes -= bytes;
+    }
   }
 
   async #permission(context: AgentDriverContext, record: JsonObject): Promise<void> {
@@ -485,14 +527,13 @@ export class PiDriverBackend implements AgentDriverBackend {
     ) {
       throw new Error("Pi transcript does not contain the completed native assistant message.");
     }
-    return createNativeCheckpoint({
+    return createPiNativeCheckpoint({
       root,
       runId: turn.runId,
       nativeRef: { runtimeId: "pi", kind: "pi_session_path", value: this.#pointer },
       signal: turn.controller.signal,
-      write: async (directory) => {
-        await writeFile(join(directory, "session.jsonl"), content, { mode: 0o600 });
-      },
+      home: this.#home,
+      content,
     });
   }
 

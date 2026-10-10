@@ -50,14 +50,8 @@ async function payloadFor(): Promise<DriverStartInput> {
       environment: {
         variables: {
           MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            providers: {
-              mosoo: {
-                api: "openai-completions",
-                baseUrl: "http://127.0.0.1:1/v1",
-                apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                models: [{ id: "pi-test" }],
-              },
-            },
+            baseUrl: "http://127.0.0.1:1/v1",
+            modelProtocol: "openai-chat-completions",
           }),
           MOSOO_PI_PROXY_GRANT: "model-grant",
           [DRIVER_BOOT_PAYLOAD_ENV_NAME]: "private-boot",
@@ -148,6 +142,9 @@ test("launch preserves native model, instruction, permission and active MCP wiri
   const config = await preparePiLaunch(payload);
   expect(config.cwd).toBe(payload.execution.session.cwd);
   expect(
+    config.args.slice(config.args.indexOf("--provider"), config.args.indexOf("--provider") + 2),
+  ).toEqual(["--provider", "deepseek"]);
+  expect(
     config.args.slice(config.args.indexOf("--model"), config.args.indexOf("--model") + 2),
   ).toEqual(["--model", "pi-test"]);
   expect(config.args).toContain("builtin:mcp");
@@ -172,8 +169,38 @@ test("launch preserves native model, instruction, permission and active MCP wiri
   expect(config.env["PATH"]?.startsWith("/runtime/bin:")).toBe(true);
   expect(config.env["HOME"]).toBe(payload.execution.session.homePath);
   expect(config.env["PI_CODING_AGENT_DIR"]).toBe(config.home);
+  for (const variable of ["TMPDIR", "TEMP", "TMP"]) {
+    expect(config.env[variable]).toBe(join(config.home, "tmp"));
+  }
   expect(config.env[DRIVER_BOOT_PAYLOAD_ENV_NAME]).toBeUndefined();
   expect(config.env[DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME]).toBeUndefined();
+});
+
+test.each([
+  "missing URL",
+  "invalid URL",
+  "non-HTTP URL",
+  "missing protocol",
+  "unknown protocol",
+  "prototype protocol",
+  "empty provider",
+  "empty model",
+])("rejects %s before publishing Pi configuration", async (invalid) => {
+  const payload = await payloadFor();
+  const config = JSON.parse(payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"]!);
+  if (invalid === "missing URL") delete config.baseUrl;
+  if (invalid === "invalid URL") config.baseUrl = "not a URL";
+  if (invalid === "non-HTTP URL") config.baseUrl = "file:///tmp/model";
+  if (invalid === "missing protocol") delete config.modelProtocol;
+  if (invalid === "unknown protocol") config.modelProtocol = "unsupported";
+  if (invalid === "prototype protocol") config.modelProtocol = "constructor";
+  if (invalid === "empty provider") payload.execution.provider = "";
+  if (invalid === "empty model") payload.execution.model = "deepseek/";
+  payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"] = JSON.stringify(config);
+  await expect(preparePiLaunch(payload)).rejects.toThrow("Pi");
+  await expect(
+    stat(join(payload.execution.session.homePath, "pi", "models.json")),
+  ).rejects.toThrow();
 });
 
 test("atomic configuration writes replace symlinks without modifying their targets", async () => {
@@ -187,6 +214,7 @@ test("atomic configuration writes replace symlinks without modifying their targe
 
   await preparePiLaunch(payload);
   expect(await readFile(target, "utf8")).toBe("keep");
+  expect(JSON.parse(await readFile(join(home, "models.json"), "utf8"))).toEqual({});
   for (const name of names) {
     expect((await lstat(join(home, name))).isSymbolicLink()).toBe(false);
     expect((await stat(join(home, name))).mode & 0o777).toBe(0o600);

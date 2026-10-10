@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { appendFile, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,12 +17,12 @@ import { fileURLToPath } from "node:url";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
 import { createBufferedSinkLogger } from "../src/observability";
-import type { CredentialId, McpServerId } from "../src/protocol/boot";
+import type { CredentialId, McpServerId, SkillId } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
+import type { RunId } from "../src/protocol/id";
 import { isJsonObject } from "../src/protocol/json";
 import type { JsonObject } from "../src/protocol/json";
 import type { DriverStartInput } from "../src/protocol/start";
-import type { RunId } from "../src/protocol/id";
 import { createNativeCheckpoint, pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { preparePiLaunch, resolvePiSessionPath } from "../src/runtimes/pi/pi-configuration";
 import { PiDriverBackend } from "../src/runtimes/pi/pi-driver-backend";
@@ -114,7 +123,10 @@ function finalMessageText(events: readonly DriverEventInput[]): string {
     .join("");
 }
 
-async function payloadFor(baseUrl: string, api = "openai-completions"): Promise<DriverStartInput> {
+async function payloadFor(
+  baseUrl: string,
+  modelProtocol = "openai-chat-completions",
+): Promise<DriverStartInput> {
   const root = await mkdtemp(join(tmpdir(), "mosoo-pi-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
   return {
@@ -130,14 +142,8 @@ async function payloadFor(baseUrl: string, api = "openai-completions"): Promise<
         variables: {
           MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
           MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            providers: {
-              mosoo: {
-                api,
-                baseUrl,
-                apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                models: [{ id: "pi-test", contextWindow: 32768, maxTokens: 4096 }],
-              },
-            },
+            baseUrl,
+            modelProtocol,
           }),
         },
       },
@@ -151,7 +157,7 @@ async function payloadFor(baseUrl: string, api = "openai-completions"): Promise<
   };
 }
 
-function response(delta: JsonObject, finish = "stop"): Response {
+function response(delta: JsonObject, finish = "stop", usage?: JsonObject): Response {
   const event = (content: JsonObject) => `data: ${JSON.stringify(content)}\n\n`;
   const chunk = (value: JsonObject, stop: string | null) => ({
     id: "pi-mock",
@@ -160,12 +166,280 @@ function response(delta: JsonObject, finish = "stop"): Response {
     model: "pi-test",
     choices: [{ index: 0, delta: value, finish_reason: stop }],
   });
-  return new Response(event(chunk(delta, null)) + event(chunk({}, finish)) + "data: [DONE]\n\n", {
+  const final = { ...chunk({}, finish), ...(usage === undefined ? {} : { usage }) };
+  return new Response(event(chunk(delta, null)) + event(final) + "data: [DONE]\n\n", {
     headers: { "Content-Type": "text/event-stream" },
   });
 }
 
 describe("Pi runtime", () => {
+  test("automatically compacts native context, reports summarizer usage, and continues", async () => {
+    const answer = "history ".repeat(12_500);
+    const requests: JsonObject[] = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const body: unknown = await request.json();
+        if (!isJsonObject(body)) throw new Error("Invalid Pi model request.");
+        requests.push(body);
+        if (requests.length === 1)
+          return response({ role: "assistant", content: answer }, "stop", {
+            prompt_tokens: 100_000,
+            completion_tokens: 25_000,
+            total_tokens: 125_000,
+          });
+        if (requests.length === 2)
+          return response({ role: "assistant", content: "compacted-history-proof" }, "stop", {
+            prompt_tokens: 7,
+            completion_tokens: 2,
+            total_tokens: 9,
+          });
+        return response({ role: "assistant", content: "Continued." }, "stop", {
+          prompt_tokens: 11,
+          completion_tokens: 4,
+          total_tokens: 15,
+        });
+      },
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const run = harness(payload);
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await run.backend.handleInput(
+      run.context,
+      { text: "Remember our earlier task." },
+      DRIVER_TEST_IDS.runId,
+    );
+    expect(requests).toHaveLength(2);
+    expect(run.events.filter((event) => event.kind === "context.compacted")).toHaveLength(1);
+    expect(finalMessageText(run.events)).toBe(answer);
+    expect(run.events.findLast((event) => event.kind === "usage.updated")?.payload).toMatchObject({
+      inputTokens: 100_007,
+      outputTokens: 25_002,
+      totalTokens: 125_009,
+    });
+    expect(run.events.findIndex((event) => event.kind === "context.compacted")).toBeLessThan(
+      run.events.findIndex((event) => event.kind === "run.completed"),
+    );
+    await run.backend.handleInput(
+      run.context,
+      { text: "Continue our task." },
+      DRIVER_TEST_IDS.secondRunId,
+    );
+    expect(requests).toHaveLength(3);
+    expect(JSON.stringify(requests[2]!["messages"])).toContain("compacted-history-proof");
+    expect(finalMessageText(run.events)).toBe("Continued.");
+    expect(run.events.filter((event) => event.kind === "context.compacted")).toHaveLength(1);
+    expect(run.events.findLast((event) => event.kind === "usage.updated")?.payload).toMatchObject({
+      inputTokens: 11,
+      outputTokens: 4,
+      totalTokens: 15,
+    });
+    expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(2);
+  }, 30_000);
+
+  test("loads a materialized skill through the unified catalog and native read tool", async () => {
+    const marker = "skill-file-content-proof";
+    const markdown = `---\nname: proof-skill\ndescription: Read the skill proof.\n---\nReply with ${marker}.\n`;
+    const requests: JsonObject[] = [];
+    let skillMarkdownPath = "";
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const body: unknown = await request.json();
+        if (!isJsonObject(body)) throw new Error("Invalid Pi model request.");
+        requests.push(body);
+        return requests.length === 1
+          ? response(
+              {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "read-skill",
+                    type: "function",
+                    function: {
+                      name: "read",
+                      arguments: JSON.stringify({ path: skillMarkdownPath }),
+                    },
+                  },
+                ],
+              },
+              "tool_calls",
+            )
+          : response({ role: "assistant", content: marker });
+      },
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const mountPath = join(input.execution.session.sharedRootPath, ".mosoo", "skill", "proof");
+    skillMarkdownPath = join(mountPath, "SKILL.md");
+    const skillId = "01J00000000000000000000022" as SkillId;
+    const payload: DriverStartInput = {
+      ...input,
+      execution: {
+        ...input.execution,
+        skillCatalog: [
+          {
+            skillId,
+            skillName: "proof-skill",
+            mountPath,
+            resolutionMode: "explicit",
+            frontmatter: { author: null, description: "Read the skill proof.", version: null },
+          },
+        ],
+      },
+    };
+    const run = harness(payload);
+    const context = {
+      ...run.context,
+      ports: {
+        ...run.context.ports,
+        skill: {
+          materialize: async () => {
+            await mkdir(mountPath, { recursive: true });
+            await writeFile(skillMarkdownPath, markdown);
+            return [
+              {
+                skillId,
+                skillName: "proof-skill",
+                mountPath,
+                skillMarkdownPath,
+                snapshotId: "proof-snapshot",
+              },
+            ];
+          },
+        },
+      },
+    };
+    await run.backend.start(context, AbortSignal.timeout(20_000));
+    await run.backend.handleInput(context, { text: "Use proof-skill." }, DRIVER_TEST_IDS.runId);
+    expect(requests).toHaveLength(2);
+    const initial = JSON.stringify(requests[0]!["messages"]);
+    expect(initial).toContain("Available skills:");
+    expect(initial).toContain("proof-skill: Read the skill proof.");
+    expect(initial).toContain(skillMarkdownPath);
+    expect(initial).not.toContain(marker);
+    const messages = requests[1]!["messages"];
+    if (!Array.isArray(messages)) throw new Error("No model continuation messages.");
+    expect(
+      messages.some(
+        (message) =>
+          isJsonObject(message) && message["role"] === "tool" && message["content"] === markdown,
+      ),
+    ).toBe(true);
+    expect(run.permissions).toEqual(["read"]);
+    expect(finalMessageText(run.events)).toBe(marker);
+  }, 30_000);
+
+  test("reads session file paths and forwards native image results to a vision model", async () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const document = "session-attachment-content";
+    const paths = ["session-files/document.txt", "session-files/pixel.png"];
+    const requests: JsonObject[] = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const body: unknown = await request.json();
+        if (!isJsonObject(body)) throw new Error("Invalid Pi model request.");
+        requests.push(body);
+        return requests.length === 1
+          ? response(
+              {
+                role: "assistant",
+                tool_calls: paths.map((path, index) => ({
+                  index,
+                  id: `read-file-${index}`,
+                  type: "function",
+                  function: { name: "read", arguments: JSON.stringify({ path }) },
+                })),
+              },
+              "tool_calls",
+            )
+          : response({ role: "assistant", content: "Read both session files." });
+      },
+    });
+    cleanup.push(async () => {
+      await server.stop(true);
+    });
+    const input = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
+    const payload: DriverStartInput = {
+      ...input,
+      execution: {
+        ...input.execution,
+        provider: "openai",
+        model: "gpt-5.4",
+        environment: {
+          variables: {
+            MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
+            MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
+              baseUrl: `http://127.0.0.1:${server.port}/v1`,
+              modelProtocol: "openai-chat-completions",
+            }),
+          },
+        },
+      },
+    };
+    await mkdir(join(payload.execution.session.cwd, "session-files"));
+    await writeFile(join(payload.execution.session.cwd, paths[0]!), document, { mode: 0o444 });
+    await writeFile(join(payload.execution.session.cwd, paths[1]!), Buffer.from(png, "base64"), {
+      mode: 0o444,
+    });
+    const run = harness(payload);
+    await run.backend.start(run.context, AbortSignal.timeout(20_000));
+    await run.backend.handleInput(
+      run.context,
+      {
+        text: [
+          "Session files available to this turn:",
+          "These files are persisted for this session and mounted read-only relative to the current working directory. Use the paths exactly as shown.",
+          `- ${paths[0]} (document.txt, ${Buffer.byteLength(document)} bytes)`,
+          `- ${paths[1]} (pixel.png, ${Buffer.from(png, "base64").length} bytes)`,
+          "",
+          "User message:",
+          "Read both files with the read tool.",
+        ].join("\n"),
+      },
+      DRIVER_TEST_IDS.runId,
+    );
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request["model"] === "gpt-5.4")).toBe(true);
+    expect(JSON.stringify(requests[0]!["messages"])).toContain(paths[0]!);
+    expect(JSON.stringify(requests[0]!["messages"])).toContain(paths[1]!);
+    expect(JSON.stringify(requests[0]!["messages"])).not.toContain("data:image/");
+    const messages = requests[1]!["messages"];
+    if (!Array.isArray(messages)) throw new Error("No model continuation messages.");
+    expect(
+      messages.some(
+        (message) =>
+          isJsonObject(message) && message["role"] === "tool" && message["content"] === document,
+      ),
+    ).toBe(true);
+    expect(
+      messages.flatMap((message) =>
+        isJsonObject(message) && Array.isArray(message["content"]) ? message["content"] : [],
+      ),
+    ).toContainEqual({ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } });
+    expect(run.permissions).toEqual(["read", "read"]);
+    expect(
+      run.events.filter(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          isJsonObject(event.payload) &&
+          event.payload["status"] === "completed",
+      ),
+    ).toHaveLength(2);
+    expect(finalMessageText(run.events)).toBe("Read both session files.");
+  }, 30_000);
+
   test("completes empty native Bash output without violating canonical event validation", async () => {
     let calls = 0;
     const server = Bun.serve({

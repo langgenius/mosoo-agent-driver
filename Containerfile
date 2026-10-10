@@ -8,7 +8,7 @@ ARG CLAUDE_AGENT_SDK_VERSION=0.3.295
 ARG BUN_VERSION
 ARG OPENAI_RUNTIME_VERSION=0.152.0
 ARG OPENCODE_VERSION=1.18.25
-ARG PI_VERSION=0.99.2
+ARG PI_VERSION=1.1.0
 
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 RUN test "$(bun --version)" = "$BUN_VERSION"
