@@ -17,8 +17,6 @@ import {
 import type { PiLaunchConfiguration } from "./pi-configuration";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
-const MAX_PENDING_EVENT_BYTES = 32 * 1024 * 1024;
-const MAX_PENDING_EVENTS = 1024;
 
 export interface PiRpcPort {
   request(type: string, fields?: JsonObject, signal?: AbortSignal): Promise<JsonObject>;
@@ -30,20 +28,18 @@ export class PiRpcClient implements PiRpcPort {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #pending = new Map<string, ReturnType<typeof Promise.withResolvers<JsonObject>>>();
   readonly #exit = Promise.withResolvers<void>();
-  readonly #onRecord: (record: JsonObject) => Promise<void>;
+  readonly #onRecord: (record: JsonObject, bytes: number) => Promise<void>;
   readonly #onFailure: (error: Error) => void;
   readonly #tree;
   readonly #bound;
   readonly #watchdog;
   #buffer = "";
-  #pendingEventBytes = 0;
-  #pendingEventCount = 0;
   #stopped = false;
   #stopTask: Promise<void> | null = null;
 
   constructor(
     config: PiLaunchConfiguration,
-    onRecord: (record: JsonObject) => Promise<void>,
+    onRecord: (record: JsonObject, bytes: number) => Promise<void>,
     onFailure: (error: Error) => void,
   ) {
     this.#onRecord = onRecord;
@@ -162,25 +158,9 @@ export class PiRpcClient implements PiRpcPort {
               );
           }
         } else {
-          if (
-            this.#pendingEventCount >= MAX_PENDING_EVENTS ||
-            bytes > MAX_PENDING_EVENT_BYTES - this.#pendingEventBytes
-          ) {
-            this.#fail(new Error("Pi RPC event queue limit exceeded."));
-            return;
-          }
-          this.#pendingEventCount++;
-          this.#pendingEventBytes += bytes;
-          // Count processing and queued events, including independent permission requests.
-          void Promise.resolve()
-            .then(() => this.#onRecord(record))
-            .catch((error: unknown) =>
-              this.#fail(error instanceof Error ? error : new Error("Pi event handling failed.")),
-            )
-            .finally(() => {
-              this.#pendingEventCount--;
-              this.#pendingEventBytes -= bytes;
-            });
+          void this.#onRecord(record, bytes).catch((error: unknown) =>
+            this.#fail(error instanceof Error ? error : new Error("Pi event handling failed.")),
+          );
         }
       } catch (error) {
         this.#fail(error instanceof Error ? error : new Error("Invalid Pi RPC frame."));

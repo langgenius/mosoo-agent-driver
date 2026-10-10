@@ -96,7 +96,7 @@ function textFieldAtJsonSize<Value>(targetBytes: number, create: (text: string) 
   return value;
 }
 
-describe("Driver RPC wire v8", () => {
+describe("Driver RPC wire v7", () => {
   const rpc = driverRuntimeRpcSchemas.driver;
 
   test("omits explicit undefined capability details", () => {

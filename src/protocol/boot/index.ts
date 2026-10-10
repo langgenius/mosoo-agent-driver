@@ -1,14 +1,14 @@
-import { parseTraceparent } from "vestig";
 import { z } from "zod";
+import { parseTraceparent } from "vestig";
 
 import type { DriverInstanceId } from "../id";
-import type { JsonObject } from "../json";
-import { readJsonObject } from "../json";
 import {
   nativeRuntimeRefsEqual,
   parseNativeCheckpoint,
   type NativeCheckpoint,
 } from "../native-checkpoint";
+import type { JsonObject } from "../json";
+import { readJsonObject } from "../json";
 import type { DriverNativeRuntimeRef } from "../runtime";
 import {
   isSupportedDriverRuntime,
@@ -47,9 +47,10 @@ export type {
 } from "./host-snapshot";
 
 /**
- * Version 8 requires generation-bound MCP grants and native Pi provider configuration.
+ * Version 7 binds native continuation to a checkpoint and requires the durable
+ * external-tool-effect RPCs shared by the host and every runtime.
  */
-export const DRIVER_PROTOCOL_VERSION = 8;
+export const DRIVER_PROTOCOL_VERSION = 7;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
 export const DRIVER_CONTROL_PORT_MAX = 59_999;
 export const DRIVER_BOOT_PAYLOAD_ENV_NAME = "MOSOO_DRIVER_BOOT_PAYLOAD";

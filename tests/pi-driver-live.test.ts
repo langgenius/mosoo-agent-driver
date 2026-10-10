@@ -164,21 +164,8 @@ async function fixture(policy: "full_access" | "supervised" = "full_access") {
               variables: {
                 MOSOO_PI_PROXY_GRANT: grant,
                 MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-                  providers: {
-                    mosoo: {
-                      api: "openai-completions",
-                      baseUrl: `http://127.0.0.1:${proxy.port}/v1`,
-                      apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                      compat: {
-                        supportsStore: false,
-                        supportsDeveloperRole: false,
-                        supportsReasoningEffort: false,
-                        maxTokensField: "max_tokens",
-                        thinkingFormat: "openrouter",
-                      },
-                      models: [{ id: modelId, maxTokens: 2048 }],
-                    },
-                  },
+                  baseUrl: `http://127.0.0.1:${proxy.port}/v1`,
+                  modelProtocol: "openai-chat-completions",
                 }),
               },
             },
@@ -403,8 +390,10 @@ liveTest(
       expect(finalText(mcpEvents)).toBe(run.mcpProof);
       expect(run.mcpCalls).toBe(1);
       const config = await readFile(join(run.home, "pi", "models.json"), "utf8");
-      expect(config).not.toContain(key);
-      expect(config).toContain("${MOSOO_PI_PROXY_GRANT}");
+      expect(JSON.parse(config)).toEqual({});
+      const extension = await readFile(join(run.home, "pi", "mosoo-permissions.mjs"), "utf8");
+      expect(extension).not.toContain(key);
+      expect(extension).toContain("${MOSOO_PI_PROXY_GRANT}");
       await resumed.stopDriver(createDriverId(), 15_000);
       console.log("Pi live: authenticated MCP and credential isolation passed");
     } finally {

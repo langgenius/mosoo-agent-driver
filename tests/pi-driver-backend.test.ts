@@ -125,8 +125,7 @@ function finalMessageText(events: readonly DriverEventInput[]): string {
 
 async function payloadFor(
   baseUrl: string,
-  api = "openai-completions",
-  maxTokens = 4096,
+  modelProtocol = "openai-chat-completions",
 ): Promise<DriverStartInput> {
   const root = await mkdtemp(join(tmpdir(), "mosoo-pi-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -143,14 +142,8 @@ async function payloadFor(
         variables: {
           MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
           MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            providers: {
-              mosoo: {
-                api,
-                baseUrl,
-                apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                models: [{ id: "pi-test", contextWindow: 32768, maxTokens }],
-              },
-            },
+            baseUrl,
+            modelProtocol,
           }),
         },
       },
@@ -192,9 +185,9 @@ describe("Pi runtime", () => {
         requests.push(body);
         if (requests.length === 1)
           return response({ role: "assistant", content: answer }, "stop", {
-            prompt_tokens: 100,
+            prompt_tokens: 100_000,
             completion_tokens: 25_000,
-            total_tokens: 25_100,
+            total_tokens: 125_000,
           });
         if (requests.length === 2)
           return response({ role: "assistant", content: "compacted-history-proof" }, "stop", {
@@ -212,7 +205,7 @@ describe("Pi runtime", () => {
     cleanup.push(async () => {
       await server.stop(true);
     });
-    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`, undefined, 25_000);
+    const payload = await payloadFor(`http://127.0.0.1:${server.port}/v1`);
     const run = harness(payload);
     await run.backend.start(run.context, AbortSignal.timeout(20_000));
     await run.backend.handleInput(
@@ -224,9 +217,9 @@ describe("Pi runtime", () => {
     expect(run.events.filter((event) => event.kind === "context.compacted")).toHaveLength(1);
     expect(finalMessageText(run.events)).toBe(answer);
     expect(run.events.findLast((event) => event.kind === "usage.updated")?.payload).toMatchObject({
-      inputTokens: 107,
+      inputTokens: 100_007,
       outputTokens: 25_002,
-      totalTokens: 25_109,
+      totalTokens: 125_009,
     });
     expect(run.events.findIndex((event) => event.kind === "context.compacted")).toBeLessThan(
       run.events.findIndex((event) => event.kind === "run.completed"),
@@ -388,14 +381,8 @@ describe("Pi runtime", () => {
           variables: {
             MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
             MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-              providers: {
-                openai: {
-                  api: "openai-completions",
-                  baseUrl: `http://127.0.0.1:${server.port}/v1`,
-                  apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                  models: [{ id: "gpt-5.4" }],
-                },
-              },
+              baseUrl: `http://127.0.0.1:${server.port}/v1`,
+              modelProtocol: "openai-chat-completions",
             }),
           },
         },

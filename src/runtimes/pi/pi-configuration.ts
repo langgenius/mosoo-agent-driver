@@ -31,11 +31,27 @@ import { readPiSessionHeader } from "./pi-session-validation";
 export const PI_CONFIG_ENV = "MOSOO_PI_CONFIG_CONTENT";
 export const PI_PROXY_GRANT_ENV = "MOSOO_PI_PROXY_GRANT";
 
+const PI_API_BY_PROTOCOL = new Map([
+  ["anthropic-messages", "anthropic-messages"],
+  ["google-gemini", "google-generative-ai"],
+  ["openai-chat-completions", "openai-completions"],
+  ["openai-responses", "openai-responses"],
+]);
+
+const PI_PROVIDER_BY_VENDOR = new Map([
+  ["gemini", "google"],
+  ["kimi", "moonshotai"],
+  ["zhipu", "zai"],
+]);
+
 // The extension asks through RPC before any tool execution. The Driver owns
 // the decision, including cancellation of an outstanding permission request.
-const PERMISSION_EXTENSION = `${PI_MODEL_CONFIGURATION_SOURCE}
+function createPiExtensionSource(
+  configuration: ReturnType<typeof readPiModelConfiguration>,
+): string {
+  return `${PI_MODEL_CONFIGURATION_SOURCE}
 export default function (pi) {
-  configurePiModel(pi);
+  configurePiModel(pi, ${JSON.stringify(configuration)});
   pi.on("tool_call", async (event, ctx) => {
     const allowed = await ctx.ui.confirm("mosoo.tool_permission", JSON.stringify({
       toolCallId: event.toolCallId, toolName: event.toolName, input: event.input
@@ -43,6 +59,7 @@ export default function (pi) {
     if (!allowed) return { block: true, reason: "Tool execution rejected by mosoo." };
   });
 }`;
+}
 
 export interface PiLaunchConfiguration {
   readonly args: string[];
@@ -52,38 +69,40 @@ export interface PiLaunchConfiguration {
   readonly home: string;
 }
 
-export function readPiModelConfiguration(payload: DriverStartInput) {
-  const execution = payload.execution;
+export function readPiModelConfiguration(
+  execution: Pick<
+    DriverStartInput["execution"],
+    "environment" | "model" | "provider" | "providerOptions"
+  >,
+) {
   const variables = execution.environment.variables;
   const content = variables[PI_CONFIG_ENV];
   const config: unknown = content === undefined ? null : JSON.parse(content);
   if (!isJsonObject(config) || !variables[PI_PROXY_GRANT_ENV]) {
     throw new Error("Pi requires a control-plane model configuration and proxy grant.");
   }
-  const providers = config["providers"];
-  if (!isJsonObject(providers) || Object.keys(providers).length !== 1) {
-    throw new Error("Pi requires exactly one configured model provider.");
+  const baseUrl = config["baseUrl"];
+  const protocol = config["modelProtocol"];
+  const api = typeof protocol === "string" ? PI_API_BY_PROTOCOL.get(protocol) : undefined;
+  if (typeof baseUrl !== "string" || !URL.canParse(baseUrl) || api === undefined) {
+    throw new Error("Pi requires a valid model proxy URL and supported model protocol.");
   }
-  const [provider, definition] = Object.entries(providers)[0]!;
+  if (!["http:", "https:"].includes(new URL(baseUrl).protocol)) {
+    throw new Error("Pi model proxy URL must use HTTP or HTTPS.");
+  }
+  const provider = PI_PROVIDER_BY_VENDOR.get(execution.provider) ?? execution.provider;
   const prefix = `${execution.provider}/`;
   const model = execution.model.startsWith(prefix)
     ? execution.model.slice(prefix.length)
     : execution.model;
-  if (
-    provider.trim() === "" ||
-    !isJsonObject(definition) ||
-    !Array.isArray(definition["models"]) ||
-    definition["models"].length !== 1 ||
-    !isJsonObject(definition["models"][0]) ||
-    definition["models"][0]["id"] !== model
-  ) {
-    throw new Error("Pi model configuration does not match the frozen execution model.");
+  if (provider.trim() === "" || model.trim() === "") {
+    throw new Error("Pi requires a provider and model from the execution configuration.");
   }
   const thinkingLevel = execution.providerOptions["thinkingLevel"];
   if (thinkingLevel !== undefined && typeof thinkingLevel !== "string") {
     throw new Error("Pi thinkingLevel must be a string.");
   }
-  return { config, model, provider, thinkingLevel };
+  return { api, baseUrl, model, provider, thinkingLevel };
 }
 
 export function resolvePiSessionPath(home: string, pointer: string): string {
@@ -155,13 +174,16 @@ export async function preparePiLaunch(
   payload: DriverStartInput,
   materializedSkills: readonly AgentDriverMaterializedSkill[] = [],
   signal: AbortSignal = AbortSignal.any([]),
-): Promise<PiLaunchConfiguration> {
+): Promise<
+  PiLaunchConfiguration & { modelConfiguration: ReturnType<typeof readPiModelConfiguration> }
+> {
   signal.throwIfAborted();
   const execution = payload.execution;
   const home = resolve(execution.session.homePath, "pi");
   const sessions = join(home, "sessions");
   const variables = execution.environment.variables;
-  const { config, model, provider } = readPiModelConfiguration(payload);
+  const modelConfiguration = readPiModelConfiguration(execution);
+  const { model, provider } = modelConfiguration;
   await using homeDirectory = await ensureAbsoluteRealDirectory(home, "Pi runtime home", signal);
   await using sessionsDirectory = await ensureRealDirectoryAt(
     homeDirectory,
@@ -180,7 +202,8 @@ export async function preparePiLaunch(
     ["models.json", "settings.json", "mosoo-permissions.mjs", "mcp.json"],
     signal,
   );
-  await writeFileAtomically(homeDirectory, "models.json", JSON.stringify(config), 0o600, signal);
+  // Pi applies models.json overrides after extensions, so discard persisted overrides.
+  await writeFileAtomically(homeDirectory, "models.json", "{}", 0o600, signal);
   await writeFileAtomically(
     homeDirectory,
     "settings.json",
@@ -199,7 +222,7 @@ export async function preparePiLaunch(
   await writeFileAtomically(
     homeDirectory,
     "mosoo-permissions.mjs",
-    PERMISSION_EXTENSION,
+    createPiExtensionSource(modelConfiguration),
     0o600,
     signal,
   );
@@ -318,6 +341,7 @@ export async function preparePiLaunch(
     command: process.env["MOSOO_PI_EXECUTABLE"] ?? "pi",
     cwd: execution.session.cwd,
     home,
+    modelConfiguration,
     env: buildRuntimeChildProcessEnv(execution.environment.paths, {
       ...inherited,
       ...variables,

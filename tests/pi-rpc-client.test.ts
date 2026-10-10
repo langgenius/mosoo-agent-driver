@@ -33,6 +33,7 @@ async function scriptedClient(
                data: "x".repeat(request.bytes ?? 0)
              }) + "\\n");
            }
+           if (request.noResponse) return;
            process.stdout.write(JSON.stringify({
              type: "response", id: request.id, success: true, data: { received: request.type }
            }) + "\\n");
@@ -80,59 +81,35 @@ test("request cancellation covers a blocked native stdin write", async () => {
   }
 }, 10_000);
 
-test.each([
-  { name: "event count", count: 1025, bytes: 0, accepted: 1024 },
-  { name: "event bytes", count: 5, bytes: 8 * 1024 * 1024 - 256, accepted: 4 },
-  {
-    name: "permission count",
-    count: 1025,
-    bytes: 0,
-    accepted: 1024,
-    eventType: "extension_ui_request",
-  },
-])(
-  "bounds $name including active handlers and automatically stops the process",
-  async (input) => {
-    const release = Promise.withResolvers<void>();
-    const failure = Promise.withResolvers<Error>();
-    let calls = 0;
-    let failures = 0;
-    const { client, root } = await scriptedClient(
-      async () => {
-        calls++;
-        await release.promise;
-      },
-      (error) => {
-        failures++;
-        failure.resolve(error);
-      },
-    );
-    const request = client.request("flood", { ...input }, AbortSignal.timeout(5_000));
-    void request.catch(() => {});
+test("event handling failure rejects commands once and automatically stops the process", async () => {
+  const failure = Promise.withResolvers<Error>();
+  let failures = 0;
+  const { client, root } = await scriptedClient(
+    async () => {
+      throw new Error("event handling failed");
+    },
+    (error) => {
+      failures++;
+      failure.resolve(error);
+    },
+  );
+  await expect(client.request("fail", { count: 3, noResponse: true })).rejects.toThrow(
+    "event handling failed",
+  );
+  expect(await failure.promise).toMatchObject({ message: "event handling failed" });
+  const pid = Number(await readFile(join(root, "child.pid"), "utf8"));
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
     try {
-      expect(await raceWithAbort(failure.promise, AbortSignal.timeout(5_000))).toMatchObject({
-        message: "Pi RPC event queue limit exceeded.",
-      });
-      await expect(request).rejects.toThrow("queue limit");
-      expect(calls).toBe(input.accepted);
-      const pid = Number(await readFile(join(root, "child.pid"), "utf8"));
-      const deadline = Date.now() + 3_000;
-      while (Date.now() < deadline) {
-        try {
-          process.kill(pid, 0);
-        } catch {
-          break;
-        }
-        await Bun.sleep(20);
-      }
-      expect(() => process.kill(pid, 0)).toThrow();
-      expect(failures).toBe(1);
-    } finally {
-      release.resolve();
+      process.kill(pid, 0);
+    } catch {
+      break;
     }
-  },
-  10_000,
-);
+    await Bun.sleep(20);
+  }
+  expect(() => process.kill(pid, 0)).toThrow();
+  expect(failures).toBe(1);
+}, 10_000);
 
 test("keeps RPC responses and permissions moving behind a full event backlog", async () => {
   const release = Promise.withResolvers<void>();

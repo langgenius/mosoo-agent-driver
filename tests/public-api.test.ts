@@ -39,7 +39,7 @@ describe("public API", () => {
   test("imports public subpath entries without process side effects", () => {
     const heartbeatReason = "ping" satisfies orpc.DriverHeartbeatInput["reason"];
 
-    expect(boot.DRIVER_PROTOCOL_VERSION).toBe(8);
+    expect(boot.DRIVER_PROTOCOL_VERSION).toBe(7);
     expect(boot.parseNativeCheckpoint).toBe(runtime.parseNativeCheckpoint);
     expect(boot.parseNativeCheckpointManifest).toBe(runtime.parseNativeCheckpointManifest);
     expect(boot.getNativeCheckpointRelativePath).toBe(runtime.getNativeCheckpointRelativePath);

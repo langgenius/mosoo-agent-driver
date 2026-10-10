@@ -207,14 +207,8 @@ test.each(["bash", "mcp"] as const)(
           variables: {
             MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
             MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-              providers: {
-                deepseek: {
-                  api: "openai-completions",
-                  baseUrl: `http://127.0.0.1:${model.port}/v1`,
-                  apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                  models: [{ id: "pi-test", contextWindow: 32768, maxTokens: 4096 }],
-                },
-              },
+              baseUrl: `http://127.0.0.1:${model.port}/v1`,
+              modelProtocol: "openai-chat-completions",
             }),
           },
         },

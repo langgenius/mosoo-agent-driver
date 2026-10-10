@@ -12,6 +12,7 @@ import type { RunId } from "../src/protocol/id";
 import type { JsonObject } from "../src/protocol/json";
 import { parseNativeCheckpoint } from "../src/protocol/native-checkpoint";
 import { readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { readPiModelConfiguration } from "../src/runtimes/pi/pi-configuration";
 import { PiDriverBackend } from "../src/runtimes/pi/pi-driver-backend";
 import { raceWithAbort } from "../src/utils/async";
 import {
@@ -42,14 +43,8 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
         variables: {
           MOSOO_PI_PROXY_GRANT: "test-grant",
           MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            providers: {
-              mosoo: {
-                api: "openai-completions",
-                baseUrl: "http://127.0.0.1:1",
-                apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                models: [{ id: "test-model" }],
-              },
-            },
+            baseUrl: "http://127.0.0.1:1",
+            modelProtocol: "openai-chat-completions",
           }),
         },
       },
@@ -98,16 +93,26 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
     ports: { skill: { materialize: async () => [] } },
   });
   const backend = new PiDriverBackend(payload, {
-    prepare: async () => ({ args: [], command: "unused", cwd: root, env: {}, home }),
+    prepare: async () => ({
+      args: [],
+      command: "unused",
+      cwd: root,
+      env: {},
+      home,
+      modelConfiguration: readPiModelConfiguration(payload.execution),
+    }),
     createClient: (_config, receive, fail) => {
-      onRecord = receive;
+      onRecord = (record) => receive(record, Buffer.byteLength(JSON.stringify(record)));
       onFailure = fail;
       return {
         request: async (type, _fields, signal) => {
           commands.push(type);
           await hooks.request(type, signal);
           if (type === "get_state")
-            return { model: { id: "test-model", provider: "mosoo" }, sessionFile };
+            return {
+              model: { id: "test-model", provider: payload.execution.provider },
+              sessionFile,
+            };
           if (type === "prompt") {
             prompt.resolve();
             return { disposition: "started" };
@@ -185,6 +190,77 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
     },
   };
 }
+
+test.each([
+  { name: "event count", count: 1023, bytes: 0, permission: false },
+  { name: "event bytes", count: 4, bytes: 8 * 1024 * 1024 - 256, permission: false },
+  { name: "permission count", count: 1024, bytes: 0, permission: true },
+])("bounds $name until queued and active handlers finish", async (input) => {
+  const run = await harness(
+    "done",
+    input.permission ? undefined : "Pi event queue limit exceeded.",
+  );
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let permissions = 0;
+  run.hooks.push = async (events) => {
+    if (events.some((event) => event.kind === "message.started")) {
+      entered.resolve();
+      await release.promise;
+    }
+  };
+  run.hooks.permission = async (signal) => {
+    permissions++;
+    await raceWithAbort(release.promise, signal);
+    return "allow_once";
+  };
+  const outcome = run.turn().catch((error: unknown) => error);
+  await run.prompt.promise;
+  const tasks: Promise<void>[] = [];
+  if (!input.permission) {
+    tasks.push(run.emit({ type: "message_start", message: { role: "assistant" } }));
+    await entered.promise;
+  }
+  const record: JsonObject = input.permission
+    ? {
+        type: "extension_ui_request",
+        method: "confirm",
+        title: "mosoo.tool_permission",
+        message: JSON.stringify({ toolCallId: "tool", toolName: "read" }),
+      }
+    : { type: "message_update", assistantMessageEvent: {}, data: "x".repeat(input.bytes) };
+  for (let index = 0; index < input.count; index++) {
+    tasks.push(run.emit({ ...record, id: String(index) }));
+  }
+  const drained = Promise.allSettled(tasks);
+  try {
+    const overflow = await run.emit({ ...record, id: "overflow" }).catch((error: unknown) => error);
+    expect(overflow).toMatchObject({ message: "Pi event queue limit exceeded." });
+    expect(permissions).toBe(input.permission ? input.count : 0);
+    run.fail(overflow as Error);
+    release.resolve();
+    await drained;
+    expect(await outcome).toBe(overflow);
+    expect(run.stopped()).toBe(1);
+    expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+    expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(0);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("releases the event budget after delivery", async () => {
+  const run = await harness();
+  const outcome = run.turn();
+  await run.prompt.promise;
+  for (let batch = 0; batch < 2; batch++) {
+    await Promise.all(Array.from({ length: 1024 }, () => run.emit({ type: "idle" })));
+  }
+  await run.complete();
+  await outcome;
+  expect(run.stopped()).toBe(0);
+  expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+});
 
 test("does not dispatch native work before the run start receipt, including cancellation", async () => {
   const run = await harness();

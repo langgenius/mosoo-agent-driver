@@ -98,7 +98,7 @@ The Contract is the vendor-neutral state and control boundary between the host a
 
 Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qualified ISO 8601 strings with UTC as the default.
 
-The process wire uses Boot protocol **8** and event schema **`2026-10-10`**.
+The process wire uses Boot protocol **7** and event schema **`2026-10-10`**.
 `execution.session.nativeCheckpoint` is required: first use supplies `null` together with a null `nativeResumeRef`; resume supplies a format-1 descriptor containing `runId` and `nativeRef`, with the same reference in both fields.
 A native reference alone cannot authorize recovery.
 Run-scoped commands and terminal RPCs identify their Run explicitly.

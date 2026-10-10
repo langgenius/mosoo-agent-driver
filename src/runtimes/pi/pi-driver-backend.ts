@@ -20,16 +20,14 @@ import {
 } from "../driver-event-publisher";
 import { writeSkillBootstrapArtifacts } from "../skill-bootstrap";
 import { createPiNativeCheckpoint } from "./pi-checkpoint";
-import {
-  preparePiLaunch,
-  readPiModelConfiguration,
-  readPiSessionFile,
-  resolvePiSessionPath,
-} from "./pi-configuration";
+import { preparePiLaunch, readPiSessionFile, resolvePiSessionPath } from "./pi-configuration";
 import { PiEventTranslator } from "./pi-event-translator";
 import { PiRpcClient } from "./pi-rpc-client";
 import type { PiRpcPort } from "./pi-rpc-client";
 import { readPiSessionHeader } from "./pi-session-validation";
+
+const MAX_PENDING_EVENT_BYTES = 32 * 1024 * 1024;
+const MAX_PENDING_EVENTS = 1024;
 
 interface ActiveTurn {
   readonly controller: AbortController;
@@ -49,7 +47,7 @@ export interface PiBackendDependencies {
   readonly prepare: typeof preparePiLaunch;
   readonly createClient: (
     config: Awaited<ReturnType<typeof preparePiLaunch>>,
-    onRecord: (record: JsonObject) => Promise<void>,
+    onRecord: (record: JsonObject, bytes: number) => Promise<void>,
     onFailure: (error: Error) => void,
   ) => PiRpcPort;
 }
@@ -68,6 +66,8 @@ export class PiDriverBackend implements AgentDriverBackend {
   #stopTask: Promise<void> | null = null;
   #failure: Error | null = null;
   #permissionTasks = new Set<Promise<void>>();
+  #pendingEventBytes = 0;
+  #pendingEventCount = 0;
 
   constructor(payload: DriverStartInput, dependencies: Partial<PiBackendDependencies> = {}) {
     this.#payload = payload;
@@ -91,7 +91,7 @@ export class PiDriverBackend implements AgentDriverBackend {
     this.#home = config.home;
     this.#client = this.#dependencies.createClient(
       config,
-      (record) => this.#receive(context, record),
+      (record, bytes) => this.#receive(context, record, bytes),
       (error) => {
         this.#failure = error;
         if (this.#turn !== null) {
@@ -103,7 +103,7 @@ export class PiDriverBackend implements AgentDriverBackend {
     try {
       const state = await this.#client.request("get_state", {}, signal);
       const model = state["model"];
-      const expected = readPiModelConfiguration(this.#payload);
+      const expected = config.modelConfiguration;
       if (
         !isJsonObject(model) ||
         model["provider"] !== expected.provider ||
@@ -380,44 +380,57 @@ export class PiDriverBackend implements AgentDriverBackend {
     return raceWithAbort(this.#stopTask, signal);
   }
 
-  async #receive(context: AgentDriverContext, record: JsonObject): Promise<void> {
+  async #receive(context: AgentDriverContext, record: JsonObject, bytes: number): Promise<void> {
     if (this.#failure !== null) throw this.#failure;
-    if (record["type"] === "extension_ui_request") {
-      const task = this.#permission(context, record);
-      this.#permissionTasks.add(task);
-      try {
-        await task;
-      } finally {
-        this.#permissionTasks.delete(task);
-      }
-      return;
+    if (
+      this.#pendingEventCount >= MAX_PENDING_EVENTS ||
+      bytes > MAX_PENDING_EVENT_BYTES - this.#pendingEventBytes
+    ) {
+      throw new Error("Pi event queue limit exceeded.");
     }
-    const turn = this.#turn;
-    if (turn === null) return;
-    this.#events = this.#events.then(async () => {
-      if (this.#failure !== null) throw this.#failure;
-      if (this.#turn !== turn) return;
-      await this.#push(
-        context,
-        turn.translator
-          .translate(record)
-          .map((event) => Object.assign(event, { runId: turn.runId })),
-      );
-      if (record["type"] === "message_end" && isJsonObject(record["message"])) {
-        if (record["message"]["role"] === "assistant") {
-          turn.nativeMessage = structuredClone(record["message"]);
+    this.#pendingEventCount++;
+    this.#pendingEventBytes += bytes;
+    try {
+      if (record["type"] === "extension_ui_request") {
+        const task = this.#permission(context, record);
+        this.#permissionTasks.add(task);
+        try {
+          await task;
+        } finally {
+          this.#permissionTasks.delete(task);
+        }
+        return;
+      }
+      const turn = this.#turn;
+      if (turn === null) return;
+      this.#events = this.#events.then(async () => {
+        if (this.#failure !== null) throw this.#failure;
+        if (this.#turn !== turn) return;
+        await this.#push(
+          context,
+          turn.translator
+            .translate(record)
+            .map((event) => Object.assign(event, { runId: turn.runId })),
+        );
+        if (record["type"] === "message_end" && isJsonObject(record["message"])) {
+          if (record["message"]["role"] === "assistant") {
+            turn.nativeMessage = structuredClone(record["message"]);
+          }
+        }
+      });
+      // Native settlement must not wait for Host receipts; handleInput drains both.
+      if (record["type"] === "agent_settled") {
+        if (record["aborted"] === true && turn.cancelled === null) {
+          turn.settled.reject(new Error("Pi aborted the native turn."));
+        } else {
+          turn.settled.resolve();
         }
       }
-    });
-    // Native settlement must not wait for Host receipts; handleInput drains both.
-    if (record["type"] === "agent_settled") {
-      if (record["aborted"] === true && turn.cancelled === null) {
-        turn.settled.reject(new Error("Pi aborted the native turn."));
-      } else {
-        turn.settled.resolve();
-      }
+      await this.#events;
+    } finally {
+      this.#pendingEventCount--;
+      this.#pendingEventBytes -= bytes;
     }
-    await this.#events;
   }
 
   async #permission(context: AgentDriverContext, record: JsonObject): Promise<void> {

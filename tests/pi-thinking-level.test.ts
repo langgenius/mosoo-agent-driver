@@ -91,14 +91,8 @@ async function harness(
         variables: {
           MOSOO_PI_PROXY_GRANT: "test-grant",
           MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            providers: {
-              [selection.provider]: {
-                api: "openai-completions",
-                baseUrl: "http://127.0.0.1:1",
-                apiKey: "${MOSOO_PI_PROXY_GRANT}",
-                models: [{ id: selection.model }],
-              },
-            },
+            baseUrl: "http://127.0.0.1:1",
+            modelProtocol: "openai-chat-completions",
           }),
         },
       },
