@@ -115,10 +115,29 @@ nativeTest(
     let controller: DriverArtifactTestController | null = null;
     try {
       await mkdir(workspace);
+      const systemConfig = await readFile("/etc/codex/config.toml", "utf8").catch(
+        (error: unknown) => {
+          if (
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+          )
+            return "";
+          throw error;
+        },
+      );
+      const systemMcpServers =
+        (Bun.TOML.parse(systemConfig) as { mcp_servers?: Record<string, unknown> }).mcp_servers ??
+        {};
+      const disabledMcpServers = Object.keys(systemMcpServers)
+        .map((name) => `-c ${shellQuote(`mcp_servers.${name}.enabled=false`)}`)
+        .join(" ");
       // Isolate this native fixture from host-only experimental config and remote MCP services.
+      // Disabling an absent server creates a table without a transport and Codex rejects it.
       await writeFile(
         executable,
-        `#!/bin/sh\nprintf '%s\\n' "$$" >> ${shellQuote(launches)}\nexec ${shellQuote(node)} ${shellQuote(codexCli)} "$@" -c 'features.context_management=false' -c 'mcp_servers.openaiDeveloperDocs.enabled=false' -c 'mcp_servers.anysearch.enabled=false'\n`,
+        `#!/bin/sh\nprintf '%s\\n' "$$" >> ${shellQuote(launches)}\nexec ${shellQuote(node)} ${shellQuote(codexCli)} "$@" -c 'features.context_management=false' ${disabledMcpServers}\n`,
       );
       await chmod(executable, 0o755);
       const start = (homePath: string, checkpoint: NativeCheckpoint | null) =>
