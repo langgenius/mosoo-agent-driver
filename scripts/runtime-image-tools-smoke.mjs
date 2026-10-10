@@ -2,7 +2,7 @@
 // No credentials, external model, or inference latency are involved.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -193,6 +193,22 @@ for (const runtime of runtimes) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   const prompt = "Use your shell tool to write the requested marker, then finish.";
+  if (runtime === "pi") {
+    await writeFile(
+      join(cwd, "models.json"),
+      JSON.stringify({
+        providers: {
+          local: {
+            api: "openai-completions",
+            baseUrl: `${base}/v1`,
+            apiKey: "fixture",
+            models: [{ id: "fixture" }],
+          },
+        },
+      }),
+    );
+    await chmod(join(cwd, "models.json"), 0o644);
+  }
   const env = {
     ...process.env,
     HOME: cwd,
@@ -204,6 +220,7 @@ for (const runtime of runtimes) {
     OPENAI_API_KEY: "fixture",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     OPENCODE_DISABLE_MODELS_FETCH: "true",
+    PI_CODING_AGENT_DIR: cwd,
     OPENCODE_CONFIG_CONTENT: JSON.stringify({
       $schema: "https://opencode.ai/config.json",
       permission: "allow",
@@ -248,6 +265,23 @@ for (const runtime of runtimes) {
       prompt,
     ],
     opencode: ["opencode", "run", "--model", "local/fixture", prompt],
+    pi: [
+      "pi",
+      "--print",
+      prompt,
+      "--provider",
+      "local",
+      "--model",
+      "fixture",
+      "--no-session",
+      "--no-approve",
+      "--offline",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--tools",
+      "bash",
+    ],
   };
   try {
     const [executable, ...args] = commands[runtime];

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { chmod, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,7 +7,7 @@ import type { AgentDriverPermissionPort } from "../src/host-ports";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
-import { isDriverId } from "../src/protocol/id";
+import { createDriverId, isDriverId, type RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { AgentDriverBackend } from "../src/core/agent-driver-backend";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
@@ -16,7 +16,9 @@ import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatch
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
+import { createOpenAiNativeCheckpoint } from "../src/runtimes/openai/native-checkpoint";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import { pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { settlePromiseWithTimeout } from "../src/utils/async";
@@ -52,6 +54,7 @@ interface CancellationHarnessOptions {
   readonly holdMessageStart?: boolean;
   readonly holdTurnStartAfterItems?: boolean;
   readonly holdToolCompletion?: boolean;
+  readonly nativeResume?: boolean;
   readonly restartResumeError?: string;
   readonly threadId?: string;
   readonly turnId?: string;
@@ -109,7 +112,8 @@ async function createHarness(
   await Bun.write(
     executable,
     `#!/usr/bin/env bun
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 let buffer = "";
 let turnStartCount = 0;
 const launchNumber = existsSync(${JSON.stringify(launchCountFile)})
@@ -188,6 +192,7 @@ const sendToolLifecycle = (turnId, finishTurn, completeItem = true) => {
     }) + "\\n");
   }
   if (finishTurn) {
+    persistCompletedTurn(turnId);
     process.stdout.write(JSON.stringify({
       method: "turn/completed",
       params: {
@@ -267,6 +272,21 @@ const threadStartResult = {
   reasoningEffort: null,
   multiAgentMode: "explicitRequestOnly",
 };
+const persistCompletedTurn = (turnId) => {
+  const sessions = join(process.env.CODEX_SQLITE_HOME, "sessions");
+  mkdirSync(sessions, { recursive: true });
+  const rollout = join(sessions, "startup-fixture.jsonl");
+  if (!existsSync(rollout)) {
+    writeFileSync(rollout, JSON.stringify({
+      type: "session_meta",
+      payload: { id: thread.id, history_mode: "paginated" },
+    }) + "\\n");
+  }
+  appendFileSync(rollout, JSON.stringify({
+    type: "event_msg",
+    payload: { type: "task_complete", turn_id: turnId, error: null },
+  }) + "\\n");
+};
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -290,13 +310,7 @@ process.stdin.on("data", (chunk) => {
         : configuredTurnStartErrorMessage;
     const configuredResumeError = ${JSON.stringify(resumeErrorMessage)};
     const restartResumeError = ${JSON.stringify(cancellationOptions.restartResumeError ?? null)};
-    const resumeError =
-      launchNumber > 1 && restartResumeError !== null
-        ? restartResumeError
-        : request.method === "thread/resume" &&
-            configuredResumeError.startsWith("no rollout found for thread id ")
-          ? "no rollout found for thread id " + request.params.threadId
-          : configuredResumeError;
+    const resumeError = launchNumber > 1 ? restartResumeError : configuredResumeError || null;
     const terminalTurn =
       ["terminal_response", "terminal_then_malformed"].includes(
         toolStartFollowup,
@@ -323,7 +337,9 @@ process.stdin.on("data", (chunk) => {
           ${JSON.stringify(cancellationOptions.failInitialThreadStart ?? false)}
         ? { id: request.id, error: { code: -32600, message: "initial thread start failed" } }
       : request.method === "thread/resume"
-      ? { id: request.id, error: { code: -32600, message: resumeError } }
+      ? resumeError === null
+        ? { id: request.id, result: threadStartResult }
+        : { id: request.id, error: { code: -32600, message: resumeError } }
       : request.method === "thread/start"
         ? { id: request.id, result: threadStartResult }
         : request.method === "turn/start" && turnStartErrorMessage !== null
@@ -361,6 +377,9 @@ process.stdin.on("data", (chunk) => {
       if (request.method === "turn/start" && duplicateRequestPhase === "turn_start") {
         sendDuplicateRequest(turnId);
         return;
+      }
+      if (request.method === "turn/start" && response?.result?.turn?.status === "completed") {
+        persistCompletedTurn(turnId);
       }
       if (
         request.method === "turn/start" &&
@@ -444,7 +463,7 @@ process.stdin.on("data", (chunk) => {
   await chmod(executable, 0o755);
   process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"] = executable;
 
-  const payload = createDriverStartInputFromBootPayload({
+  let payload = createDriverStartInputFromBootPayload({
     ...driverBootPayload,
     execution: {
       ...driverBootPayload.execution,
@@ -464,15 +483,48 @@ process.stdin.on("data", (chunk) => {
           sessionOrganizationPath: directory,
         },
         cwd: directory,
-        nativeResumeRef: {
-          kind: "openai_thread_id",
-          runtimeId: "openai-runtime",
-          value: "stale-thread",
-        },
+        nativeResumeRef: null,
+        nativeCheckpoint: null,
         recoveryMessages,
       },
     },
   });
+  if (cancellationOptions.nativeResume === true) {
+    const threadId = cancellationOptions.threadId ?? "fresh-thread";
+    const sessions = join(payload.execution.session.homePath, "sessions");
+    await mkdir(sessions, { recursive: true });
+    await Bun.write(
+      join(sessions, "startup-fixture.jsonl"),
+      [
+        { type: "session_meta", payload: { id: threadId, history_mode: "paginated" } },
+        {
+          type: "event_msg",
+          payload: { type: "task_complete", turn_id: "restored-turn", error: null },
+        },
+      ]
+        .map((record) => JSON.stringify(record) + "\n")
+        .join(""),
+    );
+    const checkpoint = await createOpenAiNativeCheckpoint({
+      root: await pinNativeCheckpointRoot(payload.execution.session.cwd),
+      payload,
+      runId: createDriverId() as RunId,
+      threadId,
+      turnId: "restored-turn",
+      signal: new AbortController().signal,
+    });
+    payload = {
+      ...payload,
+      execution: {
+        ...payload.execution,
+        session: {
+          ...payload.execution.session,
+          nativeResumeRef: checkpoint.nativeRef,
+          nativeCheckpoint: checkpoint,
+        },
+      },
+    };
+  }
   const events: DriverEventInput[] = [];
   const cmaEventTypes: string[] = [];
   const cmaStore =
@@ -628,7 +680,7 @@ process.stdin.on("data", (chunk) => {
 
 function createCancellationHarness(options: CancellationHarnessOptions) {
   return createHarness(
-    "no rollout found for thread id stale-thread",
+    "",
     [],
     false,
     async (_input, signal) => {
@@ -653,14 +705,17 @@ function createCancellationHarness(options: CancellationHarnessOptions) {
 describe("OpenAI app-server startup", () => {
   test("keeps transient auth through fake app-server native-resume startup", async () => {
     const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
+      "",
       [],
       false,
       async () => "allow_once",
       false,
       "full_access",
       false,
-      { environmentVariables: { OPENAI_API_KEY: "resume-startup-key" } },
+      {
+        environmentVariables: { OPENAI_API_KEY: "resume-startup-key" },
+        nativeResume: true,
+      },
     );
     try {
       await harness.backend.start(harness.context, new AbortController().signal);
@@ -684,117 +739,134 @@ describe("OpenAI app-server startup", () => {
     }
   });
 
-  test("maps supervised permissions to untrusted thread and turn policies", async () => {
-    const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
-      [],
-      true,
+  test.each([false, true])(
+    "maps supervised permissions to untrusted policies (resume=%s)",
+    async (nativeResume) => {
+      const harness = await createHarness(
+        "",
+        [],
+        true,
+        async () => "allow_once",
+        false,
+        "supervised",
+        false,
+        { nativeResume },
+      );
+      let stopped = false;
+
+      try {
+        await harness.backend.start(harness.context, new AbortController().signal);
+        const input = harness.backend.handleInput(
+          harness.context,
+          { text: "hello" },
+          DRIVER_TEST_IDS.runId,
+        );
+        void input.catch(() => {});
+        await harness.turnTimingEntered;
+
+        const requests = (await readFile(harness.requestLog, "utf8"))
+          .trim()
+          .split("\n")
+          .map(
+            (line) =>
+              JSON.parse(line) as {
+                method: string;
+                params?: {
+                  approvalPolicy?: string;
+                  cwd?: string;
+                  excludeTurns?: boolean;
+                  historyMode?: string;
+                  input?: unknown;
+                  model?: string;
+                  threadId?: string;
+                };
+              },
+          );
+        expect(
+          requests
+            .filter((request) =>
+              ["thread/resume", "thread/start", "turn/start"].includes(request.method),
+            )
+            .map((request) => request.params?.approvalPolicy),
+        ).toEqual(["untrusted", "untrusted"]);
+        if (nativeResume) {
+          expect(
+            requests.find((request) => request.method === "thread/resume")?.params,
+          ).toMatchObject({
+            excludeTurns: true,
+          });
+          expect(
+            requests.find((request) => request.method === "thread/resume")?.params,
+          ).not.toHaveProperty("historyMode");
+          expect(requests.some((request) => request.method === "thread/start")).toBe(false);
+        } else {
+          expect(
+            requests.find((request) => request.method === "thread/start")?.params,
+          ).toMatchObject({
+            historyMode: "paginated",
+          });
+          expect(
+            requests.find((request) => request.method === "thread/start")?.params,
+          ).not.toHaveProperty("excludeTurns");
+          expect(requests.some((request) => request.method === "thread/resume")).toBe(false);
+        }
+        expect(requests.find((request) => request.method === "turn/start")?.params).toEqual({
+          approvalPolicy: "untrusted",
+          cwd: harness.payload.execution.session.cwd,
+          input: [{ text: "hello", text_elements: [], type: "text" }],
+          model: harness.payload.execution.model,
+          threadId: "fresh-thread",
+        });
+
+        const stop = harness.backend.stop(
+          harness.context,
+          "test complete",
+          new AbortController().signal,
+        );
+        harness.releaseTurnTiming();
+        await stop;
+        stopped = true;
+        await expect(input).rejects.toThrow("test complete");
+      } finally {
+        harness.releaseTurnTiming();
+        if (!stopped) {
+          await harness.backend.stop(
+            harness.context,
+            "test complete",
+            new AbortController().signal,
+          );
+        }
+      }
+    },
+  );
+
+  test("rejects missing native rollouts without injecting the platform transcript", async () => {
+    const { backend, context, events, requestLog } = await createHarness(
+      "no rollout found for thread id fresh-thread",
+      undefined,
+      false,
       async () => "allow_once",
       false,
-      "supervised",
+      "full_access",
+      false,
+      { nativeResume: true },
     );
-    let stopped = false;
 
     try {
-      await harness.backend.start(harness.context, new AbortController().signal);
-      const input = harness.backend.handleInput(
-        harness.context,
-        { text: "hello" },
-        DRIVER_TEST_IDS.runId,
+      await expect(backend.start(context, new AbortController().signal)).rejects.toThrow(
+        "no rollout found for thread id fresh-thread",
       );
-      void input.catch(() => {});
-      await harness.turnTimingEntered;
-
-      const requests = (await readFile(harness.requestLog, "utf8"))
+      expect(events).toEqual([]);
+      const requests = (await readFile(requestLog, "utf8"))
         .trim()
         .split("\n")
-        .map(
-          (line) =>
-            JSON.parse(line) as {
-              method: string;
-              params?: {
-                approvalPolicy?: string;
-                cwd?: string;
-                excludeTurns?: boolean;
-                historyMode?: string;
-                input?: unknown;
-                model?: string;
-                threadId?: string;
-              };
-            },
-        );
-      expect(
-        requests
-          .filter((request) =>
-            ["thread/resume", "thread/start", "turn/start"].includes(request.method),
-          )
-          .map((request) => request.params?.approvalPolicy),
-      ).toEqual(["untrusted", "untrusted", "untrusted"]);
-      expect(requests.find((request) => request.method === "thread/resume")?.params).toMatchObject({
-        excludeTurns: true,
-      });
-      expect(
-        requests.find((request) => request.method === "thread/resume")?.params,
-      ).not.toHaveProperty("historyMode");
-      expect(requests.find((request) => request.method === "thread/start")?.params).toMatchObject({
-        historyMode: "paginated",
-      });
-      expect(
-        requests.find((request) => request.method === "thread/start")?.params,
-      ).not.toHaveProperty("excludeTurns");
-      expect(requests.find((request) => request.method === "turn/start")?.params).toEqual({
-        approvalPolicy: "untrusted",
-        cwd: harness.payload.execution.session.cwd,
-        input: [{ text: "hello", text_elements: [], type: "text" }],
-        model: harness.payload.execution.model,
-        threadId: "fresh-thread",
-      });
-
-      const stop = harness.backend.stop(
-        harness.context,
-        "test complete",
-        new AbortController().signal,
-      );
-      harness.releaseTurnTiming();
-      await stop;
-      stopped = true;
-      await expect(input).rejects.toThrow("test complete");
+        .map((line) => JSON.parse(line) as { method: string });
+      expect(requests.some((request) => request.method === "thread/resume")).toBe(true);
+      expect(requests.some((request) => request.method === "thread/start")).toBe(false);
+      expect(requests.some((request) => request.method === "thread/inject_items")).toBe(false);
     } finally {
-      harness.releaseTurnTiming();
-      if (!stopped) {
-        await harness.backend.stop(harness.context, "test complete", new AbortController().signal);
-      }
+      await backend.stop(context, "test complete", new AbortController().signal);
     }
-  });
-
-  test("injects platform transcript without publishing an unmaterialized thread", async () => {
-    const { backend, context, events, requestLog } = await createHarness(
-      "no rollout found for thread id stale-thread",
-    );
-
-    await backend.start(context, new AbortController().signal);
-
-    expect(events.some((event) => event.kind === "runtime.resume.updated")).toBe(false);
-    const requests = (await readFile(requestLog, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { method: string; params?: unknown });
-    expect(requests.find((request) => request.method === "thread/inject_items")?.params).toEqual({
-      items: [
-        {
-          content: [{ text: "Earlier question", type: "input_text" }],
-          role: "user",
-          type: "message",
-        },
-        {
-          content: [{ text: "Earlier answer", type: "output_text" }],
-          role: "assistant",
-          type: "message",
-        },
-      ],
-      threadId: "fresh-thread",
-    });
-    await backend.stop(context, "test complete", new AbortController().signal);
   });
 
   test("stop cleans background terminals even when the thread has no active turn", async () => {
@@ -915,14 +987,31 @@ describe("OpenAI app-server startup", () => {
     }
   });
 
-  test("does not replace the thread for other resume failures", async () => {
-    const { backend, context, events } = await createHarness("Unauthorized");
+  test("fails unauthorized native resume without replacing or injecting history", async () => {
+    const resumeError = "Unauthorized";
+    const { backend, context, events, requestLog } = await createHarness(
+      resumeError,
+      undefined,
+      false,
+      async () => "allow_once",
+      false,
+      "full_access",
+      false,
+      { nativeResume: true },
+    );
 
     try {
       await expect(backend.start(context, new AbortController().signal)).rejects.toThrow(
-        "Unauthorized",
+        resumeError,
       );
       expect(events).toEqual([]);
+      const requests = (await readFile(requestLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { method: string });
+      expect(requests.some((request) => request.method === "thread/resume")).toBe(true);
+      expect(requests.some((request) => request.method === "thread/start")).toBe(false);
+      expect(requests.some((request) => request.method === "thread/inject_items")).toBe(false);
     } finally {
       await backend.stop(context, "test complete", new AbortController().signal);
     }
@@ -998,7 +1087,7 @@ describe("OpenAI app-server startup", () => {
   test.each(["cancel", "stop"] as const)(
     "%s closes a turn whose start response is waiting on event delivery",
     async (operation) => {
-      const harness = await createHarness("no rollout found for thread id stale-thread", [], true);
+      const harness = await createHarness("", [], true);
       let stopped = false;
 
       try {
@@ -1048,7 +1137,7 @@ describe("OpenAI app-server startup", () => {
     "%s is bounded while the turn start response is pending",
     async (operation) => {
       const harness = await createHarness(
-        "no rollout found for thread id stale-thread",
+        "",
         [],
         false,
         async () => "allow_once",
@@ -1090,7 +1179,7 @@ describe("OpenAI app-server startup", () => {
         await expect(
           settlePromiseWithTimeout(lifecycle, {
             label: `${operation} during turn/start`,
-            timeoutMs: 250,
+            timeoutMs: ACTIVE_TURN_CANCEL_GRACE_MS,
           }),
         ).resolves.toMatchObject({ status: "completed" });
 
@@ -1122,9 +1211,12 @@ describe("OpenAI app-server startup", () => {
                 { text: "second" },
                 DRIVER_TEST_IDS.secondRunId,
               ),
-              { label: "turn after registration-window cancellation", timeoutMs: 250 },
+              { label: "turn after registration-window cancellation", timeoutMs: 1_000 },
             ),
-          ).resolves.toMatchObject({ status: "completed" });
+          ).resolves.toMatchObject({
+            status: "failed",
+            error: { message: expect.stringContaining("rollout at /tmp/rollout.jsonl is empty") },
+          });
           expect(
             harness.events
               .filter(
@@ -1133,7 +1225,13 @@ describe("OpenAI app-server startup", () => {
                   ["run.cancelled", "run.completed", "run.failed"].includes(event.kind),
               )
               .map((event) => event.kind),
-          ).toEqual(["run.completed"]);
+          ).toEqual(["run.failed"]);
+          const requests = (await readFile(harness.requestLog, "utf8"))
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line) as { method: string });
+          expect(requests.filter((request) => request.method === "thread/start")).toHaveLength(1);
+          expect(requests.some((request) => request.method === "thread/inject_items")).toBe(false);
         }
       } finally {
         await harness.releaseTurnStartResponse();
@@ -1337,7 +1435,7 @@ describe("OpenAI app-server startup", () => {
 
   test("dispatcher cancellation closes a pending turn start and recovers on a new client", async () => {
     const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
+      "",
       [],
       false,
       async () => "allow_once",
@@ -1489,7 +1587,7 @@ describe("OpenAI app-server startup", () => {
         requests
           .filter((request) => request.method === "thread/resume")
           .map((request) => request.params?.threadId),
-      ).toEqual(["stale-thread", "fresh-thread"]);
+      ).toEqual(["fresh-thread"]);
       expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
     } finally {
       await harness.releaseTurnStartResponse();
@@ -1609,7 +1707,7 @@ describe("OpenAI app-server startup", () => {
 
   test("fails a turn when the provider exits before turn/start responds", async () => {
     const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
+      "",
       [],
       false,
       async () => "allow_once",
@@ -2116,6 +2214,49 @@ describe("OpenAI app-server startup", () => {
     10_000,
   );
 
+  test("stop retries checkpoint cleanup after completion ACK without another terminal", async () => {
+    const harness = await createCancellationHarness({
+      terminalNotificationBeforeTurnStartResponse: true,
+    });
+    const directory = join(harness.payload.execution.session.cwd, ".state", "native-checkpoints");
+    const retained = `${directory}.retained`;
+    const sink = harness.context.ports.eventSink;
+    const pushEvents = sink.pushEvents.bind(sink);
+    const push = spyOn(sink, "pushEvents").mockImplementation(async (input) => {
+      const receipt = await pushEvents(input);
+      if (input.events.some((event) => event.kind === "run.completed")) {
+        await rename(directory, retained);
+        await writeFile(directory, "blocks checkpoint cleanup");
+      }
+      return receipt;
+    });
+
+    try {
+      await harness.backend.start(harness.context, AbortSignal.timeout(2_000));
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow("Native checkpoint cleanup failed after terminal acknowledgement.");
+      await expect(
+        harness.backend.stop(harness.context, "stop", AbortSignal.timeout(2_000)),
+      ).rejects.toMatchObject({ name: "DriverNativeCheckpointCleanupError" });
+      const providerPid = await readFirstLaunchPid(harness.processLog);
+      expect(() => process.kill(providerPid, 0)).toThrow();
+      await rm(directory);
+      await rename(retained, directory);
+      await harness.backend.stop(harness.context, "retry cleanup", AbortSignal.timeout(2_000));
+      expect(
+        harness.events
+          .filter((event) => ["run.failed", "run.completed", "run.cancelled"].includes(event.kind))
+          .map((event) => event.kind),
+      ).toEqual(["run.completed"]);
+    } finally {
+      push.mockRestore();
+      await harness.backend
+        .stop(harness.context, "test complete", AbortSignal.timeout(2_000))
+        .catch(() => {});
+    }
+  });
+
   test("retains a client whose process stop fails so shutdown can retry", async () => {
     const harness = await createCancellationHarness({});
     let stopped = false;
@@ -2234,7 +2375,7 @@ describe("OpenAI app-server startup", () => {
     const permissionAborted = Promise.withResolvers<void>();
     const permissionGate = Promise.withResolvers<void>();
     const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
+      "",
       [],
       false,
       async (_input, signal) => {
@@ -2284,7 +2425,7 @@ describe("OpenAI app-server startup", () => {
     const permissionStarted = Promise.withResolvers<void>();
     const permissionGate = Promise.withResolvers<void>();
     const harness = await createHarness(
-      "no rollout found for thread id stale-thread",
+      "",
       [],
       false,
       async () => {

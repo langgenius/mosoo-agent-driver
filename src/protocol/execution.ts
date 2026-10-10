@@ -10,6 +10,7 @@ import type {
   DriverSkillCatalogEntry,
 } from "./boot";
 import type { RunId, SessionId } from "./id";
+import type { NativeCheckpoint } from "./native-checkpoint";
 
 export interface DriverExecutionRunInput {
   readonly runId: RunId | null;
@@ -22,6 +23,7 @@ export interface DriverExecutionSessionInput {
   readonly cwd: string;
   readonly homePath: string;
   readonly mcpServers: DriverBootMcpServer[];
+  readonly nativeCheckpoint: NativeCheckpoint | null;
   readonly nativeResumeRef: DriverNativeRuntimeRef | null;
   readonly recoveryMessages: DriverRecoveryMessage[];
   readonly sharedRootPath: string;
@@ -61,6 +63,7 @@ export function createDriverExecutionInputFromBootExecution(
       cwd: execution.session.cwd,
       homePath: execution.session.context.homePath,
       mcpServers: execution.session.mcpServers,
+      nativeCheckpoint: execution.session.nativeCheckpoint,
       nativeResumeRef: execution.session.nativeResumeRef,
       recoveryMessages: execution.session.recoveryMessages,
       sharedRootPath: execution.session.context.sessionOrganizationPath,

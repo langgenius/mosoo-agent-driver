@@ -12,6 +12,59 @@ import {
 } from "./driver-runtime-boundary-fixtures";
 
 describe("AgentDriverKernelCore", () => {
+  test("completes an idle instance without creating a run success", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+
+    await kernel.start(bootPayload);
+    await expect(kernel.completeRun()).resolves.toBeUndefined();
+    await expect(kernel.stop("idle instance complete")).resolves.toBeUndefined();
+
+    expect(await Array.fromAsync(kernel.events())).toEqual([]);
+  });
+
+  test("finalizes an acknowledged run without duplicating its checkpoint terminal", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+
+    await kernel.start(bootPayload);
+    await kernel.dispatch({
+      commandId: "complete-before-instance",
+      input: { text: "complete" },
+      kind: "input.start",
+      requestId: "complete-before-instance-request",
+      runId: DRIVER_TEST_IDS.runId,
+    });
+    await expect(kernel.completeRun()).resolves.toBeUndefined();
+    await expect(kernel.completeRun()).resolves.toBeUndefined();
+    await kernel.stop("completed instance");
+
+    expect(await Array.fromAsync(kernel.events())).toEqual([
+      expect.objectContaining({
+        kind: "run.completed",
+        payload: expect.objectContaining({ checkpoint: expect.any(Object) }),
+        runId: DRIVER_TEST_IDS.runId,
+      }),
+    ]);
+  });
+
+  test("rejects instance completion while a run has no acknowledged terminal", async () => {
+    const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
+    const ticket = kernel.beginRun(DRIVER_TEST_IDS.runId);
+
+    await expect(kernel.completeRun()).rejects.toThrow("acknowledged run terminal");
+    kernel.releaseRun(ticket, "driver_failing");
+    await kernel.failRun({
+      code: "driver.runtime_failed",
+      details: {},
+      message: "run never completed",
+      retryable: false,
+    });
+    await kernel.stop("failed instance");
+
+    expect(await Array.fromAsync(kernel.events())).toEqual([
+      expect.objectContaining({ kind: "run.failed", runId: DRIVER_TEST_IDS.runId }),
+    ]);
+  });
+
   test("commits a custom event sink terminal through the kernel lifecycle owner", async () => {
     const backend = createBackend();
     const delivered: DriverEventInput[] = [];

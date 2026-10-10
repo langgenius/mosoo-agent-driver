@@ -82,6 +82,12 @@ interface ActiveMcpAdmission {
   settle(): void;
 }
 
+interface PendingInput {
+  readonly command: Extract<RuntimeCommand, { kind: "input.start" }>;
+  cancellation: { readonly reason: string; readonly source: DriverTurnCancellationSource } | null;
+  task: Promise<void>;
+}
+
 interface RunTerminalEvent {
   readonly kind: "run.cancelled" | "run.completed" | "run.failed";
   readonly runId: RunId;
@@ -174,6 +180,7 @@ export class DriverCommandDispatcher {
   #activeRunGeneration = 0;
   #activeRunSettleTask: Promise<void> | null = null;
   #activeRunTask: Promise<void> | null = null;
+  #pendingInput: PendingInput | null = null;
   #shutdownCompleted = false;
   #shutdownPermissionTask: Promise<void> | null = null;
 
@@ -584,8 +591,15 @@ export class DriverCommandDispatcher {
       return;
     }
 
+    const cancelledPendingInput =
+      command.kind === "turn.cancel" &&
+      this.#pendingInput?.command.runId === command.runId &&
+      this.#cancelPendingInput(command.reason ?? "turn.cancelled", "turn.cancel");
+    if (command.kind === "session.stop") {
+      this.#cancelPendingInput(command.reason, "session.stop");
+    }
     const eagerCancellation =
-      command.kind === "turn.cancel"
+      command.kind === "turn.cancel" && !cancelledPendingInput
         ? this.#cancelActiveWork(
             runtimeContext,
             socket,
@@ -607,41 +621,12 @@ export class DriverCommandDispatcher {
       }
 
       if (command.kind === "input.start") {
-        this.#activeRunGeneration += 1;
-        this.#runtimeState.beginRun(this.#activeRunGeneration);
-        const runId = parseRunId(command.runId);
-        const ticket = socket.beginRun(runId);
-        this.#activeRunTicket = ticket;
-        let activeRunTask!: Promise<void>;
-        activeRunTask = this.#runInputTask(
-          runtimeContext,
-          socket,
-          command,
-          this.#activeRunGeneration,
-          ticket,
-        )
-          .catch(async (error: unknown) => {
-            this.#activeWorkFailure ??= { error };
-            runtimeContext.logger.error("driver.runtime.input-task.failed", error, {
-              commandId: command.commandId,
-              driverInstanceId: this.#driverInstanceId,
-            });
-            await this.#shutdown(socket, "driver.input_task_failed").catch(
-              (shutdownError: unknown) => {
-                runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
-                  commandId: command.commandId,
-                });
-              },
-            );
-          })
-          .finally(() => {
-            if (this.#activeRunTask === activeRunTask) {
-              this.#activeRunTask = null;
-              this.#activeRunSettleTask = null;
-              this.#activeRunTicket = null;
-            }
-          });
-        this.#activeRunTask = activeRunTask;
+        this.#assertCommandRunOwnership(socket, command);
+        if (this.#activeRunTask === null) {
+          this.#startInput(runtimeContext, socket, command);
+        } else {
+          this.#queueInput(runtimeContext, socket, command);
+        }
         return;
       }
 
@@ -717,6 +702,22 @@ export class DriverCommandDispatcher {
     const currentRunId = socket.currentRunId();
 
     if (command.kind === "input.start") {
+      if (replay === "active" && this.#pendingInput?.command.commandId === command.commandId) {
+        return;
+      }
+      if (replay === null && this.#pendingInput !== null) {
+        throw new Error(`Input command ${command.commandId} cannot replace the pending run.`);
+      }
+      if (
+        replay === null &&
+        this.#activeRunTask !== null &&
+        currentRunId !== runId &&
+        !this.#runtimeState.isShuttingDown() &&
+        (socket.runSnapshot()?.terminal != null ||
+          (currentRunId === null && this.#runtimeState.status() === "ready"))
+      ) {
+        return;
+      }
       if (
         replay === "terminal"
           ? currentRunId !== null && currentRunId !== runId
@@ -732,6 +733,10 @@ export class DriverCommandDispatcher {
       return;
     }
 
+    if (command.kind === "turn.cancel" && this.#pendingInput?.command.runId === runId) {
+      return;
+    }
+
     if (currentRunId !== runId && !(replay === "terminal" && currentRunId === null)) {
       throw new Error(`Command ${command.commandId} does not target the active run.`);
     }
@@ -743,11 +748,25 @@ export class DriverCommandDispatcher {
     }
   }
 
+  #cancelPendingInput(reason: string, source: DriverTurnCancellationSource): boolean {
+    const pending = this.#pendingInput;
+    if (pending === null) {
+      return false;
+    }
+    if (pending.cancellation === null || source !== "turn.cancel") {
+      pending.cancellation = { reason, source };
+    }
+    return true;
+  }
+
   #abortActiveWork(
     socket: DriverRuntimeIo,
     reason: string,
     source: DriverTurnCancellationSource,
   ): "already_claimed" | "claimed" | "idle" | "terminal_selected" {
+    if (source !== "turn.cancel") {
+      this.#cancelPendingInput(reason, source);
+    }
     const ticket = this.#activeRunTicket;
     const cancellation =
       ticket === null || socket.runSnapshot(ticket.runId) === null
@@ -787,7 +806,7 @@ export class DriverCommandDispatcher {
       }
     }
 
-    const tasks = [this.#joinActiveWork()];
+    const tasks = [this.#joinActiveWork(source !== "turn.cancel")];
     if (source !== "turn.cancel" || cancellation !== "terminal_selected") {
       tasks.push(
         promiseWithTimeout(this.#backend.cancelActiveTurn(runtimeContext, reason), {
@@ -810,7 +829,7 @@ export class DriverCommandDispatcher {
     }
   }
 
-  async #joinActiveWork(): Promise<void> {
+  async #joinActiveWork(includePendingInput = true): Promise<void> {
     let permissionFailure: { error: unknown } | null = null;
 
     if (this.#shutdownPermissionTask !== null) {
@@ -828,6 +847,9 @@ export class DriverCommandDispatcher {
     const activeRunSettleTask = this.#settleActiveRun();
     if (activeRunSettleTask !== null) {
       tasks.push(activeRunSettleTask);
+    }
+    if (includePendingInput && this.#pendingInput !== null) {
+      tasks.push(this.#pendingInput.task);
     }
 
     if (this.#activeMcpCommands.size > 0) {
@@ -1265,14 +1287,137 @@ export class DriverCommandDispatcher {
     });
   }
 
+  #queueInput(
+    runtimeContext: AgentDriverContext,
+    socket: DriverRuntimeIo,
+    command: Extract<RuntimeCommand, { kind: "input.start" }>,
+  ): void {
+    const pending: PendingInput = { command, cancellation: null, task: Promise.resolve() };
+    this.#pendingInput = pending;
+    pending.task = this.#waitForInputHandoff(runtimeContext, socket, pending)
+      .catch(async (error: unknown) => {
+        this.#runtimeState.enter("failed");
+        try {
+          await this.#failCommand(runtimeContext, socket, command, error);
+        } finally {
+          await this.#failInputTask(runtimeContext, socket, command, error);
+        }
+      })
+      .finally(() => {
+        if (this.#pendingInput === pending) {
+          this.#pendingInput = null;
+        }
+      });
+    void pending.task.catch(() => {});
+  }
+
+  async #waitForInputHandoff(
+    runtimeContext: AgentDriverContext,
+    socket: DriverRuntimeIo,
+    pending: PendingInput,
+  ): Promise<void> {
+    await this.#settleActiveRun();
+    this.#shutdownSignal.throwIfAborted();
+    if (this.#activeWorkFenceFailure !== null || this.#activeWorkFailure !== null) {
+      throw (this.#activeWorkFenceFailure ?? this.#activeWorkFailure)!.error;
+    }
+    if (
+      this.#pendingInput !== pending ||
+      this.#activeRunTask !== null ||
+      socket.currentRunId() !== null
+    ) {
+      throw new Error("Driver input handoff lost run ownership.");
+    }
+    const cancellation = pending.cancellation;
+    const status = this.#runtimeState.status();
+    if (status !== "ready" && !(status === "stopping" && cancellation?.source === "session.stop")) {
+      throw new Error(`Driver is not ready for input: ${status}.`);
+    }
+    if (cancellation === null && this.#isShuttingDown()) {
+      throw new Error("Driver stopped before input handoff.");
+    }
+
+    this.#pendingInput = null;
+    this.#startInput(runtimeContext, socket, pending.command, cancellation);
+    if (cancellation !== null) {
+      await this.#settleActiveRun();
+    }
+  }
+
+  #startInput(
+    runtimeContext: AgentDriverContext,
+    socket: DriverRuntimeIo,
+    command: Extract<RuntimeCommand, { kind: "input.start" }>,
+    cancellation: PendingInput["cancellation"] = null,
+  ): Promise<void> {
+    this.#shutdownSignal.throwIfAborted();
+    this.#activeRunGeneration += 1;
+    if (this.#runtimeState.status() !== "stopping") {
+      this.#runtimeState.beginRun(this.#activeRunGeneration);
+    }
+    const ticket = socket.beginRun(parseRunId(command.runId));
+    this.#activeRunTicket = ticket;
+    if (cancellation !== null) {
+      socket.claimRunCancellation(ticket, cancellation.reason, cancellation.source);
+    }
+    let activeRunTask!: Promise<void>;
+    activeRunTask = this.#runInputTask(
+      runtimeContext,
+      socket,
+      command,
+      this.#activeRunGeneration,
+      ticket,
+      cancellation,
+    )
+      .catch((error: unknown) => this.#failInputTask(runtimeContext, socket, command, error))
+      .finally(() => {
+        if (this.#activeRunTask === activeRunTask) {
+          this.#activeRunTask = null;
+          this.#activeRunSettleTask = null;
+          this.#activeRunTicket = null;
+        }
+      });
+    this.#activeRunTask = activeRunTask;
+    return activeRunTask;
+  }
+
+  async #failInputTask(
+    runtimeContext: AgentDriverContext,
+    socket: DriverRuntimeIo,
+    command: Extract<RuntimeCommand, { kind: "input.start" }>,
+    error: unknown,
+  ): Promise<void> {
+    this.#activeWorkFailure ??= { error };
+    runtimeContext.logger.error("driver.runtime.input-task.failed", error, {
+      commandId: command.commandId,
+      driverInstanceId: this.#driverInstanceId,
+    });
+    await this.#shutdown(socket, "driver.input_task_failed").catch((shutdownError: unknown) => {
+      runtimeContext.logger.error("driver.runtime.shutdown.failed", shutdownError, {
+        commandId: command.commandId,
+      });
+    });
+  }
+
   async #runInputCommand(
     runtimeContext: AgentDriverContext,
     socket: DriverRuntimeIo,
     command: Extract<RuntimeCommand, { kind: "input.start" }>,
     ticket: DriverRunTicket,
+    cancellation: PendingInput["cancellation"],
   ): Promise<"command_acked" | "driver_failing"> {
     let outcome: DriverInputOutcome;
     try {
+      if (cancellation !== null) {
+        await pushLosslessEvents(runtimeContext.ports.eventSink, [
+          {
+            kind: "run.cancelled",
+            payload: { reason: cancellation.reason, stopReason: "cancelled" },
+            runId: ticket.runId,
+            sourceEventId: randomUUID(),
+          },
+        ]);
+      }
       ticket.signal.throwIfAborted();
       await this.#backend.handleInput(
         runtimeContext,
@@ -1349,10 +1494,17 @@ export class DriverCommandDispatcher {
     command: Extract<RuntimeCommand, { kind: "input.start" }>,
     generation: number,
     ticket: DriverRunTicket,
+    cancellation: PendingInput["cancellation"] = null,
   ): Promise<void> {
     let releaseReason: "command_acked" | "driver_failing" = "driver_failing";
     try {
-      releaseReason = await this.#runInputCommand(runtimeContext, socket, command, ticket);
+      releaseReason = await this.#runInputCommand(
+        runtimeContext,
+        socket,
+        command,
+        ticket,
+        cancellation,
+      );
     } finally {
       socket.releaseRun(ticket, releaseReason);
       this.#clearRunMcpState(socket, ticket.runId);

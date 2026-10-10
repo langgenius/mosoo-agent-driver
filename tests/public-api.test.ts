@@ -10,6 +10,7 @@ import * as orpc from "@mosoo/agent-driver/orpc";
 import * as paths from "@mosoo/agent-driver/paths";
 import * as providerOutput from "@mosoo/agent-driver/provider-output";
 import * as runtime from "@mosoo/agent-driver/runtime";
+import * as runtimeEvents from "@mosoo/agent-driver/runtime-events";
 
 describe("public API", () => {
   test("imports without starting the driver process", () => {
@@ -26,18 +27,22 @@ describe("public API", () => {
     expect(agentDriver.projectDriverEventToCma).toBeFunction();
     expect(agentDriver.pushDriverDiagnosticEvent).toBeFunction();
     expect(agentDriver.parseDriverNativeRuntimeRef).toBeFunction();
-    expect(agentDriver.AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(3);
+    expect(agentDriver.AGENT_DRIVER_PROVIDER_REGISTRY.list()).toHaveLength(4);
     expect(agentDriver.SUPPORTED_DRIVER_RUNTIMES).toEqual([
       "openai-runtime",
       "claude-agent-sdk",
       "acp-fallback",
+      "pi",
     ]);
   });
 
   test("imports public subpath entries without process side effects", () => {
     const heartbeatReason = "ping" satisfies orpc.DriverHeartbeatInput["reason"];
 
-    expect(boot.DRIVER_PROTOCOL_VERSION).toBe(3);
+    expect(boot.DRIVER_PROTOCOL_VERSION).toBe(7);
+    expect(boot.parseNativeCheckpoint).toBe(runtime.parseNativeCheckpoint);
+    expect(boot.parseNativeCheckpointManifest).toBe(runtime.parseNativeCheckpointManifest);
+    expect(boot.getNativeCheckpointRelativePath).toBe(runtime.getNativeCheckpointRelativePath);
     expect(contract.PROTOCOL_VERSION).toBe(3);
     expect(contract.protocolVersionSchema.parse(3)).toBe(3);
     expect(contract.protocolVersionSchema.safeParse(2).success).toBe(false);
@@ -46,8 +51,13 @@ describe("public API", () => {
     expect(cmaSdk.CmaSdkClient).toBe(agentDriver.CmaSdkClient);
     expect(events.parseDriverEventEnvelope).toBeFunction();
     expect(events.toRuntimeEventInput).toBeFunction();
-    expect(events.RUNTIME_EVENT_SCHEMA_VERSION).toBe("2026-08-29");
+    expect(events.RUNTIME_EVENT_SCHEMA_VERSION).toBe("2026-10-10");
     expect(events.RUNTIME_EVENT_KINDS).toContain("agent.tasks.replaced");
+    expect(events.RUNTIME_EVENT_KINDS).toContain("runtime.session.reset");
+    expect(events.RUNTIME_EVENT_KINDS).toContain("context.usage.updated");
+    expect(runtimeEvents.parseRuntimeEventEnvelope).toBeFunction();
+    expect(runtimeEvents.RUNTIME_EVENT_SCHEMA_VERSION).toBe(events.RUNTIME_EVENT_SCHEMA_VERSION);
+    expect(runtimeEvents.RUNTIME_EVENT_KINDS).toBe(events.RUNTIME_EVENT_KINDS);
     expect(orpc.parseDriverHeartbeatInput({ at: "now", pid: 1, reason: heartbeatReason })).toEqual({
       at: "now",
       pid: 1,
@@ -76,6 +86,7 @@ describe("public API", () => {
       driverInstanceId: "driver-1",
     });
     expect(runtime.isSupportedDriverRuntime("openai-runtime")).toBe(true);
+    expect(runtime.isSupportedDriverRuntime("pi")).toBe(true);
     expect(paths.SANDBOX_MEMORY_PATH).toBe("/workspace/memory");
     expect(paths.getSessionResourceRootPath("session-1")).toBe(
       "/workspace/se/session-1/session-files",

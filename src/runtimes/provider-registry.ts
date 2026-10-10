@@ -5,6 +5,7 @@ import { AcpDriverBackend } from "./acp/acp-driver-backend";
 import type { AgentDriverBackend } from "../core/agent-driver-backend";
 import { ClaudeAgentSdkDriverBackend } from "./claude/agent-sdk-driver-backend";
 import { OpenAiAppServerDriverBackend } from "./openai/app-server-driver-backend";
+import { PiDriverBackend } from "./pi/pi-driver-backend";
 
 export interface AgentDriverProviderDescriptor {
   readonly capabilities: readonly DriverCapability[];
@@ -48,6 +49,12 @@ const PROVIDERS = [
     id: "acp-fallback",
     runtime: "acp-fallback",
   },
+  {
+    capabilities: PROVIDER_CAPABILITIES,
+    createBackend: (payload) => new PiDriverBackend(payload),
+    id: "pi-rpc",
+    runtime: "pi",
+  },
 ] as const satisfies readonly AgentDriverProviderDescriptor[];
 
 export const AGENT_DRIVER_PROVIDER_REGISTRY = {
@@ -85,6 +92,10 @@ function resolveProviderForStartInput(input: DriverStartInput): AgentDriverProvi
     input.execution.builtInTools.some((tool) => !tool.enabled)
   ) {
     throw new Error(`Runtime ${provider.runtime} does not support built-in tool restrictions.`);
+  }
+
+  if (provider.runtime === "pi" && input.execution.session.additionalDirectories.length > 0) {
+    throw new Error("Runtime pi does not support additional directories.");
   }
 
   return provider;

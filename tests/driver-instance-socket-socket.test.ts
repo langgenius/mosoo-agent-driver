@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { ORPCError } from "@orpc/client";
 
+import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import {
+  DriverEventDeliveryOutcomeUnknownError,
+  DriverEventRejectedError,
+  pushLosslessEvents,
+} from "../src/core/driver-runtime-io";
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
 import type { DriverEventInput } from "../src/protocol/events";
 import {
@@ -7,7 +14,12 @@ import {
   measureRuntimeCommandJson,
 } from "../src/runtime-command";
 import { settlePromiseWithTimeout } from "../src/utils/async";
-import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
+import {
+  DRIVER_TEST_IDS,
+  createTestNativeCheckpoint,
+  driverBootPayload,
+} from "./driver-boot-payload-fixture";
+import { bootPayload, createBackend } from "./driver-runtime-boundary-fixtures";
 
 const nativeWebSocket = globalThis.WebSocket;
 const nativeAbortSignalTimeout = AbortSignal.timeout;
@@ -60,6 +72,7 @@ class RpcWebSocket extends OpenWebSocket {
   static nextCommand: unknown = null;
   static receiptOverride: Partial<{ eventId: string; seq: number; type: string }> | null = null;
   static responseOverrides = new Map<string, unknown>();
+  static responseStatusOverrides = new Map<string, number>();
   static sendFailurePath: string | null = null;
   static stalledPath: string | null = null;
   static stalled = Promise.withResolvers<void>();
@@ -161,6 +174,7 @@ class RpcWebSocket extends OpenWebSocket {
     if (RpcWebSocket.responseOverrides.has(path)) {
       output = RpcWebSocket.responseOverrides.get(path);
     }
+    status = RpcWebSocket.responseStatusOverrides.get(path) ?? status;
 
     queueMicrotask(() => {
       this.dispatchEvent(
@@ -199,6 +213,7 @@ afterEach(() => {
   RpcWebSocket.nextCommand = null;
   RpcWebSocket.receiptOverride = null;
   RpcWebSocket.responseOverrides.clear();
+  RpcWebSocket.responseStatusOverrides.clear();
   RpcWebSocket.sendFailurePath = null;
   RpcWebSocket.stalledPath = null;
   RpcWebSocket.stalled = Promise.withResolvers<void>();
@@ -534,7 +549,15 @@ describe("DriverInstanceSocket lifecycle", () => {
     });
     const first = socket.beginRun(DRIVER_TEST_IDS.runId);
     await socket.pushEvents({
-      events: [{ kind: "run.completed", payload: { stopReason: "end_turn" } }],
+      events: [
+        {
+          kind: "run.completed",
+          payload: {
+            checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+            stopReason: "end_turn",
+          },
+        },
+      ],
     });
     socket.releaseRun(first, "command_acked");
     socket.beginRun(DRIVER_TEST_IDS.secondRunId);
@@ -802,7 +825,10 @@ describe("DriverInstanceSocket lifecycle", () => {
     socket.beginRun(DRIVER_TEST_IDS.runId);
     const event: DriverEventInput = {
       kind: "run.completed",
-      payload: { stopReason: "end_turn" },
+      payload: {
+        checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+        stopReason: "end_turn",
+      },
     };
     const firstWire = PendingWebSocket.instances[0] as RpcWebSocket;
     RpcWebSocket.lostResponsePath = "/driver/pushEvents";
@@ -834,6 +860,210 @@ describe("DriverInstanceSocket lifecycle", () => {
     expect(sourceIds[0]).toBeString();
     expect(sourceIds[1]).toBe(sourceIds[0]);
   });
+
+  test.each(["completed", "failed", "cancelled", null] as const)(
+    "permanently rejects a terminal conflict with host status %s",
+    async (currentStatus) => {
+      globalThis.WebSocket = RpcWebSocket as unknown as typeof WebSocket;
+      const closes: { code: number; reason: string }[] = [];
+      const socket = new DriverInstanceSocket(driverBootPayload, {
+        onClose: (code, reason) => closes.push({ code, reason }),
+      });
+      await socket.connect();
+      await socket.hello({
+        capabilities: [],
+        driverVersion: "test",
+        protocolVersion: driverBootPayload.protocolVersion,
+        startedAt: new Date(0).toISOString(),
+      });
+      const ticket = socket.beginRun(DRIVER_TEST_IDS.runId);
+      const event: DriverEventInput = {
+        kind: "run.completed",
+        payload: {
+          checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+          stopReason: "end_turn",
+        },
+        runId: DRIVER_TEST_IDS.runId,
+        sourceEventId: "rejected-run-completion",
+      };
+      RpcWebSocket.responseStatusOverrides.set("/driver/pushEvents", 409);
+      RpcWebSocket.responseOverrides.set(
+        "/driver/pushEvents",
+        new ORPCError("terminal_conflict", {
+          status: 409,
+          message: "Host already selected a terminal.",
+          data: {
+            currentStatus,
+            runId: DRIVER_TEST_IDS.runId,
+            sourceEventId: currentStatus === null ? null : "host-canonical-terminal",
+          },
+        }).toJSON(),
+      );
+
+      const error = await pushLosslessEvents(socket, [event]).catch((cause: unknown) => cause);
+
+      expect(error).toBeInstanceOf(DriverEventRejectedError);
+      expect(error).toMatchObject({
+        cause: { code: "terminal_conflict" },
+        sourceEventId: event.sourceEventId,
+      });
+      expect(socket.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal).toMatchObject({
+        phase: "selected",
+        value: { sourceEventId: event.sourceEventId, status: "completed" },
+      });
+      expect(closes).toEqual([{ code: 1011, reason: "driver.terminal_conflict" }]);
+      await expect(socket.pushEvents({ events: [event] })).rejects.toBe(error);
+      await expect(socket.completeRun()).rejects.toBe(error);
+      await expect(
+        socket.failRun({ code: "failed", details: {}, message: "failed", retryable: false }),
+      ).rejects.toBe(error);
+      socket.releaseRun(ticket, "driver_failing");
+      expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+        "Host already selected a terminal.",
+      );
+      await expect(socket.connect()).rejects.toBe(error);
+      expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([
+        "/driver/hello",
+        "/driver/pushEvents",
+      ]);
+    },
+  );
+
+  test.each(["completeRun", "failRun"] as const)(
+    "fences a permanent %s control conflict without fabricating an event identity",
+    async (selected) => {
+      const socket = await connectRpcSocket();
+      const ticket = socket.beginRun(DRIVER_TEST_IDS.runId);
+      const path = `/driver/${selected}`;
+      RpcWebSocket.responseStatusOverrides.set(path, 409);
+      RpcWebSocket.responseOverrides.set(
+        path,
+        new ORPCError("terminal_conflict", {
+          status: 409,
+          message: "Host terminal cannot be changed.",
+          data: { currentStatus: "cancelled", runId: DRIVER_TEST_IDS.runId, sourceEventId: null },
+        }).toJSON(),
+      );
+      const failure = { code: "failed", details: {}, message: "failed", retryable: false };
+      const completion =
+        selected === "completeRun" ? socket.completeRun() : socket.failRun(failure);
+      const error = await completion.catch((cause: unknown) => cause);
+
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error).not.toBeInstanceOf(DriverEventRejectedError);
+      expect(error).toHaveProperty("code", "terminal_conflict");
+      await expect(socket.completeRun()).rejects.toBe(error);
+      await expect(socket.failRun(failure)).rejects.toBe(error);
+      socket.releaseRun(ticket, "driver_failing");
+      expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow(
+        "Host terminal cannot be changed.",
+      );
+      await expect(socket.connect()).rejects.toBe(error);
+      expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([path]);
+    },
+  );
+
+  test("stops the kernel after a host terminal conflict without invoking another input", async () => {
+    const socket = await connectRpcSocket();
+    await socket.hello({
+      capabilities: [],
+      driverVersion: "test",
+      protocolVersion: driverBootPayload.protocolVersion,
+      startedAt: new Date(0).toISOString(),
+    });
+    RpcWebSocket.responseStatusOverrides.set("/driver/pushEvents", 409);
+    RpcWebSocket.responseOverrides.set(
+      "/driver/pushEvents",
+      new ORPCError("terminal_conflict", {
+        status: 409,
+        message: "The host already cancelled this run.",
+        data: { currentStatus: "cancelled", runId: DRIVER_TEST_IDS.runId, sourceEventId: null },
+      }).toJSON(),
+    );
+    const backend = createBackend();
+    const handleInput = backend.handleInput.bind(backend);
+    backend.handleInput = async (context, input, runId, signal) => {
+      socket.beginRun(runId);
+      await handleInput(context, input, runId, signal);
+    };
+    const kernel = new AgentDriverKernelCore({
+      backendFactory: () => backend,
+      hostPorts: {
+        eventSink: {
+          commandUpdate: async () => {},
+          currentRunId: () => socket.currentRunId(),
+          pushEvents: (input) => socket.pushEvents(input),
+        },
+      },
+    });
+    await kernel.start(bootPayload);
+
+    await expect(
+      kernel.dispatch({
+        commandId: "host-conflict-input",
+        input: { text: "complete" },
+        kind: "input.start",
+        requestId: "host-conflict-request",
+        runId: DRIVER_TEST_IDS.runId,
+      }),
+    ).rejects.toThrow("The host already cancelled this run.");
+    await expect(
+      kernel.dispatch({
+        commandId: "after-host-conflict-input",
+        input: { text: "must not run" },
+        kind: "input.start",
+        requestId: "after-host-conflict-request",
+        runId: DRIVER_TEST_IDS.secondRunId,
+      }),
+    ).rejects.toThrow("not accepting commands");
+    await expect(kernel.stop("join host terminal conflict")).resolves.toBeUndefined();
+    expect(backend.handledInputs).toHaveLength(1);
+    expect(socket.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal?.phase).toBe("selected");
+    expect((PendingWebSocket.instances[0] as RpcWebSocket).paths).toEqual([
+      "/driver/hello",
+      "/driver/pushEvents",
+    ]);
+  });
+
+  test.each([DRIVER_TEST_IDS.secondRunId, null])(
+    "does not treat a conflict for unrelated run %s as permanent rejection",
+    async (runId) => {
+      const socket = await connectRpcSocket();
+      await socket.hello({
+        capabilities: [],
+        driverVersion: "test",
+        protocolVersion: driverBootPayload.protocolVersion,
+        startedAt: new Date(0).toISOString(),
+      });
+      socket.beginRun(DRIVER_TEST_IDS.runId);
+      const event: DriverEventInput = {
+        kind: "run.completed",
+        payload: {
+          checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+          stopReason: "end_turn",
+        },
+        sourceEventId: "completion-with-unrelated-conflict",
+      };
+      RpcWebSocket.responseStatusOverrides.set("/driver/pushEvents", 409);
+      RpcWebSocket.responseOverrides.set(
+        "/driver/pushEvents",
+        new ORPCError("terminal_conflict", {
+          status: 409,
+          data: { currentStatus: "failed", runId, sourceEventId: null },
+        }).toJSON(),
+      );
+
+      await expect(pushLosslessEvents(socket, [event])).rejects.toBeInstanceOf(
+        DriverEventDeliveryOutcomeUnknownError,
+      );
+      expect(socket.runSnapshot(DRIVER_TEST_IDS.runId)?.terminal?.phase).toBe("selected");
+      RpcWebSocket.responseOverrides.clear();
+      RpcWebSocket.responseStatusOverrides.clear();
+      await expect(socket.pushEvents({ events: [event] })).resolves.toMatchObject({
+        accepted: [{ type: "run.completed" }],
+      });
+    },
+  );
 
   test("rejects event receipts that are not a submitted-prefix", async () => {
     const socket = await connectRpcSocket();
@@ -938,7 +1168,10 @@ describe("DriverInstanceSocket lifecycle", () => {
     };
     const completed: DriverEventInput = {
       kind: "run.completed",
-      payload: { stopReason: "end_turn" },
+      payload: {
+        checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+        stopReason: "end_turn",
+      },
       sourceEventId: "linearized-run-completed",
     };
     let barrierCalls = 0;
@@ -1004,7 +1237,15 @@ describe("DriverInstanceSocket lifecycle", () => {
     });
     const ticket = socket.beginRun(DRIVER_TEST_IDS.runId);
     await socket.pushEvents({
-      events: [{ kind: "run.completed", payload: { stopReason: "end_turn" } }],
+      events: [
+        {
+          kind: "run.completed",
+          payload: {
+            checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+            stopReason: "end_turn",
+          },
+        },
+      ],
     });
 
     expect(() => socket.beginRun(DRIVER_TEST_IDS.secondRunId)).toThrow("already active");
@@ -1032,7 +1273,10 @@ describe("DriverInstanceSocket lifecycle", () => {
     RpcWebSocket.stalledPath = "/driver/pushEvents";
     const completed: DriverEventInput = {
       kind: "run.completed",
-      payload: { stopReason: "end_turn" },
+      payload: {
+        checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+        stopReason: "end_turn",
+      },
     };
     const failed: DriverEventInput = {
       kind: "run.failed",
@@ -1151,7 +1395,15 @@ describe("DriverInstanceSocket lifecycle", () => {
     });
     await RpcWebSocket.stalled.promise;
     const queuedTerminal = socket.pushEvents({
-      events: [{ kind: "run.completed", payload: { stopReason: "end_turn" } }],
+      events: [
+        {
+          kind: "run.completed",
+          payload: {
+            checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+            stopReason: "end_turn",
+          },
+        },
+      ],
     });
     const queuedOutcome = queuedTerminal.then(
       () => null,

@@ -222,19 +222,12 @@ describe("AgentDriverKernelCore", () => {
     await expect(kernel.stop("test.stop")).resolves.toBeUndefined();
   });
 
-  test("publishes one unscoped completion when an idle driver stops", async () => {
+  test("closes an idle driver without publishing a run completion", async () => {
     const kernel = new AgentDriverKernelCore({ backendFactory: () => createBackend() });
     const events = kernel.events()[Symbol.asyncIterator]();
 
     await kernel.start(bootPayload);
     await expect(kernel.stop("idle stop")).resolves.toBeUndefined();
-    const terminal = await events.next();
-
-    expect(terminal).toMatchObject({
-      done: false,
-      value: { kind: "run.completed" },
-    });
-    expect(terminal.value).not.toHaveProperty("runId");
     await expect(events.next()).resolves.toEqual({ done: true, value: undefined });
   });
 

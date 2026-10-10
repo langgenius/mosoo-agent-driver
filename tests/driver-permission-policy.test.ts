@@ -6,7 +6,7 @@ import {
   isDriverFullAccess,
 } from "../src/core/driver-permission-policy";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
-import { parseDriverBootPayload } from "../src/protocol/boot";
+import { DRIVER_PROTOCOL_VERSION, parseDriverBootPayload } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import type { DriverStartInput } from "../src/protocol/start";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
@@ -54,7 +54,9 @@ describe("driver permission policy", () => {
     const legacyPayload: Record<string, unknown> = structuredClone(driverBootPayload);
     legacyPayload["protocolVersion"] = 1;
 
-    expect(() => parseDriverBootPayload(legacyPayload)).toThrow(/protocolVersion must be 3/);
+    expect(() => parseDriverBootPayload(legacyPayload)).toThrow(
+      `protocolVersion must be ${DRIVER_PROTOCOL_VERSION}`,
+    );
   });
 
   test("isDriverFullAccess reflects the payload", () => {

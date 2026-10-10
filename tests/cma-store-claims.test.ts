@@ -32,7 +32,7 @@ function driverEvent(
     origin: "driver",
     payload,
     ...(options.runId === undefined ? {} : { runId: options.runId }),
-    schemaVersion: "2026-08-29",
+    schemaVersion: "2026-10-10",
     sessionId,
     ...(options.sourceEventId === undefined ? {} : { sourceEventId: options.sourceEventId }),
     visibility: options.visibility ?? "participant",

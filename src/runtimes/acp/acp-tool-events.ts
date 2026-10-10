@@ -23,6 +23,7 @@ const MAX_ACP_COMPLETED_TOOL_HISTORY_ITEMS = 1_024;
 
 interface AcpToolState {
   readonly completed: boolean;
+  readonly displayTitle: string | undefined;
   readonly hasNonzeroExit: boolean;
   readonly snapshot: JsonObject;
   readonly started: boolean;
@@ -79,7 +80,13 @@ export class AcpToolEventState {
 
   retainedOpenState(): readonly JsonObject[] {
     return [...this.#tools.values()].flatMap((tool) =>
-      tool.started && !tool.completed ? [tool.snapshot] : [],
+      tool.started && !tool.completed
+        ? [
+            tool.displayTitle === undefined || tool.displayTitle === tool.snapshot["title"]
+              ? tool.snapshot
+              : { ...tool.snapshot, displayTitle: tool.displayTitle },
+          ]
+        : [],
     );
   }
 
@@ -131,7 +138,11 @@ export class AcpToolEventState {
       (typeof previousSnapshot?.["parentMessageId"] === "string"
         ? previousSnapshot["parentMessageId"]
         : undefined) ?? input.parentMessageId;
-    const title = readNonEmptyString(input.update, "title") ?? previousSnapshot?.["title"];
+    const latestTitle = readNonEmptyString(input.update, "title") ?? previous?.displayTitle;
+    const title =
+      status === "running" && previousSnapshot !== undefined
+        ? (previousSnapshot["title"] ?? previousSnapshot["kind"])
+        : (latestTitle ?? previousSnapshot?.["title"]);
     const payload = {
       ...previousSnapshot,
       ...toToolCallPayload(input.toolCallId, status, input.update),
@@ -143,9 +154,14 @@ export class AcpToolEventState {
     };
     const changed = previousSnapshot === undefined || !isDeepStrictEqual(previousSnapshot, payload);
 
-    if (changed || hasNonzeroExit !== previous?.hasNonzeroExit) {
+    if (
+      changed ||
+      hasNonzeroExit !== previous?.hasNonzeroExit ||
+      latestTitle !== previous?.displayTitle
+    ) {
       this.#tools.set(input.toolCallId, {
         completed: previous?.completed ?? false,
+        displayTitle: latestTitle,
         hasNonzeroExit,
         snapshot: changed ? structuredClone(payload) : previous!.snapshot,
         started: previous?.started ?? false,
@@ -260,7 +276,8 @@ export class AcpToolEventState {
     let retainedItems = completed.length;
     let bytes = completed.reduce(
       (total, [toolCallId, tool]) =>
-        total + Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8"),
+        total +
+        Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot, tool.displayTitle]), "utf8"),
       0,
     );
 
@@ -274,7 +291,10 @@ export class AcpToolEventState {
 
       this.#tools.delete(toolCallId);
       retainedItems -= 1;
-      bytes -= Buffer.byteLength(JSON.stringify([toolCallId, tool.snapshot]), "utf8");
+      bytes -= Buffer.byteLength(
+        JSON.stringify([toolCallId, tool.snapshot, tool.displayTitle]),
+        "utf8",
+      );
     }
   }
 }

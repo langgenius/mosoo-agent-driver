@@ -4,7 +4,7 @@ import type {
   CmaProjectedDriverCommand,
   CmaSessionStatus,
 } from "../projections/cma";
-import type { RuntimeEventEnvelope } from "../runtime-events";
+import type { RuntimeEventEnvelope } from "../protocol/events/runtime-events";
 import type { RuntimeCommandResult } from "../runtime-command";
 
 export const CMA_MAX_EVENT_BYTES = 1_024 * 1_024;

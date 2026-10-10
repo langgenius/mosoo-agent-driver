@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
 import { createDisabledLogger } from "../src/observability";
@@ -12,13 +15,19 @@ import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { toRuntimeEventInput } from "../src/runtime-events";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { ClaudeDurableEventTooLargeError } from "../src/runtimes/claude/agent-sdk-event-writer";
+import { ClaudeAgentSdkDriverBackend } from "../src/runtimes/claude/agent-sdk-driver-backend";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
 import { toRuntimePublicId } from "../src/runtimes/runtime-public-id";
-import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import {
+  DriverEventPublisher,
+  DriverNativeCheckpointCleanupError,
+} from "../src/runtimes/driver-event-publisher";
+import { createNativeCheckpoint } from "../src/runtimes/native-checkpoint";
 import { CMA_MAX_EVENT_BYTES, encodeCmaSseRecord } from "../src/stores/cma-store";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import {
   DRIVER_TEST_IDS,
+  createTestNativeCheckpoint,
   driverBootPayload,
   driverStartInput as bootPayload,
 } from "./driver-boot-payload-fixture";
@@ -70,6 +79,7 @@ function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: Se
           driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
           occurredAt: "2026-08-13T00:00:00.000Z",
           runId,
+          runtimeId: "claude-agent-sdk",
           sessionId,
         },
         event,
@@ -81,7 +91,19 @@ function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: Se
   const translator = new ClaudeAgentSdkMessageTranslator({
     publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
     push: async (_context, _reason, batch) => append(batch),
-    pushTerminal: async (_context, _reason, closures, terminal) => append([...closures, terminal]),
+    pushTerminal: async (_context, _reason, closures, terminal) =>
+      append([
+        ...closures,
+        terminal.kind === "run.completed"
+          ? {
+              ...terminal,
+              payload: {
+                ...payload(terminal),
+                checkpoint: createTestNativeCheckpoint(runId, "claude-agent-sdk"),
+              },
+            }
+          : terminal,
+      ]),
     recordNativeSessionId: async () => {},
     replaceNativeSessionId: async () => {},
     sessionId,
@@ -710,5 +732,287 @@ describe("Claude Agent SDK durable event boundaries", () => {
           payload(event)["status"] === "cancelled",
       ),
     ).toHaveLength(1);
+  });
+});
+
+async function createCheckpointCleanupHarness() {
+  const cwd = await mkdtemp(join(tmpdir(), "claude-cleanup-barrier-"));
+  const checkpointDirectory = join(cwd, ".state", "native-checkpoints");
+  const retainedDirectory = `${checkpointDirectory}.retained`;
+  const events: DriverEventInput[] = [];
+  const resetAttempts: string[] = [];
+  const prompts: SDKUserMessage[] = [];
+  const resetQueued = Promise.withResolvers<void>();
+  let runId: RunId | null = null;
+  let seq = 0;
+  let blocked = false;
+  let resetHook = async () => {};
+  const startInput = {
+    ...bootPayload,
+    runtime: "claude-agent-sdk" as const,
+    runtimeTransport: "claude-agent-sdk" as const,
+    execution: {
+      ...bootPayload.execution,
+      providerOptions: {},
+      session: {
+        ...bootPayload.execution.session,
+        cwd,
+        homePath: cwd,
+        sharedRootPath: cwd,
+      },
+    },
+  };
+  const context = createAgentDriverContext({
+    eventSink: {
+      currentRunId: () => runId,
+      pushEvents: async ({ events: batch }) => {
+        for (const event of batch) {
+          toDriverEventEnvelopes(
+            {
+              ...driverBootPayload,
+              runtime: "claude-agent-sdk",
+              runtimeTransport: "claude-agent-sdk",
+            },
+            event,
+            runId,
+          );
+          if (event.kind === "run.completed" && event.runId === DRIVER_TEST_IDS.runId) {
+            await resetQueued.promise;
+            await rename(checkpointDirectory, retainedDirectory);
+            await writeFile(checkpointDirectory, "checkpoint cleanup is blocked");
+            blocked = true;
+          }
+          if (event.kind === "runtime.session.reset") {
+            resetAttempts.push(event.sourceEventId!);
+            // The reset can be attempted only after the acknowledged checkpoint survived cleanup.
+            expect(
+              await readFile(
+                join(checkpointDirectory, DRIVER_TEST_IDS.runId, "session.jsonl"),
+                "utf8",
+              ),
+            ).toBe("native-session-1\n");
+            await resetHook();
+          }
+        }
+        events.push(...batch);
+        return {
+          accepted: batch.map((event) => ({
+            eventId: event.sourceEventId!,
+            seq: ++seq,
+            type: event.kind,
+          })),
+        };
+      },
+    },
+    logger: createDisabledLogger(),
+    payload: startInput,
+    permission: { request: async () => "allow_once" },
+    ports: { skill: { materialize: async () => [] } },
+  });
+  const backend = new ClaudeAgentSdkDriverBackend(startInput, {
+    createNativeCheckpoint: async ({ root, runId: checkpointRunId, sessionId, signal }) =>
+      createNativeCheckpoint({
+        root,
+        runId: checkpointRunId,
+        nativeRef: { runtimeId: "claude-agent-sdk", kind: "claude_session_id", value: sessionId },
+        signal,
+        write: async (directory) => {
+          await writeFile(join(directory, "session.jsonl"), `${sessionId}\n`);
+        },
+      }),
+    restoreNativeCheckpoint: async () => {},
+    createQueryOptions: async () => ({}),
+    waitForTranscript: async () => true,
+    startup: async () => {
+      throw new Error("Unexpected prewarm in checkpoint test.");
+    },
+    query: ({ prompt }) => {
+      const output = (async function* () {
+        for await (const input of prompt as AsyncIterable<SDKUserMessage>) {
+          prompts.push(input);
+          const sessionId = prompts.length === 1 ? "native-session-1" : "native-session-2";
+          yield {
+            message: {
+              id: `message-${prompts.length}`,
+              role: "assistant",
+              content: [{ type: "text", text: "done" }],
+            },
+            session_id: sessionId,
+            type: "assistant",
+            uuid: `assistant-${prompts.length}`,
+          } as unknown as SDKMessage;
+          yield {
+            ...successResult({ result: "done" }),
+            session_id: sessionId,
+            user_message_uuid: input.uuid,
+          } as unknown as SDKMessage;
+          if (prompts.length === 1) {
+            yield {
+              new_conversation_id: "native-session-2",
+              session_id: sessionId,
+              type: "conversation_reset",
+              uuid: "cleanup-reset",
+            } as unknown as SDKMessage;
+            resetQueued.resolve();
+          }
+        }
+      })();
+      return Object.assign(output, {
+        close: () => {},
+        initializationResult: async () => {},
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+          session: { total_cost_usd: 0, model_usage: {} },
+        }),
+      }) as unknown as Query;
+    },
+  });
+  const unblock = async () => {
+    if (blocked) {
+      await rm(checkpointDirectory);
+      await rename(retainedDirectory, checkpointDirectory);
+      blocked = false;
+    }
+  };
+  await backend.start(context, AbortSignal.timeout(2_000));
+  return {
+    events,
+    prompts,
+    resetAttempts,
+    setResetHook: (hook: () => Promise<void>) => {
+      resetHook = hook;
+    },
+    unblock,
+    stop: () => backend.stop(context, "test.stop", AbortSignal.timeout(2_000)),
+    run: async (id: RunId) => {
+      runId = id;
+      try {
+        await backend.handleInput(context, { text: "test" }, id);
+      } finally {
+        runId = null;
+      }
+    },
+    dispose: async () => {
+      resetHook = async () => {};
+      await unblock();
+      try {
+        await backend.stop(context, "test.cleanup", AbortSignal.timeout(2_000));
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+describe("Claude acknowledged checkpoint cleanup", () => {
+  test("stop keeps queued reset behind failed cleanup and waits for its receipt after retry", async () => {
+    const h = await createCheckpointCleanupHarness();
+    const resetEntered = Promise.withResolvers<void>();
+    const acknowledgeReset = Promise.withResolvers<void>();
+    try {
+      await expect(h.run(DRIVER_TEST_IDS.runId)).rejects.toBeInstanceOf(
+        DriverNativeCheckpointCleanupError,
+      );
+      expect(h.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+      expect(h.resetAttempts).toEqual([]);
+      await expect(h.stop()).rejects.toBeInstanceOf(DriverNativeCheckpointCleanupError);
+      expect(h.resetAttempts).toEqual([]);
+      await h.unblock();
+      h.setResetHook(async () => {
+        resetEntered.resolve();
+        await acknowledgeReset.promise;
+      });
+      let stopped = false;
+      const stopping = h.stop().then(() => {
+        stopped = true;
+      });
+      await resetEntered.promise;
+      expect(stopped).toBe(false);
+      expect(h.events.some((event) => event.kind === "runtime.session.reset")).toBe(false);
+      acknowledgeReset.resolve();
+      await stopping;
+      const reset = h.events.find((event) => event.kind === "runtime.session.reset");
+      expect(reset?.runId).toBeNull();
+      expect(payload(reset!)).toMatchObject({
+        previousCheckpoint: {
+          formatVersion: 1,
+          runId: DRIVER_TEST_IDS.runId,
+          nativeRef: {
+            runtimeId: "claude-agent-sdk",
+            kind: "claude_session_id",
+            value: "native-session-1",
+          },
+        },
+        previousNativeRef: { value: "native-session-1" },
+        newNativeRef: { value: "native-session-2" },
+      });
+      expect(
+        h.events
+          .filter((event) =>
+            ["run.completed", "run.failed", "run.cancelled", "runtime.session.reset"].includes(
+              event.kind,
+            ),
+          )
+          .map((event) => event.kind),
+      ).toEqual(["run.completed", "runtime.session.reset"]);
+      expect(h.prompts).toHaveLength(1);
+    } finally {
+      acknowledgeReset.resolve();
+      await h.dispose();
+    }
+  });
+
+  test("next input retries cleanup and a rejected reset before admitting another prompt", async () => {
+    const h = await createCheckpointCleanupHarness();
+    try {
+      await expect(h.run(DRIVER_TEST_IDS.runId)).rejects.toBeInstanceOf(
+        DriverNativeCheckpointCleanupError,
+      );
+      await expect(h.run(DRIVER_TEST_IDS.secondRunId)).rejects.toBeInstanceOf(
+        DriverNativeCheckpointCleanupError,
+      );
+      expect(h.prompts).toHaveLength(1);
+      expect(h.resetAttempts).toEqual([]);
+      expect(
+        h.events.some(
+          (event) => event.kind === "run.started" && event.runId === DRIVER_TEST_IDS.secondRunId,
+        ),
+      ).toBe(false);
+      await h.unblock();
+      h.setResetHook(async () => {
+        if (h.resetAttempts.length === 1) throw new Error("reset receipt lost");
+      });
+      await expect(h.run(DRIVER_TEST_IDS.secondRunId)).rejects.toThrow("reset receipt lost");
+      expect(h.prompts).toHaveLength(1);
+      expect(
+        h.events.some(
+          (event) => event.kind === "run.started" && event.runId === DRIVER_TEST_IDS.secondRunId,
+        ),
+      ).toBe(false);
+      await h.run(DRIVER_TEST_IDS.secondRunId);
+      expect(h.resetAttempts).toHaveLength(2);
+      expect(h.resetAttempts[0]).toBe(h.resetAttempts[1]);
+      expect(h.prompts).toHaveLength(2);
+      expect(
+        h.events
+          .filter((event) =>
+            [
+              "run.started",
+              "run.completed",
+              "run.failed",
+              "run.cancelled",
+              "runtime.session.reset",
+            ].includes(event.kind),
+          )
+          .map((event) => event.kind),
+      ).toEqual([
+        "run.started",
+        "run.completed",
+        "runtime.session.reset",
+        "run.started",
+        "run.completed",
+      ]);
+    } finally {
+      await h.dispose();
+    }
   });
 });

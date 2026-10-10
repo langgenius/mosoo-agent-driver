@@ -11,6 +11,7 @@ import type {
   InitializeResponse,
 } from "@agentclientprotocol/sdk";
 import { Readable, Writable } from "node:stream";
+import { dirname, join } from "node:path";
 
 import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
@@ -53,6 +54,15 @@ import { setupAcpSession } from "./acp-session-setup";
 import { withAcpStartupStage } from "./acp-startup";
 import { AcpTurnController } from "./acp-turn-controller";
 
+import {
+  exportOpenCodeCheckpoint,
+  openCodeDataPath,
+  openCodeRunUsage,
+  readOpenCodeUsage,
+  restoreOpenCodeCheckpoint,
+  type OpenCodeUsage,
+} from "./opencode-checkpoint";
+
 const ACP_STOP_BUDGET_MS = 4_000;
 const ACP_RECYCLE_BUDGET_MS = 4_500;
 const ACP_SESSION_SHUTDOWN_TIMEOUT_MS = 750;
@@ -78,6 +88,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
   readonly #eventPublisher = new DriverEventPublisher(this.runtime, () => this.#nativeSessionId);
   #nativeSessionId: string | null = null;
   #nativeInstructionPath: string | null = null;
+  #usageBaseline: { runId: RunId; usage: OpenCodeUsage } | null = null;
   readonly #payload: DriverStartInput;
   readonly #runtimeBootstrapDigest: string | null;
   readonly #runtimeBootstrapText: string;
@@ -100,6 +111,16 @@ export class AcpDriverBackend implements AgentDriverBackend {
         this.#settleCancelledTurn(context, providerPromptAdmitted, resumeSignal),
       (context, reason, closures, terminal, cancellationSignal) =>
         this.#eventPublisher.pushTerminal(context, reason, closures, terminal, cancellationSignal),
+      (events, runId, signal) => this.#prepareTerminal(events, runId, signal),
+      (runId) => {
+        this.#usageBaseline = {
+          runId,
+          usage: readOpenCodeUsage(
+            openCodeDataPath(this.#payload.execution.session.homePath),
+            this.#requireSessionId(),
+          ),
+        };
+      },
     );
     this.#clientRequests = new AcpClientRequestHandler({
       allowedRoots: payload.execution.session.additionalDirectories,
@@ -120,6 +141,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
     }
 
     try {
+      await this.#eventPublisher.initializeNativeCheckpointRoot(context, signal);
       await raceWithAbort(this.#clientRequests.initializePathScope(), signal);
       const materializedSkills = await context.ports.skill.materialize(
         this.#payload.execution,
@@ -140,9 +162,28 @@ export class AcpDriverBackend implements AgentDriverBackend {
         args: readFallbackArgs(),
         command: readFallbackCommand(),
       });
-      this.#nativeInstructionPath = isOpenCodeCommand(launch.command)
-        ? await writeNativeRuntimeSystemPrompt(this.#payload.execution, materializedSkills, signal)
-        : null;
+      if (!isOpenCodeCommand(launch.command)) {
+        throw new Error(
+          "ACP native checkpoints require an OpenCode provider with durable native state.",
+        );
+      }
+      const dataPath = openCodeDataPath(this.#payload.execution.session.homePath);
+      this.#childProcessEnv["XDG_DATA_HOME"] = dirname(dataPath);
+      this.#childProcessEnv["OPENCODE_DB"] = join(dataPath, "opencode.db");
+      const checkpoint = this.#payload.execution.session.nativeCheckpoint;
+      if (checkpoint !== null) {
+        await restoreOpenCodeCheckpoint({
+          cwd: this.#payload.execution.session.cwd,
+          dataPath,
+          checkpoint,
+          signal,
+        });
+      }
+      this.#nativeInstructionPath = await writeNativeRuntimeSystemPrompt(
+        this.#payload.execution,
+        materializedSkills,
+        signal,
+      );
 
       if (this.#stopRequested || signal.aborted) {
         signal.throwIfAborted();
@@ -461,6 +502,69 @@ export class AcpDriverBackend implements AgentDriverBackend {
     );
   }
 
+  async #prepareTerminal(
+    events: DriverEventInput[],
+    runId: RunId,
+    signal: AbortSignal,
+  ): Promise<DriverEventInput[]> {
+    const closures = events.filter((event) => event.kind !== "usage.updated");
+    const terminal = closures.at(-1);
+    if (terminal === undefined) return closures;
+    const baseline = this.#usageBaseline?.runId === runId ? this.#usageBaseline.usage : null;
+    if (terminal.kind !== "run.completed") {
+      if (baseline === null) return closures;
+      try {
+        const usage = openCodeRunUsage(
+          readOpenCodeUsage(
+            openCodeDataPath(this.#payload.execution.session.homePath),
+            this.#requireSessionId(),
+          ),
+          baseline,
+        );
+        if (usage.totalTokens === 0 && usage.costAmount === 0) return closures;
+        return [...closures.slice(0, -1), this.#usageEvent(runId, usage), terminal];
+      } catch {
+        // A failed provider may leave no readable final accounting. Preserve its terminal.
+        return closures;
+      }
+    }
+    if (baseline === null) throw new Error("OpenCode run usage baseline is missing.");
+    const { checkpoint, usage } = await exportOpenCodeCheckpoint({
+      root: await this.#eventPublisher.getNativeCheckpointRoot(),
+      dataPath: openCodeDataPath(this.#payload.execution.session.homePath),
+      runId,
+      sessionId: this.#requireSessionId(),
+      baseline,
+      signal,
+    });
+    return [
+      ...closures.slice(0, -1),
+      {
+        kind: "runtime.resume.updated",
+        payload: { resumePointer: this.#requireSessionId() },
+        runId,
+      },
+      this.#usageEvent(runId, usage),
+      {
+        ...terminal,
+        payload: { ...(terminal.payload as Record<string, unknown>), checkpoint },
+      },
+    ];
+  }
+
+  #usageEvent(runId: RunId, usage: OpenCodeUsage): DriverEventInput {
+    return {
+      kind: "usage.updated",
+      payload: {
+        ...usage,
+        costCurrency: "USD",
+        source: "native_step_totals",
+        usageContract: "anthropic_bucketed",
+      },
+      runId,
+    };
+  }
+
   async cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void> {
     await this.#turnController.cancel(
       context,
@@ -670,6 +774,15 @@ export class AcpDriverBackend implements AgentDriverBackend {
       });
     }
 
+    const checkpointCleanup = await settlePromiseWithTimeout(
+      this.#eventPublisher.finishTerminalCleanup(context, signal),
+      {
+        label: "ACP native checkpoint cleanup",
+        signal,
+        timeoutMs: this.#remainingStopMs(deadline),
+      },
+    );
+
     if (processFailure !== null) {
       throw processFailure.error;
     }
@@ -684,6 +797,10 @@ export class AcpDriverBackend implements AgentDriverBackend {
 
     if (terminalCleanup.status !== "completed") {
       throw terminalCleanup.error;
+    }
+
+    if (checkpointCleanup.status !== "completed") {
+      throw checkpointCleanup.error;
     }
   }
 

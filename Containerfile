@@ -4,10 +4,11 @@ FROM docker.io/oven/bun:${BUN_VERSION}@sha256:5ff609364c049b54eb0ff560ec96319729
 FROM docker.io/cloudflare/sandbox:0.12.9@sha256:4a56a37a3cfd9b38d65bb4b5d0b341e6490a3a4c0226274ae4c1cca4948e85fe
 
 # Keep this pin in sync with downstream mosoo apps/api/package.json -> @cloudflare/sandbox.
-ARG CLAUDE_AGENT_SDK_VERSION=0.3.257
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.295
 ARG BUN_VERSION
 ARG OPENAI_RUNTIME_VERSION=0.152.0
 ARG OPENCODE_VERSION=1.18.25
+ARG PI_VERSION=0.99.2
 
 COPY --from=bun-runtime /usr/local/bin/bun /usr/local/bin/bun
 RUN test "$(bun --version)" = "$BUN_VERSION"
@@ -34,7 +35,7 @@ RUN node /usr/local/libexec/mosoo/environment-package-manager-check.mjs verify
 ARG RUNTIME=all
 COPY runtime-images.json /etc/mosoo/runtime-images.json
 RUN set -eu; \
-    case "$RUNTIME" in all|claude|openai|opencode) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
+    case "$RUNTIME" in all|claude|openai|opencode|pi) ;; *) echo "Unsupported RUNTIME: $RUNTIME" >&2; exit 1 ;; esac; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = claude ]; then \
       npm install -g --ignore-scripts @anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}; \
       ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude /usr/local/bin/mosoo-claude-code; \
@@ -45,6 +46,9 @@ RUN set -eu; \
     if [ "$RUNTIME" = all ] || [ "$RUNTIME" = opencode ]; then \
       npm install -g --ignore-scripts opencode-linux-x64-baseline@${OPENCODE_VERSION}; \
       ln -s /usr/local/lib/node_modules/opencode-linux-x64-baseline/bin/opencode /usr/local/bin/opencode; \
+    fi; \
+    if [ "$RUNTIME" = all ] || [ "$RUNTIME" = pi ]; then \
+      npm install -g --ignore-scripts @earendil-works/pi-coding-agent@${PI_VERSION}; \
     fi; \
     printf '%s\n' "$RUNTIME" > /etc/mosoo/runtime; \
     rm -rf /root/.npm

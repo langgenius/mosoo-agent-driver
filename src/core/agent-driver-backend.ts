@@ -130,7 +130,9 @@ export function createAgentDriverContext(input: AgentDriverContextInput): AgentD
 
 export interface AgentDriverBackend {
   readonly runtime: DriverRuntime;
+  /** Requests cancellation; handleInput still owns terminal delivery and turn cleanup. */
   cancelActiveTurn(context: AgentDriverContext, reason: string): Promise<void>;
+  /** Settles only after terminal acknowledgement and required cleanup; rejects on failure. */
   handleInput(
     context: AgentDriverContext,
     input: RuntimeCommandInput,
@@ -138,6 +140,7 @@ export interface AgentDriverBackend {
     signal?: AbortSignal,
   ): Promise<void>;
   start(context: AgentDriverContext, signal: AbortSignal): Promise<void>;
+  /** Waits for native cleanup; a failed attempt must leave cleanup available for retry. */
   stop(context: AgentDriverContext, reason: string, signal: AbortSignal): Promise<void>;
 }
 

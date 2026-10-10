@@ -164,16 +164,30 @@ export class AcpTurnController {
   readonly events = new AcpAssistantTranscriptState();
   readonly #push: AcpTurnEventPush;
   readonly #pushTerminal: AcpTurnTerminalPush;
+  readonly #prepareRun: (runId: RunId) => void;
+  readonly #prepareTerminal: (
+    events: DriverEventInput[],
+    runId: RunId,
+    signal: AbortSignal,
+  ) => Promise<DriverEventInput[]>;
 
   constructor(
     push: AcpTurnEventPush,
     cancelledTurnBarrier: AcpCancelledTurnBarrier = async () => {},
     pushTerminal: AcpTurnTerminalPush = async (context, reason, closures, terminal) =>
       push(context, reason, [...closures, terminal]),
+    prepareTerminal: (
+      events: DriverEventInput[],
+      runId: RunId,
+      signal: AbortSignal,
+    ) => Promise<DriverEventInput[]> = async (events) => events,
+    prepareRun: (runId: RunId) => void = () => {},
   ) {
     this.#push = push;
     this.#cancelledTurnBarrier = cancelledTurnBarrier;
     this.#pushTerminal = pushTerminal;
+    this.#prepareTerminal = prepareTerminal;
+    this.#prepareRun = prepareRun;
   }
 
   isCancelling(): boolean {
@@ -278,8 +292,15 @@ export class AcpTurnController {
     ): Promise<DriverEventInput[]> => {
       const restore = this.events.checkpoint();
 
+      let events: DriverEventInput[];
       try {
-        const events = prepare();
+        events = await this.#prepareTerminal(prepare(), runId, active.cancellation.signal);
+      } catch (error) {
+        restore();
+        throw error;
+      }
+      try {
+        active.terminalStarted = true;
         await this.#pushTerminalEvents(
           context,
           typeof reason === "string" ? reason : reason(events),
@@ -328,13 +349,13 @@ export class AcpTurnController {
           active.cancellationReason ?? "ACP driver backend turn was cancelled.",
         );
         await this.#crossCancelledTurnBarrier(context, active, clientRequests);
-        active.terminalStarted = true;
         await publishTerminal("driver.acp.prompt.cancelled", () =>
           this.events.completePrompt("cancelled", null),
         );
         throw new DriverTurnCancelledError("ACP driver backend turn was cancelled.");
       }
 
+      this.#prepareRun(runId);
       active.providerPromptAdmitted = true;
       const promptResult = await raceWithAbort(
         connection.request(acpMethods.agent.session.prompt, {
@@ -381,7 +402,6 @@ export class AcpTurnController {
           );
         }
       }
-      active.terminalStarted = true;
       const completionEvents = await publishTerminal(
         (events) =>
           promptCancelled
@@ -429,7 +449,6 @@ export class AcpTurnController {
       const fatal = active.fatal;
 
       if (fatal !== null) {
-        active.terminalStarted = true;
         const cleanupResults = await Promise.allSettled([
           fatal.cleanup,
           clientRequests.stopTerminals(context),
@@ -466,7 +485,6 @@ export class AcpTurnController {
       if (catchDrainError !== null) {
         const message =
           catchDrainError instanceof Error ? catchDrainError.message : "ACP turn drain failed.";
-        active.terminalStarted = true;
         await publishTerminal("driver.acp.prompt.failed", () =>
           this.events.failPrompt({ code: "acp.turn_drain_failed", message }),
         );
@@ -481,7 +499,6 @@ export class AcpTurnController {
       }
 
       if (error instanceof DriverTurnCancellationCleanupError) {
-        active.terminalStarted = true;
         await publishTerminal("driver.acp.prompt.failed", () =>
           this.events.failPrompt({
             code: "acp.cancel_cleanup_failed",
@@ -509,7 +526,6 @@ export class AcpTurnController {
             );
           }
         } catch (cleanupError) {
-          active.terminalStarted = true;
           await publishTerminal("driver.acp.prompt.failed", () =>
             this.events.failPrompt({
               code: "acp.cancel_cleanup_failed",
@@ -521,7 +537,6 @@ export class AcpTurnController {
           );
           throw cleanupError;
         }
-        active.terminalStarted = true;
         await publishTerminal("driver.acp.prompt.cancelled", () =>
           this.events.activeRunId() === null ? [] : this.events.completePrompt("cancelled", null),
         );
@@ -529,7 +544,6 @@ export class AcpTurnController {
       }
 
       const message = error instanceof Error ? error.message : "ACP driver backend turn failed.";
-      active.terminalStarted = true;
       await publishTerminal("driver.acp.prompt.failed", () =>
         this.events.failPrompt({ code: "acp.turn_failed", message }),
       );

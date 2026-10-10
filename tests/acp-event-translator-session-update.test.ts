@@ -677,7 +677,7 @@ describe("ACP runtime event translation", () => {
     ).toEqual([]);
   });
 
-  test("normalizes ACP usage sources to the mosoo usage contract", () => {
+  test("keeps context gauges separate from prompt token usage", () => {
     const state = beginAcpTranscript({ runId: RUN_ID });
 
     const sessionUsage = state.translateUpdate({
@@ -702,15 +702,8 @@ describe("ACP runtime event translation", () => {
 
     expect(sessionUsage).toEqual([
       {
-        kind: "usage.updated",
-        payload: {
-          costAmount: 0.25,
-          costCurrency: "USD",
-          size: 1_000,
-          source: "session_update",
-          usageContract: "anthropic_bucketed",
-          used: 12,
-        },
+        kind: "context.usage.updated",
+        payload: { size: 1_000, used: 12 },
       },
     ]);
     expect(completionUsage).toContainEqual({
@@ -783,12 +776,7 @@ describe("ACP runtime event translation", () => {
       })
       .find((event) => event.kind === "usage.updated");
 
-    expect(sessionUsage?.payload).toMatchObject({
-      source: "session_update",
-      used: 12,
-    });
-    expect(sessionUsage?.payload).not.toHaveProperty("size");
-    expect(sessionUsage?.payload).not.toHaveProperty("costAmount");
+    expect(sessionUsage).toBeUndefined();
     expect(completionUsage?.payload).toMatchObject({ outputTokens: 2, totalTokens: 2 });
     expect(completionUsage?.payload).not.toHaveProperty("inputTokens");
   });

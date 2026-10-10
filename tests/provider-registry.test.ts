@@ -14,6 +14,7 @@ function startInputFor(transport: DriverRuntimeTransport): DriverStartInput {
     "acp-fallback": "acp-fallback",
     "claude-agent-sdk": "claude-agent-sdk",
     "openai-app-server": "openai-runtime",
+    "pi-rpc": "pi",
   } as const satisfies Record<DriverRuntimeTransport, DriverStartInput["runtime"]>;
 
   return createDriverStartInputFromBootPayload({
@@ -38,6 +39,7 @@ describe("provider registry", () => {
         id: "acp-fallback",
         runtime: "acp-fallback",
       },
+      { id: "pi-rpc", runtime: "pi" },
     ]);
   });
 
@@ -51,6 +53,9 @@ describe("provider registry", () => {
     expect(
       AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(startInputFor("acp-fallback")).runtime,
     ).toBe("acp-fallback");
+    expect(AGENT_DRIVER_PROVIDER_REGISTRY.createBackend(startInputFor("pi-rpc")).runtime).toBe(
+      "pi",
+    );
   });
 
   test("resolves provider descriptors from driver start inputs", () => {
@@ -101,7 +106,7 @@ describe("provider registry", () => {
     ).toThrow("Runtime claude-agent-sdk does not match transport openai-app-server.");
   });
 
-  test.each(["openai-app-server", "acp-fallback"] as const)(
+  test.each(["openai-app-server", "acp-fallback", "pi-rpc"] as const)(
     "rejects built-in tool restrictions unsupported by %s",
     (transport) => {
       const input = startInputFor(transport);
@@ -172,4 +177,17 @@ describe("provider registry", () => {
       ).toBe(input.runtime);
     },
   );
+
+  test("rejects additional directories unsupported by Pi", () => {
+    const input = startInputFor("pi-rpc");
+    expect(() =>
+      AGENT_DRIVER_PROVIDER_REGISTRY.getByStartInput({
+        ...input,
+        execution: {
+          ...input.execution,
+          session: { ...input.execution.session, additionalDirectories: ["/tmp/shared"] },
+        },
+      }),
+    ).toThrow("Runtime pi does not support additional directories.");
+  });
 });

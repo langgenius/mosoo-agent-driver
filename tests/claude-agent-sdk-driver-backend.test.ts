@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type {
   Options as ClaudeQueryOptions,
   Query,
   SDKMessage,
+  SDKUserMessage,
   WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 
@@ -28,17 +33,21 @@ import {
 
 const PREWARM_ENV = "AGENT_DRIVER_CLAUDE_PREWARM";
 const previousPrewarm = process.env[PREWARM_ENV];
+const temporaryDirectories: string[] = [];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-afterEach(() => {
+afterEach(async () => {
   if (previousPrewarm === undefined) {
     delete process.env[PREWARM_ENV];
   } else {
     process.env[PREWARM_ENV] = previousPrewarm;
   }
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
 });
 
 function resultMessage(sessionId = "native-session-1"): SDKMessage {
@@ -111,7 +120,11 @@ function fakeQuery(
 
   return Object.assign(iterator, {
     close: closeOnce,
+    initializationResult: async () => ({}),
     interrupt,
+    usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+      session: { total_cost_usd: 0, model_usage: {} },
+    }),
     async return(value?: void) {
       closeOnce();
       cleanupTask ??= cleanup();
@@ -127,7 +140,13 @@ function nextEventLoopTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function createHarness(
+function createSessionPaths() {
+  const cwd = mkdtempSync(join(tmpdir(), "claude-backend-"));
+  temporaryDirectories.push(cwd);
+  return { cwd, homePath: join(cwd, "home"), sharedRootPath: join(cwd, "shared") };
+}
+
+async function createHarness(
   dependencies: ConstructorParameters<typeof ClaudeAgentSdkDriverBackend>[1],
   beforePush?: (events: readonly DriverEventInput[]) => Promise<void> | void,
   payloadOverride?: DriverStartInput,
@@ -135,13 +154,23 @@ function createHarness(
   const events: DriverEventInput[] = [];
   let currentRunId: RunId | null = null;
   let seq = 0;
-  const payload =
+  const basePayload =
     payloadOverride ??
     ({
       ...bootPayload,
       runtime: "claude-agent-sdk",
       runtimeTransport: "claude-agent-sdk",
     } as DriverStartInput);
+  // Exercise the one-shot lifecycle retained for explicit per-Run budgets.
+  // Persistent input/reader ownership is covered in the streaming backend suite.
+  const payload = {
+    ...basePayload,
+    execution: {
+      ...basePayload.execution,
+      providerOptions: { ...basePayload.execution.providerOptions, maxBudgetUsd: 1 },
+      session: { ...basePayload.execution.session, ...createSessionPaths() },
+    },
+  };
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => currentRunId,
@@ -174,7 +203,19 @@ function createHarness(
     permission: { request: async () => "allow_once" },
     ports: { skill: { materialize: async () => [] } },
   });
-  const backend = new ClaudeAgentSdkDriverBackend(payload, dependencies);
+  const backend = new ClaudeAgentSdkDriverBackend(payload, {
+    createNativeCheckpoint: async ({ runId, sessionId }) => ({
+      formatVersion: 1,
+      runId,
+      nativeRef: {
+        kind: "claude_session_id",
+        runtimeId: "claude-agent-sdk",
+        value: sessionId,
+      },
+    }),
+    restoreNativeCheckpoint: async () => {},
+    ...dependencies,
+  });
   const handleInput = backend.handleInput.bind(backend);
   backend.handleInput = async (inputContext, input, runId, signal) => {
     currentRunId ??= runId;
@@ -187,6 +228,7 @@ function createHarness(
       }
     }
   };
+  await backend.start(context, new AbortController().signal);
 
   return {
     backend,
@@ -218,7 +260,7 @@ describe("Claude Agent SDK driver backend", () => {
       "Claude native session ID must contain 1-256 UTF-8 bytes (received 257).",
     );
 
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () => fakeQuery([resultMessage(oversizedSessionId)]),
       startup: async () => {
@@ -232,7 +274,7 @@ describe("Claude Agent SDK driver backend", () => {
     expect(harness.events.some((event) => event.kind === "run.failed")).toBe(true);
     expect(JSON.stringify(harness.events)).not.toContain(oversizedSessionId);
 
-    const emptyHarness = createHarness({
+    const emptyHarness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () => fakeQuery([resultMessage("")]),
       startup: async () => {
@@ -256,7 +298,7 @@ describe("Claude Agent SDK driver backend", () => {
     const startupCalled = Promise.withResolvers<void>();
     const prompts: string[] = [];
     let coldQueries = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) =>
         ({
           abortController: input.abortController,
@@ -269,16 +311,21 @@ describe("Claude Agent SDK driver backend", () => {
         startupCalled.resolve();
         return {
           close: () => {},
-          query: (prompt) => {
-            prompts.push(String(prompt));
-            return fakeQuery([resultMessage()]);
-          },
+          query: (prompt) =>
+            fakeQuery(
+              (async function* () {
+                for await (const message of prompt as AsyncIterable<SDKUserMessage>) {
+                  prompts.push(String(message.message.content));
+                  break;
+                }
+                yield resultMessage();
+              })(),
+            ),
           async [Symbol.asyncDispose]() {},
         };
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await nextEventLoopTurn();
     await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
@@ -297,7 +344,7 @@ describe("Claude Agent SDK driver backend", () => {
     let coldQueries = 0;
     const optionSessionIds: Array<string | null> = [];
     let warmSignal: AbortSignal | undefined;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         optionSessionIds.push(input.nativeSessionId);
         return { abortController: input.abortController } as ClaudeQueryOptions;
@@ -313,7 +360,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
     expect(warmSignal?.aborted).toBe(true);
@@ -348,7 +394,7 @@ describe("Claude Agent SDK driver backend", () => {
     const warmClosed = Promise.withResolvers<void>();
     let optionCalls = 0;
     let cleanupRetries = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         optionCalls += 1;
         if (optionCalls === 1) {
@@ -366,7 +412,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
 
@@ -392,7 +437,7 @@ describe("Claude Agent SDK driver backend", () => {
     const processExit = Promise.withResolvers<void>();
     const warmClosed = Promise.withResolvers<void>();
     let warmSignal: AbortSignal | undefined;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         input.processTasks?.add(processExit.promise);
         const releaseProcess = () => input.processTasks?.delete(processExit.promise);
@@ -407,7 +452,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     let stopped = false;
     const stopping = harness.backend
@@ -435,7 +479,7 @@ describe("Claude Agent SDK driver backend", () => {
     process.env[PREWARM_ENV] = "1";
     const startupCalled = Promise.withResolvers<void>();
     let warmSignal: AbortSignal | undefined;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => ({ abortController: input.abortController }),
       query: () => fakeQuery([resultMessage()]),
       startup: ({ options } = {}) => {
@@ -451,7 +495,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await expect(
       harness.backend.stop(harness.context, "test.stop", new AbortController().signal),
@@ -464,7 +507,7 @@ describe("Claude Agent SDK driver backend", () => {
     const startup = Promise.withResolvers<WarmQuery>();
     const startupCalled = Promise.withResolvers<void>();
     let closes = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => ({ abortController: input.abortController }),
       query: () => fakeQuery([resultMessage()]),
       startup: async () => {
@@ -475,7 +518,6 @@ describe("Claude Agent SDK driver backend", () => {
     const deadline = new AbortController();
     const deadlineError = new Error("stop deadline elapsed");
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     const stopping = harness.backend.stop(harness.context, "test.stop", deadline.signal);
     await nextEventLoopTurn();
@@ -502,7 +544,7 @@ describe("Claude Agent SDK driver backend", () => {
     process.env[PREWARM_ENV] = "1";
     const startup = Promise.withResolvers<WarmQuery>();
     const startupCalled = Promise.withResolvers<void>();
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => ({ abortController: input.abortController }),
       query: () => fakeQuery([resultMessage()]),
       startup: async () => {
@@ -511,7 +553,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     const stopping = harness.backend.stop(
       harness.context,
@@ -535,7 +576,7 @@ describe("Claude Agent SDK driver backend", () => {
     const processExit = Promise.withResolvers<void>();
     const cleanupError = new Error("prewarm process cleanup failed");
     let cleanupRetries = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         input.processTasks?.add(processExit.promise);
         registerClaudeTaskRetry(processExit.promise, async () => {
@@ -554,7 +595,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await nextEventLoopTurn();
     const stopping = harness.backend.stop(
@@ -577,7 +617,7 @@ describe("Claude Agent SDK driver backend", () => {
     const startupCalled = Promise.withResolvers<void>();
     const processExit = Promise.withResolvers<void>();
     const cleanupError = new Error("spontaneous prewarm cleanup failed");
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         input.processTasks?.add(processExit.promise);
         return { abortController: input.abortController };
@@ -589,7 +629,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     processExit.reject(cleanupError);
     await nextEventLoopTurn();
@@ -607,7 +646,7 @@ describe("Claude Agent SDK driver backend", () => {
     const startupCalled = Promise.withResolvers<void>();
     const permanentError = new Error("permanent prewarm cleanup failure");
     let cleanupRetries = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         input.processTasks?.add(permanentExit.promise);
         input.processTasks?.add(retryableExit.promise);
@@ -623,7 +662,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     await nextEventLoopTurn();
     permanentExit.reject(permanentError);
@@ -645,7 +683,7 @@ describe("Claude Agent SDK driver backend", () => {
     const startup = Promise.withResolvers<WarmQuery>();
     const startupCalled = Promise.withResolvers<void>();
     let closes = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => ({ abortController: input.abortController }),
       query: () => fakeQuery([resultMessage()]),
       startup: async () => {
@@ -654,7 +692,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await startupCalled.promise;
     const first = harness.backend.stop(
       harness.context,
@@ -698,7 +735,7 @@ describe("Claude Agent SDK driver backend", () => {
     const warmClosed = Promise.withResolvers<void>();
     let optionCalls = 0;
     let stopSettled = false;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         optionCalls += 1;
         input.processTasks?.add(
@@ -724,7 +761,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await prewarmStartupCalled.promise;
     const handling = harness.backend.handleInput(
       harness.context,
@@ -781,7 +817,7 @@ describe("Claude Agent SDK driver backend", () => {
       const options = Promise.withResolvers<ClaudeQueryOptions>();
       const optionsRequested = Promise.withResolvers<void>();
       let queryCalls = 0;
-      const harness = createHarness({
+      const harness = await createHarness({
         createQueryOptions: async () => {
           optionsRequested.resolve();
           return options.promise;
@@ -827,7 +863,7 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("publishes run.started before a query option failure terminal", async () => {
     delete process.env[PREWARM_ENV];
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => {
         throw new Error("query options failed");
       },
@@ -858,7 +894,7 @@ describe("Claude Agent SDK driver backend", () => {
     const processExit = Promise.withResolvers<void>();
     let processExited = false;
     let processTasks: Set<Promise<void>> | undefined;
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async (input) => {
           processTasks = input.processTasks;
@@ -906,7 +942,7 @@ describe("Claude Agent SDK driver backend", () => {
     delete process.env[PREWARM_ENV];
     let queryCalls = 0;
     let rejectStarted = true;
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async () => ({}),
         query: () => {
@@ -970,7 +1006,11 @@ describe("Claude Agent SDK driver backend", () => {
       close() {
         closeCalls += 1;
       },
+      initializationResult: async () => ({}),
       async interrupt() {},
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+        session: { total_cost_usd: 0, model_usage: {} },
+      }),
       async next() {
         if (outerMessagePending) {
           outerMessagePending = false;
@@ -988,7 +1028,7 @@ describe("Claude Agent SDK driver backend", () => {
         return inner;
       },
     } as unknown as Query;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async ({ abortController }) => {
         turnSignal = abortController.signal;
         return {};
@@ -1047,7 +1087,7 @@ describe("Claude Agent SDK driver backend", () => {
     let cleanupFinished = false;
     let lateProcessExited = false;
     let processExited = false;
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async (input) => {
           const processTask = releaseProcess.promise.then(() => {
@@ -1111,7 +1151,7 @@ describe("Claude Agent SDK driver backend", () => {
     const processExit = Promise.withResolvers<void>();
     let cleanupRetries = 0;
     let stopSettled = false;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async ({ processTasks }) => {
         processTasks?.add(processExit.promise);
         registerClaudeTaskRetry(processExit.promise, async () => {
@@ -1178,7 +1218,7 @@ describe("Claude Agent SDK driver backend", () => {
       delete process.env[PREWARM_ENV];
       const task = Promise.withResolvers<void>();
       const taskError = new Error(`${taskKind} task failed`);
-      const harness = createHarness({
+      const harness = await createHarness({
         createQueryOptions: async (input) => {
           const tasks = taskKind === "permission" ? input.permissionTasks : input.processTasks;
           tasks?.add(task.promise);
@@ -1229,7 +1269,7 @@ describe("Claude Agent SDK driver backend", () => {
     let turnSignal: AbortSignal | undefined;
     let closes = 0;
     const terminalOrder: string[] = [];
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async ({ abortController, permissionTasks }) => {
           turnSignal = abortController.signal;
@@ -1312,7 +1352,7 @@ describe("Claude Agent SDK driver backend", () => {
     const releaseTerminal = Promise.withResolvers<void>();
     const terminalEntered = Promise.withResolvers<void>();
     const queryCreated = Promise.withResolvers<void>();
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async () => ({}),
         query: () => {
@@ -1386,7 +1426,7 @@ describe("Claude Agent SDK driver backend", () => {
     const queryCreated = Promise.withResolvers<void>();
     let cancellationSettled = false;
     let stopSettled = false;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async ({ processTasks }) => {
         processTasks?.add(processExit.promise);
         return {};
@@ -1462,7 +1502,7 @@ describe("Claude Agent SDK driver backend", () => {
     const finishing = Promise.withResolvers<void>();
     const releaseFinish = Promise.withResolvers<void>();
     let closes = 0;
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async () => ({}),
         query: () => fakeQuery([resultMessage()], () => (closes += 1)),
@@ -1505,29 +1545,43 @@ describe("Claude Agent SDK driver backend", () => {
       const releaseWindow = Promise.withResolvers<void>();
       const cancellationClaimed = Promise.withResolvers<void>();
       const order: string[] = [];
-      const backend = new ClaudeAgentSdkDriverBackend(
-        {
-          ...bootPayload,
-          runtime: "claude-agent-sdk",
-          runtimeTransport: "claude-agent-sdk",
-        } as DriverStartInput,
-        {
-          createQueryOptions: async () => ({}),
-          query: () =>
-            fakeQuery(
-              [resultMessage()],
-              () => {},
-              async () => undefined,
-              async () => {
-                if (window === "query cleanup") {
-                  windowEntered.resolve();
-                  await releaseWindow.promise;
-                }
-                order.push("cleanup");
-              },
-            ),
+      const payload = {
+        ...bootPayload,
+        execution: {
+          ...bootPayload.execution,
+          // Only the budgeted one-shot path waits for cleanup on successful results.
+          providerOptions: window === "query cleanup" ? { maxBudgetUsd: 1 } : {},
+          session: { ...bootPayload.execution.session, ...createSessionPaths() },
         },
-      );
+        runtime: "claude-agent-sdk",
+        runtimeTransport: "claude-agent-sdk",
+      } as DriverStartInput;
+      const backend = new ClaudeAgentSdkDriverBackend(payload, {
+        createNativeCheckpoint: async ({ runId, sessionId }) => ({
+          formatVersion: 1,
+          runId,
+          nativeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: sessionId,
+          },
+        }),
+        restoreNativeCheckpoint: async () => {},
+        createQueryOptions: async () => ({}),
+        query: () =>
+          fakeQuery(
+            [resultMessage()],
+            () => {},
+            async () => undefined,
+            async () => {
+              if (window === "query cleanup") {
+                windowEntered.resolve();
+                await releaseWindow.promise;
+              }
+              order.push("cleanup");
+            },
+          ),
+      });
       const socket = new FakeDriverRuntimeIo([
         {
           commandId: "result-cleanup-input",
@@ -1589,6 +1643,14 @@ describe("Claude Agent SDK driver backend", () => {
         isShuttingDown: () => socket.isDrained(),
         runtimeState,
       });
+      const context = createAgentDriverContext({
+        eventSink: socket,
+        logger,
+        payload,
+        permission: { request: async () => "reject_once" },
+        ports: { skill: { materialize: async () => [] } },
+      });
+      await backend.start(context, new AbortController().signal);
 
       const running = dispatcher.run(socket, logger);
       await windowEntered.promise;
@@ -1623,17 +1685,19 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("settles a provider-aborted result as cancellation without failing the runtime", async () => {
     delete process.env[PREWARM_ENV];
-    const backend = new ClaudeAgentSdkDriverBackend(
-      {
-        ...bootPayload,
-        runtime: "claude-agent-sdk",
-        runtimeTransport: "claude-agent-sdk",
-      } as DriverStartInput,
-      {
-        createQueryOptions: async () => ({}),
-        query: () => fakeQuery([cancelledResultMessage()]),
+    const payload = {
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        session: { ...bootPayload.execution.session, ...createSessionPaths() },
       },
-    );
+      runtime: "claude-agent-sdk",
+      runtimeTransport: "claude-agent-sdk",
+    } as DriverStartInput;
+    const backend = new ClaudeAgentSdkDriverBackend(payload, {
+      createQueryOptions: async () => ({}),
+      query: () => fakeQuery([cancelledResultMessage()]),
+    });
     const socket = new FakeDriverRuntimeIo([
       {
         commandId: "provider-cancelled-input",
@@ -1655,6 +1719,14 @@ describe("Claude Agent SDK driver backend", () => {
       isShuttingDown: () => socket.isDrained() && socket.currentRunId() === null,
       runtimeState,
     });
+    const context = createAgentDriverContext({
+      eventSink: socket,
+      logger,
+      payload,
+      permission: { request: async () => "reject_once" },
+      ports: { skill: { materialize: async () => [] } },
+    });
+    await backend.start(context, new AbortController().signal);
 
     await dispatcher.run(socket, logger);
 
@@ -1679,6 +1751,10 @@ describe("Claude Agent SDK driver backend", () => {
     const releaseCleanup = Promise.withResolvers<void>();
     const payload = {
       ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        session: { ...bootPayload.execution.session, ...createSessionPaths() },
+      },
       runtime: "claude-agent-sdk",
       runtimeTransport: "claude-agent-sdk",
     } as DriverStartInput;
@@ -1702,7 +1778,9 @@ describe("Claude Agent SDK driver backend", () => {
       logger: createDisabledLogger(),
       payload,
       permission: { request: async () => "reject_once" },
+      ports: { skill: { materialize: async () => [] } },
     });
+    await backend.start(context, new AbortController().signal);
 
     const handling = backend.handleInput(
       context,
@@ -1735,7 +1813,7 @@ describe("Claude Agent SDK driver backend", () => {
     async ({ message, terminal }) => {
       delete process.env[PREWARM_ENV];
       const terminalAttempts: string[][] = [];
-      const harness = createHarness(
+      const harness = await createHarness(
         {
           createQueryOptions: async () => ({}),
           query: () => fakeQuery([message]),
@@ -1773,7 +1851,7 @@ describe("Claude Agent SDK driver backend", () => {
     const optionsRequested = Promise.withResolvers<void>();
     const optionsReturned = Promise.withResolvers<void>();
     let startupCalls = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => {
         optionsRequested.resolve();
         const value = await options.promise;
@@ -1787,7 +1865,6 @@ describe("Claude Agent SDK driver backend", () => {
       },
     });
 
-    await harness.backend.start(harness.context, new AbortController().signal);
     await optionsRequested.promise;
     const stopping = harness.backend.stop(
       harness.context,
@@ -1805,7 +1882,7 @@ describe("Claude Agent SDK driver backend", () => {
   test("fails a turn when its native session changes", async () => {
     delete process.env[PREWARM_ENV];
     let queryIndex = 0;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () => fakeQuery([resultMessage(`native-session-${(queryIndex += 1)}`)]),
       startup: async () => {
@@ -1833,7 +1910,7 @@ describe("Claude Agent SDK driver backend", () => {
     delete process.env[PREWARM_ENV];
     let queryIndex = 0;
     const optionSessionIds: Array<string | null> = [];
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async (input) => {
         optionSessionIds.push(input.nativeSessionId);
         return {};
@@ -1873,18 +1950,38 @@ describe("Claude Agent SDK driver backend", () => {
     await harness.backend.stop(harness.context, "test.complete", new AbortController().signal);
 
     expect(optionSessionIds).toEqual([null, "native-session-1"]);
-    expect(
-      harness.events.flatMap((event) => {
-        if (
-          event.kind !== "runtime.resume.updated" ||
-          !isRecord(event.payload) ||
-          typeof event.payload["resumePointer"] !== "string"
-        ) {
-          return [];
-        }
-        return [event.payload["resumePointer"]];
-      }),
-    ).toEqual(["native-session-1", "native-session-2"]);
+    expect(harness.events.filter((event) => event.kind === "runtime.resume.updated")).toMatchObject(
+      [
+        { runId: DRIVER_TEST_IDS.runId, payload: { resumePointer: "native-session-1" } },
+        { runId: DRIVER_TEST_IDS.runId, payload: { resumePointer: "native-session-1" } },
+        { runId: DRIVER_TEST_IDS.secondRunId, payload: { resumePointer: "native-session-2" } },
+      ],
+    );
+    expect(harness.events.filter((event) => event.kind === "runtime.session.reset")).toMatchObject([
+      {
+        payload: {
+          previousCheckpoint: {
+            formatVersion: 1,
+            runId: DRIVER_TEST_IDS.runId,
+            nativeRef: {
+              kind: "claude_session_id",
+              runtimeId: "claude-agent-sdk",
+              value: "native-session-1",
+            },
+          },
+          previousNativeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: "native-session-1",
+          },
+          newNativeRef: {
+            kind: "claude_session_id",
+            runtimeId: "claude-agent-sdk",
+            value: "native-session-2",
+          },
+        },
+      },
+    ]);
     expect(harness.events.some(({ kind }) => kind === "message.cancelled")).toBe(true);
     expect(harness.events.filter(({ kind }) => kind === "run.completed")).toHaveLength(2);
   });
@@ -1894,7 +1991,7 @@ describe("Claude Agent SDK driver backend", () => {
     let closedAfterTail = false;
     let queryIndex = 0;
     let lateFrameRead = false;
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () => {
         queryIndex += 1;
@@ -1981,7 +2078,7 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("fails closed on turn content after a result frame", async () => {
     delete process.env[PREWARM_ENV];
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () =>
         fakeQuery([
@@ -2018,7 +2115,7 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("keeps result bookkeeping causal across a post-result conversation reset", async () => {
     delete process.env[PREWARM_ENV];
-    const harness = createHarness({
+    const harness = await createHarness({
       createQueryOptions: async () => ({}),
       query: () =>
         fakeQuery([
@@ -2056,13 +2153,14 @@ describe("Claude Agent SDK driver backend", () => {
 
     const resetIndex = harness.events.findIndex(
       (event) =>
-        event.kind === "runtime.resume.updated" &&
+        event.kind === "runtime.session.reset" &&
         isRecord(event.payload) &&
-        event.payload["resumePointer"] === "native-session-2",
+        isRecord(event.payload["newNativeRef"]) &&
+        event.payload["newNativeRef"]["value"] === "native-session-2",
     );
     const terminalIndex = harness.events.findIndex((event) => event.kind === "run.completed");
-    expect(resetIndex).toBeGreaterThanOrEqual(0);
-    expect(terminalIndex).toBeGreaterThan(resetIndex);
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(resetIndex).toBeGreaterThan(terminalIndex);
     expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
     expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
     expect(
@@ -2105,14 +2203,20 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("replays recovery messages in the first prompt when no native session exists", async () => {
     const prompts: string[] = [];
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async (input) =>
           ({ abortController: input.abortController }) as ClaudeQueryOptions,
-        query: (input) => {
-          prompts.push(String(input.prompt));
-          return fakeQuery([resultMessage()]);
-        },
+        query: (input) =>
+          fakeQuery(
+            (async function* () {
+              for await (const message of input.prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(String(message.message.content));
+                break;
+              }
+              yield resultMessage();
+            })(),
+          ),
         startup: async () => {
           throw new Error("prewarm is disabled");
         },
@@ -2148,14 +2252,20 @@ describe("Claude Agent SDK driver backend", () => {
 
   test("does not replay recovery messages when a native resume ref is present", async () => {
     const prompts: string[] = [];
-    const harness = createHarness(
+    const harness = await createHarness(
       {
         createQueryOptions: async (input) =>
           ({ abortController: input.abortController }) as ClaudeQueryOptions,
-        query: (input) => {
-          prompts.push(String(input.prompt));
-          return fakeQuery([resultMessage()]);
-        },
+        query: (input) =>
+          fakeQuery(
+            (async function* () {
+              for await (const message of input.prompt as AsyncIterable<SDKUserMessage>) {
+                prompts.push(String(message.message.content));
+                break;
+              }
+              yield resultMessage();
+            })(),
+          ),
         startup: async () => {
           throw new Error("prewarm is disabled");
         },

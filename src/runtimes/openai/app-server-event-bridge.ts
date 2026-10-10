@@ -1,6 +1,7 @@
 import { DriverTurnCancelledError } from "../../core/driver-runtime-state";
 import type { DriverEventInput } from "../../protocol/events";
 import { createDriverId, driverIdTimeMs, type RunId } from "../../protocol/id";
+import type { NativeCheckpoint } from "../../protocol/native-checkpoint";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import {
@@ -20,6 +21,12 @@ import { OpenAiTurnTracker, type OpenAiTurnAdmission } from "./app-server-turn-t
 import type { ServerNotificationMethod } from "./app-server-protocol";
 
 interface OpenAiAppServerEventBridgeOptions {
+  prepareCheckpoint(
+    context: AgentDriverContext,
+    runId: RunId,
+    turnId: string,
+    signal?: AbortSignal,
+  ): Promise<NativeCheckpoint>;
   beforeInterruptedTurn?(context: AgentDriverContext, turnId: string): Promise<void>;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
   pushSession(
@@ -1169,9 +1176,16 @@ export class OpenAiAppServerEventBridge {
         return;
       }
 
-      // A fresh app-server thread may not have a rollout until its first successful
-      // turn is materialized. Resume metadata must never turn that successful turn
-      // into a failure.
+      const checkpointRunId = runId ?? context.ports.eventSink.currentRunId();
+      if (checkpointRunId === null) {
+        throw new Error("OpenAI completion requires an active run for its native checkpoint.");
+      }
+      const checkpoint = await this.#options.prepareCheckpoint(
+        context,
+        checkpointRunId,
+        turnId,
+        cancellationSignal ?? undefined,
+      );
       try {
         await this.publishNativeResumeRef(context);
       } catch (publishError) {
@@ -1200,6 +1214,7 @@ export class OpenAiAppServerEventBridge {
           }),
           kind: "run.completed",
           payload: {
+            checkpoint,
             ...(authoritativeFinalSnapshot === null
               ? {}
               : { finalMessageId: authoritativeFinalSnapshot.id }),

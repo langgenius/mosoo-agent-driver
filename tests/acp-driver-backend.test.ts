@@ -1,7 +1,16 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ClientContext } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,10 +25,13 @@ import { createDisabledLogger } from "../src/observability";
 import type { AgentDriverFilePort, AgentDriverPermissionPort } from "../src/host-ports";
 import type { DriverBootPayload } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
-import type { RunId } from "../src/protocol/id";
+import { createDriverId } from "../src/protocol/id";
+import type { EventId, RunId } from "../src/protocol/id";
+import { toRuntimeEventInput } from "../src/runtime-events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
 import * as acpAgentProcess from "../src/runtimes/acp/acp-agent-process";
+import * as openCodeCheckpoint from "../src/runtimes/acp/opencode-checkpoint";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
 import { AcpTurnController } from "../src/runtimes/acp/acp-turn-controller";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
@@ -31,6 +43,12 @@ import { createDispatcher, FakeDriverRuntimeIo } from "./driver-runtime-boundary
 const FAKE_AGENT = String.raw`
 const { appendFileSync, existsSync } = require("node:fs");
 const { spawn } = require("node:child_process");
+const { Database } = require("bun:sqlite");
+const { mkdirSync } = require("node:fs");
+const { dirname } = require("node:path");
+mkdirSync(dirname(process.env.OPENCODE_DB), { recursive: true });
+const nativeDb = new Database(process.env.OPENCODE_DB);
+nativeDb.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, parent_id TEXT); CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, session_id TEXT, data TEXT); INSERT OR IGNORE INTO session VALUES ('native-session-1', NULL)");
 const logPath = process.env.TEST_LOG_PATH;
 const agentPidPath = process.env.TEST_AGENT_PID_PATH;
 const backpressurePath = process.env.TEST_BACKPRESSURE_PATH;
@@ -72,7 +90,14 @@ const sendFloodWaits = () => {
     });
   }
 };
-const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+const send = (message) => {
+  if (message.result?.stopReason) {
+    const usage = message.result.usage;
+    const part = { type: "step-finish", cost: 0.01, tokens: { input: usage?.inputTokens ?? 3, output: usage?.outputTokens ?? 2, reasoning: usage?.thoughtTokens ?? 0, cache: { read: usage?.cachedReadTokens ?? 0, write: usage?.cachedWriteTokens ?? 0 } } };
+    nativeDb.query("INSERT INTO part VALUES (?, 'native-session-1', ?)").run(crypto.randomUUID(), JSON.stringify(part));
+  }
+  return process.stdout.write(JSON.stringify(message) + "\n");
+};
 const requestClient = (message) => {
   appendFileSync(logPath, message.method + "\n");
   send(message);
@@ -627,6 +652,7 @@ async function createHarness(
     readonly hangClose?: boolean;
     readonly metadataOnResume?: boolean;
     readonly openCodeInstructions?: boolean;
+    readonly unsupportedProvider?: boolean;
     onEvents?(events: readonly DriverEventInput[]): void;
     readonly permission?: AgentDriverPermissionPort["request"];
     readonly spawnLateChild?: boolean;
@@ -644,11 +670,8 @@ async function createHarness(
   const responsePath = join(root, "responses.log");
   const resumeGatePath = join(root, "resume-gate");
   const triggerPath = join(root, "send-update");
-  const command = options.openCodeInstructions ? join(root, "opencode") : process.execPath;
-
-  if (options.openCodeInstructions) {
-    await symlink(process.execPath, command);
-  }
+  const command = options.unsupportedProvider ? process.execPath : join(root, "opencode");
+  if (!options.unsupportedProvider) await symlink(process.execPath, command);
   const boot = {
     ...driverBootPayload,
     execution: {
@@ -723,6 +746,20 @@ async function createHarness(
           await current.release.promise;
         }
 
+        for (const event of events) {
+          const eventRunId = event.runId === undefined ? activeRunId : event.runId;
+          toRuntimeEventInput(
+            {
+              createId: () => createDriverId() as EventId,
+              driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
+              occurredAt: "2026-10-10T00:00:00.000Z",
+              ...(eventRunId === null ? {} : { runId: eventRunId }),
+              runtimeId: "acp-fallback",
+              sessionId: DRIVER_TEST_IDS.sessionId,
+            },
+            event,
+          );
+        }
         publishedEvents.push(...events);
         for (const event of events) {
           if (
@@ -768,6 +805,12 @@ async function createHarness(
 
   try {
     await backend.start(context, new AbortController().signal);
+  } catch (error) {
+    await backend
+      .stop(context, "test startup cleanup", new AbortController().signal)
+      .catch(() => {});
+    await rm(root, { force: true, recursive: true });
+    throw error;
   } finally {
     if (previousCommand === undefined) {
       delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
@@ -916,6 +959,154 @@ describe("ACP driver backend lifecycle", () => {
       const [instructionPath] = config.instructions as [string];
       expect(await readFile(instructionPath, "utf8")).toContain("Always answer concisely.");
     } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("rejects ACP providers without a native checkpoint exporter", async () => {
+    await expect(createHarness({ unsupportedProvider: true })).rejects.toThrow(
+      "require an OpenCode provider",
+    );
+  });
+
+  test("accepts cancellation while the native checkpoint is still being prepared", async () => {
+    const harness = await createHarness();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const actualExport = openCodeCheckpoint.exportOpenCodeCheckpoint;
+    const exportSpy = spyOn(openCodeCheckpoint, "exportOpenCodeCheckpoint").mockImplementation(
+      async (input) => {
+        entered.resolve();
+        await release.promise;
+        return actualExport(input);
+      },
+    );
+    try {
+      const turn = harness.backend.handleInput(
+        harness.context,
+        { text: "hello" },
+        DRIVER_TEST_IDS.runId,
+      );
+      void turn.catch(() => {});
+      await entered.promise;
+      await harness.backend.cancelActiveTurn(harness.context, "cancel checkpoint preparation");
+      release.resolve();
+      await expect(turn).rejects.toThrow("cancelled");
+      expect(harness.events.filter((event) => event.kind === "run.cancelled")).toHaveLength(1);
+      expect(harness.events.find((event) => event.kind === "usage.updated")?.payload).toMatchObject(
+        { inputTokens: 3, outputTokens: 2 },
+      );
+      expect(harness.events.some((event) => event.kind === "run.completed")).toBe(false);
+    } finally {
+      release.resolve();
+      exportSpy.mockRestore();
+      await harness.destroy();
+    }
+  });
+
+  test("publishes failure if its native checkpoint cannot be sealed", async () => {
+    const harness = await createHarness();
+    try {
+      const cwd = harness.context.payload.execution.session.cwd;
+      await mkdir(join(cwd, ".state"), { recursive: true });
+      await symlink(cwd, join(cwd, ".state", "native-checkpoints"));
+      await expect(
+        harness.backend.handleInput(harness.context, { text: "hello" }, DRIVER_TEST_IDS.runId),
+      ).rejects.toThrow("checkpoint");
+      expect(harness.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
+      expect(harness.events.find((event) => event.kind === "usage.updated")?.payload).toMatchObject(
+        { inputTokens: 3, outputTokens: 2 },
+      );
+      expect(harness.events.some((event) => event.kind === "run.completed")).toBe(false);
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("reports the native session, checkpoint, and usage before every completed run", async () => {
+    const harness = await createHarness();
+    try {
+      for (const runId of [DRIVER_TEST_IDS.runId, DRIVER_TEST_IDS.secondRunId]) {
+        await harness.backend.handleInput(harness.context, { text: "hello" }, runId);
+        const events = harness.events.filter((event) => event.runId === runId);
+        const resume = events.filter((event) => event.kind === "runtime.resume.updated");
+        expect(resume).toHaveLength(1);
+        expect(resume[0]?.payload).toEqual({ resumePointer: "native-session-1" });
+        const usage = events.filter((event) => event.kind === "usage.updated");
+        expect(usage).toHaveLength(1);
+        expect(usage[0]?.payload).toMatchObject({
+          source: "native_step_totals",
+          inputTokens: 3,
+          outputTokens: 2,
+        });
+        const terminal = events.find((event) => event.kind === "run.completed");
+        expect(terminal?.payload).toMatchObject({
+          checkpoint: {
+            formatVersion: 1,
+            runId,
+            nativeRef: {
+              runtimeId: "acp-fallback",
+              kind: "acp_session_id",
+              value: "native-session-1",
+            },
+          },
+        });
+        expect(events.indexOf(resume[0]!)).toBeLessThan(events.indexOf(terminal!));
+        expect(events.indexOf(usage[0]!)).toBeLessThan(events.indexOf(terminal!));
+      }
+    } finally {
+      await harness.destroy();
+    }
+  });
+
+  test("retries acknowledged checkpoint cleanup during stop without repeating the terminal", async () => {
+    const harness = await createHarness();
+    const directory = join(
+      harness.context.payload.execution.session.cwd,
+      ".state/native-checkpoints",
+    );
+    const retainedDirectory = `${directory}.retained`;
+    let releaseTerminal = () => {};
+
+    try {
+      await harness.backend.handleInput(harness.context, { text: "first" }, DRIVER_TEST_IDS.runId);
+      const gate = harness.blockNext("run.completed");
+      releaseTerminal = gate.release;
+      const turn = harness.backend.handleInput(
+        harness.context,
+        { text: "second" },
+        DRIVER_TEST_IDS.secondRunId,
+      );
+      void turn.catch(() => {});
+      await gate.entered;
+      await rename(directory, retainedDirectory);
+      await writeFile(directory, "block checkpoint cleanup");
+      gate.release();
+
+      await expect(turn).rejects.toThrow("Native checkpoint cleanup failed");
+      // The provider's close update also fails while the publisher cleanup slot is reserved.
+      await expect(
+        harness.backend.stop(harness.context, "blocked cleanup", new AbortController().signal),
+      ).rejects.toThrow("terminal settlement slot is full");
+      expect((await readdir(retainedDirectory)).sort()).toEqual([
+        ".gitignore",
+        DRIVER_TEST_IDS.runId,
+        DRIVER_TEST_IDS.secondRunId,
+      ]);
+
+      await rm(directory);
+      await rename(retainedDirectory, directory);
+      await expect(
+        harness.backend.stop(harness.context, "retry cleanup", new AbortController().signal),
+      ).rejects.toThrow("terminal settlement slot is full");
+      expect((await readdir(directory)).sort()).toEqual([
+        ".gitignore",
+        DRIVER_TEST_IDS.secondRunId,
+      ]);
+      expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(2);
+      expect(harness.events.some((event) => event.kind === "run.failed")).toBe(false);
+    } finally {
+      releaseTerminal();
       await harness.destroy();
     }
   });
@@ -2919,7 +3110,7 @@ describe("ACP driver backend lifecycle", () => {
     const harness = await createHarness();
 
     try {
-      const gate = harness.blockNext("usage.updated");
+      const gate = harness.blockNext("context.usage.updated");
       await writeFile(harness.triggerPath, "send");
       await gate.entered;
       const stop = harness.backend.stop(harness.context, "test stop", new AbortController().signal);
@@ -2943,7 +3134,7 @@ describe("ACP driver backend lifecycle", () => {
       await harness.backend.stop(harness.context, "test stop", new AbortController().signal);
       expect(harness.events).toContainEqual(
         expect.objectContaining({
-          kind: "usage.updated",
+          kind: "context.usage.updated",
           payload: expect.objectContaining({ size: 20, used: 2 }),
         }),
       );
@@ -2967,7 +3158,7 @@ describe("ACP driver backend lifecycle", () => {
         "ACP session/prompt request",
       );
 
-      const gate = harness.blockNext("usage.updated");
+      const gate = harness.blockNext("context.usage.updated");
       const stop = harness.backend.stop(
         harness.context,
         "test failed stop",
@@ -3011,7 +3202,7 @@ describe("ACP driver backend lifecycle", () => {
     const harness = await createHarness({ hangClose: true });
 
     try {
-      const gate = harness.blockNext("usage.updated");
+      const gate = harness.blockNext("context.usage.updated");
       await writeFile(harness.triggerPath, "send");
       await gate.entered;
       const startedAt = Date.now();

@@ -122,15 +122,19 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
       ];
     case "run.waiting":
     case "run.cancelled":
-    case "run.completed":
+    case "run.completed": {
+      const metadata = Object.fromEntries(
+        Object.entries(payload).filter(([key]) => key !== "checkpoint"),
+      );
       return [
         {
-          metadata: payload,
+          metadata,
           sessionStatus: "idle",
           sourceEventKind: event.kind,
           type: "session.status_idle",
         },
       ];
+    }
     case "run.failed": {
       const recoverable = isRecoverableFailure(payload);
       return [

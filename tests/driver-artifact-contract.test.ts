@@ -39,6 +39,7 @@ const PUBLIC_EXPORTS = [
   "./paths",
   "./provider-output",
   "./runtime",
+  "./runtime-events",
 ] as const;
 
 function readText(path: string): string {
@@ -157,6 +158,7 @@ describe("driver artifact contract", () => {
       CLAUDE_AGENT_SDK_VERSION: packageJson.dependencies["@anthropic-ai/claude-agent-sdk"],
       OPENAI_RUNTIME_VERSION: packageJson.devDependencies["@openai/codex"],
       OPENCODE_VERSION: packageJson.devDependencies["opencode-ai"],
+      PI_VERSION: packageJson.devDependencies["@earendil-works/pi-coding-agent"],
     };
 
     expect(readContainerArguments()).toMatchObject(versions);
@@ -167,6 +169,7 @@ describe("driver artifact contract", () => {
       'test "$(bun --version)" = "$BUN_VERSION"',
       "@anthropic-ai/claude-agent-sdk-linux-x64@${CLAUDE_AGENT_SDK_VERSION}",
       "opencode-linux-x64-baseline@${OPENCODE_VERSION}",
+      "@earendil-works/pi-coding-agent@${PI_VERSION}",
     ])
       expect(containerfile).toContain(marker);
 

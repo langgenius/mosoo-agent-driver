@@ -27,10 +27,10 @@ import { OpenAiAppServerClient } from "./app-server-client";
 import { openAiAgentTasksClosedEvent } from "./app-server-agent-task-events";
 import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "./app-server-env";
 import { OpenAiAppServerEventBridge } from "./app-server-event-bridge";
+import { createOpenAiNativeCheckpoint, restoreOpenAiNativeCheckpoint } from "./native-checkpoint";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import type {
   ApprovalPolicy,
-  ThreadInjectItemsParams,
   ThreadResumeParams,
   ThreadStartParams,
   ThreadStartResponse,
@@ -108,32 +108,6 @@ function isTerminalTurn(status: TurnStatus): boolean {
   return status === "completed" || status === "failed" || status === "interrupted";
 }
 
-function isUnmaterializedRollout(error: unknown, threadId: string): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-
-  return (
-    error.message === `no rollout found for thread id ${threadId}` ||
-    (error.message.includes("rollout at ") && error.message.endsWith(" is empty"))
-  );
-}
-
-function toRecoveryItems(
-  messages: DriverStartInput["execution"]["session"]["recoveryMessages"],
-): ThreadInjectItemsParams["items"] {
-  return messages.map((message) => ({
-    content: [
-      {
-        text: message.content,
-        type: message.role === "user" ? "input_text" : "output_text",
-      },
-    ],
-    role: message.role,
-    type: "message",
-  }));
-}
-
 export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   readonly runtime: DriverRuntime = "openai-runtime";
   readonly #payload: DriverStartInput;
@@ -154,6 +128,15 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   #turnStartInFlight = false;
   #turnStartRunId: RunId | null = null;
   readonly #events = new OpenAiAppServerEventBridge({
+    prepareCheckpoint: async (_context, runId, turnId, signal) =>
+      createOpenAiNativeCheckpoint({
+        root: await this.#eventPublisher.getNativeCheckpointRoot(),
+        payload: this.#payload,
+        runId,
+        threadId: this.#requireThreadId(),
+        turnId,
+        signal: signal ?? new AbortController().signal,
+      }),
     beforeInterruptedTurn: async (context) => {
       const client = this.#client;
       if (client !== null) {
@@ -182,6 +165,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
   async start(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
+    await this.#eventPublisher.initializeNativeCheckpointRoot(context, signal);
     const startupStartedAt = new Date().toISOString();
     const startupPhases: ReturnType<typeof createTimingPhase>[] = [];
     const measureStartupPhase = async <T>(name: string, task: () => Promise<T>): Promise<T> => {
@@ -195,6 +179,12 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       }
     };
 
+    await measureStartupPhase("native_checkpoint.restore", () =>
+      restoreOpenAiNativeCheckpoint(this.#payload, signal),
+    );
+    const nativeResumeThreadId = readResumeThreadId(this.#payload);
+    // Resume emits historical usage before its response; bind the verified native identity first.
+    this.#threadId = nativeResumeThreadId;
     const client = this.#createClient(context);
     this.#client = client;
     const clientStartPromise = (async () => {
@@ -225,16 +215,13 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       throw error;
     }
 
-    let nativeResumeThreadId: string | null;
     let threadResult: ThreadStartResponse;
     try {
       signal.throwIfAborted();
       if (this.#client !== client) {
         throw new Error("OpenAi app-server backend stopped during startup.");
       }
-      nativeResumeThreadId = readResumeThreadId(this.#payload);
       threadResult = await this.#startThread(
-        context,
         client,
         signal,
         nativeResumeThreadId,
@@ -339,7 +326,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   }
 
   async #startThread(
-    context: AgentDriverContext,
     client: OpenAiAppServerClient,
     signal: AbortSignal,
     resumeThreadId: string | null,
@@ -368,54 +354,20 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       );
     }
 
-    try {
-      return validateOpenAiThreadResponse(
-        await measure("thread.resume", () =>
-          client.request(
-            "thread/resume",
-            {
-              ...baseThreadParams,
-              ...(developerInstructions === null ? {} : { developerInstructions }),
-              excludeTurns: true,
-              threadId: resumeThreadId,
-            } satisfies ThreadResumeParams,
-            signal,
-          ),
-        ),
-      );
-    } catch (error) {
-      if (!isUnmaterializedRollout(error, resumeThreadId)) {
-        throw error;
-      }
-    }
-
-    context.logger.warn("driver.openai.native_resume_ref.missing_rollout", {
-      nativeResumeRefPresent: true,
-    });
-    const threadResult = validateOpenAiThreadResponse(
-      await measure("thread.start_after_missing_rollout", () =>
-        client.request("thread/start", threadStartParams, signal),
-      ),
-    );
-    const recoveryItems = toRecoveryItems(this.#payload.execution.session.recoveryMessages);
-
-    if (recoveryItems.length > 0) {
-      await measure("thread.inject_recovery_items", () =>
+    return validateOpenAiThreadResponse(
+      await measure("thread.resume", () =>
         client.request(
-          "thread/inject_items",
+          "thread/resume",
           {
-            items: recoveryItems,
-            threadId: threadResult.thread.id,
-          },
+            ...baseThreadParams,
+            ...(developerInstructions === null ? {} : { developerInstructions }),
+            excludeTurns: true,
+            threadId: resumeThreadId,
+          } satisfies ThreadResumeParams,
           signal,
         ),
-      );
-    }
-
-    context.logger.warn("driver.openai.native_resume_ref.semantic_recovery", {
-      recoveryMessageCount: recoveryItems.length,
-    });
-    return threadResult;
+      ),
+    );
   }
 
   async #ensureClient(context: AgentDriverContext): Promise<void> {
@@ -437,6 +389,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     const client = this.#createClient(context);
     const startupCancellation = new AbortController();
     const resumeThreadId = this.#restartThreadId ?? this.#threadId;
+    this.#threadId = resumeThreadId;
     this.#client = client;
     this.#clientStartupCancellation = startupCancellation;
     this.#clientStopRequested = false;
@@ -444,7 +397,6 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     try {
       await client.start(startupCancellation.signal);
       const threadResult = await this.#startThread(
-        context,
         client,
         startupCancellation.signal,
         resumeThreadId,
@@ -1117,6 +1069,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
           this.#client = null;
         }
       }
+      await this.#eventPublisher.finishTerminalCleanup(context, signal);
     }
   }
 

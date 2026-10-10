@@ -19,5 +19,12 @@
     "command": "opencode",
     "package": "opencode-linux-x64-baseline",
     "probe": ["acp", "--help"]
+  },
+  {
+    "runtimeId": "pi",
+    "profile": "pi",
+    "command": "pi",
+    "package": "@earendil-works/pi-coding-agent",
+    "probe": ["--version"]
   }
 ]

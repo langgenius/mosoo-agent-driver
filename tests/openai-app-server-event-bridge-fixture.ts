@@ -94,6 +94,11 @@ export function createOpenAiBridgeHarness(
     }
   };
   const bridge = new OpenAiAppServerEventBridge({
+    prepareCheckpoint: async (_context, runId) => ({
+      formatVersion: 1,
+      nativeRef: { kind: "openai_thread_id", runtimeId: "openai-runtime", value: "thread-1" },
+      runId,
+    }),
     push,
     pushSession: push,
     pushTerminal: async (pushContext, reason, closures, terminal, cancellationSignal) => {
