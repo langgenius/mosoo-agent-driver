@@ -26,8 +26,8 @@ import { PiRpcClient } from "./pi-rpc-client";
 import type { PiRpcPort } from "./pi-rpc-client";
 import { readPiSessionHeader } from "./pi-session-validation";
 
-const MAX_PENDING_EVENT_BYTES = 32 * 1024 * 1024;
-const MAX_PENDING_EVENTS = 1024;
+const MAX_PENDING_PERMISSION_BYTES = 32 * 1024 * 1024;
+const MAX_PENDING_PERMISSIONS = 1024;
 
 interface ActiveTurn {
   readonly controller: AbortController;
@@ -41,6 +41,7 @@ interface ActiveTurn {
   terminal: "completed" | "other" | null;
   admission: Promise<JsonObject> | null;
   nativeMessage: JsonObject | null;
+  thoughtDeliveryFailure: { cause: unknown } | null;
 }
 
 export interface PiBackendDependencies {
@@ -61,13 +62,12 @@ export class PiDriverBackend implements AgentDriverBackend {
   #home: string | null = null;
   #pointer: string | null = null;
   #turn: ActiveTurn | null = null;
-  #events: Promise<void> = Promise.resolve();
+  readonly #eventTasks = new Set<Promise<void>>();
   #stopped = false;
   #stopTask: Promise<void> | null = null;
   #failure: Error | null = null;
   #permissionTasks = new Set<Promise<void>>();
-  #pendingEventBytes = 0;
-  #pendingEventCount = 0;
+  #pendingPermissionBytes = 0;
 
   constructor(payload: DriverStartInput, dependencies: Partial<PiBackendDependencies> = {}) {
     this.#payload = payload;
@@ -92,13 +92,7 @@ export class PiDriverBackend implements AgentDriverBackend {
     this.#client = this.#dependencies.createClient(
       config,
       (record, bytes) => this.#receive(context, record, bytes),
-      (error) => {
-        this.#failure = error;
-        if (this.#turn !== null) {
-          this.#turn.controller.abort(error);
-          this.#turn.settled.reject(error);
-        } else if (!this.#stopped) context.lifecycle.fail(error);
-      },
+      (error) => this.#fail(context, error),
     );
     try {
       const state = await this.#client.request("get_state", {}, signal);
@@ -151,6 +145,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       terminal: null,
       admission: null,
       nativeMessage: null,
+      thoughtDeliveryFailure: null,
     };
     // Attach a rejection handler before dispatch: process failure can arrive
     // while the prompt admission request is still pending.
@@ -178,7 +173,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       if (response["disposition"] !== "started")
         throw new Error("Pi did not start the admitted prompt.");
       await turn.settled.promise;
-      await this.#events;
+      await this.#drainEvents();
       await Promise.all(this.#permissionTasks);
       if (turn.cancelled !== null) throw new DriverTurnCancelledError(turn.cancelled);
       if (turn.translator.failure !== null) throw new Error(turn.translator.failure);
@@ -225,7 +220,7 @@ export class PiDriverBackend implements AgentDriverBackend {
         try {
           const drained = await Promise.allSettled([
             turn.cancellation,
-            this.#events,
+            this.#drainEvents(),
             ...this.#permissionTasks,
           ]);
           const failed = drained.find((result) => result.status === "rejected");
@@ -241,10 +236,11 @@ export class PiDriverBackend implements AgentDriverBackend {
         if (this.#failure === null && !(error instanceof DriverTurnCancellationCleanupError)) {
           turn.terminal = "other";
           try {
+            const closures = await this.#closeItems(context, turn);
             await this.#publisher.pushTerminal(
               context,
               "driver.pi.cancelled",
-              [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems(true)],
+              [...(started ? [] : [startEvent]), ...closures],
               {
                 kind: "run.cancelled",
                 runId,
@@ -272,15 +268,17 @@ export class PiDriverBackend implements AgentDriverBackend {
           "Pi failed turn could not stop the native process.",
           cleanupError,
         );
-        await Promise.allSettled([this.#events, ...this.#permissionTasks]);
+        await Promise.allSettled([this.#drainEvents(), ...this.#permissionTasks]);
         throw this.#failure;
       }
-      await Promise.allSettled([this.#events, ...this.#permissionTasks]);
+      await Promise.allSettled([this.#drainEvents(), ...this.#permissionTasks]);
+      if (turn.thoughtDeliveryFailure !== null) throw turn.thoughtDeliveryFailure.cause;
       turn.terminal = "other";
+      const closures = await this.#closeItems(context, turn);
       await this.#publisher.pushTerminal(
         context,
         "driver.pi.failed",
-        [...(started ? [] : [startEvent]), ...turn.translator.closeOpenItems(true)],
+        [...(started ? [] : [startEvent]), ...closures],
         {
           kind: "run.failed",
           runId,
@@ -367,7 +365,7 @@ export class PiDriverBackend implements AgentDriverBackend {
       ]);
       if (turn !== null) await turn.done.promise;
       const drains = await Promise.allSettled([
-        this.#events,
+        this.#drainEvents(),
         ...this.#permissionTasks,
         this.#publisher.finishTerminalCleanup(context),
       ]);
@@ -382,55 +380,88 @@ export class PiDriverBackend implements AgentDriverBackend {
 
   async #receive(context: AgentDriverContext, record: JsonObject, bytes: number): Promise<void> {
     if (this.#failure !== null) throw this.#failure;
-    if (
-      this.#pendingEventCount >= MAX_PENDING_EVENTS ||
-      bytes > MAX_PENDING_EVENT_BYTES - this.#pendingEventBytes
-    ) {
-      throw new Error("Pi event queue limit exceeded.");
-    }
-    this.#pendingEventCount++;
-    this.#pendingEventBytes += bytes;
-    try {
-      if (record["type"] === "extension_ui_request") {
-        const task = this.#permission(context, record);
-        this.#permissionTasks.add(task);
-        try {
-          await task;
-        } finally {
-          this.#permissionTasks.delete(task);
-        }
-        return;
+    if (record["type"] === "extension_ui_request") {
+      if (
+        this.#permissionTasks.size >= MAX_PENDING_PERMISSIONS ||
+        bytes > MAX_PENDING_PERMISSION_BYTES - this.#pendingPermissionBytes
+      ) {
+        throw new Error("Pi permission queue limit exceeded.");
       }
-      const turn = this.#turn;
-      if (turn === null) return;
-      this.#events = this.#events.then(async () => {
-        if (this.#failure !== null) throw this.#failure;
-        if (this.#turn !== turn) return;
-        await this.#push(
-          context,
-          turn.translator
-            .translate(record)
-            .map((event) => Object.assign(event, { runId: turn.runId })),
-        );
-        if (record["type"] === "message_end" && isJsonObject(record["message"])) {
-          if (record["message"]["role"] === "assistant") {
-            turn.nativeMessage = structuredClone(record["message"]);
-          }
-        }
-      });
-      // Native settlement must not wait for Host receipts; handleInput drains both.
-      if (record["type"] === "agent_settled") {
-        if (record["aborted"] === true && turn.cancelled === null) {
-          turn.settled.reject(new Error("Pi aborted the native turn."));
-        } else {
-          turn.settled.resolve();
-        }
+      const task = this.#permission(context, record);
+      this.#permissionTasks.add(task);
+      this.#pendingPermissionBytes += bytes;
+      try {
+        await task;
+      } finally {
+        this.#permissionTasks.delete(task);
+        this.#pendingPermissionBytes -= bytes;
       }
-      await this.#events;
-    } finally {
-      this.#pendingEventCount--;
-      this.#pendingEventBytes -= bytes;
+      return;
     }
+    const turn = this.#turn;
+    if (turn === null) return;
+    const events = turn.translator
+      .translate(record)
+      .map((event) => Object.assign(event, { runId: turn.runId }));
+    const submitted = this.#push(context, events);
+    const task = events.some((event) => event.kind === "thought.updated")
+      ? submitted.catch((error: unknown) => {
+          turn.thoughtDeliveryFailure ??= { cause: error };
+          throw error;
+        })
+      : submitted;
+    if (events.some((event) => event.delivery !== "best_effort")) {
+      this.#eventTasks.add(task);
+      void task.then(
+        () => this.#eventTasks.delete(task),
+        (error: unknown) => {
+          this.#fail(
+            context,
+            error instanceof Error ? error : new Error("Pi event delivery failed."),
+          );
+          this.#eventTasks.delete(task);
+        },
+      );
+    }
+    if (record["type"] === "message_end" && isJsonObject(record["message"])) {
+      if (record["message"]["role"] === "assistant") {
+        turn.nativeMessage = structuredClone(record["message"]);
+      }
+    }
+    // Native settlement must not wait for Host receipts; handleInput drains both.
+    if (record["type"] === "agent_settled") {
+      if (record["aborted"] === true && turn.cancelled === null) {
+        turn.settled.reject(new Error("Pi aborted the native turn."));
+      } else {
+        turn.settled.resolve();
+      }
+    }
+    return task;
+  }
+
+  #fail(context: AgentDriverContext, error: Error): void {
+    this.#failure ??= error;
+    if (this.#turn !== null) {
+      this.#turn.controller.abort(this.#failure);
+      this.#turn.settled.reject(this.#failure);
+    } else if (!this.#stopped) context.lifecycle.fail(this.#failure);
+  }
+
+  async #drainEvents(): Promise<void> {
+    const results = await Promise.allSettled(this.#eventTasks);
+    const failed = results.find((result) => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+  }
+
+  async #closeItems(context: AgentDriverContext, turn: ActiveTurn): Promise<DriverEventInput[]> {
+    const events = turn.translator.closeOpenItems(true);
+    await this.#push(
+      context,
+      events
+        .filter((event) => event.kind === "thought.updated")
+        .map((event) => ({ ...event, runId: turn.runId })),
+    );
+    return events.filter((event) => event.kind !== "thought.updated");
   }
 
   async #permission(context: AgentDriverContext, record: JsonObject): Promise<void> {

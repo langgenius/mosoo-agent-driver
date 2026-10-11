@@ -6,7 +6,10 @@ import { join } from "node:path";
 
 import { createBashTool, createPowerShellTool } from "@earendil-works/pi-coding-agent";
 
-import { MAX_NATIVE_CHECKPOINT_FILE_BYTES } from "../src/protocol/native-checkpoint";
+import {
+  MAX_NATIVE_CHECKPOINT_ENTRIES,
+  MAX_NATIVE_CHECKPOINT_FILE_BYTES,
+} from "../src/protocol/native-checkpoint";
 import type { DriverNativeRuntimeRef } from "../src/protocol/runtime";
 import {
   createNativeCheckpoint,
@@ -36,11 +39,12 @@ async function fixture() {
   const cwd = await mkdtemp(join(tmpdir(), "mosoo-pi-checkpoint-"));
   roots.push(cwd);
   const home = join(cwd, "pi");
+  const outputs = join(home, "outputs");
   const temporary = join(home, "tmp");
-  await mkdir(temporary, { recursive: true });
+  await Promise.all([outputs, temporary].map((path) => mkdir(path, { recursive: true })));
   const root = await pinNativeCheckpointRoot(cwd);
   const content = (
-    fullOutputPath: unknown = join(temporary, bash),
+    fullOutputPath: unknown = join(outputs, bash),
     text = "truncated",
     message: object = {},
   ) =>
@@ -66,6 +70,7 @@ async function fixture() {
   return {
     cwd,
     home,
+    outputs,
     temporary,
     root,
     content,
@@ -84,39 +89,39 @@ async function fixture() {
 test("native output checkpoint cold restores shell logs and binary MCP files without arbitrary temporary data", async () => {
   const run = await fixture();
   const binaryBytes = Buffer.from([0x00, 0xff, 0xc3, 0x28, 0x80]);
-  const binaryReference = `[Binary resource resource://example/data.bin (application/octet-stream, 5 B) saved to ${join(run.temporary, binary)}]`;
+  const binaryReference = `[Binary resource resource://example/data.bin (application/octet-stream, 5 B) saved to ${join(run.outputs, binary)}]`;
   await Promise.all([
-    writeFile(join(run.temporary, bash), "bash output"),
-    writeFile(join(run.temporary, powershell), "powershell output"),
-    writeFile(join(run.temporary, mcpText), `MCP content\n${binaryReference}\n`),
-    writeFile(join(run.temporary, binary), binaryBytes),
-    writeFile(join(run.temporary, "secret.json"), "do not save"),
+    writeFile(join(run.outputs, bash), "bash output"),
+    writeFile(join(run.outputs, powershell), "powershell output"),
+    writeFile(join(run.outputs, mcpText), `MCP content\n${binaryReference}\n`),
+    writeFile(join(run.outputs, binary), binaryBytes),
+    writeFile(join(run.outputs, "secret.json"), "do not save"),
     writeFile(join(run.home, "models.json"), "private configuration"),
-    symlink(join(run.home, "models.json"), join(run.temporary, "unrelated-link")),
+    symlink(join(run.home, "models.json"), join(run.outputs, "unrelated-link")),
   ]);
-  const content = run.content(join(run.temporary, mcpText));
+  const content = run.content(join(run.outputs, mcpText));
   const checkpoint = await run.create(content);
   const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint });
   expect(saved.manifest.files.map((file) => file.path).toSorted()).toEqual(
     [
       "native-home.json",
       "session.jsonl",
-      ...[bash, powershell, mcpText, binary].map((name) => `tmp/${name}`),
+      ...[bash, powershell, mcpText, binary].map((name) => `outputs/${name}`),
     ].toSorted(),
   );
   await rm(run.home, { recursive: true });
   await restorePiNativeOutputs({ saved, content, home: run.home, signal });
-  expect(await readFile(join(run.temporary, binary))).toEqual(binaryBytes);
-  expect(await readFile(join(run.temporary, bash), "utf8")).toBe("bash output");
-  expect(await readFile(join(run.temporary, powershell), "utf8")).toBe("powershell output");
-  await rejects(readFile(join(run.temporary, "secret.json")));
+  expect(await readFile(join(run.outputs, binary))).toEqual(binaryBytes);
+  expect(await readFile(join(run.outputs, bash), "utf8")).toBe("bash output");
+  expect(await readFile(join(run.outputs, powershell), "utf8")).toBe("powershell output");
+  await rejects(readFile(join(run.outputs, "secret.json")));
 });
 
 test.each(["missing", "symbolic link", "hard link", "directory", "oversized"])(
   "checkpoint rejects %s native outputs before publishing the snapshot",
   async (damage) => {
     const run = await fixture();
-    const path = join(run.temporary, bash);
+    const path = join(run.outputs, bash);
     const target = join(run.cwd, "outside");
     await writeFile(target, "original");
     if (damage === "symbolic link") await symlink(target, path);
@@ -142,35 +147,55 @@ test.each([
   "non-string",
 ])("checkpoint rejects %s output references", async (damage) => {
   const run = await fixture();
-  await writeFile(join(run.temporary, bash), "output");
+  await writeFile(join(run.outputs, bash), "output");
   const path =
     damage === "outside home"
       ? join(run.cwd, bash)
       : damage === "parent traversal"
-        ? `${run.temporary}/../tmp/${bash}`
+        ? `${run.outputs}/../outputs/${bash}`
         : damage === "legacy temporary path"
           ? `/tmp/${bash}`
           : damage === "unsupported name"
-            ? join(run.temporary, "secret.json")
+            ? join(run.outputs, "secret.json")
             : null;
   await rejects(run.create(run.content(path)), /outside/u);
 });
 
-test("checkpoint rejects missing MCP binary output referenced inside its truncated text file", async () => {
+test("checkpoint preserves native outputs without treating quoted paths as metadata", async () => {
   const run = await fixture();
-  await writeFile(
-    join(run.temporary, mcpText),
-    `[Binary resource resource://data (application/octet-stream, 5 B) saved to ${join(run.temporary, binary)}]`,
+  const quotedBinary = `[Binary resource resource://data (application/octet-stream, 5 B) saved to /tmp/${binary}]`;
+  const quotedShell = `[Showing lines 3001-5000 of 5000. Full output: /tmp/${bash}]`;
+  await writeFile(join(run.outputs, mcpText), quotedBinary);
+  const content = run.content(join(run.outputs, mcpText), `${quotedBinary}\n${quotedShell}`);
+  const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create(content) });
+  await rm(run.home, { recursive: true });
+  await restorePiNativeOutputs({ saved, content, home: run.home, signal });
+  expect(await readFile(join(run.outputs, mcpText), "utf8")).toBe(quotedBinary);
+});
+
+test("shell temporary files do not consume the native output checkpoint entry limit", async () => {
+  const run = await fixture();
+  const files = Array.from({ length: MAX_NATIVE_CHECKPOINT_ENTRIES + 1 }, (_, index) =>
+    join(run.temporary, `build-cache-${index}`),
   );
-  await rejects(
-    run.create(run.content(join(run.temporary, mcpText))),
-    /missing a referenced output/u,
-  );
+  for (let offset = 0; offset < files.length; offset += 100) {
+    await Promise.all(files.slice(offset, offset + 100).map((path) => writeFile(path, "")));
+  }
+  await writeFile(join(run.outputs, bash), "native output");
+  const content = run.content();
+  const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create(content) });
+  await restorePiNativeOutputs({ saved, content, home: run.home, signal });
+  expect(saved.manifest.files.map((file) => file.path).toSorted()).toEqual([
+    "native-home.json",
+    `outputs/${bash}`,
+    "session.jsonl",
+  ]);
+  expect(await readFile(files.at(-1)!, "utf8")).toBe("");
 });
 
 test("restore requires the original native home and rejects unexpected checkpoint files", async () => {
   const run = await fixture();
-  await writeFile(join(run.temporary, bash), "output");
+  await writeFile(join(run.outputs, bash), "output");
   const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create() });
   await rejects(
     restorePiNativeOutputs({ saved, content: run.content(), home: join(run.cwd, "moved"), signal }),
@@ -201,7 +226,7 @@ test.each(["symbolic link", "hard link"])(
   "restore refuses a %s output destination",
   async (damage) => {
     const run = await fixture();
-    const path = join(run.temporary, bash);
+    const path = join(run.outputs, bash);
     await writeFile(path, "output");
     const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create() });
     await rm(path);
@@ -219,28 +244,28 @@ test.each(["symbolic link", "hard link"])(
 
 test("restore verifies output hashes again after opening the saved checkpoint", async () => {
   const run = await fixture();
-  await writeFile(join(run.temporary, bash), "original");
+  await writeFile(join(run.outputs, bash), "original");
   const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create() });
-  await writeFile(join(run.temporary, powershell), "uncommitted output");
-  await writeFile(join(saved.directory, "tmp", bash), "tampered");
+  await writeFile(join(run.outputs, powershell), "uncommitted output");
+  await writeFile(join(saved.directory, "outputs", bash), "tampered");
   await rejects(
     restorePiNativeOutputs({ saved, content: run.content(), home: run.home, signal }),
     /manifest/u,
   );
-  expect(await readFile(join(run.temporary, bash), "utf8")).toBe("original");
-  expect(await readFile(join(run.temporary, powershell), "utf8")).toBe("uncommitted output");
+  expect(await readFile(join(run.outputs, bash), "utf8")).toBe("original");
+  expect(await readFile(join(run.outputs, powershell), "utf8")).toBe("uncommitted output");
 });
 
 test("restore removes stale native outputs after validation and preserves unrelated temporary files", async () => {
   const run = await fixture();
-  await writeFile(join(run.temporary, bash), "committed output");
+  await writeFile(join(run.outputs, bash), "committed output");
   const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint: await run.create() });
-  await writeFile(join(run.temporary, powershell), "uncommitted output");
-  await writeFile(join(run.temporary, "user-temp.txt"), "unrelated temporary file");
+  await writeFile(join(run.outputs, powershell), "uncommitted output");
+  await writeFile(join(run.outputs, "user-temp.txt"), "unrelated temporary file");
   await restorePiNativeOutputs({ saved, content: run.content(), home: run.home, signal });
-  expect(await readFile(join(run.temporary, bash), "utf8")).toBe("committed output");
-  await rejects(readFile(join(run.temporary, powershell)));
-  expect(await readFile(join(run.temporary, "user-temp.txt"), "utf8")).toBe(
+  expect(await readFile(join(run.outputs, bash), "utf8")).toBe("committed output");
+  await rejects(readFile(join(run.outputs, powershell)));
+  expect(await readFile(join(run.outputs, "user-temp.txt"), "utf8")).toBe(
     "unrelated temporary file",
   );
 });
@@ -250,7 +275,7 @@ test.each([
   { toolName: "powershell", output: `${"x".repeat(200)}\n`.repeat(1_000), error: "aborted" },
   { toolName: "bash", output: "x".repeat(80_000), error: null },
 ])(
-  "checkpoint validates native $toolName error output references when details were dropped",
+  "checkpoint restores native $toolName error output when details were dropped",
   async ({ toolName, output, error }) => {
     const run = await fixture();
     const createTool = toolName === "bash" ? createBashTool : createPowerShellTool;
@@ -267,7 +292,7 @@ test.each([
     const previousTemporary = process.env["TMPDIR"];
     let errorText = "";
     try {
-      process.env["TMPDIR"] = run.temporary;
+      process.env["TMPDIR"] = run.outputs;
       await rejects(
         tool.execute("error-output", { command: "unused", timeout: 1 }),
         (failure: unknown) => {
@@ -292,12 +317,6 @@ test.each([
     const bytes = await readFile(outputPath!);
     expect(bytes.toString("utf8")).toBe(output);
     const content = run.content(undefined, errorText, { toolName, details: {}, isError: true });
-    await rm(outputPath!);
-    await rejects(run.create(content), /missing a referenced output/u);
-    await rejects(
-      readFile(join(run.cwd, ".state/native-checkpoints", DRIVER_TEST_IDS.runId, "manifest.json")),
-    );
-    await writeFile(outputPath!, bytes);
     const saved = await readNativeCheckpoint({
       cwd: run.cwd,
       checkpoint: await run.create(content),
@@ -308,12 +327,8 @@ test.each([
   },
 );
 
-test("shell error output footers reject references outside the Session output directory", async () => {
+test("quoted native output footers do not require files outside the Session output directory", async () => {
   const run = await fixture();
-  const text = `[Showing lines 3001-5000 of 5000. Full output: /tmp/${bash}]\n\nCommand timed out after 1 seconds`;
-  await rejects(
-    run.create(run.content(undefined, text, { details: {}, isError: true })),
-    /outside/u,
-  );
-  await run.create(run.content(undefined, text, { toolName: "read", details: {} }));
+  const text = `[Showing lines 3001-5000 of 5000. Full output: /tmp/${bash}]\n[Binary resource resource://data (application/octet-stream, 5 B) saved to /tmp/${binary}]`;
+  await run.create(run.content(undefined, text, { details: {} }));
 });

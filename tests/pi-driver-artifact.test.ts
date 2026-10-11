@@ -73,14 +73,10 @@ test.skipIf(!existsSync(artifactPath))(
           ...driverBootPayload.execution,
           provider: "deepseek",
           model: "pi-test",
-          environment: {
-            variables: {
-              MOSOO_PI_PROXY_GRANT: "artifact-pi-grant",
-              MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-                baseUrl: `http://127.0.0.1:${model.port}/v1`,
-                modelProtocol: "openai-chat-completions",
-              }),
-            },
+          modelConnection: {
+            proxyGrant: "artifact-pi-grant",
+            proxyUrl: `http://127.0.0.1:${model.port}/v1`,
+            protocol: "openai-chat-completions",
           },
           session: {
             ...driverBootPayload.execution.session,

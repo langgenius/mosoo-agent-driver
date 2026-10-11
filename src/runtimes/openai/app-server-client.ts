@@ -6,12 +6,11 @@ import type { Interface as ReadlineInterface } from "node:readline";
 import { Transform } from "node:stream";
 import type { TransformCallback } from "node:stream";
 
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { toDurationMs } from "../../core/driver-runtime-timing";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { DriverStartInput } from "../../protocol/start";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import { AGENT_DRIVER_VERSION } from "../../core/version";
-import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
@@ -22,15 +21,11 @@ import {
   waitForLinuxProcessMarkerExit,
 } from "../child-process";
 import type { BoundSpawnedProcess } from "../child-process";
+import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { summarizeOpenAiProxyEnv } from "./app-server-env";
+import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import { isRecord, readNonEmptyString, toJsonRpcId } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
-import {
-  cleanupOpenAiRuntimeHome,
-  createOpenAiRuntimeHome,
-  materializeOpenAiAuthState,
-  materializeOpenAiModelProviderConfig,
-} from "./auth-state";
 import type {
   ClientRequestMethod,
   ClientRequestParams,
@@ -45,10 +40,15 @@ import {
   parseServerNotification,
   parseServerRequest,
 } from "./app-server-protocol";
-import { buildOpenAiMcpServerConfig } from "./mcp-config";
-import { OpenAiAppServerRequestHandler } from "./app-server-request-handler";
 import { jsonRpcResponseSchema } from "./app-server-protocol-client-schemas";
-import { toOpenAiProtocolError } from "./app-server-event-mapping";
+import { OpenAiAppServerRequestHandler } from "./app-server-request-handler";
+import {
+  cleanupOpenAiRuntimeHome,
+  createOpenAiRuntimeHome,
+  materializeOpenAiAuthState,
+  materializeOpenAiModelProviderConfig,
+} from "./auth-state";
+import { buildOpenAiMcpServerConfig } from "./mcp-config";
 
 interface PendingJsonRpcRequest {
   accept: ((value: unknown) => Promise<unknown>) | null;
@@ -258,10 +258,14 @@ export class OpenAiAppServerClient {
 
   async #performStart(signal?: AbortSignal): Promise<OpenAiAppServerClientStartResult> {
     const mcpConfig = buildOpenAiMcpServerConfig(this.#payload.execution.session.mcpServers);
+    const { modelConnection, provider } = this.#payload.execution;
+    const modelEnvPrefix = provider === "openai-compatible" ? "OPENAI_COMPATIBLE" : "OPENAI";
     const env = buildRuntimeChildProcessEnv(this.#payload.execution.environment.paths, {
       ...process.env,
       ...this.#payload.execution.environment.variables,
       ...mcpConfig.env,
+      [`${modelEnvPrefix}_API_KEY`]: modelConnection.proxyGrant,
+      [`${modelEnvPrefix}_BASE_URL`]: modelConnection.proxyUrl,
       LOG_FORMAT: "json",
     });
     const onAbort = () => {
@@ -301,7 +305,6 @@ export class OpenAiAppServerClient {
         "app_server.home.create",
         async () => {
           const state = await createOpenAiRuntimeHome({
-            driverGeneration: this.#payload.driverGeneration,
             driverInstanceId: this.#payload.driverInstanceId,
             persistentRuntimeHome,
             ...(signal === undefined ? {} : { signal }),

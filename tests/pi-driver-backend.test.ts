@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-event-envelope";
 import { createBufferedSinkLogger } from "../src/observability";
-import type { CredentialId, McpServerId, SkillId } from "../src/protocol/boot";
+import type { CredentialId, DriverModelProtocol, McpServerId, SkillId } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { isJsonObject } from "../src/protocol/json";
@@ -125,7 +125,7 @@ function finalMessageText(events: readonly DriverEventInput[]): string {
 
 async function payloadFor(
   baseUrl: string,
-  modelProtocol = "openai-chat-completions",
+  modelProtocol: DriverModelProtocol = "openai-chat-completions",
 ): Promise<DriverStartInput> {
   const root = await mkdtemp(join(tmpdir(), "mosoo-pi-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -138,14 +138,10 @@ async function payloadFor(
       model: "pi-test",
       provider: "deepseek",
       systemPrompt: "mosoo-pi-test-instructions",
-      environment: {
-        variables: {
-          MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
-          MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            baseUrl,
-            modelProtocol,
-          }),
-        },
+      modelConnection: {
+        proxyGrant: "test-proxy-grant",
+        proxyUrl: baseUrl,
+        protocol: modelProtocol,
       },
       session: {
         ...bootPayload.execution.session,
@@ -377,14 +373,10 @@ describe("Pi runtime", () => {
         ...input.execution,
         provider: "openai",
         model: "gpt-5.4",
-        environment: {
-          variables: {
-            MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
-            MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-              baseUrl: `http://127.0.0.1:${server.port}/v1`,
-              modelProtocol: "openai-chat-completions",
-            }),
-          },
+        modelConnection: {
+          proxyGrant: "test-proxy-grant",
+          proxyUrl: `http://127.0.0.1:${server.port}/v1`,
+          protocol: "openai-chat-completions",
         },
       },
     };

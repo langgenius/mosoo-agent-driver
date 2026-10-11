@@ -31,6 +31,7 @@ afterEach(async () => {
 
 function harness(payload: DriverStartInput) {
   const events: DriverEventInput[] = [];
+  const permissions: string[] = [];
   let seq = 0;
   let currentRunId: RunId | null = null;
   const context = createAgentDriverContext({
@@ -49,7 +50,12 @@ function harness(payload: DriverStartInput) {
         };
       },
     },
-    permission: { request: async () => "allow_once" },
+    permission: {
+      request: async (request) => {
+        permissions.push(request.title);
+        return "allow_once";
+      },
+    },
     ports: { skill: { materialize: async () => [] } },
   });
   const backend = new PiDriverBackend(payload, {
@@ -62,6 +68,7 @@ function harness(payload: DriverStartInput) {
   cleanup.push(stop);
   return {
     events,
+    permissions,
     start: () => backend.start(context, AbortSignal.timeout(20_000)),
     stop,
     run: async (runId: RunId) => {
@@ -108,7 +115,10 @@ test.each(["bash", "mcp"] as const)(
     cleanup.push(() => rm(root, { recursive: true, force: true }));
     const marker = `${source}-output-line`;
     const repetitions = source === "bash" ? 80_000 : 4_000;
-    const fullOutput = `${marker}\n`.repeat(repetitions);
+    const quotedOutput =
+      "[Binary resource docs://example (application/octet-stream, 5B) saved to /tmp/pi-mcp-0123456789abcdef.bin]\n" +
+      "[Showing lines 3001-5000 of 5000. Full output: /tmp/pi-bash-0123456789abcdef.log]\n";
+    const fullOutput = `${marker}\n`.repeat(repetitions) + quotedOutput;
     const binaryOutput = Buffer.from([0, 255, 1, 128, 2, 127]);
     let mcpCalls = 0;
     const mcp = Bun.serve({
@@ -171,7 +181,14 @@ test.each(["bash", "mcp"] as const)(
         if (calls === 1) {
           if (source === "bash") {
             return toolCall("large-output", "bash", {
-              command: `node -e 'process.stdout.write("${marker}\\n".repeat(${repetitions}))'`,
+              command: `node <<'NODE'
+const { writeFileSync } = require("node:fs");
+const { tmpdir } = require("node:os");
+writeFileSync(tmpdir() + "/shell-temporary.json", JSON.stringify({
+  TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP
+}));
+process.stdout.write("${marker}\\n".repeat(${repetitions}) + ${JSON.stringify(quotedOutput)});
+NODE`,
             });
           }
           const tool = body.tools.find((entry) => entry.function.name.endsWith("__output"));
@@ -203,14 +220,10 @@ test.each(["bash", "mcp"] as const)(
         ...driverStartInput.execution,
         model: "pi-test",
         provider: "deepseek",
-        environment: {
-          variables: {
-            MOSOO_PI_PROXY_GRANT: "test-proxy-grant",
-            MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-              baseUrl: `http://127.0.0.1:${model.port}/v1`,
-              modelProtocol: "openai-chat-completions",
-            }),
-          },
+        modelConnection: {
+          proxyGrant: "test-proxy-grant",
+          proxyUrl: `http://127.0.0.1:${model.port}/v1`,
+          protocol: "openai-chat-completions",
         },
         session: {
           ...driverStartInput.execution.session,
@@ -241,6 +254,10 @@ test.each(["bash", "mcp"] as const)(
     const home = join(root, "pi");
     await writeFile(join(home, "tmp", "secret.json"), "test-private-data");
     await first.run(DRIVER_TEST_IDS.runId);
+    expect(first.permissions).toHaveLength(1);
+    expect(first.permissions[0]).toBe(
+      source === "bash" ? "bash" : "mcp__01J00000000000000000000020__output",
+    );
     const completed = first.events.findLast((event) => event.kind === "run.completed");
     expect(first.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
     expect(first.events.some((event) => event.kind === "run.failed")).toBe(false);
@@ -256,20 +273,22 @@ test.each(["bash", "mcp"] as const)(
       const path = message["details"]["fullOutputPath"];
       if (typeof path === "string") outputPath = path;
     }
-    expect(dirname(outputPath)).toBe(join(home, "tmp"));
+    expect(dirname(outputPath)).toBe(join(home, "outputs"));
     expect(basename(outputPath)).toMatch(
       source === "bash" ? /^pi-bash-[0-9a-f]{16}\.log$/u : /^pi-mcp-[0-9a-f]{16}\.txt$/u,
     );
-    const relativeOutput = `tmp/${basename(outputPath)}`;
+    const relativeOutput = `outputs/${basename(outputPath)}`;
     const originalOutput = await readFile(outputPath);
     const expectedFiles = ["native-home.json", "session.jsonl", relativeOutput];
     let binaryPath: string | undefined;
     if (source === "mcp") {
-      binaryPath = /^\[Binary resource .+ saved to (.+)\]$/mu.exec(originalOutput.toString())?.[1];
+      binaryPath = /^\[Binary resource mosoo:\/\/output\/blob\.bin .+ saved to (.+)\]$/mu.exec(
+        originalOutput.toString(),
+      )?.[1];
       expect(binaryPath).toBeDefined();
-      expect(dirname(binaryPath!)).toBe(join(home, "tmp"));
+      expect(dirname(binaryPath!)).toBe(join(home, "outputs"));
       expect(basename(binaryPath!)).toMatch(/^pi-mcp-[0-9a-f]{16}\.bin$/u);
-      const relativeBinary = `tmp/${basename(binaryPath!)}`;
+      const relativeBinary = `outputs/${basename(binaryPath!)}`;
       expectedFiles.push(relativeBinary);
       expect(await bundle.readFile(relativeBinary)).toEqual(binaryOutput);
     }
@@ -277,6 +296,15 @@ test.each(["bash", "mcp"] as const)(
     expect(JSON.parse((await bundle.readFile("native-home.json")).toString())).toEqual({ home });
     expect(await bundle.readFile(relativeOutput)).toEqual(originalOutput);
     expect(originalOutput.toString()).toContain(fullOutput);
+    if (source === "bash") {
+      expect(JSON.parse(await readFile(join(home, "tmp", "shell-temporary.json"), "utf8"))).toEqual(
+        {
+          TMPDIR: join(home, "tmp"),
+          TEMP: join(home, "tmp"),
+          TMP: join(home, "tmp"),
+        },
+      );
+    }
     expect(originalOutput.byteLength).toBeGreaterThan(source === "bash" ? 1024 * 1024 : 20 * 1024);
     await first.stop();
     await rm(home, { recursive: true, force: true });
@@ -295,6 +323,7 @@ test.each(["bash", "mcp"] as const)(
     expect(await readFile(outputPath)).toEqual(originalOutput);
     if (binaryPath !== undefined) expect(await readFile(binaryPath)).toEqual(binaryOutput);
     await second.run(DRIVER_TEST_IDS.secondRunId);
+    expect(second.permissions).toEqual(["read"]);
     expect(calls).toBe(4);
     expect(mcpCalls).toBe(source === "mcp" ? 1 : 0);
     expect(JSON.stringify(restoredToolResult)).toContain(marker);

@@ -3,9 +3,14 @@ import { createDriverId } from "../../protocol/id";
 import { isJsonObject } from "../../protocol/json";
 import type { JsonObject, JsonValue } from "../../protocol/json";
 import { chunkJsonText } from "../provider-json";
+import {
+  createThoughtContentEvents,
+  MAX_THOUGHT_CONTENT_BYTES,
+  thoughtContentBytes,
+  thoughtContentDeltaBytes,
+} from "../thought-content";
 
 const MAX_PI_THOUGHT_TEXT_BYTES = 512 * 1_024;
-const MAX_PI_MESSAGE_THOUGHT_BYTES = 16 * 1_024 * 1_024;
 const MAX_PI_MESSAGE_THOUGHTS = 1_000;
 
 interface PiThought {
@@ -131,15 +136,25 @@ export class PiEventTranslator {
       const interrupted = stop === "error" || stop === "aborted" || stop === "length";
       const events: DriverEventInput[] = [];
       if (Array.isArray(content)) {
-        // Validate every final block before scheduling any completion events.
+        let bytes = this.#thoughtBytes;
+        let count = this.#thoughts.size;
         for (const [index, block] of content.entries()) {
           if (
-            isJsonObject(block) &&
-            block["type"] === "thinking" &&
-            typeof block["thinking"] === "string"
+            !isJsonObject(block) ||
+            block["type"] !== "thinking" ||
+            typeof block["thinking"] !== "string"
           )
-            this.#assertThoughtPrefix(`${id}:${index}`, block["thinking"]);
+            continue;
+          const thought = this.#thoughts.get(`${id}:${index}`);
+          if (thought?.completed) continue;
+          bytes +=
+            thoughtContentBytes(block["thinking"]) - thoughtContentBytes(thought?.text ?? "");
+          if (thought === undefined) count++;
         }
+        if (bytes > MAX_THOUGHT_CONTENT_BYTES)
+          throw new Error("Pi assistant message exceeds the thinking content byte limit.");
+        if (count > MAX_PI_MESSAGE_THOUGHTS)
+          throw new Error("Pi assistant message exceeds the thinking block limit.");
         for (const [index, block] of content.entries()) {
           if (
             isJsonObject(block) &&
@@ -285,30 +300,21 @@ export class PiEventTranslator {
 
   #appendThought(thoughtId: string, text: string, events: DriverEventInput[]): void {
     if (text.length === 0) return;
-    const bytes = Buffer.byteLength(JSON.stringify(text), "utf8") - 2;
-    if (this.#thoughtBytes + bytes > MAX_PI_MESSAGE_THOUGHT_BYTES)
+    const current = this.#thoughts.get(thoughtId);
+    if (current?.completed) return;
+    const bytes = thoughtContentDeltaBytes(current?.text ?? "", text);
+    if (this.#thoughtBytes + bytes > MAX_THOUGHT_CONTENT_BYTES)
       throw new Error("Pi assistant message exceeds the thinking content byte limit.");
     const thought = this.#ensureThought(thoughtId, events);
-    if (thought.completed) throw new Error("Pi thinking delta arrived after completion.");
     events.push(
       ...chunkJsonText(text, MAX_PI_THOUGHT_TEXT_BYTES).map((contentDelta): DriverEventInput => ({
         kind: "thought.delta",
-        delivery: "lossless",
+        delivery: "best_effort",
         payload: { thoughtId, channel: "summary", contentDelta },
       })),
     );
-    // The backend awaits lossless delivery before translating the next native record.
     thought.text += text;
     this.#thoughtBytes += bytes;
-  }
-
-  #assertThoughtPrefix(thoughtId: string, text: string): void {
-    const thought = this.#thoughts.get(thoughtId);
-    if (
-      thought !== undefined &&
-      (!text.startsWith(thought.text) || (thought.completed && text !== thought.text))
-    )
-      throw new Error("Pi final thinking content does not match the delivered prefix.");
   }
 
   #completeThought(
@@ -317,10 +323,17 @@ export class PiEventTranslator {
     events: DriverEventInput[],
     cancelled = false,
   ): void {
-    if (text !== undefined) this.#assertThoughtPrefix(thoughtId, text);
+    const current = this.#thoughts.get(thoughtId);
+    if (current?.completed) return;
+    const content = text ?? current?.text ?? "";
+    const bytes =
+      this.#thoughtBytes - thoughtContentBytes(current?.text ?? "") + thoughtContentBytes(content);
+    if (bytes > MAX_THOUGHT_CONTENT_BYTES)
+      throw new Error("Pi assistant message exceeds the thinking content byte limit.");
     const thought = this.#ensureThought(thoughtId, events);
-    if (thought.completed) return;
-    if (text !== undefined) this.#appendThought(thoughtId, text.slice(thought.text.length), events);
+    events.push(...createThoughtContentEvents(thoughtId, content));
+    thought.text = content;
+    this.#thoughtBytes = bytes;
     thought.completed = true;
     events.push({
       kind: cancelled ? "thought.cancelled" : "thought.completed",

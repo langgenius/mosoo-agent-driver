@@ -6,6 +6,12 @@ import type { MessageId, RunId } from "../../protocol/id";
 import type { JsonValue } from "../../protocol/json";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { chunkJsonText } from "../provider-json";
+import {
+  createThoughtContentEvents,
+  MAX_THOUGHT_CONTENT_BYTES,
+  thoughtContentBytes,
+  thoughtContentDeltaBytes,
+} from "../thought-content";
 import type { JsonObject } from "./agent-sdk-json";
 import { toClaudeDiagnosticEvent, toClaudeUsageUpdatedEvents } from "./agent-sdk-message-events";
 
@@ -117,6 +123,10 @@ export class ClaudeAgentSdkEventWriter {
   readonly #options: ClaudeAgentSdkEventWriterOptions;
   readonly #thoughtEnded = new Set<string>();
   readonly #thoughtStarted = new Set<string>();
+  readonly #thoughtSealed = new Set<string>();
+  readonly #thoughtText = new Map<string, string>();
+  readonly #thoughtContentPublished = new Set<string>();
+  #thoughtBytes = 0;
   readonly #toolEnded = new Set<string>();
   readonly #toolParentMessage = new Map<string, string>();
   readonly #toolStarted = new Set<string>();
@@ -137,6 +147,10 @@ export class ClaudeAgentSdkEventWriter {
     this.#messageStarted.clear();
     this.#thoughtEnded.clear();
     this.#thoughtStarted.clear();
+    this.#thoughtSealed.clear();
+    this.#thoughtText.clear();
+    this.#thoughtContentPublished.clear();
+    this.#thoughtBytes = 0;
     this.#toolEnded.clear();
     this.#toolParentMessage.clear();
     this.#toolStarted.clear();
@@ -495,10 +509,13 @@ export class ClaudeAgentSdkEventWriter {
   }
 
   async pushThoughtDelta({ context, delta, thoughtId }: ClaudeThoughtDeltaEvent): Promise<void> {
-    if (this.#thoughtEnded.has(thoughtId)) {
+    if (this.#thoughtEnded.has(thoughtId) || this.#thoughtSealed.has(thoughtId)) {
       return;
     }
 
+    const previous = this.#thoughtText.get(thoughtId) ?? "";
+    const nextBytes = this.#thoughtBytes + thoughtContentDeltaBytes(previous, delta);
+    this.#assertThoughtBytes(nextBytes);
     await this.ensureThoughtStarted(context, thoughtId);
     await this.#options.push(context, "driver.claude.thought.delta", [
       {
@@ -511,6 +528,55 @@ export class ClaudeAgentSdkEventWriter {
         },
       },
     ]);
+    this.#thoughtText.set(thoughtId, `${previous}${delta}`);
+    this.#thoughtBytes = nextBytes;
+  }
+
+  replaceThoughtText(thoughtId: string, text: string): void {
+    if (this.#thoughtEnded.has(thoughtId)) return;
+    const nextBytes =
+      this.#thoughtBytes -
+      thoughtContentBytes(this.#thoughtText.get(thoughtId) ?? "") +
+      thoughtContentBytes(text);
+    this.#assertThoughtBytes(nextBytes);
+    this.#thoughtText.set(thoughtId, text);
+    this.#thoughtBytes = nextBytes;
+  }
+
+  sealThought(thoughtId: string): void {
+    this.#thoughtSealed.add(thoughtId);
+  }
+
+  async publishOpenThoughtContents(context: AgentDriverContext): Promise<void> {
+    for (const thoughtId of this.#thoughtStarted) {
+      if (!this.#thoughtEnded.has(thoughtId)) {
+        await this.#publishThoughtContent(context, thoughtId);
+      }
+    }
+  }
+
+  async #publishThoughtContent(context: AgentDriverContext, thoughtId: string): Promise<void> {
+    if (this.#thoughtContentPublished.has(thoughtId)) return;
+    await this.#options.push(
+      context,
+      "driver.claude.thought.content",
+      createThoughtContentEvents(
+        thoughtId,
+        this.#thoughtText.get(thoughtId) ?? "",
+        `${thoughtId}:content`,
+      ),
+    );
+    this.#thoughtContentPublished.add(thoughtId);
+  }
+
+  #assertThoughtBytes(bytes: number): void {
+    if (bytes > MAX_THOUGHT_CONTENT_BYTES) {
+      throw new ClaudeDurableEventTooLargeError(
+        "claude.thought_content_too_large",
+        "turn thought content",
+        bytes,
+      );
+    }
   }
 
   async settleThought(
@@ -522,6 +588,7 @@ export class ClaudeAgentSdkEventWriter {
       return;
     }
 
+    await this.#publishThoughtContent(context, thoughtId);
     await this.#options.push(context, `driver.claude.thought.${status}`, [
       {
         kind: status === "completed" ? "thought.completed" : "thought.cancelled",

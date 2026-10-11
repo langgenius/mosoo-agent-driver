@@ -1,3 +1,5 @@
+import { basename } from "node:path";
+
 import { PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type {
   AgentCapabilities,
@@ -5,9 +7,9 @@ import type {
   ClientCapabilities,
   McpServer,
 } from "@agentclientprotocol/sdk";
-import { basename } from "node:path";
 
-import type { DriverExecutionSessionContext } from "../../protocol/boot";
+import type { DriverExecutionSessionContext, DriverModelConnection } from "../../protocol/boot";
+import type { DriverExecutionInput } from "../../protocol/execution";
 import type { DriverStartInput } from "../../protocol/start";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import type { JsonObject } from "./acp-types";
@@ -17,6 +19,12 @@ type AcpHttpMcpServer = Extract<McpServer, { type: "http" }>;
 export const ACP_PROTOCOL_VERSION = PROTOCOL_VERSION;
 const ACP_RUNTIME_HOME_DIR = "acp-fallback";
 const ACP_DEFAULT_COMMAND = "acp-agent";
+const OPENCODE_SDK_BY_PROTOCOL: Record<DriverModelConnection["protocol"], string> = {
+  "anthropic-messages": "@ai-sdk/anthropic",
+  "google-gemini": "@ai-sdk/google",
+  "openai-chat-completions": "@ai-sdk/openai-compatible",
+  "openai-responses": "@ai-sdk/openai",
+};
 const ACP_INHERITED_PROCESS_ENV_KEYS = [
   "ALL_PROXY",
   "HTTP_PROXY",
@@ -106,6 +114,39 @@ function buildInheritedEnv(env: NodeJS.ProcessEnv): Record<string, string> {
   return inherited;
 }
 
+export function buildOpenCodeModelConfig(
+  execution: Pick<DriverExecutionInput, "model" | "modelConnection" | "provider">,
+): string {
+  const { modelConnection, provider } = execution;
+  const providerId = provider === "zhipu" ? "zai" : provider;
+  const modelId = execution.model.startsWith(`${providerId}/`)
+    ? execution.model.slice(providerId.length + 1)
+    : execution.model.startsWith(`${provider}/`)
+      ? execution.model.slice(provider.length + 1)
+      : execution.model;
+  const model = `${providerId}/${modelId}`;
+
+  return JSON.stringify({
+    $schema: "https://opencode.ai/config.json",
+    enabled_providers: [providerId],
+    model,
+    permission: { "*": "ask" },
+    provider: {
+      [providerId]: {
+        models: { [modelId]: { name: modelId } },
+        npm: OPENCODE_SDK_BY_PROTOCOL[modelConnection.protocol],
+        options: {
+          apiKey: "{env:OPENCODE_API_KEY}",
+          // Anthropic's SDK includes /v1 in its base; the upstream proxy base does not.
+          baseURL:
+            provider === "anthropic" ? `${modelConnection.proxyUrl}/v1` : modelConnection.proxyUrl,
+        },
+      },
+    },
+    small_model: model,
+  });
+}
+
 export function buildChildEnv(
   payload: DriverStartInput,
   processEnv: NodeJS.ProcessEnv = process.env,
@@ -119,6 +160,8 @@ export function buildChildEnv(
     DISABLE_ERROR_REPORTING: "1",
     DISABLE_TELEMETRY: "1",
     MOSOO_ACP_HOME: `${homePath}/${ACP_RUNTIME_HOME_DIR}`,
+    OPENCODE_API_KEY: payload.execution.modelConnection.proxyGrant,
+    OPENCODE_CONFIG_CONTENT: buildOpenCodeModelConfig(payload.execution),
     HOME: homePath,
     IS_SANDBOX: "1",
     PATH: processEnv["PATH"] ?? "",

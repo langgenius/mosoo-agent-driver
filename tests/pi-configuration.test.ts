@@ -45,15 +45,16 @@ async function payloadFor(): Promise<DriverStartInput> {
     execution: {
       ...driverStartInput.execution,
       model: "deepseek/pi-test",
+      modelConnection: {
+        protocol: "openai-chat-completions",
+        proxyUrl: "http://127.0.0.1:1/v1",
+        proxyGrant: "model-grant",
+      },
       provider: "deepseek",
       systemPrompt: "Keep this instruction.",
       environment: {
         variables: {
-          MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            baseUrl: "http://127.0.0.1:1/v1",
-            modelProtocol: "openai-chat-completions",
-          }),
-          MOSOO_PI_PROXY_GRANT: "model-grant",
+          MOSOO_MODEL_PROXY_GRANT: "untrusted-grant",
           [DRIVER_BOOT_PAYLOAD_ENV_NAME]: "private-boot",
           [DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME]: "/private/boot.json",
         },
@@ -165,43 +166,29 @@ test("launch preserves native model, instruction, permission and active MCP wiri
     },
   });
   expect(config.env["MOSOO_PI_MCP_GRANT_0"]).toBe("mcp-grant");
-  expect(config.env["MOSOO_PI_PROXY_GRANT"]).toBe("model-grant");
+  expect(config.env["MOSOO_MODEL_PROXY_GRANT"]).toBe("model-grant");
   expect(config.env["PATH"]?.startsWith("/runtime/bin:")).toBe(true);
   expect(config.env["HOME"]).toBe(payload.execution.session.homePath);
   expect(config.env["PI_CODING_AGENT_DIR"]).toBe(config.home);
   for (const variable of ["TMPDIR", "TEMP", "TMP"]) {
-    expect(config.env[variable]).toBe(join(config.home, "tmp"));
+    expect(config.env[variable]).toBe(join(config.home, "outputs"));
   }
   expect(config.env[DRIVER_BOOT_PAYLOAD_ENV_NAME]).toBeUndefined();
   expect(config.env[DRIVER_BOOT_PAYLOAD_FILE_ENV_NAME]).toBeUndefined();
 });
 
-test.each([
-  "missing URL",
-  "invalid URL",
-  "non-HTTP URL",
-  "missing protocol",
-  "unknown protocol",
-  "prototype protocol",
-  "empty provider",
-  "empty model",
-])("rejects %s before publishing Pi configuration", async (invalid) => {
-  const payload = await payloadFor();
-  const config = JSON.parse(payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"]!);
-  if (invalid === "missing URL") delete config.baseUrl;
-  if (invalid === "invalid URL") config.baseUrl = "not a URL";
-  if (invalid === "non-HTTP URL") config.baseUrl = "file:///tmp/model";
-  if (invalid === "missing protocol") delete config.modelProtocol;
-  if (invalid === "unknown protocol") config.modelProtocol = "unsupported";
-  if (invalid === "prototype protocol") config.modelProtocol = "constructor";
-  if (invalid === "empty provider") payload.execution.provider = "";
-  if (invalid === "empty model") payload.execution.model = "deepseek/";
-  payload.execution.environment.variables["MOSOO_PI_CONFIG_CONTENT"] = JSON.stringify(config);
-  await expect(preparePiLaunch(payload)).rejects.toThrow("Pi");
-  await expect(
-    stat(join(payload.execution.session.homePath, "pi", "models.json")),
-  ).rejects.toThrow();
-});
+test.each([{ provider: "" }, { model: "deepseek/" }])(
+  "rejects an empty native model identity before publishing Pi configuration: %p",
+  async (identity) => {
+    const payload = await payloadFor();
+    await expect(
+      preparePiLaunch({ ...payload, execution: { ...payload.execution, ...identity } }),
+    ).rejects.toThrow("Pi");
+    await expect(
+      stat(join(payload.execution.session.homePath, "pi", "models.json")),
+    ).rejects.toThrow();
+  },
+);
 
 test("atomic configuration writes replace symlinks without modifying their targets", async () => {
   const payload = await payloadFor();
@@ -239,20 +226,6 @@ test("cancelled startup performs no configuration write", async () => {
   ).rejects.toThrow("cancelled");
   await expect(stat(join(payload.execution.session.homePath, "pi"))).rejects.toThrow();
 });
-
-test.each(["missing-config", "invalid-json", "non-object", "missing-grant"])(
-  "requires a model configuration and grant: %s",
-  async (invalid) => {
-    const payload = await payloadFor();
-    const variables = payload.execution.environment.variables;
-    if (invalid === "missing-config") delete variables["MOSOO_PI_CONFIG_CONTENT"];
-    if (invalid === "invalid-json") variables["MOSOO_PI_CONFIG_CONTENT"] = "{broken";
-    if (invalid === "non-object") variables["MOSOO_PI_CONFIG_CONTENT"] = "[]";
-    if (invalid === "missing-grant") delete variables["MOSOO_PI_PROXY_GRANT"];
-    await expect(preparePiLaunch(payload)).rejects.toThrow();
-    await expect(stat(join(payload.execution.session.homePath, "pi"))).rejects.toThrow();
-  },
-);
 
 test("resume reconstructs the native session from the durable checkpoint", async () => {
   const payload = await payloadFor();

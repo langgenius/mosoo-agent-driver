@@ -85,9 +85,11 @@ Claude Agent SDK, OpenAI's app-server, ACP agents, and Pi RPC each speak their o
 - `@mosoo/agent-driver/cma-http`: experimental, unsupported CMA-shaped HTTP handler.
 - `@mosoo/agent-driver/cma-sdk`: experimental, unsupported CMA-shaped client.
 
-## Runtime Contract
+## Contract Library
 
-The Contract is the vendor-neutral state and control boundary between the host and provider executors.
+The `@mosoo/agent-driver/contract` entry defines a vendor-neutral state and control model.
+Its Authority, Preview, mutation, and lease APIs are standalone contracts.
+The production Driver and mosoo Host exchange runtime events and commands over oRPC, as described below.
 
 - **Stable model.** A `Session` owns ordered `Run` work, each Run owns observable `Item` values, and `Interaction` represents input required from outside the executor.
 - **Authority and Preview.** Authority is the only durable truth and advances through atomic full-entity mutations, while Preview is a bounded best-effort overlay for streaming content that may be merged or dropped and is always repairable from Authority.
@@ -98,10 +100,21 @@ The Contract is the vendor-neutral state and control boundary between the host a
 
 Contract-owned IDs use ULIDs, and internal absolute timestamps use timezone-qualified ISO 8601 strings with UTC as the default.
 
+## Runtime Protocol
+
 The process wire uses Boot protocol **7** and event schema **`2026-10-10`**.
+`execution.modelConnection` supplies the model protocol, proxy URL, and expiring proxy grant.
+Each backend derives its native model configuration from this connection and the execution's provider and model.
+The Host keeps upstream credentials outside the sandbox.
 `execution.session.nativeCheckpoint` is required: first use supplies `null` together with a null `nativeResumeRef`; resume supplies a format-1 descriptor containing `runId` and `nativeRef`, with the same reference in both fields.
 A native reference alone cannot authorize recovery.
 Run-scoped commands and terminal RPCs identify their Run explicitly.
+
+`thought.delta` provides disposable streaming previews.
+Before completing or cancelling a thought, the backend submits its final content as lossless `thought.updated` chunks.
+An offset of zero replaces the preview, including with an empty string; subsequent offsets count UTF-16 code units in the final content.
+Consumers ignore previews after the first final chunk and preserve each thought's identity through live updates and recovery.
+Final content is acknowledged through the shared event publisher before the Run terminal, keeping large thoughts outside the terminal batch limit.
 
 Each successful Run exports an immutable, verified native bundle under `.state/native-checkpoints/<runId>` and includes its descriptor in `run.completed`.
 In mosoo, the host backs up that bundle before atomically committing the checkpoint descriptor and canonical completion receipt.
@@ -293,7 +306,7 @@ OpenAI persistence in the session home is limited to native rollout, memory, and
 
 It must never contain `auth.json` or be used as a credential archive.
 
-The Driver fails closed when it finds legacy credentials there and accepts OpenAI API-key auth only from the current execution environment.
+The Driver fails closed when it finds legacy credentials there and accepts OpenAI API-key auth only from the current execution's model connection.
 
 ## Artifact Live Tests
 

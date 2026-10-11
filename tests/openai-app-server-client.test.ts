@@ -7,16 +7,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverExecutionEnvironment } from "../src/protocol/boot";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { PermissionEventDeliveryError } from "../src/core/driver-permission-broker";
 import * as childProcessHelpers from "../src/runtimes/child-process";
 import { OpenAiAppServerClient, limitNdjsonLines } from "../src/runtimes/openai/app-server-client";
-import * as openAiAuthState from "../src/runtimes/openai/auth-state";
 import type { ServerNotificationMethod } from "../src/runtimes/openai/app-server-protocol";
+import * as openAiAuthState from "../src/runtimes/openai/auth-state";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 
@@ -107,7 +107,7 @@ async function createClientHarness(
   requestPermission: AgentDriverPermissionPort["request"] = async () => "allow_once",
   interpreter = "bun",
   environment: DriverExecutionEnvironment = driverBootPayload.execution.environment,
-  runtimeOptions: { driverGeneration?: number; homePath?: string } = {},
+  runtimeOptions: { homePath?: string; provider?: "openai" | "openai-compatible" } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "mosoo-openai-client-"));
   temporaryDirectories.push(directory);
@@ -118,10 +118,10 @@ async function createClientHarness(
 
   const payload = createDriverStartInputFromBootPayload({
     ...driverBootPayload,
-    driverGeneration: runtimeOptions.driverGeneration ?? driverBootPayload.driverGeneration,
     execution: {
       ...driverBootPayload.execution,
       environment,
+      provider: runtimeOptions.provider ?? "openai",
       session: {
         ...driverBootPayload.execution.session,
         context: {
@@ -172,6 +172,64 @@ afterEach(async () => {
 });
 
 describe("OpenAi app-server client", () => {
+  test.each(["openai", "openai-compatible"] as const)(
+    "uses the typed %s connection over environment overrides",
+    async (provider) => {
+      const envPrefix = provider === "openai" ? "OPENAI" : "OPENAI_COMPATIBLE";
+      const harness = await createClientHarness(
+        (directory) => `
+await Bun.write(${JSON.stringify(join(directory, "model-connection.json"))}, JSON.stringify({
+  apiKey: process.env.${envPrefix}_API_KEY,
+  baseUrl: process.env.${envPrefix}_BASE_URL,
+  config: Bun.TOML.parse(await Bun.file(process.env.CODEX_HOME + "/config.toml").text()),
+}));
+process.stdin.once("data", (chunk) => {
+  const request = JSON.parse(String(chunk).trim());
+  process.stdout.write(JSON.stringify({ id: request.id, result: ${initializeResultJson} }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`,
+        undefined,
+        undefined,
+        "bun",
+        {
+          ...driverBootPayload.execution.environment,
+          variables: {
+            [`${envPrefix}_API_KEY`]: "environment-key",
+            [`${envPrefix}_BASE_URL`]: "https://environment.example/v1",
+          },
+        },
+        { provider },
+      );
+
+      try {
+        await harness.client.start();
+        const { proxyGrant, proxyUrl } = driverBootPayload.execution.modelConnection;
+        expect(await Bun.file(join(harness.directory, "model-connection.json")).json()).toEqual({
+          apiKey: proxyGrant,
+          baseUrl: proxyUrl,
+          config: expect.objectContaining(
+            provider === "openai"
+              ? { openai_base_url: proxyUrl }
+              : {
+                  model_provider: provider,
+                  model_providers: {
+                    [provider]: {
+                      base_url: proxyUrl,
+                      env_key: `${envPrefix}_API_KEY`,
+                      name: "mosoo OpenAI-Compatible",
+                      wire_api: "responses",
+                    },
+                  },
+                },
+          ),
+        });
+      } finally {
+        await harness.client.stop().catch(() => {});
+      }
+    },
+  );
+
   test("keeps transient API-key auth for the fake app-server lifetime", async () => {
     const harness = await createClientHarness(
       (directory) => `
@@ -195,13 +253,6 @@ process.stdin.on("data", (chunk) => {
 });
 setInterval(() => {}, 1000);
 `,
-      undefined,
-      undefined,
-      "bun",
-      {
-        ...driverBootPayload.execution.environment,
-        variables: { OPENAI_API_KEY: "client-lifetime-key" },
-      },
     );
 
     try {
@@ -216,10 +267,12 @@ setInterval(() => {}, 1000);
       expect((await lstat(authJsonPath)).isFile()).toBe(true);
       expect((await lstat(authJsonPath)).mode & 0o777).toBe(0o600);
       expect(JSON.parse(await readFile(authJsonPath, "utf8"))).toMatchObject({
-        OPENAI_API_KEY: "client-lifetime-key",
+        OPENAI_API_KEY: driverBootPayload.execution.modelConnection.proxyGrant,
       });
       await expect(harness.client.start()).rejects.toThrow("cannot be started more than once");
-      expect(await readFile(authJsonPath, "utf8")).toContain("client-lifetime-key");
+      expect(await readFile(authJsonPath, "utf8")).toContain(
+        driverBootPayload.execution.modelConnection.proxyGrant,
+      );
       await harness.client.stop();
       await expect(lstat(runtimeEnv.codexHome)).rejects.toThrow();
       expect((await lstat(join(runtimeEnv.sqliteHome, "sessions"))).isDirectory()).toBe(true);
@@ -245,13 +298,6 @@ process.stdin.once("data", (chunk) => {
 });
 setInterval(() => {}, 1000);
 `,
-      undefined,
-      undefined,
-      "bun",
-      {
-        ...driverBootPayload.execution.environment,
-        variables: { OPENAI_API_KEY: "failed-start-key" },
-      },
     );
 
     try {
@@ -264,14 +310,10 @@ setInterval(() => {}, 1000);
     }
   });
 
-  test("lists and resumes persistent native state across Driver generations", async () => {
+  test("lists and resumes persistent native state across Driver instances", async () => {
     const sharedRoot = await mkdtemp(join(tmpdir(), "mosoo-openai-native-state-"));
     temporaryDirectories.push(sharedRoot);
     const persistentRuntimeHome = join(sharedRoot, "home");
-    const environment = {
-      ...driverBootPayload.execution.environment,
-      variables: { OPENAI_API_KEY: "native-state-key" },
-    };
     const first = await createClientHarness(
       (directory) => `
 await Bun.write(process.env.CODEX_HOME + "/sessions/thread-1.jsonl", "rollout");
@@ -295,8 +337,8 @@ setInterval(() => {}, 1000);
       undefined,
       undefined,
       "bun",
-      environment,
-      { driverGeneration: 1, homePath: persistentRuntimeHome },
+      undefined,
+      { homePath: persistentRuntimeHome },
     );
 
     let firstRuntimeHome = "";
@@ -340,8 +382,8 @@ setInterval(() => {}, 1000);
       undefined,
       undefined,
       "bun",
-      environment,
-      { driverGeneration: 2, homePath: persistentRuntimeHome },
+      undefined,
+      { homePath: persistentRuntimeHome },
     );
 
     try {
@@ -901,13 +943,6 @@ setInterval(() => {}, 1000);
 await Bun.write(${JSON.stringify(join(directory, "setup-race-spawned"))}, "spawned");
 setInterval(() => {}, 1000);
 `,
-        undefined,
-        undefined,
-        "bun",
-        {
-          ...driverBootPayload.execution.environment,
-          variables: { OPENAI_API_KEY: "setup-race-key" },
-        },
       );
 
       try {
@@ -945,13 +980,6 @@ await Bun.write(${JSON.stringify(join(directory, "aborted-runtime-home"))}, proc
 process.stdin.resume();
 setInterval(() => {}, 1000);
 `,
-      undefined,
-      undefined,
-      "bun",
-      {
-        ...driverBootPayload.execution.environment,
-        variables: { OPENAI_API_KEY: "aborted-start-key" },
-      },
     );
     const controller = new AbortController();
 
@@ -1880,13 +1908,6 @@ process.stdin.on("data", (chunk) => {
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
 `,
-      undefined,
-      undefined,
-      "bun",
-      {
-        ...driverBootPayload.execution.environment,
-        variables: { OPENAI_API_KEY: "retry-stop-key" },
-      },
     );
     const nativeKill = process.kill;
     let childPid = 0;
@@ -1907,7 +1928,9 @@ setInterval(() => {}, 1000);
       }) as typeof process.kill;
 
       await expect(harness.client.stop()).rejects.toThrow("process tree did not exit");
-      expect(await readFile(join(runtimeHome, "auth.json"), "utf8")).toContain("retry-stop-key");
+      expect(await readFile(join(runtimeHome, "auth.json"), "utf8")).toContain(
+        driverBootPayload.execution.modelConnection.proxyGrant,
+      );
       suppressKill = false;
       await expect(harness.client.stop()).resolves.toBeUndefined();
       await expect(lstat(runtimeHome)).rejects.toThrow();

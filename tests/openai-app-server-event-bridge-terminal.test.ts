@@ -9,12 +9,12 @@ import type { DriverEventInput } from "../src/protocol/events";
 import { isDriverId } from "../src/protocol/id";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { OpenAiAppServerEventBridge } from "../src/runtimes/openai/app-server-event-bridge";
-import { createRuntimeSourceEventId } from "../src/runtimes/runtime-public-id";
 import {
   parseServerNotification,
   parseServerRequest,
 } from "../src/runtimes/openai/app-server-protocol-server";
 import { OpenAiAppServerRequestHandler } from "../src/runtimes/openai/app-server-request-handler";
+import { createRuntimeSourceEventId } from "../src/runtimes/runtime-public-id";
 import { createCmaMemoryStore } from "../src/stores/memory";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import { driverBootPayload, driverStartInput as bootPayload } from "./driver-boot-payload-fixture";
@@ -137,6 +137,123 @@ function createPublisherHarness(
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test.each(["completed", "cancelled", "failed"] as const)(
+    "snapshots open reasoning once before retrying a %s terminal",
+    async (outcome) => {
+      const { bridge, context, events, batches, terminalAttempts } = createHarness({
+        failTerminalOnce: true,
+      });
+      const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+      void trackedTurn.catch(() => {});
+      await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+        delta: "Partial reasoning",
+        itemId: "reasoning-1",
+        summaryIndex: 0,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+      const finish = () =>
+        outcome === "cancelled"
+          ? bridge.cancelTurn(context, "turn-1", "test.cancel")
+          : outcome === "failed"
+            ? bridge.failActiveTurns(context, new Error("test.failure"))
+            : bridge.handleNotification(context, "turn/completed", {
+                threadId: "thread-1",
+                turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "completed" },
+              });
+      await expect(finish()).rejects.toThrow("terminal sink rejected the first attempt");
+      await finish();
+      if (outcome === "completed") {
+        await expect(trackedTurn).resolves.toBeUndefined();
+      } else {
+        await expect(trackedTurn).rejects.toThrow(
+          outcome === "failed" ? "test.failure" : "test.cancel",
+        );
+      }
+
+      const snapshotBatches = batches.filter(
+        ({ reason }) => reason === "driver.openai.reasoning.snapshot",
+      );
+      expect(snapshotBatches).toHaveLength(1);
+      expect(snapshotBatches[0]?.events).toMatchObject([
+        {
+          kind: "thought.updated",
+          delivery: "lossless",
+          payload: { content: "Partial reasoning", offset: 0 },
+        },
+      ]);
+      expect(terminalAttempts).toHaveLength(2);
+      expect(
+        terminalAttempts.every(({ closures }) =>
+          closures.every((event) => event.kind !== "thought.updated"),
+        ),
+      ).toBe(true);
+      const thoughtEvents = events().filter((event) => event.kind.startsWith("thought."));
+      expect(thoughtEvents.map((event) => event.kind)).toEqual([
+        "thought.started",
+        "thought.delta",
+        "thought.updated",
+        outcome === "completed" ? "thought.completed" : "thought.cancelled",
+      ]);
+      expect(events().at(-1)?.kind).toBe(`run.${outcome}`);
+    },
+  );
+
+  test.each(["completed", "cancelled"] as const)(
+    "delivers a large %s reasoning snapshot before the terminal byte limit applies",
+    async (outcome) => {
+      const { bridge, context, delivered } = createPublisherHarness();
+      const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+      void trackedTurn.catch(() => {});
+      const text = "界\n".repeat(280_000);
+      if (outcome === "completed") {
+        await bridge.handleNotification(context, "item/completed", {
+          item: { content: [], id: "reasoning-1", summary: [text], type: "reasoning" },
+          threadId: "thread-1",
+          turnId: "turn-1",
+        });
+        await bridge.handleNotification(context, "turn/completed", {
+          threadId: "thread-1",
+          turn: { id: "turn-1", items: [], itemsView: "notLoaded", status: "completed" },
+        });
+        await expect(trackedTurn).resolves.toBeUndefined();
+      } else {
+        await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+          delta: text,
+          itemId: "reasoning-1",
+          summaryIndex: 0,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        });
+        await bridge.cancelTurn(context, "turn-1", "test.cancel");
+        await expect(trackedTurn).rejects.toThrow("test.cancel");
+      }
+
+      const snapshots = delivered.filter((event) => event.kind === "thought.updated");
+      expect(snapshots.length).toBeGreaterThan(2);
+      let offset = 0;
+      for (const event of snapshots) {
+        expect(event.delivery).toBe("lossless");
+        expect(event.payload).toMatchObject({ offset });
+        expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThanOrEqual(512 * 1_024);
+        offset += readEventPayloadString(event, "content")!.length;
+      }
+      expect(snapshots.map((event) => readEventPayloadString(event, "content")).join("")).toBe(
+        text,
+      );
+      const finalSnapshotIndex = delivered.findLastIndex(
+        (event) => event.kind === "thought.updated",
+      );
+      expect(
+        delivered.findIndex(
+          (event) =>
+            event.kind === (outcome === "completed" ? "thought.completed" : "thought.cancelled"),
+        ),
+      ).toBeGreaterThan(finalSnapshotIndex);
+      expect(delivered.at(-1)?.kind).toBe(`run.${outcome}`);
+    },
+  );
+
   test("reports monotonic per-turn usage from cumulative thread totals", async () => {
     const harness = createHarness();
     const trackedTurn = harness.bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);

@@ -4,7 +4,7 @@ import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import type { AgentDriverMaterializedSkill } from "../../host-ports";
-import { isJsonObject } from "../../protocol/json";
+import type { DriverModelProtocol } from "../../protocol/boot";
 import {
   MAX_NATIVE_CHECKPOINT_FILE_BYTES,
   nativeRuntimeRefsEqual,
@@ -25,18 +25,15 @@ import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { readNativeCheckpoint } from "../native-checkpoint";
 import { writeNativeRuntimeSystemPrompt } from "../skill-bootstrap";
 import { restorePiNativeOutputs } from "./pi-checkpoint";
-import { PI_MODEL_CONFIGURATION_SOURCE } from "./pi-model-configuration";
+import { PI_MODEL_CONFIGURATION_SOURCE, PI_PROXY_GRANT_ENV } from "./pi-model-configuration";
 import { readPiSessionHeader } from "./pi-session-validation";
 
-export const PI_CONFIG_ENV = "MOSOO_PI_CONFIG_CONTENT";
-export const PI_PROXY_GRANT_ENV = "MOSOO_PI_PROXY_GRANT";
-
-const PI_API_BY_PROTOCOL = new Map([
-  ["anthropic-messages", "anthropic-messages"],
-  ["google-gemini", "google-generative-ai"],
-  ["openai-chat-completions", "openai-completions"],
-  ["openai-responses", "openai-responses"],
-]);
+const PI_API_BY_PROTOCOL: Record<DriverModelProtocol, string> = {
+  "anthropic-messages": "anthropic-messages",
+  "google-gemini": "google-generative-ai",
+  "openai-chat-completions": "openai-completions",
+  "openai-responses": "openai-responses",
+};
 
 const PI_PROVIDER_BY_VENDOR = new Map([
   ["gemini", "google"],
@@ -48,10 +45,20 @@ const PI_PROVIDER_BY_VENDOR = new Map([
 // the decision, including cancellation of an outstanding permission request.
 function createPiExtensionSource(
   configuration: ReturnType<typeof readPiModelConfiguration>,
+  temporaryDirectory: string,
 ): string {
-  return `${PI_MODEL_CONFIGURATION_SOURCE}
+  return `import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+${PI_MODEL_CONFIGURATION_SOURCE}
 export default function (pi) {
   configurePiModel(pi, ${JSON.stringify(configuration)});
+  pi.registerTool(createBashToolDefinition(process.cwd(), {
+    spawnHook: (context) => ({ ...context, env: {
+      ...context.env,
+      TMPDIR: ${JSON.stringify(temporaryDirectory)},
+      TEMP: ${JSON.stringify(temporaryDirectory)},
+      TMP: ${JSON.stringify(temporaryDirectory)}
+    } })
+  }));
   pi.on("tool_call", async (event, ctx) => {
     const allowed = await ctx.ui.confirm("mosoo.tool_permission", JSON.stringify({
       toolCallId: event.toolCallId, toolName: event.toolName, input: event.input
@@ -72,24 +79,11 @@ export interface PiLaunchConfiguration {
 export function readPiModelConfiguration(
   execution: Pick<
     DriverStartInput["execution"],
-    "environment" | "model" | "provider" | "providerOptions"
+    "modelConnection" | "model" | "provider" | "providerOptions"
   >,
 ) {
-  const variables = execution.environment.variables;
-  const content = variables[PI_CONFIG_ENV];
-  const config: unknown = content === undefined ? null : JSON.parse(content);
-  if (!isJsonObject(config) || !variables[PI_PROXY_GRANT_ENV]) {
-    throw new Error("Pi requires a control-plane model configuration and proxy grant.");
-  }
-  const baseUrl = config["baseUrl"];
-  const protocol = config["modelProtocol"];
-  const api = typeof protocol === "string" ? PI_API_BY_PROTOCOL.get(protocol) : undefined;
-  if (typeof baseUrl !== "string" || !URL.canParse(baseUrl) || api === undefined) {
-    throw new Error("Pi requires a valid model proxy URL and supported model protocol.");
-  }
-  if (!["http:", "https:"].includes(new URL(baseUrl).protocol)) {
-    throw new Error("Pi model proxy URL must use HTTP or HTTPS.");
-  }
+  const { protocol, proxyUrl: baseUrl } = execution.modelConnection;
+  const api = PI_API_BY_PROTOCOL[protocol];
   const provider = PI_PROVIDER_BY_VENDOR.get(execution.provider) ?? execution.provider;
   const prefix = `${execution.provider}/`;
   const model = execution.model.startsWith(prefix)
@@ -194,6 +188,12 @@ export async function preparePiLaunch(
   await using temporaryDirectory = await ensureRealDirectoryAt(
     homeDirectory,
     "tmp",
+    "Pi shell temporary directory",
+    signal,
+  );
+  await using outputsDirectory = await ensureRealDirectoryAt(
+    homeDirectory,
+    "outputs",
     "Pi native output directory",
     signal,
   );
@@ -222,7 +222,7 @@ export async function preparePiLaunch(
   await writeFileAtomically(
     homeDirectory,
     "mosoo-permissions.mjs",
-    createPiExtensionSource(modelConfiguration),
+    createPiExtensionSource(modelConfiguration, join(home, "tmp")),
     0o600,
     signal,
   );
@@ -334,6 +334,11 @@ export async function preparePiLaunch(
   await assertDirectoryIdentity(
     temporaryDirectory,
     join(home, "tmp"),
+    "Pi shell temporary directory",
+  );
+  await assertDirectoryIdentity(
+    outputsDirectory,
+    join(home, "outputs"),
     "Pi native output directory",
   );
   return {
@@ -346,10 +351,11 @@ export async function preparePiLaunch(
       ...inherited,
       ...variables,
       ...mcpEnv,
+      [PI_PROXY_GRANT_ENV]: execution.modelConnection.proxyGrant,
       HOME: execution.session.homePath,
-      TMPDIR: join(home, "tmp"),
-      TEMP: join(home, "tmp"),
-      TMP: join(home, "tmp"),
+      TMPDIR: join(home, "outputs"),
+      TEMP: join(home, "outputs"),
+      TMP: join(home, "outputs"),
       PI_CODING_AGENT_DIR: home,
       PI_OFFLINE: "1",
     }),

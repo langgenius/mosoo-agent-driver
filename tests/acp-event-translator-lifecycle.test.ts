@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+
 import { RequestError } from "@agentclientprotocol/sdk";
 import type { PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 
@@ -11,20 +12,22 @@ import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-t
 import { limitAcpInput } from "../src/runtimes/acp/acp-driver-backend";
 import { toPermissionRequest } from "../src/runtimes/acp/acp-permission-events";
 import { toPromptStartEvents } from "../src/runtimes/acp/acp-session-events";
+import { MAX_ACP_LOSSLESS_EVENT_BYTES } from "../src/runtimes/acp/acp-types";
 import {
   MAX_RUN_TERMINAL_BATCH_BYTES,
   MAX_RUN_TERMINAL_BATCH_EVENTS,
   preflightDriverEventPush,
 } from "../src/runtimes/driver-event-admission";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import { MAX_THOUGHT_CONTENT_BYTES } from "../src/runtimes/thought-content";
 import { CMA_MAX_EVENT_BYTES } from "../src/stores/cma-store";
 import { createCmaMemoryStore } from "../src/stores/memory";
+import { beginAcpTranscript } from "./acp-test-helpers";
 import {
   DRIVER_TEST_IDS,
   driverBootPayload,
   driverStartInput,
 } from "./driver-boot-payload-fixture";
-import { beginAcpTranscript } from "./acp-test-helpers";
 
 const RUN_ID = "run-1" as RunId;
 const SECOND_RUN_ID = "run-2" as RunId;
@@ -63,6 +66,116 @@ function requireEvent(events: readonly DriverEventInput[], kind: string): Driver
 }
 
 describe("ACP runtime event translation", () => {
+  test.each(["completed", "cancelled", "failed"] as const)(
+    "retains every thought across message boundaries when the turn is %s",
+    (outcome) => {
+      const state = beginAcpTranscript();
+      for (const [messageId, thought] of [
+        ["native-1", "first "],
+        ["native-2", "second"],
+      ]) {
+        state.translateUpdate({
+          update: {
+            content: { text: thought, type: "text" },
+            messageId,
+            sessionUpdate: "agent_thought_chunk",
+          },
+        });
+        state.translateUpdate({
+          update: {
+            content: { text: "answer", type: "text" },
+            messageId,
+            sessionUpdate: "agent_message_chunk",
+          },
+        });
+      }
+
+      const terminal =
+        outcome === "failed"
+          ? state.failPrompt({ code: "acp.turn_failed", message: "provider failed" })
+          : state.completePrompt(outcome === "completed" ? "end_turn" : "cancelled", null);
+      expect(state.thoughtContentEvents()).toMatchObject([
+        {
+          delivery: "lossless",
+          kind: "thought.updated",
+          payload: { content: "first second", offset: 0, thoughtId: "message-1:thought" },
+          runId: RUN_ID,
+        },
+      ]);
+      expect(terminal.some((event) => event.kind === "thought.updated")).toBe(false);
+      expect(
+        eventPayload(
+          requireEvent(
+            terminal,
+            outcome === "completed" ? "thought.completed" : "thought.cancelled",
+          ),
+        ),
+      ).not.toHaveProperty("content");
+    },
+  );
+
+  test("chunks a full thought independently of the terminal closure budget", () => {
+    const state = beginAcpTranscript();
+    const text = '"\n😀'.repeat(180_000);
+    state.translateUpdate({
+      update: { content: { text, type: "text" }, sessionUpdate: "agent_thought_chunk" },
+    });
+    state.translateUpdate({
+      update: {
+        content: { text: "answer", type: "text" },
+        messageId: "native-answer",
+        sessionUpdate: "agent_message_chunk",
+      },
+    });
+    const events = state.thoughtContentEvents();
+    let offset = 0;
+    let restored = "";
+    for (const event of events) {
+      expect(eventPayload(event)["offset"]).toBe(offset);
+      const content = eventPayloadString(event, "content");
+      restored += content;
+      offset += content.length;
+      expect(Buffer.byteLength(JSON.stringify(event))).toBeLessThan(MAX_ACP_LOSSLESS_EVENT_BYTES);
+    }
+    expect(events.length).toBeGreaterThan(2);
+    expect(restored).toBe(text);
+    expect(() =>
+      preflightDriverEventPush(state.completePrompt("end_turn", null), RUN_ID),
+    ).not.toThrow();
+  });
+
+  test("restores the full thought after rejected ingress and clears it before the next turn", () => {
+    const state = beginAcpTranscript();
+    const update = (text: string) =>
+      state.translateUpdate({
+        update: { content: { text, type: "text" }, sessionUpdate: "agent_thought_chunk" },
+      });
+    update("partial");
+    const before = state.thoughtContentEvents();
+    const restore = state.checkpoint();
+    update(" later");
+    restore();
+    expect(state.thoughtContentEvents()).toEqual(before);
+    expect(() => update("x".repeat(MAX_THOUGHT_CONTENT_BYTES))).toThrow(
+      "ACP thought content exceeds",
+    );
+    expect(state.thoughtContentEvents()).toEqual(before);
+    state.begin({ messageId: "next", runId: SECOND_RUN_ID });
+    expect(state.thoughtContentEvents()).toEqual([]);
+  });
+
+  test("counts split surrogate pairs once when enforcing the full thought limit", () => {
+    const state = beginAcpTranscript();
+    const update = (text: string) =>
+      state.translateUpdate({
+        update: { content: { text, type: "text" }, sessionUpdate: "agent_thought_chunk" },
+      });
+    update("\ud83d");
+    update("\ude00");
+    expect(() => update("x".repeat(MAX_THOUGHT_CONTENT_BYTES - 4))).not.toThrow();
+    expect(() => update("x")).toThrow("ACP thought content exceeds");
+  });
+
   test("bounds an official ACP JSON-RPC failure across every terminal event", async () => {
     const originalMessage = "x".repeat(1_100_000);
     const wire = `${JSON.stringify({

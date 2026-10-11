@@ -145,6 +145,7 @@ export class ClaudeAgentSdkMessageTranslator {
     };
 
     try {
+      await this.#events.publishOpenThoughtContents(context);
       await this.#options.pushTerminal(
         context,
         reason,
@@ -186,11 +187,15 @@ export class ClaudeAgentSdkMessageTranslator {
     );
   }
 
-  async #endThought(context: AgentDriverContext, messageId: string): Promise<void> {
+  async #endThought(
+    context: AgentDriverContext,
+    messageId: string,
+    status: "cancelled" | "completed" = "completed",
+  ): Promise<void> {
     const thoughtId = this.#state.thoughtIdForMessage(messageId);
 
     if (thoughtId !== undefined) {
-      await this.#events.settleThought(context, thoughtId, "completed");
+      await this.#events.settleThought(context, thoughtId, status);
       this.#state.deleteThoughtId(messageId);
     }
   }
@@ -306,6 +311,7 @@ export class ClaudeAgentSdkMessageTranslator {
     );
     const content = Array.isArray(message.message.content) ? message.message.content : [];
     const authoritativeText: string[] = [];
+    const authoritativeThinking: string[] = [];
     const toolCallIds: string[] = [];
 
     for (const [index, block] of content.entries()) {
@@ -314,6 +320,12 @@ export class ClaudeAgentSdkMessageTranslator {
       }
 
       const blockType = readString(block, "type");
+
+      if (blockType === "thinking") {
+        const thinking = readString(block, "thinking");
+        if (thinking !== null) authoritativeThinking.push(thinking);
+        continue;
+      }
 
       if (blockType === "text") {
         const text = readString(block, "text");
@@ -360,6 +372,15 @@ export class ClaudeAgentSdkMessageTranslator {
     this.#state.bindWireAssistantMessage(message.uuid, messageId);
     this.#state.bindWireToolCalls(message.uuid, toolCallIds);
 
+    if (
+      authoritativeThinking.length > 0 ||
+      (outcome.status === "completed" && this.#state.thoughtIdForMessage(messageId) !== undefined)
+    ) {
+      const thoughtId = this.#state.thoughtId(messageId);
+      this.#events.replaceThoughtText(thoughtId, authoritativeThinking.join(""));
+      await this.#events.ensureThoughtStarted(context, thoughtId);
+    }
+
     if (authoritativeText.length > 0) {
       const text = authoritativeText.join("");
       if (await this.#events.pushMessageSnapshot(context, messageId, text)) {
@@ -382,7 +403,7 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     if (outcome.status === "failed") {
-      await this.#endThought(context, messageId);
+      await this.#endThought(context, messageId, "cancelled");
       await this.#events.ensureMessageStarted(context, messageId);
       await this.#events.settleMessage(context, messageId, {
         error: {
@@ -465,7 +486,8 @@ export class ClaudeAgentSdkMessageTranslator {
     }
 
     if (eventType === "message_stop") {
-      await this.#endThought(context, messageId);
+      const thoughtId = this.#state.thoughtIdForMessage(messageId);
+      if (thoughtId !== undefined) this.#events.sealThought(thoughtId);
       this.#events.sealMessage(messageId);
       this.#state.clearStreamingNativeMessageId(streamScopeKey);
       this.#state.clearToolCallIds(messageId);
@@ -547,6 +569,10 @@ export class ClaudeAgentSdkMessageTranslator {
     if (blockType === "thinking") {
       const thoughtId = this.#state.thoughtId(messageId);
       await this.#events.ensureThoughtStarted(context, thoughtId);
+      const thinking = readString(block, "thinking");
+      if (thinking) {
+        await this.#events.pushThoughtDelta({ context, delta: thinking, thoughtId });
+      }
       return;
     }
 
@@ -689,6 +715,7 @@ export class ClaudeAgentSdkMessageTranslator {
     runId: RunId,
     messageId: MessageId,
   ): Promise<void> {
+    await this.#endThought(context, messageId);
     const ended = await this.#events.settleMessage(context, messageId, { status: "completed" });
     this.#state.completeAssistantMessage(runId, messageId, ended);
   }

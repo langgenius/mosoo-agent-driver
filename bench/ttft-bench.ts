@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { AgentDriverKernelCore, type AgentDriverKernel } from "../src/core/agent-driver-kernel";
 import type { PermissionDecision } from "../src/core/driver-permission-broker";
+import type { DriverModelConnection } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, parseRunId, type RunId, type SessionId } from "../src/protocol/id";
 import { parseNativeCheckpoint, type NativeCheckpoint } from "../src/protocol/native-checkpoint";
@@ -415,6 +416,7 @@ interface RuntimeConfig {
   readonly runtime: RuntimeId;
   readonly provider: string;
   readonly model: string;
+  readonly modelConnection: DriverModelConnection;
   readonly variables: Record<string, string>;
 }
 
@@ -446,6 +448,7 @@ function startInput(
       ...bootPayload.execution,
       provider: config.provider,
       model: config.model,
+      modelConnection: config.modelConnection,
       run: { runId: null, sessionId },
       environment: { variables: config.variables },
       session: {
@@ -609,13 +612,6 @@ function runtimeConfigs(): RuntimeConfig[] {
   if (requested.some((id) => !["claude", "openai", "opencode", "pi"].includes(id)))
     throw new Error("Unknown TTFT_RUNTIMES entry.");
   const configs: RuntimeConfig[] = [];
-  const forwarded = (names: string[]) =>
-    Object.fromEntries(
-      names.flatMap((name) => {
-        const value = readEnv(name);
-        return value === null ? [] : [[name, value]];
-      }),
-    );
   for (const runtime of requested as RuntimeId[]) {
     const provider =
       runtime === "claude"
@@ -625,25 +621,42 @@ function runtimeConfigs(): RuntimeConfig[] {
           : runtime === "pi"
             ? (readEnv("TTFT_PI_PROVIDER") ?? "openai")
             : "openai";
-    const apiEnv = provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
-    const model =
-      readEnv(`TTFT_${runtime.toUpperCase()}_MODEL`) ??
-      (provider === "anthropic" ? "claude-sonnet-4-5" : "gpt-5.4");
-    const variables = forwarded([
-      apiEnv,
-      "ANTHROPIC_BASE_URL",
-      "OPENAI_BASE_URL",
-      "MOSOO_PI_CONFIG_CONTENT",
-      "MOSOO_PI_PROXY_GRANT",
-    ]);
+    const prefix = `TTFT_${runtime.toUpperCase()}`;
+    const anthropic = provider === "anthropic";
+    const google = provider === "google" || provider === "gemini";
+    const apiEnv = anthropic ? "ANTHROPIC_API_KEY" : google ? "GEMINI_API_KEY" : "OPENAI_API_KEY";
+    const defaultProtocol = anthropic
+      ? "anthropic-messages"
+      : google
+        ? "google-gemini"
+        : provider === "openai"
+          ? "openai-responses"
+          : "openai-chat-completions";
+    const protocol = readEnv(`${prefix}_PROTOCOL`) ?? defaultProtocol;
     if (
-      runtime === "pi"
-        ? !variables["MOSOO_PI_CONFIG_CONTENT"] || !variables["MOSOO_PI_PROXY_GRANT"]
-        : !variables[apiEnv]
-    ) {
+      protocol !== "anthropic-messages" &&
+      protocol !== "google-gemini" &&
+      protocol !== "openai-chat-completions" &&
+      protocol !== "openai-responses"
+    )
+      throw new Error(`Unsupported ${prefix}_PROTOCOL.`);
+    const proxyGrant = readEnv(`${prefix}_API_KEY`) ?? readEnv(apiEnv);
+    const proxyUrl =
+      readEnv(`${prefix}_BASE_URL`) ??
+      readEnv(anthropic ? "ANTHROPIC_BASE_URL" : google ? "GEMINI_BASE_URL" : "OPENAI_BASE_URL") ??
+      (anthropic
+        ? "https://api.anthropic.com"
+        : google
+          ? "https://generativelanguage.googleapis.com/v1beta"
+          : "https://api.openai.com/v1");
+    const model =
+      readEnv(`${prefix}_MODEL`) ??
+      (anthropic ? "claude-sonnet-4-5" : google ? "gemini-3.5-flash" : "gpt-5.4");
+    if (proxyGrant === null) {
       process.stdout.write(`Skipping ${runtime}: provider credentials/configuration missing.\n`);
       continue;
     }
+    const variables: Record<string, string> = {};
     if (runtime === "claude")
       Object.assign(variables, {
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
@@ -653,21 +666,14 @@ function runtimeConfigs(): RuntimeConfig[] {
     if (runtime === "opencode") {
       process.env["MOSOO_ACP_FALLBACK_COMMAND"] ??= "opencode";
       process.env["MOSOO_ACP_FALLBACK_ARGS"] ??= JSON.stringify(["acp", "--pure"]);
-      const baseURL =
-        variables[provider === "anthropic" ? "ANTHROPIC_BASE_URL" : "OPENAI_BASE_URL"];
-      variables["OPENCODE_CONFIG_CONTENT"] = JSON.stringify({
-        $schema: "https://opencode.ai/config.json",
-        enabled_providers: [provider],
-        model: `${provider}/${model}`,
-        small_model: `${provider}/${model}`,
-        provider: {
-          [provider]: {
-            options: { apiKey: `{env:${apiEnv}}`, ...(baseURL === undefined ? {} : { baseURL }) },
-          },
-        },
-      });
     }
-    configs.push({ runtime, provider, model, variables });
+    configs.push({
+      runtime,
+      provider,
+      model,
+      modelConnection: { protocol, proxyUrl, proxyGrant },
+      variables,
+    });
   }
   return configs;
 }

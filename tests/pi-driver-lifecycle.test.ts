@@ -26,7 +26,7 @@ afterEach(async () => {
   for (const dispose of cleanup.splice(0).toReversed()) await dispose();
 });
 
-async function harness(nativeText = "done", expectedCleanupError?: string) {
+async function harness(nativeText = "done", nativeThinking?: string) {
   const root = await mkdtemp(join(tmpdir(), "mosoo-pi-lifecycle-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
   const home = join(root, "pi");
@@ -39,14 +39,10 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
     execution: {
       ...driverStartInput.execution,
       model: "test-model",
-      environment: {
-        variables: {
-          MOSOO_PI_PROXY_GRANT: "test-grant",
-          MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            baseUrl: "http://127.0.0.1:1",
-            modelProtocol: "openai-chat-completions",
-          }),
-        },
+      modelConnection: {
+        proxyGrant: "test-grant",
+        proxyUrl: "http://127.0.0.1:1",
+        protocol: "openai-chat-completions" as const,
       },
       session: { ...driverStartInput.execution.session, homePath: root, cwd: root },
     },
@@ -129,14 +125,15 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
     },
   });
   cleanup.push(async () => {
-    const task = backend.stop(context, "cleanup", AbortSignal.timeout(2_000));
-    if (expectedCleanupError === undefined) await task;
-    else await expect(task).rejects.toThrow(expectedCleanupError);
+    await backend.stop(context, "cleanup", AbortSignal.timeout(2_000));
   });
   await backend.start(context, AbortSignal.timeout(2_000));
   const nativeMessage: JsonObject = {
     role: "assistant",
-    content: [{ type: "text", text: nativeText }],
+    content: [
+      ...(nativeThinking === undefined ? [] : [{ type: "thinking", thinking: nativeThinking }]),
+      { type: "text", text: nativeText },
+    ],
     stopReason: "stop",
     timestamp: 1,
   };
@@ -192,23 +189,12 @@ async function harness(nativeText = "done", expectedCleanupError?: string) {
 }
 
 test.each([
-  { name: "event count", count: 1023, bytes: 0, permission: false },
-  { name: "event bytes", count: 4, bytes: 8 * 1024 * 1024 - 256, permission: false },
-  { name: "permission count", count: 1024, bytes: 0, permission: true },
-])("bounds $name until queued and active handlers finish", async (input) => {
-  const run = await harness(
-    "done",
-    input.permission ? undefined : "Pi event queue limit exceeded.",
-  );
-  const entered = Promise.withResolvers<void>();
+  { name: "count", count: 1024, bytes: 0 },
+  { name: "bytes", count: 4, bytes: 8 * 1024 * 1024 - 256 },
+])("bounds permission $name while requests await decisions", async (input) => {
+  const run = await harness();
   const release = Promise.withResolvers<void>();
   let permissions = 0;
-  run.hooks.push = async (events) => {
-    if (events.some((event) => event.kind === "message.started")) {
-      entered.resolve();
-      await release.promise;
-    }
-  };
   run.hooks.permission = async (signal) => {
     permissions++;
     await raceWithAbort(release.promise, signal);
@@ -216,50 +202,66 @@ test.each([
   };
   const outcome = run.turn().catch((error: unknown) => error);
   await run.prompt.promise;
-  const tasks: Promise<void>[] = [];
-  if (!input.permission) {
-    tasks.push(run.emit({ type: "message_start", message: { role: "assistant" } }));
-    await entered.promise;
-  }
-  const record: JsonObject = input.permission
-    ? {
-        type: "extension_ui_request",
-        method: "confirm",
-        title: "mosoo.tool_permission",
-        message: JSON.stringify({ toolCallId: "tool", toolName: "read" }),
-      }
-    : { type: "message_update", assistantMessageEvent: {}, data: "x".repeat(input.bytes) };
-  for (let index = 0; index < input.count; index++) {
-    tasks.push(run.emit({ ...record, id: String(index) }));
-  }
-  const drained = Promise.allSettled(tasks);
+  const record: JsonObject = {
+    type: "extension_ui_request",
+    method: "confirm",
+    title: "mosoo.tool_permission",
+    message: JSON.stringify({ toolCallId: "tool", toolName: "read" }),
+    data: "x".repeat(input.bytes),
+  };
+  const drained = Promise.allSettled(
+    Array.from({ length: input.count }, (_, index) => run.emit({ ...record, id: String(index) })),
+  );
   try {
     const overflow = await run.emit({ ...record, id: "overflow" }).catch((error: unknown) => error);
-    expect(overflow).toMatchObject({ message: "Pi event queue limit exceeded." });
-    expect(permissions).toBe(input.permission ? input.count : 0);
+    expect(overflow).toMatchObject({ message: "Pi permission queue limit exceeded." });
+    expect(permissions).toBe(input.count);
     run.fail(overflow as Error);
     release.resolve();
     await drained;
     expect(await outcome).toBe(overflow);
     expect(run.stopped()).toBe(1);
     expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
-    expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(0);
   } finally {
     release.resolve();
   }
 });
 
-test("releases the event budget after delivery", async () => {
-  const run = await harness();
+test("batches a long thinking stream behind slow ACKs and restores dropped previews", async () => {
+  const run = await harness("done", "Final summary.");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let maximumBatch = 0;
+  run.hooks.push = async (events) => {
+    maximumBatch = Math.max(maximumBatch, events.length);
+    if (events.some((event) => event.kind === "message.started")) {
+      entered.resolve();
+      await release.promise;
+    }
+  };
   const outcome = run.turn();
-  await run.prompt.promise;
-  for (let batch = 0; batch < 2; batch++) {
-    await Promise.all(Array.from({ length: 1024 }, () => run.emit({ type: "idle" })));
-  }
-  await run.complete();
+  const completion = run.complete();
+  await entered.promise;
+  const streamed = Array.from({ length: 1500 }, () =>
+    run.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hello " },
+    }),
+  );
+  release.resolve();
+  await Promise.all(streamed);
+  await completion;
   await outcome;
-  expect(run.stopped()).toBe(0);
+  expect(maximumBatch).toBeGreaterThan(1);
+  expect(run.events.filter((event) => event.kind === "thought.delta").length).toBeLessThan(1500);
+  expect(
+    run.events
+      .filter((event) => event.kind === "thought.updated")
+      .map((event) => (event.payload as JsonObject)["content"])
+      .join(""),
+  ).toBe("Final summary.");
   expect(run.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
+  expect(run.stopped()).toBe(0);
 });
 
 test("does not dispatch native work before the run start receipt, including cancellation", async () => {
@@ -463,31 +465,88 @@ test("fails and reaps the process if native cancellation times out", async () =>
   expect(run.events.filter((event) => event.kind === "run.cancelled")).toHaveLength(0);
 }, 10_000);
 
-test("cancels an unfinished thought when its native final content conflicts", async () => {
-  const run = await harness(
-    "done",
-    "Pi final thinking content does not match the delivered prefix.",
-  );
-  const outcome = run.turn().catch((error: unknown) => error);
-  await run.prompt.promise;
-  await run.emit({ type: "message_start", message: { role: "assistant" } });
-  await run.emit({
-    type: "message_update",
-    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "sent prefix" },
-  });
-  const mismatch = await run
-    .emit({
-      type: "message_end",
-      message: { role: "assistant", content: [{ type: "thinking", thinking: "different final" }] },
-    })
-    .catch((error: unknown) => error);
-  expect(mismatch).toBeInstanceOf(Error);
-  run.fail(mismatch as Error);
-  expect(await outcome).toBe(mismatch);
-  expect(run.events.filter((event) => event.kind === "thought.cancelled")).toHaveLength(1);
-  expect(run.events.filter((event) => event.kind === "thought.completed")).toHaveLength(0);
-  expect(run.events.filter((event) => event.kind === "run.failed")).toHaveLength(1);
-});
+test.each(["cancelled", "failed"])(
+  "acknowledges large partial thinking before the %s run terminal",
+  async (status) => {
+    const run = await harness();
+    const outcome = run.turn().catch((error: unknown) => error);
+    await run.prompt.promise;
+    await run.emit({ type: "message_start", message: { role: "assistant" } });
+    const partial = "思考😀".repeat(180_000);
+    await run.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: partial },
+    });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    run.hooks.push = async (events) => {
+      if (events.some((event) => event.kind === "thought.updated")) {
+        entered.resolve();
+        await release.promise;
+      }
+      if (events.some((event) => event.kind === `run.${status}`)) {
+        expect(events.some((event) => event.kind === "thought.updated")).toBe(false);
+        expect(Buffer.byteLength(JSON.stringify(events))).toBeLessThan(1_024 * 1_024);
+      }
+    };
+    if (status === "cancelled") await run.backend.cancelActiveTurn(run.context, "stop");
+    else run.fail(new Error("native failed"));
+    await entered.promise;
+    expect(run.events.some((event) => event.kind === `run.${status}`)).toBe(false);
+    release.resolve();
+    await outcome;
+    const updates = run.events.filter((event) => event.kind === "thought.updated");
+    expect(updates.length).toBeGreaterThan(1);
+    expect(updates.map((event) => (event.payload as JsonObject)["content"]).join("")).toBe(partial);
+    expect(run.events.filter((event) => event.kind === "thought.cancelled")).toHaveLength(1);
+    expect(run.events.filter((event) => event.kind === `run.${status}`)).toHaveLength(1);
+  },
+);
+
+test.each([false, true])(
+  "preserves authoritative thought delivery failure without a competing terminal (cancel=%s)",
+  async (cancel) => {
+    const run = await harness();
+    const outcome = run.turn().catch((error: unknown) => error);
+    await run.prompt.promise;
+    await run.emit({ type: "message_start", message: { role: "assistant" } });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let deliveryError: DriverEventRejectedError | undefined;
+    run.hooks.push = async (events) => {
+      const update = events.find((event) => event.kind === "thought.updated");
+      if (update) {
+        entered.resolve();
+        await release.promise;
+        deliveryError = new DriverEventRejectedError(
+          update.sourceEventId!,
+          new Error("snapshot rejected"),
+        );
+        throw deliveryError;
+      }
+      const request = events.find((event) => event.kind === "run.cancel.requested");
+      if (request)
+        throw new DriverEventRejectedError(request.sourceEventId!, new Error("cancel rejected"));
+    };
+    const delivery = run
+      .emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "Final summary." },
+      })
+      .catch((error: unknown) => error);
+    await entered.promise;
+    if (cancel) await run.backend.cancelActiveTurn(run.context, "stop");
+    release.resolve();
+    expect(await delivery).toBe(deliveryError);
+    expect(await outcome).toBe(deliveryError);
+    expect(run.stopped()).toBe(1);
+    expect(
+      run.events.filter((event) =>
+        ["run.completed", "run.cancelled", "run.failed"].includes(event.kind),
+      ),
+    ).toEqual([]);
+  },
+);
 
 test("creates an independently readable checkpoint before completed delivery and waits for its receipt", async () => {
   const run = await harness();

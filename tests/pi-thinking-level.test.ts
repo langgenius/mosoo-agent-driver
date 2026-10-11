@@ -87,14 +87,10 @@ async function harness(
       ...driverStartInput.execution,
       ...selection,
       providerOptions,
-      environment: {
-        variables: {
-          MOSOO_PI_PROXY_GRANT: "test-grant",
-          MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-            baseUrl: "http://127.0.0.1:1",
-            modelProtocol: "openai-chat-completions",
-          }),
-        },
+      modelConnection: {
+        proxyGrant: "test-grant",
+        proxyUrl: "http://127.0.0.1:1",
+        protocol: "openai-chat-completions",
       },
       session: {
         ...driverStartInput.execution.session,

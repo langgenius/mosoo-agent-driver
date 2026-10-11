@@ -3,6 +3,7 @@ import type {
   DriverExecutionEnvironment,
   DriverExecutionSessionContext,
   DriverExecutionSpec,
+  DriverModelConnection,
   DriverNativeRuntimeRef,
   DriverPermissionPolicy,
   DriverRecoveryMessage,
@@ -33,6 +34,7 @@ export interface DriverExecutionInput {
   readonly builtInTools: DriverExecutionSpec["builtInTools"];
   readonly environment: DriverExecutionEnvironment;
   readonly model: string;
+  readonly modelConnection: DriverModelConnection;
   readonly permissionPolicy: DriverPermissionPolicy;
   readonly provider: string;
   readonly providerOptions: DriverExecutionSpec["providerOptions"];
@@ -50,6 +52,7 @@ export function createDriverExecutionInputFromBootExecution(
     builtInTools: execution.builtInTools,
     environment: execution.environment,
     model: execution.model,
+    modelConnection: execution.modelConnection,
     permissionPolicy: execution.permissionPolicy,
     provider: execution.provider,
     providerOptions: execution.providerOptions,

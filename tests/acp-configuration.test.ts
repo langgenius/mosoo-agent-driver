@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+
 import { ClientSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
 
 import {
@@ -6,6 +7,7 @@ import {
   appendOpenCodeInstruction,
   buildChildEnv,
   buildClientCapabilities,
+  buildOpenCodeModelConfig,
   assertProtocolVersion,
   isOpenCodeCommand,
   resolveAuthMethod,
@@ -26,6 +28,114 @@ function createInitializeResult(protocolVersion: number | string | null) {
 }
 
 describe("ACP runtime configuration", () => {
+  test.each([
+    {
+      provider: "anthropic",
+      model: "anthropic/claude-sonnet-5",
+      protocol: "anthropic-messages" as const,
+      providerId: "anthropic",
+      modelId: "claude-sonnet-5",
+      npm: "@ai-sdk/anthropic",
+      baseSuffix: "/v1",
+    },
+    {
+      provider: "openai-compatible",
+      model: "custom-claude",
+      protocol: "anthropic-messages" as const,
+      providerId: "openai-compatible",
+      modelId: "custom-claude",
+      npm: "@ai-sdk/anthropic",
+      baseSuffix: "",
+    },
+    {
+      provider: "gemini",
+      model: "gemini-3.5-flash",
+      protocol: "google-gemini" as const,
+      providerId: "gemini",
+      modelId: "gemini-3.5-flash",
+      npm: "@ai-sdk/google",
+      baseSuffix: "",
+    },
+    {
+      provider: "openai",
+      model: "openai/gpt-5.5",
+      protocol: "openai-responses" as const,
+      providerId: "openai",
+      modelId: "gpt-5.5",
+      npm: "@ai-sdk/openai",
+      baseSuffix: "",
+    },
+    ...["zhipu/glm-4.7", "zai/glm-4.7", "glm-4.7"].map((model) => ({
+      provider: "zhipu",
+      model,
+      protocol: "openai-chat-completions" as const,
+      providerId: "zai",
+      modelId: "glm-4.7",
+      npm: "@ai-sdk/openai-compatible",
+      baseSuffix: "",
+    })),
+    {
+      provider: "openai-compatible",
+      model: "openrouter/anthropic/claude-sonnet-5",
+      protocol: "openai-chat-completions" as const,
+      providerId: "openai-compatible",
+      modelId: "openrouter/anthropic/claude-sonnet-5",
+      npm: "@ai-sdk/openai-compatible",
+      baseSuffix: "",
+    },
+  ])("routes $provider/$model through its frozen $protocol connection", (input) => {
+    const config = JSON.parse(
+      buildOpenCodeModelConfig({
+        model: input.model,
+        provider: input.provider,
+        modelConnection: {
+          protocol: input.protocol,
+          proxyGrant: "frozen-proxy-grant",
+          proxyUrl: "https://api.example/llm/proxy/credential",
+        },
+      }),
+    );
+    const model = `${input.providerId}/${input.modelId}`;
+    expect(config).toEqual({
+      $schema: "https://opencode.ai/config.json",
+      enabled_providers: [input.providerId],
+      model,
+      permission: { "*": "ask" },
+      provider: {
+        [input.providerId]: {
+          models: { [input.modelId]: { name: input.modelId } },
+          npm: input.npm,
+          options: {
+            apiKey: "{env:OPENCODE_API_KEY}",
+            baseURL: `https://api.example/llm/proxy/credential${input.baseSuffix}`,
+          },
+        },
+      },
+      small_model: model,
+    });
+  });
+
+  test("builds the OpenCode model config after environment overrides", () => {
+    const env = buildChildEnv({
+      ...bootPayload,
+      execution: {
+        ...bootPayload.execution,
+        environment: {
+          variables: {
+            OPENCODE_API_KEY: "overridden-key",
+            OPENCODE_CONFIG_CONTENT: "malformed override",
+          },
+        },
+      },
+    });
+
+    expect(env["OPENCODE_CONFIG_CONTENT"]).toBe(buildOpenCodeModelConfig(bootPayload.execution));
+    expect(env["OPENCODE_CONFIG_CONTENT"]).not.toContain(
+      bootPayload.execution.modelConnection.proxyGrant,
+    );
+    expect(env["OPENCODE_API_KEY"]).toBe(bootPayload.execution.modelConnection.proxyGrant);
+  });
+
   test("adds a session instruction to OpenCode's inline config", () => {
     const instructionPath = "/workspace/session/runtime-instructions.md";
     const env = appendOpenCodeInstruction(

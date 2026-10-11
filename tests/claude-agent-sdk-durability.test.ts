@@ -14,7 +14,10 @@ import type { EventId, RunId, SessionId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import { toRuntimeEventInput } from "../src/runtime-events";
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { ClaudeDurableEventTooLargeError } from "../src/runtimes/claude/agent-sdk-event-writer";
+import {
+  ClaudeAgentSdkEventWriter,
+  ClaudeDurableEventTooLargeError,
+} from "../src/runtimes/claude/agent-sdk-event-writer";
 import { ClaudeAgentSdkDriverBackend } from "../src/runtimes/claude/agent-sdk-driver-backend";
 import { ClaudeAgentSdkMessageTranslator } from "../src/runtimes/claude/agent-sdk-message-translator";
 import { toRuntimePublicId } from "../src/runtimes/runtime-public-id";
@@ -55,11 +58,18 @@ function successResult(input: {
   } as unknown as SDKMessage;
 }
 
-function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: SessionId } = {}) {
+function createCmaHarness(
+  ids: {
+    readonly runId?: RunId;
+    readonly sessionId?: SessionId;
+    readonly dropPreviews?: boolean;
+  } = {},
+) {
   const runId = ids.runId ?? (createDriverId() as RunId);
   const sessionId = ids.sessionId ?? (createDriverId() as SessionId);
   const events: DriverEventInput[] = [];
   const sseFrameBytes: number[] = [];
+  const terminalClosures: DriverEventInput[][] = [];
   const context = createAgentDriverContext({
     eventSink: {
       currentRunId: () => runId,
@@ -72,6 +82,7 @@ function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: Se
   const store = createCmaMemoryStore({ sessions: [{ id: sessionId }] });
   const append = async (batch: readonly DriverEventInput[]) => {
     for (const event of batch) {
+      if (ids.dropPreviews && event.delivery === "best_effort") continue;
       events.push(event);
       const [envelope] = toRuntimeEventInput(
         {
@@ -91,8 +102,9 @@ function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: Se
   const translator = new ClaudeAgentSdkMessageTranslator({
     publicToolCallId: (nativeToolCallId) => toRuntimePublicId(nativeToolCallId, "claude-tool"),
     push: async (_context, _reason, batch) => append(batch),
-    pushTerminal: async (_context, _reason, closures, terminal) =>
-      append([
+    pushTerminal: async (_context, _reason, closures, terminal) => {
+      terminalClosures.push([...closures]);
+      await append([
         ...closures,
         terminal.kind === "run.completed"
           ? {
@@ -103,16 +115,173 @@ function createCmaHarness(ids: { readonly runId?: RunId; readonly sessionId?: Se
               },
             }
           : terminal,
-      ]),
+      ]);
+    },
     recordNativeSessionId: async () => {},
     replaceNativeSessionId: async () => {},
     sessionId,
   });
 
-  return { context, events, runId, sessionId, sseFrameBytes, translator };
+  return { context, events, runId, sessionId, sseFrameBytes, terminalClosures, translator };
 }
 
 describe("Claude Agent SDK durable event boundaries", () => {
+  test("bounds retained thinking across the whole turn before accepting a new thought", async () => {
+    const { context } = createCmaHarness();
+    const delivered: DriverEventInput[] = [];
+    const writer = new ClaudeAgentSdkEventWriter({
+      push: async (_context, _reason, events) => {
+        delivered.push(...events.filter((event) => event.delivery !== "best_effort"));
+      },
+    });
+    await writer.pushThoughtDelta({
+      context,
+      delta: "x".repeat(9 * 1_024 * 1_024),
+      thoughtId: "first",
+    });
+    await expect(
+      writer.pushThoughtDelta({
+        context,
+        delta: "y".repeat(8 * 1_024 * 1_024),
+        thoughtId: "second",
+      }),
+    ).rejects.toThrow("turn thought content exceeds");
+    expect(delivered.filter((event) => event.kind === "thought.started")).toHaveLength(1);
+    writer.replaceThoughtText("first", "retained");
+    await writer.settleThought(context, "first", "cancelled");
+    expect(delivered.filter((event) => event.kind === "thought.updated")).toMatchObject([
+      { payload: { content: "retained", offset: 0, thoughtId: "first" } },
+    ]);
+  });
+
+  test.each(["authoritative", "", null])(
+    "replaces dropped thought previews with the native final %j after message_stop",
+    async (thinking) => {
+      const harness = createCmaHarness({ dropPreviews: true });
+      const messages = [
+        {
+          event: { message: { id: "thinking-message" }, type: "message_start" },
+          type: "stream_event",
+        },
+        {
+          event: {
+            content_block: { thinking: "draft", type: "thinking" },
+            index: 0,
+            type: "content_block_start",
+          },
+          type: "stream_event",
+        },
+        { event: { type: "message_stop" }, type: "stream_event" },
+        {
+          message: {
+            content: [
+              ...(thinking === null ? [] : [{ thinking, type: "thinking" }]),
+              { text: "done", type: "text" },
+            ],
+            id: "thinking-message",
+          },
+          type: "assistant",
+          uuid: "thinking-wire",
+        },
+      ] as unknown as SDKMessage[];
+
+      for (const message of messages) {
+        await harness.translator.handleSdkMessage(harness.context, message, harness.runId);
+      }
+      const snapshots = harness.events.filter((event) => event.kind === "thought.updated");
+      expect(snapshots).toHaveLength(1);
+      expect(payload(snapshots[0]!)).toMatchObject({ content: thinking ?? "", offset: 0 });
+      expect(harness.events.filter((event) => event.kind === "thought.delta")).toHaveLength(0);
+      expect(harness.events.filter((event) => event.kind === "thought.completed")).toHaveLength(1);
+    },
+  );
+
+  test.each(["cancelled", "failed"])(
+    "keeps explicit thinking from a %s assistant as the latest partial",
+    async (status) => {
+      for (const streamed of [false, true]) {
+        const harness = createCmaHarness({ dropPreviews: true });
+        if (streamed) {
+          for (const event of [
+            { message: { id: "partial-native" }, type: "message_start" },
+            { delta: { thinking: "earlier", type: "thinking_delta" }, type: "content_block_delta" },
+          ]) {
+            await harness.translator.handleSdkMessage(
+              harness.context,
+              { event, type: "stream_event" } as unknown as SDKMessage,
+              harness.runId,
+            );
+          }
+        }
+        await harness.translator.handleSdkMessage(
+          harness.context,
+          {
+            ...(status === "cancelled" ? { aborted: true } : { error: "rate_limit" }),
+            message: {
+              content: [{ thinking: "latest partial", type: "thinking" }],
+              id: "partial-native",
+            },
+            type: "assistant",
+            uuid: "partial-wire",
+          } as unknown as SDKMessage,
+          harness.runId,
+        );
+        expect(harness.events.filter((event) => event.kind === "thought.updated")).toMatchObject([
+          { payload: { content: "latest partial", offset: 0 } },
+        ]);
+        expect(harness.events.filter((event) => event.kind === "thought.cancelled")).toHaveLength(
+          1,
+        );
+      }
+    },
+  );
+
+  test.each(["cancelled", "failed"])(
+    "persists a large partial thought before lightweight %s terminal closures",
+    async (status) => {
+      const harness = createCmaHarness({ dropPreviews: true });
+      const partial = `开始😀${"x".repeat(1_200_000)}结束`;
+      await harness.translator.handleSdkMessage(
+        harness.context,
+        {
+          event: {
+            delta: { thinking: partial, type: "thinking_delta" },
+            type: "content_block_delta",
+          },
+          type: "stream_event",
+          uuid: "partial-thought",
+        } as unknown as SDKMessage,
+        harness.runId,
+      );
+      if (status === "cancelled") {
+        await harness.translator.cancelTurn(harness.context, harness.runId, "user.cancelled");
+      } else {
+        await harness.translator.failTurn(
+          harness.context,
+          harness.runId,
+          "test.failure",
+          "provider failed",
+        );
+      }
+
+      const snapshots = harness.events.filter((event) => event.kind === "thought.updated");
+      expect(snapshots.length).toBeGreaterThan(1);
+      expect(snapshots.every((event) => event.delivery !== "best_effort")).toBe(true);
+      expect(snapshots.map((event) => payload(event)["content"]).join("")).toBe(partial);
+      let offset = 0;
+      for (const event of snapshots) {
+        expect(payload(event)["offset"]).toBe(offset);
+        offset += (payload(event)["content"] as string).length;
+      }
+      expect(
+        harness.terminalClosures.flat().some((event) => event.kind === "thought.updated"),
+      ).toBe(false);
+      expect(harness.events.at(-1)?.kind).toBe(`run.${status}`);
+      expect(harness.events.filter((event) => event.kind === "thought.cancelled")).toHaveLength(1);
+      expect(harness.sseFrameBytes.every((bytes) => bytes < CMA_MAX_EVENT_BYTES)).toBe(true);
+    },
+  );
+
   test("materializes a large result fallback as bounded lossless message chunks", async () => {
     const harness = createCmaHarness();
     const text = `开始😀${"x".repeat(1_200_000)}结束`;
@@ -686,13 +855,20 @@ describe("Claude Agent SDK durable event boundaries", () => {
       type: "stream_event",
       uuid: "thought-wire",
     } as unknown as SDKMessage;
-    await expect(translator.handleSdkMessage(context, messageStop, runId)).rejects.toThrow(
+    await translator.handleSdkMessage(context, messageStop, runId);
+    const completedThought = {
+      message: { content: [{ thinking: "", type: "thinking" }] },
+      type: "assistant",
+      uuid: "thought-wire",
+    } as unknown as SDKMessage;
+    await expect(translator.handleSdkMessage(context, completedThought, runId)).rejects.toThrow(
       "thought delivery failed",
     );
-    await expect(translator.handleSdkMessage(context, messageStop, runId)).resolves.toBeNull();
+    await expect(translator.handleSdkMessage(context, completedThought, runId)).resolves.toBeNull();
     expect(reasons.filter((reason) => reason === "driver.claude.thought.completed")).toHaveLength(
       2,
     );
+    expect(replayedEvents.filter((event) => event.kind === "thought.updated")).toHaveLength(1);
 
     await translator.handleSdkMessage(
       context,

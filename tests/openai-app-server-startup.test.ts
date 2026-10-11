@@ -3,25 +3,25 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { AgentDriverBackend } from "../src/core/agent-driver-backend";
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
+import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
 import type { AgentDriverPermissionPort } from "../src/host-ports";
+import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
 import { createDisabledLogger } from "../src/observability";
 import type { DriverPermissionPolicy } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId, isDriverId, type RunId } from "../src/protocol/id";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import type { AgentDriverBackend } from "../src/core/agent-driver-backend";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
-import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
-import { ACTIVE_TURN_CANCEL_GRACE_MS } from "../src/core/driver-command-dispatcher";
-import { toDriverEventEnvelopes } from "../src/infrastructure/runtime/driver-instance-socket";
+import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
+import { pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { OpenAiAppServerClient } from "../src/runtimes/openai/app-server-client";
 import { OpenAiAppServerDriverBackend } from "../src/runtimes/openai/app-server-driver-backend";
 import { createOpenAiNativeCheckpoint } from "../src/runtimes/openai/native-checkpoint";
-import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
-import { pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import { createCmaMemoryStore } from "../src/stores/memory";
-import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 import { settlePromiseWithTimeout } from "../src/utils/async";
+import { DRIVER_TEST_IDS, driverBootPayload } from "./driver-boot-payload-fixture";
 
 const originalExecutable = process.env["MOSOO_OPENAI_RUNTIME_EXECUTABLE"];
 const temporaryDirectories: string[] = [];
@@ -46,7 +46,6 @@ interface CancellationHarnessOptions {
   readonly emitInterruptedTurnOnStart?: boolean;
   readonly terminalNotificationBeforeTurnStartResponse?: boolean;
   readonly emitToolCompletionOnTurnStart?: boolean;
-  readonly environmentVariables?: Readonly<Record<string, string>>;
   readonly failCancellationRequest?: boolean;
   readonly failInitialThreadStart?: boolean;
   readonly holdCancellationRequest?: boolean;
@@ -467,14 +466,8 @@ process.stdin.on("data", (chunk) => {
     ...driverBootPayload,
     execution: {
       ...driverBootPayload.execution,
-      environment: {
-        ...driverBootPayload.execution.environment,
-        variables: {
-          ...driverBootPayload.execution.environment.variables,
-          ...cancellationOptions.environmentVariables,
-        },
-      },
       permissionPolicy,
+      provider: "openai",
       session: {
         ...driverBootPayload.execution.session,
         context: {
@@ -713,7 +706,6 @@ describe("OpenAI app-server startup", () => {
       "full_access",
       false,
       {
-        environmentVariables: { OPENAI_API_KEY: "resume-startup-key" },
         nativeResume: true,
       },
     );
@@ -726,7 +718,7 @@ describe("OpenAI app-server startup", () => {
 
       expect(firstLaunch.sqliteHome).toBe(harness.payload.execution.session.homePath);
       expect(JSON.parse(await readFile(authJsonPath, "utf8"))).toMatchObject({
-        OPENAI_API_KEY: "resume-startup-key",
+        OPENAI_API_KEY: driverBootPayload.execution.modelConnection.proxyGrant,
       });
       expect(await readFile(harness.requestLog, "utf8")).toContain('"method":"thread/resume"');
       await harness.backend.stop(harness.context, "test complete", new AbortController().signal);

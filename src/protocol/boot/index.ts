@@ -48,7 +48,7 @@ export type {
 
 /**
  * Version 7 binds native continuation to a checkpoint and requires the durable
- * external-tool-effect RPCs shared by the host and every runtime.
+ * external-tool-effect RPCs and model connections shared by the host and every runtime.
  */
 export const DRIVER_PROTOCOL_VERSION = 7;
 export const DRIVER_CONTROL_PORT_MIN = 20_000;
@@ -163,6 +163,26 @@ const driverExecutionEnvironmentSchema = ownObjectSchema({
 }).transform(omitUndefinedProperties);
 
 export type DriverExecutionEnvironment = z.infer<typeof driverExecutionEnvironmentSchema>;
+
+const driverModelProtocolSchema = z.enum([
+  "anthropic-messages",
+  "google-gemini",
+  "openai-chat-completions",
+  "openai-responses",
+]);
+
+export type DriverModelProtocol = z.infer<typeof driverModelProtocolSchema>;
+
+const driverModelConnectionSchema = ownObjectSchema({
+  protocol: driverModelProtocolSchema,
+  proxyUrl: z.url().refine((value) => /^https?:/iu.test(value), "must use http or https"),
+  proxyGrant: nonEmptyStringSchema.refine(
+    (value) => !value.includes("\0"),
+    "must not contain null bytes",
+  ),
+});
+
+export type DriverModelConnection = z.infer<typeof driverModelConnectionSchema>;
 
 const driverBuiltInToolNameSchema = z.enum([
   "bash",
@@ -335,6 +355,7 @@ const driverExecutionSpecSchema = ownObjectSchema({
   configRevision: driverConfigRevisionSchema,
   environment: driverExecutionEnvironmentSchema,
   model: nonEmptyStringSchema,
+  modelConnection: driverModelConnectionSchema,
   permissionPolicy: driverPermissionPolicySchema,
   profilePrompt: z.string(),
   provider: nonEmptyStringSchema,
@@ -350,7 +371,6 @@ const driverBootPayloadSchema = ownObjectSchema({
   bootToken: nonEmptyStringSchema,
   controlUrl: controlUrlSchema,
   driverControlPort: z.number().int().min(DRIVER_CONTROL_PORT_MIN).max(DRIVER_CONTROL_PORT_MAX),
-  driverGeneration: z.number().int().nonnegative(),
   driverInstanceId: createDriverIdSchema<DriverInstanceId>(),
   execution: driverExecutionSpecSchema,
   heartbeatIntervalMs: z.number().finite().min(250),

@@ -31,7 +31,6 @@ export const driverBootPayload = {
   bootToken: "boot-token",
   controlUrl: "http://host.containers.internal:8787/api/driver/socket",
   driverControlPort: DRIVER_CONTROL_PORT_MIN,
-  driverGeneration: 0,
   driverInstanceId: DRIVER_TEST_IDS.driverInstanceId,
   execution: {
     builtInTools: [
@@ -57,6 +56,11 @@ export const driverBootPayload = {
       variables: {},
     },
     model: "model-1",
+    modelConnection: {
+      protocol: "openai-responses",
+      proxyUrl: "http://host.containers.internal:8787/api/driver/llm/proxy/test",
+      proxyGrant: "test-model-grant",
+    },
     permissionPolicy: "full_access",
     profilePrompt: "",
     provider: "provider-1",

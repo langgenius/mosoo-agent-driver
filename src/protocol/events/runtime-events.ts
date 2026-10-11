@@ -6,6 +6,8 @@ import { parseDriverNativeRuntimeRef } from "../runtime";
 import {
   RUNTIME_EVENT_KINDS,
   RUNTIME_EVENT_SCHEMA_VERSION,
+  MAX_THOUGHT_CONTENT_BYTES,
+  MAX_THOUGHT_UPDATE_BYTES,
   type RuntimeEventActor,
   type RuntimeContextUsagePayload,
   type RuntimeEventBuildContext,
@@ -552,6 +554,20 @@ function admitRuntimeEventPayload(
       }
 
       requireString(record, "thoughtId", context.kind);
+      return omitPayloadIdentity(record);
+    }
+    case "thought.updated": {
+      const record = requirePayloadRecord(context.kind, canonicalPayload);
+      requireString(record, "thoughtId", context.kind);
+      const offset = requireNonNegativeInt(record, "offset");
+      if (
+        context.delivery !== "lossless" ||
+        typeof record["content"] !== "string" ||
+        offset + record["content"].length > MAX_THOUGHT_CONTENT_BYTES ||
+        utf8Encoder.encode(JSON.stringify(record)).byteLength > MAX_THOUGHT_UPDATE_BYTES
+      ) {
+        throw new Error("Runtime event thought.updated requires bounded lossless text content.");
+      }
       return omitPayloadIdentity(record);
     }
     case "permission.requested": {

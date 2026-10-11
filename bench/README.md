@@ -35,10 +35,13 @@ ANTHROPIC_API_KEY=... OPENAI_API_KEY=... vp run bench
 Env knobs:
 
 - `TTFT_TRIALS=5` trials per cell (+1 discarded warmup).
-- `TTFT_RUNTIMES=claude,openai,opencode` subset to run.
+- `TTFT_RUNTIMES=claude,openai,opencode,pi` subset to run.
 - `TTFT_SCENARIOS=no_tool,long_output,tool_write_allow,tool_write_reject`.
 - `TTFT_OPENCODE_PROVIDER=openai|anthropic` backing provider for the opencode/ACP runtime.
-- `TTFT_CLAUDE_MODEL` / `TTFT_OPENAI_MODEL` model overrides.
+- `TTFT_PI_PROVIDER=openai|anthropic|google` backing provider for Pi.
+- `TTFT_<RUNTIME>_MODEL`, `TTFT_<RUNTIME>_API_KEY`, and `TTFT_<RUNTIME>_BASE_URL` override each runtime's connection.
+- `TTFT_<RUNTIME>_PROTOCOL` selects `openai-responses`, `openai-chat-completions`, `anthropic-messages`, or `google-gemini` for a custom endpoint.
+- Provider defaults read `OPENAI_API_KEY` / `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL`, or `GEMINI_API_KEY` / `GEMINI_BASE_URL`.
 - `TTFT_BOOT_TIMEOUT_MS=100000` guard against a hung runtime spawn.
 - `TTFT_UPDATE_BASELINE=1` writes `outputs/baseline.json` (committed as the regression baseline).
 - `TTFT_STAMP=<name>` labels the run's output files.

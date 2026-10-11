@@ -75,7 +75,6 @@ describe("Driver execution environment paths", () => {
     const parsed = parseDriverBootPayload(driverBootPayload);
 
     expect(parsed.driverControlPort).toBe(20_000);
-    expect(parsed.driverGeneration).toBe(0);
     expect(parsed.heartbeatIntervalMs).toBe(1_000);
     expect(createDriverStartInputFromBootPayload(parsed).sandboxId).toBe(
       driverBootPayload.execution.session.context.sandboxId,

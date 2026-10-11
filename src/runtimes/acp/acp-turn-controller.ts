@@ -14,9 +14,9 @@ import type { MessageId, RunId } from "../../protocol/id";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
 import { DriverCompletedTerminalSupersededError } from "../driver-event-publisher";
+import { AcpAssistantTranscriptState } from "./acp-assistant-transcript-state";
 import type { AcpClientRequestHandler } from "./acp-client-request-handler";
 import { toRequestMeta } from "./acp-configuration";
-import { AcpAssistantTranscriptState } from "./acp-assistant-transcript-state";
 import { toPromptStartEvents } from "./acp-session-events";
 
 interface ActiveAcpTurn {
@@ -301,6 +301,9 @@ export class AcpTurnController {
       }
       try {
         active.terminalStarted = true;
+        for (const event of this.events.thoughtContentEvents()) {
+          await this.#push(context, "driver.acp.thought.updated", [event]);
+        }
         await this.#pushTerminalEvents(
           context,
           typeof reason === "string" ? reason : reason(events),

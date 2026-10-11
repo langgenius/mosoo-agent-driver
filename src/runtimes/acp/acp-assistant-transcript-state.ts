@@ -8,6 +8,11 @@ import {
   MAX_RUN_TERMINAL_BATCH_EVENTS,
 } from "../driver-event-admission";
 import { chunkJsonText } from "../provider-json";
+import {
+  createThoughtContentEvents,
+  MAX_THOUGHT_CONTENT_BYTES,
+  thoughtContentDeltaBytes,
+} from "../thought-content";
 import { toPermissionRequest } from "./acp-permission-events";
 import type { AcpPermissionTranslation } from "./acp-permission-events";
 import {
@@ -74,11 +79,13 @@ export class AcpAssistantTranscriptState {
   #sequence = 0;
   readonly #settledAssistantNativeMessageIds = new Set<string>();
   #settledAssistantNativeMessageIdBytes = 0;
+  #thoughtBytes = 0;
   #thoughtCompleted = false;
   #thoughtFallbackText = "";
   #thoughtFallbackNativeMessageId: string | null = null;
   #thoughtId: string | null = null;
   #thoughtStarted = false;
+  #thoughtText = "";
   readonly #tools = new AcpToolEventState();
 
   activeRunId(): RunId | null {
@@ -100,11 +107,13 @@ export class AcpAssistantTranscriptState {
     this.#sequence = 0;
     this.#settledAssistantNativeMessageIds.clear();
     this.#settledAssistantNativeMessageIdBytes = 0;
+    this.#thoughtBytes = 0;
     this.#thoughtCompleted = false;
     this.#thoughtFallbackText = "";
     this.#thoughtFallbackNativeMessageId = null;
     this.#thoughtId = null;
     this.#thoughtStarted = false;
+    this.#thoughtText = "";
     this.#tools.clear();
   }
 
@@ -118,10 +127,12 @@ export class AcpAssistantTranscriptState {
     const sequence = this.#sequence;
     const settledAssistantNativeMessageIds = new Set(this.#settledAssistantNativeMessageIds);
     const settledAssistantNativeMessageIdBytes = this.#settledAssistantNativeMessageIdBytes;
+    const thoughtBytes = this.#thoughtBytes;
     const thoughtCompleted = this.#thoughtCompleted;
     const thoughtFallbackNativeMessageId = this.#thoughtFallbackNativeMessageId;
     const thoughtFallbackText = this.#thoughtFallbackText;
     const thoughtStarted = this.#thoughtStarted;
+    const thoughtText = this.#thoughtText;
     const restoreTools = this.#tools.checkpoint();
 
     return () => {
@@ -133,12 +144,24 @@ export class AcpAssistantTranscriptState {
         this.#settledAssistantNativeMessageIds.add(id),
       );
       this.#settledAssistantNativeMessageIdBytes = settledAssistantNativeMessageIdBytes;
+      this.#thoughtBytes = thoughtBytes;
       this.#thoughtCompleted = thoughtCompleted;
       this.#thoughtFallbackNativeMessageId = thoughtFallbackNativeMessageId;
       this.#thoughtFallbackText = thoughtFallbackText;
       this.#thoughtStarted = thoughtStarted;
+      this.#thoughtText = thoughtText;
       restoreTools();
     };
+  }
+
+  thoughtContentEvents(): DriverEventInput[] {
+    if (!this.#thoughtStarted) return [];
+    const thoughtId = this.#requireThoughtId();
+    return assertBoundedLosslessEvents(
+      createThoughtContentEvents(thoughtId, this.#thoughtText, `${thoughtId}:snapshot`).map(
+        (event) => Object.assign(event, { runId: this.#requireRunId() }),
+      ),
+    );
   }
 
   completePrompt(
@@ -497,6 +520,15 @@ export class AcpAssistantTranscriptState {
     if (delta === null) {
       return [];
     }
+
+    const bytes = this.#thoughtBytes + thoughtContentDeltaBytes(this.#thoughtText, delta);
+    if (bytes > MAX_THOUGHT_CONTENT_BYTES) {
+      throw new AcpTurnStateLimitError(
+        `ACP thought content exceeds ${MAX_THOUGHT_CONTENT_BYTES} UTF-8 bytes.`,
+      );
+    }
+    this.#thoughtBytes = bytes;
+    this.#thoughtText += delta;
 
     const nativeMessageId = readNonEmptyString(update, "messageId");
     const events: DriverEventInput[] = [];

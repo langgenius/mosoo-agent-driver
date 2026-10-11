@@ -9,9 +9,10 @@ function configurePiModel(pi, { provider, model: id, api, baseUrl }) {
     contextWindow: 128000, maxTokens: 16384
   };
   pi.registerProvider(provider, {
-    apiKey: "\${MOSOO_PI_PROXY_GRANT}",
+    apiKey: "\${MOSOO_MODEL_PROXY_GRANT}",
     baseUrl,
     api,
     models: [{ ...model, api, baseUrl }]
   });
 }`;
+export const PI_PROXY_GRANT_ENV = "MOSOO_MODEL_PROXY_GRANT";

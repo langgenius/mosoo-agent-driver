@@ -289,12 +289,11 @@ export class OpenAiAppServerEventBridge {
     }
     const publicTurnId = this.publicTurnId(turnId);
     const completionClosuresCommitted = this.#turns.completionClosuresCommitted(turnId);
-    const cancelledClosures = completionClosuresCommitted
-      ? []
-      : this.#itemEvents.terminalEvents({ kind: "cancelled" });
-    const [taskClosure, ...itemClosures] = cancelledClosures;
-
     try {
+      const cancelledClosures = completionClosuresCommitted
+        ? []
+        : await this.#itemEvents.terminalEvents(context, { kind: "cancelled" });
+      const [taskClosure, ...itemClosures] = cancelledClosures;
       await this.#options.pushTerminal(
         context,
         "driver.openai.turn.cancelled",
@@ -366,7 +365,10 @@ export class OpenAiAppServerEventBridge {
           "driver.openai.provider.failed",
           turnClosureEvents({
             eventName: "provider.failed",
-            events: this.#itemEvents.terminalEvents({ error: protocolError, kind: "failed" }),
+            events: await this.#itemEvents.terminalEvents(context, {
+              error: protocolError,
+              kind: "failed",
+            }),
             publicTurnId,
             runId,
           }),
@@ -394,10 +396,11 @@ export class OpenAiAppServerEventBridge {
     this.#itemEvents.reset();
   }
 
-  turnStartTerminalEvents(
+  async turnStartTerminalEvents(
+    context: AgentDriverContext,
     outcome: OpenAiTerminalOutcome,
-  ): [DriverEventInput, ...DriverEventInput[]] {
-    return this.#itemEvents.terminalEvents(outcome);
+  ): Promise<[DriverEventInput, ...DriverEventInput[]]> {
+    return this.#itemEvents.terminalEvents(context, outcome);
   }
 
   async trackTurn(turnId: string, runId: RunId, signal?: AbortSignal): Promise<void> {
@@ -1125,7 +1128,7 @@ export class OpenAiAppServerEventBridge {
           "driver.openai.turn.interrupted",
           turnClosureEvents({
             eventName: "turn.interrupted",
-            events: this.#itemEvents.terminalEvents({ kind: "cancelled" }),
+            events: await this.#itemEvents.terminalEvents(context, { kind: "cancelled" }),
             publicTurnId,
             runId,
           }),
@@ -1152,7 +1155,7 @@ export class OpenAiAppServerEventBridge {
           "driver.openai.turn.failed",
           turnClosureEvents({
             eventName: "turn.failed",
-            events: this.#itemEvents.terminalEvents({ error, kind: "failed" }),
+            events: await this.#itemEvents.terminalEvents(context, { error, kind: "failed" }),
             publicTurnId,
             runId,
           }),
@@ -1202,7 +1205,7 @@ export class OpenAiAppServerEventBridge {
         "driver.openai.turn.completed",
         turnClosureEvents({
           eventName: "turn.completed",
-          events: this.#itemEvents.terminalEvents({ kind: "completed" }),
+          events: await this.#itemEvents.terminalEvents(context, { kind: "completed" }),
           publicTurnId,
           runId,
         }),

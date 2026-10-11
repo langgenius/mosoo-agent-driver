@@ -3,6 +3,8 @@ import type { NativeCheckpoint } from "../native-checkpoint";
 import type { DriverNativeRuntimeRef } from "../runtime";
 
 export const RUNTIME_EVENT_SCHEMA_VERSION = "2026-10-10";
+export const MAX_THOUGHT_CONTENT_BYTES = 16 * 1_024 * 1_024;
+export const MAX_THOUGHT_UPDATE_BYTES = 512 * 1_024;
 
 export const RUNTIME_EVENT_KINDS = [
   "account.limits.updated",
@@ -103,6 +105,7 @@ export const RUNTIME_EVENT_KINDS = [
   "thought.cancelled",
   "thought.delta",
   "thought.started",
+  "thought.updated",
   "tool.call.updated",
   "tool.dynamic.updated",
   "usage.updated",
@@ -131,6 +134,13 @@ export type RuntimeEventRecord = Record<string, unknown>;
 export interface RuntimeContextUsagePayload {
   readonly used: number;
   readonly size: number;
+}
+
+export interface RuntimeThoughtUpdatedPayload {
+  readonly thoughtId: string;
+  readonly content: string;
+  /** UTF-16 offset in the authoritative text; zero replaces the preview. */
+  readonly offset: number;
 }
 
 export interface RuntimeRunCompletedPayload extends RuntimeEventRecord {

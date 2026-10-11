@@ -62,6 +62,17 @@
       "visibility": "owner_debug"
     },
     {
+      "kind": "thought.updated",
+      "delivery": "lossless",
+      "payload": {
+        "thoughtId": "message-1:thought",
+        "content": "plan",
+        "offset": 0
+      },
+      "sourceEventId": "message-1:thought:snapshot:0",
+      "runId": "run-1"
+    },
+    {
       "kind": "thought.completed",
       "payload": {
         "channel": "summary",

@@ -160,14 +160,10 @@ async function fixture(policy: "full_access" | "supervised" = "full_access") {
             permissionPolicy: policy,
             profilePrompt:
               "Follow the exact requested tool and reply. After a rejected tool, do not retry or use another tool.",
-            environment: {
-              variables: {
-                MOSOO_PI_PROXY_GRANT: grant,
-                MOSOO_PI_CONFIG_CONTENT: JSON.stringify({
-                  baseUrl: `http://127.0.0.1:${proxy.port}/v1`,
-                  modelProtocol: "openai-chat-completions",
-                }),
-              },
+            modelConnection: {
+              proxyGrant: grant,
+              proxyUrl: `http://127.0.0.1:${proxy.port}/v1`,
+              protocol: "openai-chat-completions",
             },
             session: {
               ...driverBootPayload.execution.session,
@@ -393,7 +389,7 @@ liveTest(
       expect(JSON.parse(config)).toEqual({});
       const extension = await readFile(join(run.home, "pi", "mosoo-permissions.mjs"), "utf8");
       expect(extension).not.toContain(key);
-      expect(extension).toContain("${MOSOO_PI_PROXY_GRANT}");
+      expect(extension).toContain("${MOSOO_MODEL_PROXY_GRANT}");
       await resumed.stopDriver(createDriverId(), 15_000);
       console.log("Pi live: authenticated MCP and credential isolation passed");
     } finally {

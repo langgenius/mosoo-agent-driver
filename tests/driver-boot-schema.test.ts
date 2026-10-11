@@ -79,7 +79,36 @@ describe("Driver boot schema", () => {
     expect(parsed.protocolVersion).toBe(7);
     expect(parsed.execution.session.nativeCheckpoint).toBeNull();
     expect(parsed.execution.session.nativeResumeRef).toBeNull();
+    expect(parsed.execution.modelConnection).toEqual(driverBootPayload.execution.modelConnection);
   });
+
+  test.each(
+    [
+      undefined,
+      null,
+      [],
+      {},
+      { ...driverBootPayload.execution.modelConnection, protocol: undefined },
+      { ...driverBootPayload.execution.modelConnection, protocol: "constructor" },
+      { ...driverBootPayload.execution.modelConnection, protocol: "unsupported" },
+      { ...driverBootPayload.execution.modelConnection, proxyUrl: undefined },
+      { ...driverBootPayload.execution.modelConnection, proxyUrl: "not a URL" },
+      { ...driverBootPayload.execution.modelConnection, proxyUrl: "file:///tmp/model" },
+      { ...driverBootPayload.execution.modelConnection, proxyGrant: undefined },
+      { ...driverBootPayload.execution.modelConnection, proxyGrant: "" },
+      { ...driverBootPayload.execution.modelConnection, proxyGrant: "invalid\0grant" },
+    ].map((modelConnection) => ({ modelConnection })),
+  )(
+    "rejects an absent or invalid typed model connection: $modelConnection",
+    ({ modelConnection }) => {
+      expect(() =>
+        parseDriverBootPayload({
+          ...driverBootPayload,
+          execution: { ...driverBootPayload.execution, modelConnection },
+        }),
+      ).toThrow("modelConnection");
+    },
+  );
 
   test.each([
     ["openai-runtime", "openai-app-server", "openai_thread_id", "thread-1"],

@@ -71,6 +71,7 @@ export function projectDriverEventToCma(event: DriverEventInput): CmaOutboundEve
     case "thought.completed":
     case "thought.delta":
     case "thought.started":
+    case "thought.updated":
       return [{ message: payload, sourceEventKind: event.kind, type: "agent.thinking" }];
     case "tool.call.updated":
       return [{ message: payload, sourceEventKind: event.kind, type: readToolEventType(payload) }];

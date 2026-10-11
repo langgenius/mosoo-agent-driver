@@ -187,13 +187,6 @@
       }
     },
     {
-      "kind": "thought.completed",
-      "payload": {
-        "channel": "summary",
-        "thoughtId": "<driver-id>:thought"
-      }
-    },
-    {
       "kind": "usage.updated",
       "payload": {
         "cachedReadTokens": 0,
@@ -208,6 +201,23 @@
         "totalTokens": 8,
         "usageContract": "anthropic_bucketed",
         "used": null
+      }
+    },
+    {
+      "delivery": "lossless",
+      "kind": "thought.updated",
+      "payload": {
+        "content": "consider",
+        "offset": 0,
+        "thoughtId": "<driver-id>:thought"
+      },
+      "sourceEventId": "<driver-id>:thought:content:0"
+    },
+    {
+      "kind": "thought.completed",
+      "payload": {
+        "channel": "summary",
+        "thoughtId": "<driver-id>:thought"
       }
     },
     {

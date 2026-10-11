@@ -1,5 +1,4 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { ClientContext } from "@agentclientprotocol/sdk";
 import { readFileSync } from "node:fs";
 import {
   mkdir,
@@ -14,27 +13,29 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ClientContext } from "@agentclientprotocol/sdk";
+
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
-import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import type { DriverRuntimeEventPort } from "../src/core/driver-runtime-io";
+import { DriverRuntimeStateMachine } from "../src/core/driver-runtime-state";
 import { DriverTerminalStateMachine } from "../src/core/driver-terminal-state";
-import { createDisabledLogger } from "../src/observability";
 import type { AgentDriverFilePort, AgentDriverPermissionPort } from "../src/host-ports";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverBootPayload } from "../src/protocol/boot";
 import type { DriverEventInput } from "../src/protocol/events";
 import { createDriverId } from "../src/protocol/id";
 import type { EventId, RunId } from "../src/protocol/id";
-import { toRuntimeEventInput } from "../src/runtime-events";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
-import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
+import { toRuntimeEventInput } from "../src/runtime-events";
 import * as acpAgentProcess from "../src/runtimes/acp/acp-agent-process";
-import * as openCodeCheckpoint from "../src/runtimes/acp/opencode-checkpoint";
 import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
+import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
 import { AcpTurnController } from "../src/runtimes/acp/acp-turn-controller";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import * as openCodeCheckpoint from "../src/runtimes/acp/opencode-checkpoint";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import { waitForAcpTestCondition } from "./acp-test-helpers";
 import { driverBootPayload, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
@@ -1515,6 +1516,12 @@ describe("ACP driver backend lifecycle", () => {
             (event.payload as Record<string, unknown>)["role"] === "agent",
         )?.payload,
       ).toMatchObject({ content: "final from thought" });
+      expect(
+        harness.events.find((event) => event.kind === "thought.updated")?.payload,
+      ).toMatchObject({ content: "final from thought", offset: 0 });
+      expect(harness.events.findIndex((event) => event.kind === "thought.updated")).toBeLessThan(
+        harness.events.findIndex((event) => event.kind === "thought.completed"),
+      );
       expect(harness.events.filter((event) => event.kind === "run.completed")).toHaveLength(1);
       expect(harness.lifecycleFailures).toEqual([]);
     } finally {
@@ -2033,6 +2040,136 @@ describe("ACP driver backend lifecycle", () => {
 
       expect(turn.events.activeRunId()).toBe(DRIVER_TEST_IDS.runId);
       expect(turn.events.completePrompt("end_turn", null)).toEqual(rejectedSettlement);
+    } finally {
+      turn.events.clear();
+      await harness.destroy();
+    }
+  });
+
+  test.each(["completed", "cancelled", "failed"] as const)(
+    "waits for the thought snapshot before publishing a %s terminal",
+    async (outcome) => {
+      const harness = await createHarness();
+      const snapshotStarted = Promise.withResolvers<void>();
+      const snapshotAccepted = Promise.withResolvers<void>();
+      const events: DriverEventInput[] = [];
+      const turn = new AcpTurnController(async (_context, _reason, pushed) => {
+        if (pushed.some((event) => event.kind === "thought.updated")) {
+          snapshotStarted.resolve();
+          await snapshotAccepted.promise;
+        }
+        events.push(...pushed);
+      });
+      const clientRequests = new AcpClientRequestHandler({
+        allowedRoots: [process.cwd()],
+        cwd: process.cwd(),
+        env: {},
+        isCancelling: () => turn.isCancelling(),
+        nativeSessionId: () => "native-session-1",
+        onUpdateFailure: () => {},
+        push: async () => {},
+        turnEvents: turn.events,
+      });
+      const connection = {
+        notify: async () => {},
+        request: async () => {
+          await clientRequests.enqueueUpdate(harness.context, {
+            sessionId: "native-session-1",
+            update: {
+              content: { text: "last partial", type: "text" },
+              messageId: "native-thought",
+              sessionUpdate: "agent_thought_chunk",
+            },
+          });
+          if (outcome === "failed") throw new Error("provider failed");
+          return { stopReason: outcome === "completed" ? "end_turn" : "cancelled" };
+        },
+      } as unknown as ClientContext;
+
+      try {
+        const input = turn.handleInput(
+          harness.context,
+          { text: "think" },
+          DRIVER_TEST_IDS.runId,
+          connection,
+          "native-session-1",
+          clientRequests,
+        );
+        void input.catch(() => {});
+        await snapshotStarted.promise;
+        expect(events.some((event) => event.kind === `run.${outcome}`)).toBe(false);
+        snapshotAccepted.resolve();
+        if (outcome === "completed") await expect(input).resolves.toBeUndefined();
+        else
+          await expect(input).rejects.toThrow(
+            outcome === "failed" ? "provider failed" : "cancelled",
+          );
+        expect(events.find((event) => event.kind === "thought.updated")?.payload).toMatchObject({
+          content: "last partial",
+          offset: 0,
+        });
+        expect(events.at(-1)?.kind).toBe(`run.${outcome}`);
+      } finally {
+        snapshotAccepted.resolve();
+        await harness.destroy();
+      }
+    },
+  );
+
+  test("preserves thought state when snapshot delivery fails without reporting a model failure", async () => {
+    const harness = await createHarness();
+    const deliveryError = new Error("thought snapshot rejected");
+    const events: DriverEventInput[] = [];
+    let snapshot: DriverEventInput | undefined;
+    const turn = new AcpTurnController(async (_context, _reason, pushed) => {
+      snapshot = pushed.find((event) => event.kind === "thought.updated");
+      if (snapshot !== undefined) throw deliveryError;
+      events.push(...pushed);
+    });
+    const clientRequests = new AcpClientRequestHandler({
+      allowedRoots: [process.cwd()],
+      cwd: process.cwd(),
+      env: {},
+      isCancelling: () => turn.isCancelling(),
+      nativeSessionId: () => "native-session-1",
+      onUpdateFailure: () => {},
+      push: async () => {},
+      turnEvents: turn.events,
+    });
+    const connection = {
+      notify: async () => {},
+      request: async () => {
+        await clientRequests.enqueueUpdate(harness.context, {
+          sessionId: "native-session-1",
+          update: {
+            content: { text: "last partial", type: "text" },
+            messageId: "native-thought",
+            sessionUpdate: "agent_thought_chunk",
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    } as unknown as ClientContext;
+
+    try {
+      await expect(
+        turn.handleInput(
+          harness.context,
+          { text: "think" },
+          DRIVER_TEST_IDS.runId,
+          connection,
+          "native-session-1",
+          clientRequests,
+        ),
+      ).rejects.toBe(deliveryError);
+      expect(
+        events.some((event) =>
+          ["run.completed", "run.cancelled", "run.failed"].includes(event.kind),
+        ),
+      ).toBe(false);
+      expect(turn.events.activeRunId()).toBe(DRIVER_TEST_IDS.runId);
+      expect(turn.events.thoughtContentEvents()).toEqual([snapshot!]);
+      expect(turn.events.completePrompt("end_turn", null).at(-1)?.kind).toBe("run.completed");
     } finally {
       turn.events.clear();
       await harness.destroy();

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+
 import type { StopReason } from "@agentclientprotocol/sdk";
 
 import type { DriverEventInput } from "../src/protocol/events";
@@ -56,11 +57,12 @@ function appAcpFixture(fixture: AcpProviderFixtureCase): DriverEventInput[] {
   }
 
   if (fixture.failPrompt !== undefined) {
-    events.push(...state.failPrompt(fixture.failPrompt));
+    events.push(...state.thoughtContentEvents(), ...state.failPrompt(fixture.failPrompt));
   }
 
   if (fixture.completePrompt !== undefined) {
     events.push(
+      ...state.thoughtContentEvents(),
       ...state.completePrompt(fixture.completePrompt.stopReason, fixture.completePrompt.usage),
     );
   }

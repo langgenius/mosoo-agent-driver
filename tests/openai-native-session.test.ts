@@ -151,11 +151,10 @@ nativeTest(
               configRevision: { ...driverBootPayload.execution.configRevision, runId: null },
               provider: "openai-compatible",
               model: "gpt-5.4",
-              environment: {
-                variables: {
-                  OPENAI_COMPATIBLE_API_KEY: grant,
-                  OPENAI_COMPATIBLE_BASE_URL: `${model.url.origin}/v1`,
-                },
+              modelConnection: {
+                protocol: "openai-responses",
+                proxyGrant: grant,
+                proxyUrl: `${model.url.origin}/v1`,
               },
               session: {
                 ...driverBootPayload.execution.session,

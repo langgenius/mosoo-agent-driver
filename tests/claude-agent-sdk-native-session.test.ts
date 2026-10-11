@@ -110,14 +110,17 @@ nativeTest(
             builtInTools: [{ enabled: true, name: "bash" }],
             environment: {
               variables: {
-                ANTHROPIC_API_KEY: "local-fixture-only",
-                ANTHROPIC_BASE_URL: server.url.origin,
                 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
                 DISABLE_ERROR_REPORTING: "1",
                 DISABLE_TELEMETRY: "1",
               },
             },
             model: "claude-sonnet-4-5",
+            modelConnection: {
+              protocol: "anthropic-messages",
+              proxyGrant: "local-fixture-only",
+              proxyUrl: server.url.origin,
+            },
             provider: "anthropic",
             providerOptions: mode === "one-shot" ? { maxBudgetUsd: 1 } : {},
             session: {

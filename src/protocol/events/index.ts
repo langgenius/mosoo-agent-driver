@@ -9,12 +9,15 @@ import type { RunId } from "../id";
 export {
   RUNTIME_EVENT_KINDS,
   RUNTIME_EVENT_SCHEMA_VERSION,
+  MAX_THOUGHT_CONTENT_BYTES,
+  MAX_THOUGHT_UPDATE_BYTES,
   toRuntimeEventInput,
 } from "./runtime-events";
 export type {
   RuntimeContextUsagePayload,
   RuntimeRunCompletedPayload,
   RuntimeSessionResetPayload,
+  RuntimeThoughtUpdatedPayload,
 } from "./runtime-event-types";
 
 export type DriverEvent = RuntimeEventEnvelope;

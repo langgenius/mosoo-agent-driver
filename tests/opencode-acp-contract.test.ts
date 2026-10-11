@@ -1,13 +1,5 @@
-import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
-
-import {
-  client as createAcpClient,
-  methods as acpMethods,
-  ndJsonStream,
-} from "@agentclientprotocol/sdk";
-import type { ClientConnection } from "@agentclientprotocol/sdk";
+import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -17,29 +9,38 @@ import { join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import {
-  ACP_PROTOCOL_VERSION,
-  assertProtocolVersion,
-  buildClientCapabilities,
-} from "../src/runtimes/acp/acp-configuration";
-import { limitAcpInput } from "../src/runtimes/acp/acp-input-limit";
-import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
-import { createDisabledLogger } from "../src/observability";
-import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
+  client as createAcpClient,
+  methods as acpMethods,
+  ndJsonStream,
+} from "@agentclientprotocol/sdk";
+import type { ClientConnection } from "@agentclientprotocol/sdk";
+
 import { createAgentDriverContext } from "../src/core/agent-driver-backend";
+import { createDriverPermissionRequestHandler } from "../src/core/driver-permission-policy";
+import { createDisabledLogger } from "../src/observability";
 import type { DriverEventInput } from "../src/protocol/events";
 import type { RunId } from "../src/protocol/id";
 import { parseNativeCheckpoint, type NativeCheckpoint } from "../src/protocol/native-checkpoint";
 import type { DriverStartInput } from "../src/protocol/start";
+import {
+  ACP_PROTOCOL_VERSION,
+  assertProtocolVersion,
+  buildClientCapabilities,
+} from "../src/runtimes/acp/acp-configuration";
 import { AcpDriverBackend } from "../src/runtimes/acp/acp-driver-backend";
-import { settlePromiseWithTimeout } from "../src/utils/async";
+import { limitAcpInput } from "../src/runtimes/acp/acp-input-limit";
+import { setupAcpSession } from "../src/runtimes/acp/acp-session-setup";
 import { openCodeDataPath } from "../src/runtimes/acp/opencode-checkpoint";
+import { readNativeCheckpoint } from "../src/runtimes/native-checkpoint";
+import { exposeNativeSkillAliases } from "../src/runtimes/skill-bootstrap";
+import { settlePromiseWithTimeout } from "../src/utils/async";
 import {
   DRIVER_TEST_IDS,
   driverBootPayload,
   driverStartInput,
 } from "./driver-boot-payload-fixture";
 
-const OPENCODE_COMMAND = resolve(process.cwd(), "node_modules", ".bin", "opencode");
+const OPENCODE_COMMAND = resolve(import.meta.dirname, "../node_modules/.bin/opencode");
 const REQUEST_TIMEOUT_MS = 10_000;
 
 function discoverOpenCodeSkills(
@@ -275,230 +276,277 @@ Check the diff.`,
   }
 });
 
-test("OpenCode resumes exported native history and Git snapshots after deleting its home", async () => {
-  const root = await mkdtemp(join(tmpdir(), "opencode-native-restore-contract-"));
-  const cwd = join(root, "workspace");
-  const homePath = join(root, "home");
-  await mkdir(cwd);
-  await mkdir(homePath);
-  expect(spawnSync("git", ["init", "--quiet"], { cwd }).status).toBe(0);
-  await writeFile(join(cwd, "history.txt"), "native snapshot continuity");
-  expect(spawnSync("git", ["add", "history.txt"], { cwd }).status).toBe(0);
-  expect(
-    spawnSync(
-      "git",
-      [
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.test",
-        "commit",
-        "--quiet",
-        "-m",
-        "test: seed native fixture",
-      ],
-      { cwd },
-    ).status,
-  ).toBe(0);
-  const dataPath = openCodeDataPath(homePath);
-  const requests: Record<string, unknown>[] = [];
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(request) {
-      const body = (await request.json()) as Record<string, unknown>;
-      requests.push(body);
-      const message = "native continuity proof";
-      if (body["stream"] === true) {
-        const chunks = [
-          {
-            id: "chatcmpl-fixture",
-            object: "chat.completion.chunk",
-            created: 1,
-            model: "fixture",
-            choices: [
-              { index: 0, delta: { role: "assistant", content: message }, finish_reason: null },
-            ],
-          },
-          {
-            id: "chatcmpl-fixture",
-            object: "chat.completion.chunk",
-            created: 1,
-            model: "fixture",
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: { prompt_tokens: 17, completion_tokens: 3, total_tokens: 20 },
-          },
-        ];
-        return new Response(
-          chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
-          { headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      return Response.json({
-        id: "chatcmpl-fixture",
-        object: "chat.completion",
-        created: 1,
-        model: "fixture",
-        choices: [
-          { index: 0, message: { role: "assistant", content: message }, finish_reason: "stop" },
+test.each(["full_access", "supervised"] as const)(
+  "OpenCode resumes native history and applies %s tool permissions",
+  async (permissionPolicy) => {
+    const root = await mkdtemp(join(tmpdir(), "opencode-native-restore-contract-"));
+    const cwd = join(root, "workspace");
+    const homePath = join(root, "home");
+    await mkdir(cwd);
+    await mkdir(homePath);
+    expect(spawnSync("git", ["init", "--quiet"], { cwd }).status).toBe(0);
+    await writeFile(join(cwd, "history.txt"), "native snapshot continuity");
+    expect(spawnSync("git", ["add", "history.txt"], { cwd }).status).toBe(0);
+    expect(
+      spawnSync(
+        "git",
+        [
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.test",
+          "commit",
+          "--quiet",
+          "-m",
+          "test: seed native fixture",
         ],
-        usage: { prompt_tokens: 17, completion_tokens: 3, total_tokens: 20 },
-      });
-    },
-  });
-  const config = JSON.stringify({
-    model: "fixture/fixture",
-    small_model: "fixture/fixture",
-    provider: {
-      fixture: {
-        npm: "@ai-sdk/openai-compatible",
-        options: { baseURL: `http://127.0.0.1:${server.port}/v1`, apiKey: "fixture" },
-        models: { fixture: { name: "fixture", limit: { context: 8192, output: 1024 } } },
-      },
-    },
-  });
-  const events: DriverEventInput[] = [];
-  let activeRunId: RunId | null = null;
-  let seq = 0;
-  const launch = async (nativeCheckpoint: NativeCheckpoint | null = null) => {
-    const payload: DriverStartInput = {
-      ...driverStartInput,
-      execution: {
-        ...driverStartInput.execution,
-        environment: { variables: { OPENCODE_CONFIG_CONTENT: config } },
-        session: {
-          ...driverStartInput.execution.session,
-          context: {
-            ...driverStartInput.execution.session.context,
-            homePath,
-            sessionOrganizationPath: cwd,
-          },
-          cwd,
-          homePath,
-          sharedRootPath: cwd,
-          nativeCheckpoint,
-          nativeResumeRef: nativeCheckpoint?.nativeRef ?? null,
-        },
-      },
-      runtime: "acp-fallback",
-      runtimeTransport: "acp-fallback",
-    };
-    const context = createAgentDriverContext({
-      payload,
-      logger: createDisabledLogger(),
-      permission: { request: async () => "allow_once" },
-      ports: { skill: { materialize: async () => [] } },
-      eventSink: {
-        currentRunId: () => activeRunId,
-        pushEvents: async (input) => {
-          events.push(...input.events);
-          return {
-            accepted: input.events.map((event) => ({
-              eventId: event.sourceEventId ?? event.id!,
-              seq: ++seq,
-              type: event.kind,
-            })),
-          };
-        },
+        { cwd },
+      ).status,
+    ).toBe(0);
+    const dataPath = openCodeDataPath(homePath);
+    const requests: Record<string, unknown>[] = [];
+    const proxyGrant = "local-opencode-native-fixture-grant";
+    let toolPending = false;
+    let permissionRequests = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        expect(request.headers.get("authorization")).toBe(`Bearer ${proxyGrant}`);
+        const body = (await request.json()) as Record<string, unknown>;
+        expect(body["model"]).toBe("deepseek/deepseek-v4-flash");
+        requests.push(body);
+        const message = "native continuity proof";
+        const toolCall = toolPending
+          ? {
+              index: 0,
+              id: "permission-probe",
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: JSON.stringify({
+                  command: "printf permission-proof > permission-proof.txt",
+                  description: "Verify Driver tool permission policy",
+                }),
+              },
+            }
+          : null;
+        toolPending = false;
+        const assistant =
+          toolCall === null
+            ? { role: "assistant", content: message }
+            : { role: "assistant", tool_calls: [toolCall] };
+        const finishReason = toolCall === null ? "stop" : "tool_calls";
+        if (body["stream"] === true) {
+          const chunks = [
+            {
+              id: "chatcmpl-fixture",
+              object: "chat.completion.chunk",
+              created: 1,
+              model: "fixture",
+              choices: [{ index: 0, delta: assistant, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-fixture",
+              object: "chat.completion.chunk",
+              created: 1,
+              model: "fixture",
+              choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+              usage: { prompt_tokens: 17, completion_tokens: 3, total_tokens: 20 },
+            },
+          ];
+          return new Response(
+            chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") +
+              "data: [DONE]\n\n",
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
+        return Response.json({
+          id: "chatcmpl-fixture",
+          object: "chat.completion",
+          created: 1,
+          model: "fixture",
+          choices: [{ index: 0, message: assistant, finish_reason: finishReason }],
+          usage: { prompt_tokens: 17, completion_tokens: 3, total_tokens: 20 },
+        });
       },
     });
-    const backend = new AcpDriverBackend(payload);
-    await backend.start(context, new AbortController().signal);
-    return { backend, context };
-  };
-  const prompt = async (
-    runtime: Awaited<ReturnType<typeof launch>>,
-    runId: RunId,
-    text: string,
-  ) => {
-    activeRunId = runId;
-    try {
-      await runtime.backend.handleInput(runtime.context, { text }, runId);
-    } finally {
-      activeRunId = null;
-    }
-    const runEvents = events.filter((event) => event.runId === runId);
-    const terminal = runEvents.find((event) => event.kind === "run.completed");
-    if (terminal === undefined) throw new Error("OpenCode Run did not complete.");
-    const checkpoint = parseNativeCheckpoint(
-      (terminal.payload as Record<string, unknown>)["checkpoint"],
-    );
-    const resumes = runEvents.filter((event) => event.kind === "runtime.resume.updated");
-    expect(resumes).toHaveLength(1);
-    expect(resumes[0]?.payload).toEqual({ resumePointer: checkpoint.nativeRef.value });
-    expect(runEvents.indexOf(resumes[0]!)).toBeLessThan(runEvents.indexOf(terminal!));
-    const usage = runEvents.find((event) => event.kind === "usage.updated")?.payload as {
-      inputTokens: number;
-      outputTokens: number;
+    const events: DriverEventInput[] = [];
+    let activeRunId: RunId | null = null;
+    let seq = 0;
+    const launch = async (nativeCheckpoint: NativeCheckpoint | null = null) => {
+      const payload: DriverStartInput = {
+        ...driverStartInput,
+        execution: {
+          ...driverStartInput.execution,
+          model: "openrouter/deepseek/deepseek-v4-flash",
+          modelConnection: {
+            protocol: "openai-chat-completions",
+            proxyGrant,
+            proxyUrl: `http://127.0.0.1:${server.port}/v1`,
+          },
+          permissionPolicy,
+          provider: "openrouter",
+          session: {
+            ...driverStartInput.execution.session,
+            context: {
+              ...driverStartInput.execution.session.context,
+              homePath,
+              sessionOrganizationPath: cwd,
+            },
+            cwd,
+            homePath,
+            sharedRootPath: cwd,
+            nativeCheckpoint,
+            nativeResumeRef: nativeCheckpoint?.nativeRef ?? null,
+          },
+        },
+        runtime: "acp-fallback",
+        runtimeTransport: "acp-fallback",
+      };
+      const context = createAgentDriverContext({
+        payload,
+        logger: createDisabledLogger(),
+        permission: {
+          request: createDriverPermissionRequestHandler({
+            payload,
+            supervised: async () => {
+              permissionRequests++;
+              return "reject_once";
+            },
+          }),
+        },
+        ports: { skill: { materialize: async () => [] } },
+        eventSink: {
+          currentRunId: () => activeRunId,
+          pushEvents: async (input) => {
+            events.push(...input.events);
+            return {
+              accepted: input.events.map((event) => ({
+                eventId: event.sourceEventId ?? event.id!,
+                seq: ++seq,
+                type: event.kind,
+              })),
+            };
+          },
+        },
+      });
+      const backend = new AcpDriverBackend(payload);
+      await backend.start(context, new AbortController().signal);
+      return { backend, context };
     };
-    expect(usage.inputTokens).toBeGreaterThan(0);
-    expect(usage.outputTokens).toBeGreaterThan(0);
-    return checkpoint;
-  };
-  const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-  const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
-  process.env["MOSOO_ACP_FALLBACK_COMMAND"] = OPENCODE_COMMAND;
-  process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["acp", "--pure"]);
-  let runtime: Awaited<ReturnType<typeof launch>> | null = null;
-  try {
-    runtime = await launch();
-    const first = await prompt(
-      runtime,
-      DRIVER_TEST_IDS.runId,
-      "Remember the secret word continuity.",
-    );
-    const second = await prompt(runtime, DRIVER_TEST_IDS.secondRunId, "Continue the conversation.");
-    expect(second.nativeRef).toEqual(first.nativeRef);
-    await runtime.backend.stop(runtime.context, "restore fixture", new AbortController().signal);
-    runtime = null;
-    await rm(homePath, { force: true, recursive: true });
-    runtime = await launch(second);
-    using restored = new Database(join(dataPath, "opencode.db"), { readonly: true });
-    expect(
-      restored
-        .query("SELECT count(*) AS count FROM message WHERE session_id = ?")
-        .get(second.nativeRef.value),
-    ).toMatchObject({ count: 4 });
-    requests.length = 0;
-    const resumed = await prompt(
-      runtime,
-      DRIVER_TEST_IDS.thirdRunId,
-      "Continue with the previous answer.",
-    );
-    expect(resumed.nativeRef).toEqual(first.nativeRef);
-    expect(
-      requests.some((request) =>
-        JSON.stringify(request["messages"]).includes("native continuity proof"),
-      ),
-    ).toBe(true);
-    const sealed = await readNativeCheckpoint({ cwd, checkpoint: resumed });
-    const snapshotFile = sealed.manifest.files.find(
-      (file) => file.path.startsWith("snapshot/") && file.path.endsWith(".pack"),
-    );
-    expect(snapshotFile).toBeDefined();
-    const snapshotDirectory = join(dataPath, ...snapshotFile!.path.split("/").slice(0, 3));
-    const row = restored
-      .query<{ snapshot: string }, []>(
-        "SELECT json_extract(data, '$.snapshot') AS snapshot FROM part WHERE json_extract(data, '$.type') = 'step-finish' ORDER BY time_created DESC LIMIT 1",
-      )
-      .get();
-    const tree = spawnSync(
-      "git",
-      ["--git-dir", snapshotDirectory, "ls-tree", "-r", "--name-only", row!.snapshot],
-      { cwd, encoding: "utf8" },
-    );
-    expect(tree.status).toBe(0);
-    expect(tree.stdout).toContain("history.txt");
-    expect(tree.stdout).not.toContain(".state/native-checkpoints/");
-  } finally {
-    if (runtime !== null) {
-      await runtime.backend.stop(runtime.context, "fixture complete", new AbortController().signal);
+    const prompt = async (
+      runtime: Awaited<ReturnType<typeof launch>>,
+      runId: RunId,
+      text: string,
+    ) => {
+      activeRunId = runId;
+      try {
+        await runtime.backend.handleInput(runtime.context, { text }, runId);
+      } finally {
+        activeRunId = null;
+      }
+      const runEvents = events.filter((event) => event.runId === runId);
+      const terminal = runEvents.find((event) => event.kind === "run.completed");
+      if (terminal === undefined) throw new Error("OpenCode Run did not complete.");
+      const checkpoint = parseNativeCheckpoint(
+        (terminal.payload as Record<string, unknown>)["checkpoint"],
+      );
+      const resumes = runEvents.filter((event) => event.kind === "runtime.resume.updated");
+      expect(resumes).toHaveLength(1);
+      expect(resumes[0]?.payload).toEqual({ resumePointer: checkpoint.nativeRef.value });
+      expect(runEvents.indexOf(resumes[0]!)).toBeLessThan(runEvents.indexOf(terminal!));
+      const usage = runEvents.find((event) => event.kind === "usage.updated")?.payload as {
+        inputTokens: number;
+        outputTokens: number;
+      };
+      expect(usage.inputTokens).toBeGreaterThan(0);
+      expect(usage.outputTokens).toBeGreaterThan(0);
+      return checkpoint;
+    };
+    const previousCommand = process.env["MOSOO_ACP_FALLBACK_COMMAND"];
+    const previousArgs = process.env["MOSOO_ACP_FALLBACK_ARGS"];
+    process.env["MOSOO_ACP_FALLBACK_COMMAND"] = OPENCODE_COMMAND;
+    process.env["MOSOO_ACP_FALLBACK_ARGS"] = JSON.stringify(["acp", "--pure"]);
+    let runtime: Awaited<ReturnType<typeof launch>> | null = null;
+    try {
+      runtime = await launch();
+      const first = await prompt(
+        runtime,
+        DRIVER_TEST_IDS.runId,
+        "Remember the secret word continuity.",
+      );
+      const second = await prompt(
+        runtime,
+        DRIVER_TEST_IDS.secondRunId,
+        "Continue the conversation.",
+      );
+      expect(second.nativeRef).toEqual(first.nativeRef);
+      await runtime.backend.stop(runtime.context, "restore fixture", new AbortController().signal);
+      runtime = null;
+      await rm(homePath, { force: true, recursive: true });
+      runtime = await launch(second);
+      using restored = new Database(join(dataPath, "opencode.db"), { readonly: true });
+      expect(
+        restored
+          .query("SELECT count(*) AS count FROM message WHERE session_id = ?")
+          .get(second.nativeRef.value),
+      ).toMatchObject({ count: 4 });
+      requests.length = 0;
+      toolPending = true;
+      const resumed = await prompt(
+        runtime,
+        DRIVER_TEST_IDS.thirdRunId,
+        "Continue with the previous answer.",
+      );
+      expect(permissionRequests).toBe(permissionPolicy === "supervised" ? 1 : 0);
+      expect(existsSync(join(cwd, "permission-proof.txt"))).toBe(
+        permissionPolicy === "full_access",
+      );
+      expect(resumed.nativeRef).toEqual(first.nativeRef);
+      expect(
+        requests.some((request) =>
+          JSON.stringify(request["messages"]).includes("native continuity proof"),
+        ),
+      ).toBe(true);
+      const sealed = await readNativeCheckpoint({ cwd, checkpoint: resumed });
+      for (const file of sealed.manifest.files) {
+        expect((await sealed.readFile(file.path)).includes(Buffer.from(proxyGrant))).toBe(false);
+      }
+      expect(JSON.stringify(events)).not.toContain(proxyGrant);
+      const snapshotFile = sealed.manifest.files.find(
+        (file) => file.path.startsWith("snapshot/") && file.path.endsWith(".pack"),
+      );
+      expect(snapshotFile).toBeDefined();
+      const snapshotDirectory = join(dataPath, ...snapshotFile!.path.split("/").slice(0, 3));
+      const row = restored
+        .query<{ snapshot: string }, []>(
+          "SELECT json_extract(data, '$.snapshot') AS snapshot FROM part WHERE json_extract(data, '$.type') = 'step-finish' ORDER BY time_created DESC LIMIT 1",
+        )
+        .get();
+      const tree = spawnSync(
+        "git",
+        ["--git-dir", snapshotDirectory, "ls-tree", "-r", "--name-only", row!.snapshot],
+        { cwd, encoding: "utf8" },
+      );
+      expect(tree.status).toBe(0);
+      expect(tree.stdout).toContain("history.txt");
+      expect(tree.stdout).not.toContain(".state/native-checkpoints/");
+    } finally {
+      if (runtime !== null) {
+        await runtime.backend.stop(
+          runtime.context,
+          "fixture complete",
+          new AbortController().signal,
+        );
+      }
+      if (previousCommand === undefined) delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
+      else process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
+      if (previousArgs === undefined) delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
+      else process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
     }
-    if (previousCommand === undefined) delete process.env["MOSOO_ACP_FALLBACK_COMMAND"];
-    else process.env["MOSOO_ACP_FALLBACK_COMMAND"] = previousCommand;
-    if (previousArgs === undefined) delete process.env["MOSOO_ACP_FALLBACK_ARGS"];
-    else process.env["MOSOO_ACP_FALLBACK_ARGS"] = previousArgs;
-    server.stop(true);
-    await rm(root, { recursive: true, force: true });
-  }
-}, 30_000);
+  },
+  30_000,
+);

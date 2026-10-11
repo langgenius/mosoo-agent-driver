@@ -14,7 +14,6 @@ import {
 import { mergeProviderOptions } from "../provider-options";
 
 interface OpenAiRuntimeHomeInput {
-  driverGeneration: number;
   driverInstanceId: DriverInstanceId;
   persistentRuntimeHome: string;
   signal?: AbortSignal;
@@ -78,19 +77,6 @@ function readEnvVar(env: NodeJS.ProcessEnv, key: string): string | null {
   return value || null;
 }
 
-function assertOpenAiRuntimeIdentity(
-  driverInstanceId: DriverInstanceId,
-  driverGeneration: number,
-): void {
-  if (
-    !isDriverId(driverInstanceId) ||
-    !Number.isSafeInteger(driverGeneration) ||
-    driverGeneration < 0
-  ) {
-    throw new TypeError("OpenAI runtime identity is invalid.");
-  }
-}
-
 async function readRuntimeHomeIdentity(runtimeHome: string): Promise<{
   readonly dev: number;
   readonly ino: number;
@@ -112,7 +98,9 @@ export async function createOpenAiRuntimeHome(
   input: OpenAiRuntimeHomeInput,
 ): Promise<OpenAiRuntimeHomeState> {
   input.signal?.throwIfAborted();
-  assertOpenAiRuntimeIdentity(input.driverInstanceId, input.driverGeneration);
+  if (!isDriverId(input.driverInstanceId)) {
+    throw new TypeError("OpenAI runtime identity is invalid.");
+  }
   const persistentRuntimeHome = resolve(input.persistentRuntimeHome);
   await using persistentHome = await ensureAbsoluteRealDirectory(
     persistentRuntimeHome,
@@ -137,9 +125,7 @@ export async function createOpenAiRuntimeHome(
   }
 
   input.signal?.throwIfAborted();
-  const runtimeHome = await mkdtemp(
-    `${OPENAI_RUNTIME_HOME_PREFIX}${input.driverInstanceId}-g${String(input.driverGeneration)}-`,
-  );
+  const runtimeHome = await mkdtemp(`${OPENAI_RUNTIME_HOME_PREFIX}${input.driverInstanceId}-`);
 
   try {
     input.signal?.throwIfAborted();
@@ -283,6 +269,19 @@ export async function materializeOpenAiAuthState(
 export async function materializeOpenAiModelProviderConfig(
   input: OpenAiModelProviderConfigInput,
 ): Promise<OpenAiModelProviderConfigResult> {
+  const providerOptions = input.providerOptions ?? {};
+  for (const key of [
+    "model",
+    "model_provider",
+    "model_providers",
+    "openai_base_url",
+    "profile",
+    "profiles",
+  ]) {
+    if (Object.hasOwn(providerOptions, key)) {
+      throw new Error(`OpenAI provider option ${key} cannot override the model connection.`);
+    }
+  }
   const configTomlPath = join(input.runtimeHome, "config.toml");
   const generatedConfig: Record<string, JsonValue> = {
     features: Object.fromEntries(DISABLED_RUNTIME_FEATURES.map((feature) => [feature, false])),
@@ -319,7 +318,7 @@ export async function materializeOpenAiModelProviderConfig(
     generatedConfig["mcp_servers"] = input.mcpServers;
   }
 
-  const config = mergeProviderOptions(generatedConfig, input.providerOptions ?? {});
+  const config = mergeProviderOptions(generatedConfig, providerOptions);
 
   const written = await writeFileAtomicallyAtPath(configTomlPath, Bun.TOML.stringify(config)!, {
     mode: 0o666,

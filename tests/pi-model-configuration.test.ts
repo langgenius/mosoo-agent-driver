@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
+import type { DriverModelProtocol } from "../src/protocol/boot";
 import { isJsonObject } from "../src/protocol/json";
 import { readPiModelConfiguration } from "../src/runtimes/pi/pi-configuration";
 import { PI_MODEL_CONFIGURATION_SOURCE } from "../src/runtimes/pi/pi-model-configuration";
@@ -16,21 +17,22 @@ afterEach(async () => {
   for (const dispose of cleanup.splice(0).toReversed()) await dispose();
 });
 
-async function inspectModel(vendor: string, id: string, modelProtocol: string, resumed = false) {
+async function inspectModel(
+  vendor: string,
+  id: string,
+  modelProtocol: DriverModelProtocol,
+  resumed = false,
+) {
   const home = await mkdtemp(join(tmpdir(), "mosoo-pi-model-"));
   cleanup.push(() => rm(home, { recursive: true, force: true }));
   const agentDir = join(home, "pi");
   await mkdir(agentDir);
   const baseUrl = "http://127.0.0.1:1/model-proxy";
-  const variables = {
-    MOSOO_PI_CONFIG_CONTENT: JSON.stringify({ baseUrl, modelProtocol }),
-    MOSOO_PI_PROXY_GRANT: "test-grant",
-  };
   const configuration = readPiModelConfiguration({
     provider: vendor,
     model: `${vendor}/${id}`,
     providerOptions: {},
-    environment: { variables },
+    modelConnection: { protocol: modelProtocol, proxyUrl: baseUrl, proxyGrant: "test-grant" },
   });
   const { api, provider } = configuration;
   const extension = join(agentDir, "mosoo-model.mjs");
@@ -96,7 +98,7 @@ async function inspectModel(vendor: string, id: string, modelProtocol: string, r
         HOME: home,
         PI_CODING_AGENT_DIR: agentDir,
         PI_OFFLINE: "1",
-        ...variables,
+        MOSOO_MODEL_PROXY_GRANT: "test-grant",
       },
     },
     async () => {},
@@ -129,11 +131,10 @@ test.each([
   ["openai", "gpt-5.4", "openai-responses"],
   ["anthropic", "claude-sonnet-5", "anthropic-messages"],
   ["gemini", "gemini-3.5-flash", "google-gemini"],
-  ["gemini", "gemini-3.5-flash", "openai-chat-completions"],
   ["kimi", "kimi-k2.7-code", "openai-chat-completions"],
   ["zhipu", "glm-4.7", "openai-chat-completions"],
   ["minimax", "MiniMax-M3", "anthropic-messages"],
-])(
+] as const)(
   "preserves native %s/%s metadata when configuring %s through a proxy",
   async (vendor, id, modelProtocol) => {
     const { model, builtin, baseUrl, api } = await inspectModel(vendor, id, modelProtocol);

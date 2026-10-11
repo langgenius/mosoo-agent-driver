@@ -43,13 +43,9 @@ async function createTemporaryDirectory(prefix = "mosoo-openai-auth-"): Promise<
   return directory;
 }
 
-async function createRuntimeHome(
-  persistentRuntimeHome?: string,
-  driverGeneration = 0,
-): Promise<RuntimeHomeState> {
+async function createRuntimeHome(persistentRuntimeHome?: string): Promise<RuntimeHomeState> {
   const persistentHome = persistentRuntimeHome ?? (await createTemporaryDirectory());
   const state = await createOpenAiRuntimeHome({
-    driverGeneration,
     driverInstanceId: createDriverInstanceId(),
     persistentRuntimeHome: persistentHome,
   });
@@ -98,7 +94,6 @@ async function runCrossProcessAuthChild(
   try {
     if (role === "old") {
       state = await authState.createOpenAiRuntimeHome({
-        driverGeneration: 1,
         driverInstanceId,
         persistentRuntimeHome: root,
       });
@@ -118,7 +113,6 @@ async function runCrossProcessAuthChild(
 
     await waitFor("old-home.json");
     state = await authState.createOpenAiRuntimeHome({
-      driverGeneration: 2,
       driverInstanceId,
       persistentRuntimeHome: root,
     });
@@ -167,14 +161,6 @@ describe("OpenAI app-server auth state", () => {
 
     await expect(
       createOpenAiRuntimeHome({
-        driverGeneration: -1,
-        driverInstanceId: createDriverInstanceId(),
-        persistentRuntimeHome,
-      }),
-    ).rejects.toThrow("identity is invalid");
-    await expect(
-      createOpenAiRuntimeHome({
-        driverGeneration: 0,
         driverInstanceId: "../../credential" as DriverInstanceId,
         persistentRuntimeHome,
       }),
@@ -193,16 +179,16 @@ describe("OpenAI app-server auth state", () => {
     }
   });
 
-  test("persists rollout and memory state across isolated runtime-home generations", async () => {
+  test("persists rollout and memory state across isolated runtime homes", async () => {
     const persistentRuntimeHome = await createTemporaryDirectory();
-    const first = await createRuntimeHome(persistentRuntimeHome, 1);
+    const first = await createRuntimeHome(persistentRuntimeHome);
 
     for (const name of PERSISTENT_DIRECTORIES) {
       await writeFile(join(first.runtimeHome, name, "retained"), name);
     }
     await cleanupOpenAiRuntimeHome(first);
 
-    const successor = await createRuntimeHome(persistentRuntimeHome, 2);
+    const successor = await createRuntimeHome(persistentRuntimeHome);
     for (const name of PERSISTENT_DIRECTORIES) {
       expect(await readFile(join(successor.runtimeHome, name, "retained"), "utf8")).toBe(name);
     }
@@ -346,7 +332,6 @@ await (${runCrossProcessAuthChild.toString()})(authState)`;
 
       await expect(
         createOpenAiRuntimeHome({
-          driverGeneration: 0,
           driverInstanceId: createDriverInstanceId(),
           persistentRuntimeHome,
         }),
@@ -371,7 +356,6 @@ await (${runCrossProcessAuthChild.toString()})(authState)`;
       provider: "openai-compatible",
       providerOptions: {
         features: { tool_suggest: true },
-        model_providers: { "openai-compatible": { wire_api: "chat" } },
         sandbox_workspace_write: true,
       },
       runtimeHome,
@@ -385,7 +369,7 @@ await (${runCrossProcessAuthChild.toString()})(authState)`;
       base_url: "https://compat.example/v1",
       env_key: "OPENAI_COMPATIBLE_API_KEY",
       name: "mosoo OpenAI-Compatible",
-      wire_api: "chat",
+      wire_api: "responses",
     });
     expect(requireRecord(config["features"], "runtime features")).toMatchObject({
       plugins: false,
@@ -422,6 +406,7 @@ await (${runCrossProcessAuthChild.toString()})(authState)`;
       providerOptions: {
         model_reasoning_effort: "high",
         model_verbosity: "low",
+        plan_mode_reasoning_effort: "medium",
       },
       runtimeHome,
     });
@@ -430,7 +415,28 @@ await (${runCrossProcessAuthChild.toString()})(authState)`;
     expect(result.written).toBe(true);
     expect(config["model_reasoning_effort"]).toBe("high");
     expect(config["model_verbosity"]).toBe("low");
+    expect(config["plan_mode_reasoning_effort"]).toBe("medium");
     expectDisabledRuntimeFeatures(config);
+  });
+
+  test.each([
+    "model",
+    "model_provider",
+    "model_providers",
+    "openai_base_url",
+    "profile",
+    "profiles",
+  ])("rejects the connection override %s in provider options", async (key) => {
+    const runtimeHome = await createTemporaryDirectory();
+    await expect(
+      materializeOpenAiModelProviderConfig({
+        env: { OPENAI_API_KEY: "openai-key", OPENAI_BASE_URL: "https://proxy.example/v1" },
+        provider: "openai",
+        providerOptions: { [key]: "override" },
+        runtimeHome,
+      }),
+    ).rejects.toThrow(`OpenAI provider option ${key} cannot override the model connection.`);
+    expect(await Bun.file(join(runtimeHome, "config.toml")).exists()).toBe(false);
   });
 
   test("writes only configured mcp_servers tables", async () => {

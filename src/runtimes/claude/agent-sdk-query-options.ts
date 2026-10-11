@@ -7,12 +7,12 @@ import type {
   PermissionResult,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import type { DriverBootMcpServer } from "../../protocol/boot";
 import type { DriverBuiltInToolName } from "../../protocol/boot";
 import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
-import { AGENT_DRIVER_VERSION } from "../../core/version";
-import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { buildRuntimeChildProcessEnv } from "../child-process-env";
 import { toMcpServerKey } from "../mcp/server-key";
 import { mergeProviderOptions } from "../provider-options";
@@ -144,6 +144,9 @@ function toClaudeEnv(payload: DriverStartInput, claudeConfigDir: string): NodeJS
   return {
     ...process.env,
     ...payload.execution.environment.variables,
+    ANTHROPIC_API_KEY: payload.execution.modelConnection.proxyGrant,
+    ANTHROPIC_AUTH_TOKEN: "",
+    ANTHROPIC_BASE_URL: payload.execution.modelConnection.proxyUrl,
     CLAUDE_AGENT_SDK_CLIENT_APP: `mosoo-driver/${AGENT_DRIVER_VERSION}`,
     CLAUDE_CONFIG_DIR: claudeConfigDir,
   };

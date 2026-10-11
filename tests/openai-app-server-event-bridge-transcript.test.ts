@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import { DriverTurnCancelledError } from "../src/core/driver-runtime-state";
+import { MAX_THOUGHT_CONTENT_BYTES } from "../src/protocol/events";
+import { OpenAiMessageState } from "../src/runtimes/openai/app-server-event-state";
 import { DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 import {
   createOpenAiBridgeHarness as createHarness,
@@ -9,6 +11,30 @@ import {
 } from "./openai-app-server-event-bridge-fixture";
 
 describe("OpenAi app-server event bridge", () => {
+  test("bounds total thought state and releases capacity when a snapshot shrinks", () => {
+    const messages = new OpenAiMessageState();
+    const halfCapacity = "x".repeat(MAX_THOUGHT_CONTENT_BYTES / 2);
+    messages.prepareReasoningText("first", halfCapacity)();
+    messages.prepareReasoningText("second", halfCapacity)();
+    expect(() => messages.prepareReasoningText("second", halfCapacity)()).not.toThrow();
+    expect(() => messages.prepareReasoningText("third", "x")).toThrow("byte limit");
+    expect(messages.currentReasoningText("third")).toBe("");
+
+    messages.prepareReasoningText("first", "")();
+    expect(() => messages.prepareReasoningText("third", halfCapacity)()).not.toThrow();
+    expect(messages.currentReasoningText("third")).toBe(halfCapacity);
+  });
+
+  test("counts a split surrogate pair by its completed JSON byte length", () => {
+    const messages = new OpenAiMessageState();
+    messages.prepareReasoningText("first", "x".repeat(MAX_THOUGHT_CONTENT_BYTES - 6))();
+    messages.prepareReasoningDelta("second", "\ud83d")();
+    messages.prepareReasoningDelta("second", "\ude00")();
+    messages.prepareReasoningDelta("second", "ab")();
+    expect(messages.currentReasoningText("second")).toBe("😀ab");
+    expect(() => messages.prepareReasoningDelta("second", "x")).toThrow("byte limit");
+  });
+
   test("closes only open item state when a mixed turn is cancelled", async () => {
     const { bridge, context, events } = createHarness();
     const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
@@ -119,7 +145,7 @@ describe("OpenAi app-server event bridge", () => {
     expect(events().filter((event) => event.kind === "agent.tasks.replaced")).toHaveLength(1);
   });
 
-  test("does not duplicate streamed reasoning in the completed snapshot", async () => {
+  test("publishes the complete reasoning snapshot after streamed previews", async () => {
     const { bridge, context, events } = createHarness();
 
     await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
@@ -160,8 +186,56 @@ describe("OpenAi app-server event bridge", () => {
         .map((event) => readEventPayloadString(event, "contentDelta"))
         .join(""),
     ).toBe("First\n\nSecond");
+    expect(events().filter((event) => event.kind === "thought.delta")).toEqual([
+      expect.objectContaining({ delivery: "best_effort" }),
+      expect.objectContaining({ delivery: "best_effort" }),
+      expect.objectContaining({ delivery: "best_effort" }),
+    ]);
+    expect(events().filter((event) => event.kind === "thought.updated")).toMatchObject([
+      { delivery: "lossless", payload: { content: "First\n\nSecond", offset: 0 } },
+    ]);
     expect(events().filter((event) => event.kind === "thought.completed")).toHaveLength(1);
   });
+
+  test.each([
+    ["different", ["Revised summary"], "Revised summary"],
+    ["shorter", ["First"], "First"],
+    ["empty", [], ""],
+  ] as const)(
+    "replaces streamed reasoning with the %s final summary",
+    async (_label, summary, text) => {
+      const { bridge, context, events } = createHarness();
+      await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+        delta: "First draft\n\n",
+        itemId: "reasoning-1",
+        summaryIndex: 0,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+      const completion = {
+        item: { content: [], id: "reasoning-1", summary: [...summary], type: "reasoning" },
+        threadId: "thread-1",
+        turnId: "turn-1",
+      };
+      await bridge.handleNotification(context, "item/completed", completion);
+      await bridge.handleNotification(context, "item/completed", completion);
+
+      const thoughtEvents = events().filter((event) => event.kind.startsWith("thought."));
+      expect(thoughtEvents).toMatchObject([
+        { kind: "thought.started" },
+        {
+          kind: "thought.delta",
+          delivery: "best_effort",
+          payload: { contentDelta: "First draft\n\n" },
+        },
+        { kind: "thought.updated", delivery: "lossless", payload: { content: text, offset: 0 } },
+        { kind: "thought.completed" },
+      ]);
+      expect(
+        new Set(thoughtEvents.map((event) => readEventPayloadString(event, "thoughtId"))).size,
+      ).toBe(1);
+    },
+  );
 
   test("releases translation state between turns and ignores late terminal replay", async () => {
     const { bridge, context, events } = createHarness();

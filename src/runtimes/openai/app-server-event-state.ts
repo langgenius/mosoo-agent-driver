@@ -4,6 +4,12 @@ import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { ProtocolError } from "../../contract";
 import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
 import { createRuntimeAssistantMessageId } from "../runtime-turn-transcript";
+import {
+  createThoughtContentEvents,
+  MAX_THOUGHT_CONTENT_BYTES,
+  thoughtContentBytes,
+  thoughtContentDeltaBytes,
+} from "../thought-content";
 import { toOpenAiSessionUsageSummary } from "./app-server-event-mapping";
 import { readRecord } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
@@ -142,7 +148,9 @@ export class OpenAiMessageState {
   readonly #reasoningEnded = new Set<string>();
   readonly #reasoningParts = new Map<string, Set<number>>();
   readonly #reasoningStarted = new Set<string>();
+  readonly #reasoningSnapshots = new Set<string>();
   readonly #reasoningTextById = new Map<string, string>();
+  #reasoningContentBytes = 0;
   readonly #starting = new Map<MessageId, Promise<void>>();
   readonly #started = new Set<MessageId>();
   readonly #textById = new Map<MessageId, string>();
@@ -183,15 +191,30 @@ export class OpenAiMessageState {
     });
   }
 
-  appendReasoningText(messageId: string, delta: string): void {
-    if (delta.length === 0 || this.#reasoningEnded.has(messageId)) {
-      return;
+  prepareReasoningText(messageId: string, text: string): () => void {
+    const bytes =
+      this.#reasoningContentBytes -
+      thoughtContentBytes(this.currentReasoningText(messageId)) +
+      thoughtContentBytes(text);
+    if (bytes > MAX_THOUGHT_CONTENT_BYTES) {
+      throw new RangeError("OpenAI thought content exceeds the byte limit.");
     }
+    return () => {
+      this.#reasoningTextById.set(messageId, text);
+      this.#reasoningContentBytes = bytes;
+    };
+  }
 
-    this.#reasoningTextById.set(
-      messageId,
-      `${this.#reasoningTextById.get(messageId) ?? ""}${delta}`,
-    );
+  prepareReasoningDelta(messageId: string, delta: string): () => void {
+    const previous = this.currentReasoningText(messageId);
+    const bytes = this.#reasoningContentBytes + thoughtContentDeltaBytes(previous, delta);
+    if (bytes > MAX_THOUGHT_CONTENT_BYTES) {
+      throw new RangeError("OpenAI thought content exceeds the byte limit.");
+    }
+    return () => {
+      this.#reasoningTextById.set(messageId, previous + delta);
+      this.#reasoningContentBytes = bytes;
+    };
   }
 
   beginReasoningPart(messageId: string, summaryIndex: number, commit = true): boolean {
@@ -214,6 +237,25 @@ export class OpenAiMessageState {
 
   currentReasoningText(messageId: string): string {
     return this.#reasoningTextById.get(messageId) ?? "";
+  }
+
+  async publishReasoningSnapshots(
+    context: AgentDriverContext,
+    push: OpenAiEventPush,
+  ): Promise<void> {
+    for (const thoughtId of this.#reasoningStarted) {
+      if (this.#reasoningSnapshots.has(thoughtId)) continue;
+      await push(
+        context,
+        "driver.openai.reasoning.snapshot",
+        createThoughtContentEvents(
+          thoughtId,
+          this.currentReasoningText(thoughtId),
+          `openai.reasoning.snapshot:${thoughtId}`,
+        ),
+      );
+      this.#reasoningSnapshots.add(thoughtId);
+    }
   }
 
   terminalEvents(outcome: OpenAiTerminalOutcome): DriverEventInput[] {
@@ -456,7 +498,9 @@ export class OpenAiMessageState {
     this.#reasoningEnded.clear();
     this.#reasoningParts.clear();
     this.#reasoningStarted.clear();
+    this.#reasoningSnapshots.clear();
     this.#reasoningTextById.clear();
+    this.#reasoningContentBytes = 0;
     this.#starting.clear();
     this.#started.clear();
     this.#textById.clear();

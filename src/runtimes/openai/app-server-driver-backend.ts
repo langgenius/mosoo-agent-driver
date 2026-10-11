@@ -679,7 +679,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       ...toOpenAiProtocolError({ message: error.message }),
       code: "openai.provider_failed",
     } as const;
-    const [taskClosure, ...itemClosures] = this.#events.turnStartTerminalEvents({
+    const [taskClosure, ...itemClosures] = await this.#events.turnStartTerminalEvents(context, {
       error: protocolError,
       kind: "failed",
     });
@@ -744,7 +744,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     runId: RunId,
     reason: string,
   ): Promise<void> {
-    const [taskClosure, ...itemClosures] = this.#events.turnStartTerminalEvents({
+    const [taskClosure, ...itemClosures] = await this.#events.turnStartTerminalEvents(context, {
       kind: "cancelled",
     });
     const closureSourcePrefix = createRuntimeSourceEventId(
