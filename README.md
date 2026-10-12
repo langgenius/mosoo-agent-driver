@@ -337,6 +337,7 @@ Image and package publication require the same `packed/dist/driver.mjs` to pass 
 ## Acknowledgments
 
 The native Pi RPC backend was originally contributed by [jackie-cqz](https://github.com/jackie-cqz) in [#129](https://github.com/langgenius/mosoo-agent-driver/pull/129).
+[Frad LEE (FradSer)](https://github.com/FradSer) contributed the native Pi 1.1.0 upgrade and its compatibility and regression coverage on `release/protocol-v2` in [#132](https://github.com/langgenius/mosoo-agent-driver/pull/132).
 
 ## License
 
