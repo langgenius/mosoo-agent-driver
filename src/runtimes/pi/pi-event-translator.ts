@@ -30,6 +30,12 @@ export class PiEventTranslator {
 
   translate(record: JsonObject): DriverEventInput[] {
     const type = record["type"];
+    // Pi 1.1 reports aborts at settlement even after a successful tool/message.
+    // Host-requested cancellations still take precedence in the backend.
+    if (type === "agent_settled" && record["aborted"] === true) {
+      this.#failure ??= "Pi run was aborted.";
+      return [];
+    }
     const message = isJsonObject(record["message"]) ? record["message"] : null;
     if (type === "message_start" && message?.["role"] === "assistant") {
       this.#messageId = createDriverId();
