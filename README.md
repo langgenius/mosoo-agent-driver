@@ -334,6 +334,10 @@ Protocol-only races such as ACP load replay barriers, burst updates, and event-d
 The release workflow extracts the packed NPM archive to `packed/`, verifies its declarations, and runs the local MCP, Codex, and Pi artifact tests.
 Image and package publication require the same `packed/dist/driver.mjs` to pass the OpenAI, Claude, OpenCode, and Pi live tests through OpenRouter.
 
+## Acknowledgments
+
+The native Pi RPC backend was originally contributed by [jackie-cqz](https://github.com/jackie-cqz) in [#129](https://github.com/langgenius/mosoo-agent-driver/pull/129).
+
 ## License
 
 Licensed under the [Apache License 2.0](./LICENSE.txt).
