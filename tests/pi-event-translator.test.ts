@@ -15,7 +15,9 @@ function completeAssistant(translator: PiEventTranslator, usage: JsonObject) {
 }
 
 function thinkingUpdate(translator: PiEventTranslator, update: JsonObject) {
-  return translator.translate({ type: "message_update", assistantMessageEvent: update });
+  const events = translator.translate({ type: "message_update", assistantMessageEvent: update });
+  translator.accept(events);
+  return events;
 }
 
 function finishThinking(translator: PiEventTranslator, thinking: string, stopReason = "stop") {
@@ -261,10 +263,11 @@ describe("Pi thinking delivery", () => {
       events.filter((event) => event.kind.startsWith("thought.")).map((event) => event.kind),
     ).toEqual(["thought.started", "thought.delta", "thought.updated", "thought.cancelled"]);
     expect(thoughtText(events)).toBe("partial");
+    translator.accept(events);
     expect(translator.closeOpenItems(true)).toEqual([]);
   });
 
-  test("bounds retained thinking across blocks and releases it after the message", () => {
+  test("bounds retained thinking across blocks until message admission", () => {
     const translator = new PiEventTranslator();
     translator.translate({ type: "message_start", message: { role: "assistant" } });
     const delta = "x".repeat(1_024 * 1_024);
@@ -273,11 +276,15 @@ describe("Pi thinking delivery", () => {
     expect(() =>
       thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "x" }),
     ).toThrow("Pi assistant message exceeds the thinking content byte limit.");
-    translator.translate({
+    const ended = translator.translate({
       type: "message_end",
       message: { role: "assistant", content: [], stopReason: "stop" },
     });
     translator.translate({ type: "message_start", message: { role: "assistant" } });
+    expect(() =>
+      thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta: "x" }),
+    ).toThrow("Pi assistant message exceeds the thinking content byte limit.");
+    translator.accept(ended);
     thinkingUpdate(translator, { type: "thinking_delta", contentIndex: 0, delta });
     expect(thoughtText(translator.closeOpenItems(true))).toBe(delta);
   });
@@ -290,8 +297,12 @@ describe("Pi thinking delivery", () => {
     expect(() =>
       thinkingUpdate(translator, { type: "thinking_start", contentIndex: 1_000 }),
     ).toThrow("Pi assistant message exceeds the thinking block limit.");
-    translator.closeOpenItems(true);
+    const closures = translator.closeOpenItems(true);
     translator.translate({ type: "message_start", message: { role: "assistant" } });
+    expect(() => thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 })).toThrow(
+      "Pi assistant message exceeds the thinking block limit.",
+    );
+    translator.accept(closures);
     expect(thinkingUpdate(translator, { type: "thinking_start", contentIndex: 0 })).toHaveLength(1);
   });
 
@@ -515,6 +526,27 @@ describe("Pi tool event contract", () => {
     ]);
   });
 
+  test("retains unadmitted thoughts from consecutive native messages until closure admission", () => {
+    const translator = new PiEventTranslator();
+    for (const thinking of ["first", "second"]) {
+      translator.translate({ type: "message_start", message: { role: "assistant" } });
+      translator.translate({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "thinking", thinking }],
+          stopReason: "stop",
+        },
+      });
+    }
+    const closures = translator.closeOpenItems(true);
+    expect(thoughtText(closures)).toBe("firstsecond");
+    expect(closures.filter((event) => event.kind === "thought.started")).toHaveLength(2);
+    expect(thoughtText(translator.closeOpenItems(true))).toBe("firstsecond");
+    translator.accept(closures);
+    expect(translator.closeOpenItems(true)).toEqual([]);
+  });
+
   test("closes interrupted messages, thoughts and running tools once", () => {
     const translator = new PiEventTranslator();
     const first = translator.translate({ type: "message_start", message: { role: "assistant" } });
@@ -552,10 +584,13 @@ describe("Pi tool event contract", () => {
         }),
       );
     }
-    translator.translate({
-      type: "message_update",
-      assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
-    });
+    translator.accept(thoughts);
+    translator.accept(
+      translator.translate({
+        type: "message_update",
+        assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
+      }),
+    );
     const closures = translator.closeOpenItems();
     expect(closures.map((event) => event.kind)).toEqual([
       "thought.updated",
@@ -585,6 +620,7 @@ describe("Pi tool event contract", () => {
         ),
       ),
     ).toHaveLength(4);
+    translator.accept(closures);
     expect(translator.closeOpenItems()).toEqual([]);
   });
 

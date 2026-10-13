@@ -15,6 +15,7 @@ const MAX_PI_MESSAGE_THOUGHTS = 1_000;
 
 interface PiThought {
   text: string;
+  started: boolean;
   completed: boolean;
 }
 
@@ -63,8 +64,22 @@ export class PiEventTranslator {
     for (const event of events) {
       const payload = event.payload;
       if (!isJsonObject(payload)) continue;
+      if (typeof payload["thoughtId"] === "string") {
+        const thought = this.#thoughts.get(payload["thoughtId"]);
+        if (thought !== undefined) {
+          if (event.kind === "thought.started") thought.started = true;
+          if (event.kind === "thought.completed" || event.kind === "thought.cancelled")
+            thought.completed = true;
+        }
+      }
       if (event.kind === "message.completed" && typeof payload["messageId"] === "string") {
         this.#openMessages.delete(payload["messageId"]);
+        for (const [thoughtId, thought] of this.#thoughts) {
+          if (thought.completed && thoughtId.startsWith(`${payload["messageId"]}:`)) {
+            this.#thoughtBytes -= thoughtContentBytes(thought.text);
+            this.#thoughts.delete(thoughtId);
+          }
+        }
       }
       if (
         event.kind === "tool.call.updated" &&
@@ -98,8 +113,6 @@ export class PiEventTranslator {
       });
     }
     this.#messageId = null;
-    this.#thoughts.clear();
-    this.#thoughtBytes = 0;
     this.#openMessages.clear();
     this.#openTools.clear();
     this.#toolMessageIds.clear();
@@ -155,6 +168,7 @@ export class PiEventTranslator {
       const stop = message["stopReason"];
       const interrupted = stop === "error" || stop === "aborted" || stop === "length";
       const events: DriverEventInput[] = [];
+      const thoughtIds = new Set<string>();
       if (Array.isArray(content)) {
         let bytes = this.#thoughtBytes;
         let count = this.#thoughts.size;
@@ -175,13 +189,18 @@ export class PiEventTranslator {
           throw new Error("Pi assistant message exceeds the thinking content byte limit.");
         if (count > MAX_PI_MESSAGE_THOUGHTS)
           throw new Error("Pi assistant message exceeds the thinking block limit.");
+        this.#thoughtBytes = bytes;
         for (const [index, block] of content.entries()) {
           if (
             isJsonObject(block) &&
             block["type"] === "thinking" &&
             typeof block["thinking"] === "string"
-          )
-            this.#completeThought(`${id}:${index}`, block["thinking"], events, interrupted);
+          ) {
+            const thoughtId = `${id}:${index}`;
+            const thought = this.#ensureThought(thoughtId);
+            if (!thought.completed) thought.text = block["thinking"];
+            thoughtIds.add(thoughtId);
+          }
           if (
             isJsonObject(block) &&
             block["type"] === "toolCall" &&
@@ -191,9 +210,9 @@ export class PiEventTranslator {
           }
         }
       }
-      events.push(...this.#closeThoughts(interrupted));
-      this.#thoughts.clear();
-      this.#thoughtBytes = 0;
+      for (const thoughtId of this.#thoughts.keys())
+        if (thoughtId.startsWith(`${id}:`)) thoughtIds.add(thoughtId);
+      events.push(...this.#closeThoughts(interrupted, thoughtIds));
       const text = textContent(message["content"]);
       this.#final = { id, text };
       this.#messageId = null;
@@ -305,15 +324,16 @@ export class PiEventTranslator {
     return [];
   }
 
-  #ensureThought(thoughtId: string, events: DriverEventInput[]): PiThought {
+  #ensureThought(thoughtId: string, events?: DriverEventInput[]): PiThought {
     let thought = this.#thoughts.get(thoughtId);
     if (thought === undefined) {
       if (this.#thoughts.size >= MAX_PI_MESSAGE_THOUGHTS)
         throw new Error("Pi assistant message exceeds the thinking block limit.");
-      thought = { text: "", completed: false };
+      thought = { text: "", started: false, completed: false };
       this.#thoughts.set(thoughtId, thought);
-      events.push({ kind: "thought.started", payload: { thoughtId, channel: "summary" } });
     }
+    if (!thought.started)
+      events?.push({ kind: "thought.started", payload: { thoughtId, channel: "summary" } });
     return thought;
   }
 
@@ -353,16 +373,18 @@ export class PiEventTranslator {
     events.push(...createThoughtContentEvents(thoughtId, content));
     thought.text = content;
     this.#thoughtBytes = bytes;
-    thought.completed = true;
     events.push({
       kind: cancelled ? "thought.cancelled" : "thought.completed",
       payload: { thoughtId, channel: "summary" },
     });
   }
 
-  #closeThoughts(cancelled: boolean): DriverEventInput[] {
+  #closeThoughts(
+    cancelled: boolean,
+    thoughtIds: Iterable<string> = this.#thoughts.keys(),
+  ): DriverEventInput[] {
     const events: DriverEventInput[] = [];
-    for (const thoughtId of this.#thoughts.keys())
+    for (const thoughtId of thoughtIds)
       this.#completeThought(thoughtId, undefined, events, cancelled);
     return events;
   }

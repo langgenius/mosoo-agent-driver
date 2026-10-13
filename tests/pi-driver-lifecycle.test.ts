@@ -638,6 +638,117 @@ test.each(["cancelled", "failed"])(
   },
 );
 
+test.each([
+  { source: "thinking_end", count: 1 },
+  { source: "message_end", count: 9 },
+  { source: "message_end", count: 1_000 },
+])(
+  "recovers $count thoughts after $source cannot enter the event queue",
+  async ({ source, count }) => {
+    const run = await harness();
+    const outcome = run.turn().catch((error: unknown) => error);
+    await run.prompt.promise;
+    await run.emit({ type: "message_start", message: { role: "assistant" } });
+    await run.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tool", name: "mcp__report", arguments: {} }],
+        stopReason: "toolUse",
+      },
+    });
+    await run.emit({ type: "tool_execution_start", toolCallId: "tool", toolName: "mcp__report" });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const snapshotEntered = Promise.withResolvers<void>();
+    const releaseSnapshot = Promise.withResolvers<void>();
+    run.hooks.push = async (events) => {
+      if (events.some((event) => event.kind === "tool.call.updated")) {
+        entered.resolve();
+        await release.promise;
+      }
+      if (events.some((event) => event.kind === "thought.updated")) {
+        snapshotEntered.resolve();
+        await releaseSnapshot.promise;
+      }
+    };
+    const progress = Promise.allSettled(
+      Array.from({ length: 1_020 }, () =>
+        run.emit({ type: "tool_execution_update", toolCallId: "tool", toolName: "mcp__report" }),
+      ),
+    );
+    await entered.promise;
+    const toolEnd = run.emit({
+      type: "tool_execution_end",
+      toolCallId: "tool",
+      toolName: "mcp__report",
+    });
+    const messageStart = run.emit({ type: "message_start", message: { role: "assistant" } });
+    const content = Array.from({ length: count }, (_, index) => ({
+      type: "thinking",
+      thinking: `Final thought ${index}.`,
+    }));
+    const endings = [
+      ...(source === "thinking_end"
+        ? [
+            run
+              .emit({
+                type: "message_update",
+                assistantMessageEvent: {
+                  type: source,
+                  contentIndex: 0,
+                  content: content[0]!.thinking,
+                },
+              })
+              .catch((error: unknown) => error),
+          ]
+        : []),
+      run
+        .emit({ type: "message_end", message: { role: "assistant", content, stopReason: "stop" } })
+        .catch((error: unknown) => error),
+    ];
+    // Pi can start the next message in the same stdout chunk, before rejection handlers run.
+    const nextMessage = run.emit({ type: "message_start", message: { role: "assistant" } });
+    try {
+      for (const ending of endings) {
+        expect(await ending).toMatchObject({ message: "Driver event queue exceeds 1024 events." });
+      }
+    } finally {
+      release.resolve();
+    }
+    await Promise.all([progress, toolEnd, messageStart, nextMessage]);
+    try {
+      await raceWithAbort(snapshotEntered.promise, AbortSignal.timeout(2_000));
+      expect(run.events.some((event) => event.kind === "run.failed")).toBe(false);
+    } finally {
+      releaseSnapshot.resolve();
+    }
+    expect(await outcome).toMatchObject({ message: "Driver event queue exceeds 1024 events." });
+    const snapshots = run.events.filter((event) => event.kind === "thought.updated");
+    expect(snapshots.map((event) => (event.payload as JsonObject)["content"])).toEqual(
+      content.map((block) => block.thinking),
+    );
+    for (const snapshot of snapshots) {
+      const thoughtId = (snapshot.payload as JsonObject)["thoughtId"];
+      const thought = run.events.filter(
+        (event) => (event.payload as JsonObject)["thoughtId"] === thoughtId,
+      );
+      expect(thought.map((event) => event.kind)).toEqual([
+        "thought.started",
+        "thought.updated",
+        "thought.cancelled",
+      ]);
+    }
+    expect(
+      run.events
+        .filter((event) => ["run.failed", "run.completed", "run.cancelled"].includes(event.kind))
+        .map((event) => event.kind),
+    ).toEqual(["run.failed"]);
+    expect(run.events.at(-1)?.kind).toBe("run.failed");
+    expect(run.stopped()).toBe(1);
+  },
+);
+
 test.each([false, true])(
   "preserves authoritative thought delivery failure without a competing terminal (cancel=%s)",
   async (cancel) => {

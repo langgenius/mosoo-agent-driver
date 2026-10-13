@@ -14,6 +14,7 @@ import type { JsonObject } from "../../protocol/json";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort } from "../../utils/async";
+import { MAX_PENDING_DRIVER_EVENTS } from "../driver-event-admission";
 import {
   DriverCompletedTerminalSupersededError,
   DriverEventPublisher,
@@ -403,10 +404,14 @@ export class PiDriverBackend implements AgentDriverBackend {
     const events = turn.translator
       .translate(record)
       .map((event) => Object.assign(event, { runId: turn.runId }));
-    const submitted = this.#push(context, events, () => turn.translator.accept(events));
+    let admitted = false;
+    const submitted = this.#push(context, events, () => {
+      admitted = true;
+      turn.translator.accept(events);
+    });
     const task = events.some((event) => event.kind === "thought.updated")
       ? submitted.catch((error: unknown) => {
-          turn.thoughtDeliveryFailure ??= { cause: error };
+          if (admitted) turn.thoughtDeliveryFailure ??= { cause: error };
           throw error;
         })
       : submitted;
@@ -455,13 +460,14 @@ export class PiDriverBackend implements AgentDriverBackend {
 
   async #closeItems(context: AgentDriverContext, turn: ActiveTurn): Promise<DriverEventInput[]> {
     const events = turn.translator.closeOpenItems(true);
-    await this.#push(
-      context,
-      events
-        .filter((event) => event.kind === "thought.updated")
-        .map((event) => ({ ...event, runId: turn.runId })),
-    );
-    return events.filter((event) => event.kind !== "thought.updated");
+    const thoughts = events
+      .filter((event) => event.kind.startsWith("thought."))
+      .map((event) => ({ ...event, runId: turn.runId }));
+    for (let offset = 0; offset < thoughts.length; offset += MAX_PENDING_DRIVER_EVENTS) {
+      const batch = thoughts.slice(offset, offset + MAX_PENDING_DRIVER_EVENTS);
+      await this.#push(context, batch, () => turn.translator.accept(batch));
+    }
+    return events.filter((event) => !event.kind.startsWith("thought."));
   }
 
   async #permission(context: AgentDriverContext, record: JsonObject): Promise<void> {
