@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants, type Dirent } from "node:fs";
+import { constants, type Dirent, type Stats } from "node:fs";
 import { lstat, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -80,9 +80,7 @@ export async function openOptionalRealDirectory(
   }
 }
 
-export async function readPathStats(
-  path: string,
-): Promise<Awaited<ReturnType<typeof lstat>> | null> {
+export async function readPathStats(path: string): Promise<Stats | null> {
   try {
     return await lstat(path);
   } catch (error) {

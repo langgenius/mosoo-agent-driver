@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
   chmod,
+  appendFile,
   link,
   mkdir,
   mkdtemp,
@@ -13,6 +14,7 @@ import {
   rename,
   rm,
   symlink,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -75,6 +77,19 @@ test.each([0o640, 0o751])(
     expect(source.mode).toBe(mode);
   },
 );
+
+test("source reads reject growth beyond the size reserved by checkpoint preflight", async () => {
+  const input = await fixture();
+  const path = join(input.cwd, "source");
+  await writeFile(path, "native output");
+  const { size } = await stat(path);
+  await appendFile(path, "unexpected growth");
+  await using directory = await open(input.cwd, "r");
+  await expect(
+    readNativeCheckpointSourceFile(directory, "source", input.signal, size),
+  ).rejects.toThrow(/size limit/u);
+  expect(await readFile(path, "utf8")).toBe("native outputunexpected growth");
+});
 
 test.each(["before", "after"])(
   "excludes checkpoint bundles from Git initialized %s publication and repairs missing ignore rules",

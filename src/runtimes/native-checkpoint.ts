@@ -11,6 +11,7 @@ import {
   MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH,
   MAX_NATIVE_CHECKPOINT_ENTRIES,
   MAX_NATIVE_CHECKPOINT_FILE_BYTES,
+  MAX_PI_NATIVE_CHECKPOINT_BYTES,
   MAX_NATIVE_CHECKPOINT_MANIFEST_BYTES,
   NATIVE_CHECKPOINT_MANIFEST_NAME,
   nativeRuntimeRefsEqual,
@@ -136,19 +137,30 @@ export async function readNativeCheckpointSourceFile(
   directory: FileHandle,
   name: string,
   signal?: AbortSignal,
+  maxBytes = MAX_NATIVE_CHECKPOINT_FILE_BYTES,
 ): Promise<{ bytes: Buffer; mode: number }> {
-  const { bytes, mode } = await readRegularFile(directory, name, signal, false, true);
+  const { bytes, mode } = await readRegularFile(
+    directory,
+    name,
+    signal,
+    false,
+    true,
+    Math.min(maxBytes, MAX_NATIVE_CHECKPOINT_FILE_BYTES),
+  );
   return { bytes, mode };
 }
 
 async function scanCheckpoint(
   directory: FileHandle,
+  checkpoint: NativeCheckpoint,
   signal: AbortSignal | undefined,
   sync: boolean,
   hasManifest: boolean,
 ): Promise<NativeCheckpointFile[]> {
   const files: NativeCheckpointFile[] = [];
   let count = 0;
+  let remainingBytes =
+    checkpoint.nativeRef.runtimeId === "pi" ? MAX_PI_NATIVE_CHECKPOINT_BYTES : Infinity;
   async function visit(current: FileHandle, prefix: string, depth: number): Promise<void> {
     if (depth > MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH) {
       throw new Error(`${CHECKPOINT_LABEL} has too many directory levels.`);
@@ -182,7 +194,15 @@ async function scanCheckpoint(
         );
         await visit(child, path, depth + 1);
       } else {
-        const { size, sha256 } = await readRegularFile(current, entry.name, signal, sync, false);
+        const { size, sha256 } = await readRegularFile(
+          current,
+          entry.name,
+          signal,
+          sync,
+          false,
+          Math.min(remainingBytes, MAX_NATIVE_CHECKPOINT_FILE_BYTES),
+        );
+        remainingBytes -= size;
         files.push({ path, size, sha256 });
       }
     }
@@ -214,7 +234,7 @@ async function validateCheckpoint(
   ) {
     throw new Error(`${CHECKPOINT_LABEL} identity does not match its descriptor.`);
   }
-  const files = await scanCheckpoint(directory, signal, false, true);
+  const files = await scanCheckpoint(directory, expected, signal, false, true);
   const expectedFiles = new Map(manifest.files.map((file) => [file.path, file]));
   if (
     files.length !== expectedFiles.size ||
@@ -325,7 +345,7 @@ export async function createNativeCheckpoint(input: {
   try {
     // Keep the callback anchored to this directory even if an ancestor is renamed.
     await input.write(join("/proc", String(process.pid), "fd", String(staging.fd)));
-    const files = await scanCheckpoint(staging, input.signal, true, false);
+    const files = await scanCheckpoint(staging, checkpoint, input.signal, true, false);
     const manifest = parseNativeCheckpointManifest({ ...checkpoint, files });
     const serialized = JSON.stringify(manifest);
     if (Buffer.byteLength(serialized) > MAX_NATIVE_CHECKPOINT_MANIFEST_BYTES) {

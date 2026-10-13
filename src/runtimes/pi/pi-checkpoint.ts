@@ -4,7 +4,10 @@ import { basename, join, resolve } from "node:path";
 
 import type { RunId } from "../../protocol/id";
 import { isJsonObject } from "../../protocol/json";
-import { MAX_NATIVE_CHECKPOINT_ENTRIES } from "../../protocol/native-checkpoint";
+import {
+  MAX_NATIVE_CHECKPOINT_ENTRIES,
+  MAX_PI_NATIVE_CHECKPOINT_BYTES,
+} from "../../protocol/native-checkpoint";
 import type { DriverNativeRuntimeRef } from "../../protocol/runtime";
 import {
   assertDirectoryIdentity,
@@ -113,10 +116,27 @@ export async function createPiNativeCheckpoint(input: {
         MAX_NATIVE_CHECKPOINT_ENTRIES,
         input.signal,
       );
-      const outputs = entries.filter((entry) => OUTPUT_NAME.test(entry.name));
+      // Native shell errors and MCP binary files can have only textual references.
+      const outputs: { name: string; size: number }[] = [];
+      for (const entry of entries) {
+        input.signal.throwIfAborted();
+        if (!OUTPUT_NAME.test(entry.name)) continue;
+        const stats = await readPathStats(directoryEntryPath(source, entry.name));
+        if (stats === null) throw new Error(`${LABEL} is missing a native output.`);
+        outputs.push({ name: entry.name, size: stats.size });
+      }
       if (outputs.length + 4 > MAX_NATIVE_CHECKPOINT_ENTRIES) {
         throw new Error(`${LABEL} contains too many entries.`);
       }
+      const nativeHome = JSON.stringify({ home: resolve(input.home) });
+      const totalBytes =
+        Buffer.byteLength(input.content) +
+        (outputs.length === 0 ? 0 : Buffer.byteLength(nativeHome)) +
+        outputs.reduce((bytes, file) => bytes + file.size, 0);
+      if (totalBytes > MAX_PI_NATIVE_CHECKPOINT_BYTES) {
+        throw new Error(`${LABEL} exceeds its total size limit.`);
+      }
+      validateReferences(input.content, input.home, new Set(outputs.map((entry) => entry.name)));
       if (outputs.length > 0) {
         await using outputDirectory = await ensureRealDirectoryAt(
           destination,
@@ -125,18 +145,16 @@ export async function createPiNativeCheckpoint(input: {
           input.signal,
         );
         for (const entry of outputs) {
-          const { bytes } = await readNativeCheckpointSourceFile(source, entry.name, input.signal);
+          const { bytes } = await readNativeCheckpointSourceFile(
+            source,
+            entry.name,
+            input.signal,
+            entry.size,
+          );
           await writeFileAtomically(outputDirectory, entry.name, bytes, 0o600, input.signal);
         }
-        await writeFileAtomically(
-          destination,
-          NATIVE_HOME_FILE,
-          JSON.stringify({ home: resolve(input.home) }),
-          0o600,
-          input.signal,
-        );
+        await writeFileAtomically(destination, NATIVE_HOME_FILE, nativeHome, 0o600, input.signal);
       }
-      validateReferences(input.content, input.home, new Set(outputs.map((entry) => entry.name)));
       await assertDirectoryIdentity(source, join(input.home, "outputs"), LABEL);
       await writeFileAtomically(destination, "session.jsonl", input.content, 0o600, input.signal);
     },

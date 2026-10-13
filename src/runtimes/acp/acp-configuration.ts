@@ -139,7 +139,9 @@ export function buildOpenCodeModelConfig(
           apiKey: "{env:OPENCODE_API_KEY}",
           // Anthropic's SDK includes /v1 in its base; the upstream proxy base does not.
           baseURL:
-            provider === "anthropic" ? `${modelConnection.proxyUrl}/v1` : modelConnection.proxyUrl,
+            modelConnection.protocol === "anthropic-messages"
+              ? `${modelConnection.proxyUrl}/v1`
+              : modelConnection.proxyUrl,
         },
       },
     },

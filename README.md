@@ -122,6 +122,11 @@ The next Run waits for terminal acknowledgement, backend settlement, required cl
 A cleanup failure blocks handoff while preserving the committed outcome.
 This atomic boundary covers native conversation state; workspace files have no transactional snapshot guarantee, and native restore preserves an existing workspace.
 
+Pi checkpoint payloads are bounded by `MAX_PI_NATIVE_CHECKPOINT_BYTES` across the session, native home metadata, and all managed output files.
+Creation checks the aggregate before copying, and recovery enforces the same limit on both declared and actual file sizes.
+Managed outputs are retained together because native shell errors and MCP binary references are not always represented in structured metadata.
+Exceeding the limit fails the checkpoint explicitly and preserves the previous committed checkpoint.
+
 A typed `runtime.session.reset` event records the previous checkpoint and native reference plus the new native reference.
 Once the host acknowledges the reset, the previous checkpoint is invalid for cold recovery.
 The live runtime can continue, but restart and cold recovery remain unavailable until a subsequent successful Run commits a new checkpoint.

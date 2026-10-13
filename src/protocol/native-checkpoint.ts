@@ -53,6 +53,7 @@ export const MAX_NATIVE_CHECKPOINT_ENTRIES = 10_000;
 export const MAX_NATIVE_CHECKPOINT_MANIFEST_BYTES = 2 * 1_024 * 1_024;
 export const MAX_NATIVE_CHECKPOINT_DIRECTORY_DEPTH = 64;
 export const MAX_NATIVE_CHECKPOINT_FILE_BYTES = 256 * 1_024 * 1_024;
+export const MAX_PI_NATIVE_CHECKPOINT_BYTES = 512 * 1_024 * 1_024;
 
 export interface NativeCheckpointFile {
   readonly path: string;
@@ -131,5 +132,12 @@ export function parseNativeCheckpointManifest(value: unknown): NativeCheckpointM
     }
   }
 
-  return { ...parseNativeCheckpoint(checkpoint), files };
+  const descriptor = parseNativeCheckpoint(checkpoint);
+  if (
+    descriptor.nativeRef.runtimeId === "pi" &&
+    files.reduce((bytes, file) => bytes + file.size, 0) > MAX_PI_NATIVE_CHECKPOINT_BYTES
+  ) {
+    throw new TypeError("Pi native checkpoint exceeds its total size limit.");
+  }
+  return { ...descriptor, files };
 }

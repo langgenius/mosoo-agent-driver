@@ -1,6 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
 import { rejects } from "node:assert/strict";
-import { link, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +20,8 @@ import { createBashTool, createPowerShellTool } from "@earendil-works/pi-coding-
 import {
   MAX_NATIVE_CHECKPOINT_ENTRIES,
   MAX_NATIVE_CHECKPOINT_FILE_BYTES,
+  MAX_PI_NATIVE_CHECKPOINT_BYTES,
+  parseNativeCheckpointManifest,
 } from "../src/protocol/native-checkpoint";
 import type { DriverNativeRuntimeRef } from "../src/protocol/runtime";
 import {
@@ -159,6 +172,52 @@ test.each([
             ? join(run.outputs, "secret.json")
             : null;
   await rejects(run.create(run.content(path)), /outside/u);
+});
+
+test("checkpoint rejects cumulative output size before copying and preserves the previous bundle", async () => {
+  const run = await fixture();
+  await writeFile(join(run.outputs, bash), "committed output");
+  const checkpoint = await run.create();
+  for (const name of [powershell, binary]) {
+    await writeFile(join(run.outputs, name), "");
+    await truncate(join(run.outputs, name), MAX_NATIVE_CHECKPOINT_FILE_BYTES);
+  }
+  await rejects(
+    createPiNativeCheckpoint({
+      root: run.root,
+      home: run.home,
+      content: run.content(),
+      runId: DRIVER_TEST_IDS.secondRunId,
+      nativeRef,
+      signal,
+    }),
+    /total size limit/u,
+  );
+  expect((await readdir(join(run.cwd, ".state/native-checkpoints"))).toSorted()).toEqual([
+    ".gitignore",
+    DRIVER_TEST_IDS.runId,
+  ]);
+  const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint });
+  expect((await saved.readFile(`outputs/${bash}`)).toString()).toBe("committed output");
+  expect((await stat(join(run.outputs, powershell))).size).toBe(MAX_NATIVE_CHECKPOINT_FILE_BYTES);
+});
+
+test("recovery rejects a manifest over the Pi payload budget before reading its files", async () => {
+  const run = await fixture();
+  await writeFile(join(run.outputs, bash), "committed output");
+  const checkpoint = await run.create();
+  const saved = await readNativeCheckpoint({ cwd: run.cwd, checkpoint });
+  const files = saved.manifest.files.map((file, index) => ({
+    ...file,
+    size: index < 2 ? MAX_NATIVE_CHECKPOINT_FILE_BYTES : 0,
+  }));
+  const manifest = { ...saved.manifest, files };
+  expect(files.reduce((bytes, file) => bytes + file.size, 0)).toBe(MAX_PI_NATIVE_CHECKPOINT_BYTES);
+  expect(parseNativeCheckpointManifest(manifest)).toEqual(manifest);
+  files[2]!.size = 1;
+  await writeFile(join(saved.directory, "manifest.json"), JSON.stringify(manifest));
+  await rejects(readNativeCheckpoint({ cwd: run.cwd, checkpoint }), /total size limit/u);
+  expect(await readFile(join(run.outputs, bash), "utf8")).toBe("committed output");
 });
 
 test("checkpoint preserves native outputs without treating quoted paths as metadata", async () => {

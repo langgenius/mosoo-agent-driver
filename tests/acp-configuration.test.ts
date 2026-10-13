@@ -45,7 +45,7 @@ describe("ACP runtime configuration", () => {
       providerId: "openai-compatible",
       modelId: "custom-claude",
       npm: "@ai-sdk/anthropic",
-      baseSuffix: "",
+      baseSuffix: "/v1",
     },
     {
       provider: "gemini",
