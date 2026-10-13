@@ -42,6 +42,7 @@ export class PiEventTranslator {
   #messageId: string | null = null;
   #failure: string | null = null;
   #final: { id: string; text: string } | null = null;
+  readonly #openMessages = new Set<string>();
   readonly #openTools = new Map<
     string,
     { title: string; parentMessageId: string; args: JsonObject }
@@ -58,12 +59,29 @@ export class PiEventTranslator {
     return this.#final;
   }
 
+  accept(events: readonly DriverEventInput[]): void {
+    for (const event of events) {
+      const payload = event.payload;
+      if (!isJsonObject(payload)) continue;
+      if (event.kind === "message.completed" && typeof payload["messageId"] === "string") {
+        this.#openMessages.delete(payload["messageId"]);
+      }
+      if (
+        event.kind === "tool.call.updated" &&
+        payload["status"] !== "running" &&
+        typeof payload["toolCallId"] === "string"
+      ) {
+        this.#openTools.delete(payload["toolCallId"]);
+      }
+    }
+  }
+
   closeOpenItems(cancelled = false): DriverEventInput[] {
     const events = this.#closeThoughts(cancelled);
-    if (this.#messageId !== null) {
+    for (const messageId of this.#openMessages) {
       events.push({
         kind: "message.completed",
-        payload: { messageId: this.#messageId, role: "agent" },
+        payload: { messageId, role: "agent" },
       });
     }
     for (const [toolCallId, tool] of this.#openTools) {
@@ -82,6 +100,7 @@ export class PiEventTranslator {
     this.#messageId = null;
     this.#thoughts.clear();
     this.#thoughtBytes = 0;
+    this.#openMessages.clear();
     this.#openTools.clear();
     this.#toolMessageIds.clear();
     return events;
@@ -92,6 +111,7 @@ export class PiEventTranslator {
     const message = isJsonObject(record["message"]) ? record["message"] : null;
     if (type === "message_start" && message?.["role"] === "assistant") {
       this.#messageId = createDriverId();
+      this.#openMessages.add(this.#messageId);
       return [{ kind: "message.started", payload: { messageId: this.#messageId, role: "agent" } }];
     }
     if (type === "message_update" && this.#messageId !== null) {
@@ -252,7 +272,6 @@ export class PiEventTranslator {
         },
       ];
       if (type === "tool_execution_end") {
-        this.#openTools.delete(toolCallId);
         this.#toolMessageIds.delete(toolCallId);
         if (
           record["isError"] !== true &&

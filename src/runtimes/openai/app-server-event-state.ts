@@ -1,7 +1,7 @@
+import type { ProtocolError } from "../../contract";
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { DriverEventInput } from "../../protocol/events";
 import type { MessageId } from "../../protocol/id";
-import type { AgentDriverContext } from "../../core/agent-driver-backend";
-import type { ProtocolError } from "../../contract";
 import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
 import { createRuntimeAssistantMessageId } from "../runtime-turn-transcript";
 import {
@@ -243,17 +243,19 @@ export class OpenAiMessageState {
     context: AgentDriverContext,
     push: OpenAiEventPush,
   ): Promise<void> {
-    for (const thoughtId of this.#reasoningStarted) {
-      if (this.#reasoningSnapshots.has(thoughtId)) continue;
-      await push(
-        context,
-        "driver.openai.reasoning.snapshot",
-        createThoughtContentEvents(
+    for (const thoughtId of this.#reasoningTextById.keys()) {
+      if (this.#reasoningEnded.has(thoughtId) || this.#reasoningSnapshots.has(thoughtId)) continue;
+      const events: DriverEventInput[] = [];
+      this.ensureReasoning(thoughtId, events, false);
+      events.push(
+        ...createThoughtContentEvents(
           thoughtId,
           this.currentReasoningText(thoughtId),
           `openai.reasoning.snapshot:${thoughtId}`,
         ),
       );
+      await push(context, "driver.openai.reasoning.snapshot", events);
+      this.ensureReasoning(thoughtId, [], true);
       this.#reasoningSnapshots.add(thoughtId);
     }
   }

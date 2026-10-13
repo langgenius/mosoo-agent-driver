@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { DriverEventRejectedError } from "../../core/driver-runtime-io";
 import type { DriverBootPayload } from "../../protocol/boot";
 import type { DriverEventEnvelope, DriverEventInput } from "../../protocol/events";
@@ -25,6 +27,7 @@ export function toDriverEventEnvelopes(
   payload: DriverBootPayload,
   event: DriverEventInput,
   activeRunId: RunId | null,
+  retained?: DriverEventEnvelope,
 ): DriverEventEnvelope[] {
   const sourceEventId = readExplicitSourceEventId(event) ?? createDriverId();
 
@@ -33,12 +36,12 @@ export function toDriverEventEnvelopes(
       throw new Error("Driver event uplink accepts drafts only.");
     }
 
-    const occurredAt = event.occurredAt ?? new Date().toISOString();
+    const occurredAt = event.occurredAt ?? retained?.event.occurredAt ?? new Date().toISOString();
     const runId = readEventRunId(event, activeRunId);
 
     return toRuntimeEventInput(
       {
-        createId: () => createDriverId() as EventId,
+        createId: () => retained?.event.id ?? (createDriverId() as EventId),
         draftRunIdPolicy: "ignore",
         driverInstanceId: parseDriverId(
           payload.driverInstanceId,
@@ -54,11 +57,19 @@ export function toDriverEventEnvelopes(
         sourceEventId,
       },
       event,
-    ).map((canonicalEvent): DriverEventEnvelope => ({
-      event: canonicalEvent,
-      eventId: canonicalEvent.sourceEventId ?? canonicalEvent.id,
-      occurredAt: canonicalEvent.occurredAt,
-    }));
+    ).map((canonicalEvent): DriverEventEnvelope => {
+      if (retained !== undefined) {
+        if (!isDeepStrictEqual(canonicalEvent, retained.event)) {
+          throw new Error("Driver source event ID conflicts with a retained event.");
+        }
+        return retained;
+      }
+      return {
+        event: canonicalEvent,
+        eventId: canonicalEvent.sourceEventId ?? canonicalEvent.id,
+        occurredAt: canonicalEvent.occurredAt,
+      };
+    });
   } catch (error) {
     throw new DriverEventRejectedError(sourceEventId, error);
   }

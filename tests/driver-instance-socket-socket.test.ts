@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+
 import { ORPCError } from "@orpc/client";
 
 import { AgentDriverKernelCore } from "../src/core/agent-driver-kernel";
@@ -8,11 +9,17 @@ import {
   pushLosslessEvents,
 } from "../src/core/driver-runtime-io";
 import { DriverInstanceSocket } from "../src/infrastructure/runtime/driver-instance-socket";
-import type { DriverEventInput } from "../src/protocol/events";
+import type { DriverEventEnvelope, DriverEventInput } from "../src/protocol/events";
 import {
   DURABLE_RUN_ERROR_MAX_UTF8_BYTES,
   measureRuntimeCommandJson,
 } from "../src/runtime-command";
+import {
+  MAX_PENDING_DRIVER_EVENTS,
+  MAX_PENDING_DRIVER_EVENT_BYTES,
+  MAX_RUN_TERMINAL_BATCH_BYTES,
+  MAX_RUN_TERMINAL_BATCH_EVENTS,
+} from "../src/runtimes/driver-event-admission";
 import { settlePromiseWithTimeout } from "../src/utils/async";
 import {
   DRIVER_TEST_IDS,
@@ -65,6 +72,7 @@ interface RpcRequest {
 
 class RpcWebSocket extends OpenWebSocket {
   static acceptedEventCounts: number[] = [];
+  static eventResponseFailures = new Set<number>();
   static eventBatchMaxSize = 2;
   static heartbeatFails = false;
   static heartbeatIntervalMs = 1_000;
@@ -158,6 +166,12 @@ class RpcWebSocket extends OpenWebSocket {
       }
 
       output = { accepted };
+      if (RpcWebSocket.eventResponseFailures.has(this.eventBatchSizes.length)) {
+        status = 500;
+        output = new ORPCError("INTERNAL_SERVER_ERROR", {
+          message: "test event receipt lost",
+        }).toJSON();
+      }
     } else if (path === "/driver/heartbeat") {
       if (RpcWebSocket.heartbeatFails) {
         status = 500;
@@ -201,11 +215,29 @@ const connectRpcSocket = async () => {
   return socket;
 };
 
+const connectEventSocket = async () => {
+  const socket = await connectRpcSocket();
+  await socket.hello({
+    capabilities: [],
+    driverVersion: "test",
+    protocolVersion: driverBootPayload.protocolVersion,
+    startedAt: new Date(0).toISOString(),
+  });
+  return socket;
+};
+
+function eventRequests(wire: RpcWebSocket): DriverEventEnvelope[][] {
+  return wire.requests
+    .filter(({ path }) => path === "/driver/pushEvents")
+    .map(({ input }) => (input as { events: DriverEventEnvelope[] }).events);
+}
+
 afterEach(() => {
   globalThis.WebSocket = nativeWebSocket;
   AbortSignal.timeout = nativeAbortSignalTimeout;
   PendingWebSocket.instances.length = 0;
   RpcWebSocket.acceptedEventCounts = [];
+  RpcWebSocket.eventResponseFailures.clear();
   RpcWebSocket.eventBatchMaxSize = 2;
   RpcWebSocket.heartbeatFails = false;
   RpcWebSocket.heartbeatIntervalMs = 1_000;
@@ -849,16 +881,228 @@ describe("DriverInstanceSocket lifecycle", () => {
       accepted: [{ type: "run.completed" }],
     });
 
-    const sourceIds = [firstWire, PendingWebSocket.instances[1] as RpcWebSocket].map(
-      (wire) =>
-        (
-          wire.requests.find((request) => request.path === "/driver/pushEvents")!.input as {
-            events: { event: { sourceEventId: string } }[];
-          }
-        ).events[0]!.event.sourceEventId,
+    const envelopes = [firstWire, PendingWebSocket.instances[1] as RpcWebSocket].map(
+      (wire) => eventRequests(wire)[0]![0]!,
     );
-    expect(sourceIds[0]).toBeString();
-    expect(sourceIds[1]).toBe(sourceIds[0]);
+    expect(envelopes[0]!.event.sourceEventId).toBeString();
+    expect(envelopes[1]).toEqual(envelopes[0]);
+    await expect(
+      socket.pushEvents({ events: [{ ...event, occurredAt: new Date(0).toISOString() }] }),
+    ).rejects.toThrow("conflicts with a retained event");
+  });
+
+  test("retries complete canonical envelopes after a later sub-batch loses its receipt", async () => {
+    const socket = await connectEventSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const events: DriverEventInput[] = Array.from({ length: 3 }, (_, index) => ({
+      kind: "thought.updated",
+      sourceEventId: `reasoning:${index}`,
+      payload: { thoughtId: `thought:${index}`, content: "Final reasoning", offset: 0 },
+    }));
+    RpcWebSocket.eventResponseFailures.add(2);
+    await expect(socket.pushEvents({ events })).rejects.toThrow("test event receipt lost");
+    await expect(socket.pushEvents({ events })).resolves.toMatchObject({
+      accepted: events.map(({ sourceEventId }) => ({ eventId: sourceEventId })),
+    });
+    const requests = eventRequests(PendingWebSocket.instances[0] as RpcWebSocket);
+    expect(requests.map((batch) => batch.length)).toEqual([2, 1, 2, 1]);
+    expect(requests.slice(2).flat()).toEqual(requests.slice(0, 2).flat());
+  });
+
+  test("retains partial receipt prefixes and rejects changes until retry succeeds", async () => {
+    const socket = await connectEventSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const events: DriverEventInput[] = ["first", "second"].map((thoughtId) => ({
+      kind: "thought.updated",
+      sourceEventId: thoughtId,
+      payload: { thoughtId, content: "Original", offset: 0 },
+    }));
+    RpcWebSocket.acceptedEventCounts = [1];
+    RpcWebSocket.eventResponseFailures.add(2);
+    await expect(socket.pushEvents({ events })).rejects.toThrow("test event receipt lost");
+    for (const change of [
+      { payload: { thoughtId: "first", content: "Changed", offset: 0 } },
+      { occurredAt: new Date(0).toISOString() },
+    ]) {
+      await expect(socket.pushEvents({ events: [{ ...events[0]!, ...change }] })).rejects.toThrow(
+        "conflicts with a retained event",
+      );
+    }
+    await expect(
+      socket.pushEvents({ events: [{ ...events[0]!, delivery: "best_effort" }] }),
+    ).rejects.toThrow("requires bounded lossless text content");
+    await socket.pushEvents({ events });
+    const requests = eventRequests(PendingWebSocket.instances[0] as RpcWebSocket);
+    expect(requests.map((batch) => batch.length)).toEqual([2, 1, 2]);
+    expect(requests[2]).toEqual(requests[0]);
+  });
+
+  test("does not discard an overlapping push's identity when an earlier push succeeds", async () => {
+    const socket = await connectEventSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const event: DriverEventInput = {
+      kind: "thought.updated",
+      sourceEventId: "overlapping-thought",
+      payload: { thoughtId: "thought", content: "Original", offset: 0 },
+    };
+    RpcWebSocket.eventResponseFailures.add(2);
+    const first = socket.pushEvents({ events: [event] });
+    const second = socket.pushEvents({ events: [event] });
+    await first;
+    await expect(second).rejects.toThrow("test event receipt lost");
+    await socket.pushEvents({ events: [event] });
+    const requests = eventRequests(PendingWebSocket.instances[0] as RpcWebSocket);
+    expect(requests).toHaveLength(3);
+    expect(requests[2]).toEqual(requests[0]);
+  });
+
+  test("bounds retained events without poisoning retries and releases acknowledged session events", async () => {
+    RpcWebSocket.eventBatchMaxSize = 64;
+    const socket = await connectEventSocket();
+    const events: DriverEventInput[] = Array.from(
+      { length: MAX_PENDING_DRIVER_EVENTS + MAX_RUN_TERMINAL_BATCH_EVENTS },
+      (_, index) => ({
+        kind: "session.info.updated",
+        runId: null,
+        sourceEventId: `session:${index}`,
+        payload: { title: "Session" },
+      }),
+    );
+    RpcWebSocket.eventResponseFailures.add(1);
+    await expect(socket.pushEvents({ events })).rejects.toThrow("test event receipt lost");
+    await expect(
+      socket.pushEvents({ events: [{ ...events[0]!, sourceEventId: "over-capacity" }] }),
+    ).rejects.toThrow("retained event capacity");
+    await socket.pushEvents({ events });
+    await socket.pushEvents({
+      events: events.map((event) =>
+        Object.assign({}, event, { sourceEventId: `${event.sourceEventId}:next` }),
+      ),
+    });
+  });
+
+  test("rejects oversized retained batches before reserving a run terminal", async () => {
+    const socket = await connectEventSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const oversized: DriverEventInput = {
+      kind: "message.added",
+      sourceEventId: "oversized-message",
+      payload: {
+        messageId: "message",
+        role: "agent",
+        content: "x".repeat(MAX_PENDING_DRIVER_EVENT_BYTES + MAX_RUN_TERMINAL_BATCH_BYTES),
+      },
+    };
+    await expect(socket.pushEvents({ events: [oversized] })).rejects.toThrow(
+      "retained event capacity",
+    );
+    await expect(
+      socket.pushEvents({
+        events: [
+          {
+            kind: "run.completed",
+            sourceEventId: "terminal-after-rejection",
+            payload: {
+              checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+              stopReason: "end_turn",
+            },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ accepted: [{ type: "run.completed" }] });
+  });
+
+  test("retains room for terminal prelude events while ordinary events await receipts", async () => {
+    const socket = await connectEventSocket();
+    socket.beginRun(DRIVER_TEST_IDS.runId);
+    const events: DriverEventInput[] = Array.from(
+      { length: MAX_PENDING_DRIVER_EVENTS + MAX_RUN_TERMINAL_BATCH_EVENTS - 1 },
+      (_, index) => ({
+        kind: "session.info.updated",
+        runId: null,
+        sourceEventId: `pending:${index}`,
+        payload: { title: "Session" },
+      }),
+    );
+    RpcWebSocket.eventResponseFailures.add(1);
+    await expect(socket.pushEvents({ events })).rejects.toThrow("test event receipt lost");
+    await expect(
+      socket.pushEvents({
+        events: [
+          {
+            kind: "run.completed",
+            payload: {
+              checkpoint: createTestNativeCheckpoint(DRIVER_TEST_IDS.runId),
+              stopReason: "end_turn",
+            },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ accepted: [{ type: "run.completed" }] });
+  });
+
+  test.each(["run release", "explicit close"] as const)(
+    "forgets retained identity after %s",
+    async (cleanup) => {
+      const socket = await connectEventSocket();
+      const ticket = socket.beginRun(DRIVER_TEST_IDS.runId);
+      const event: DriverEventInput = {
+        kind: "thought.updated",
+        sourceEventId: "forgotten-thought",
+        payload: { thoughtId: "thought", content: "Original", offset: 0 },
+      };
+      RpcWebSocket.eventResponseFailures.add(1);
+      await expect(socket.pushEvents({ events: [event] })).rejects.toThrow(
+        "test event receipt lost",
+      );
+      if (cleanup === "run release") {
+        socket.releaseRun(ticket, "driver_failing");
+        socket.beginRun(DRIVER_TEST_IDS.secondRunId);
+      } else {
+        socket.close();
+        await socket.connect();
+        await socket.hello({
+          capabilities: [],
+          driverVersion: "test",
+          protocolVersion: driverBootPayload.protocolVersion,
+          startedAt: new Date(0).toISOString(),
+        });
+      }
+      RpcWebSocket.eventResponseFailures.clear();
+      await expect(
+        socket.pushEvents({
+          events: [{ ...event, payload: { thoughtId: "thought", content: "Changed", offset: 0 } }],
+        }),
+      ).resolves.toMatchObject({ accepted: [{ eventId: "forgotten-thought" }] });
+    },
+  );
+
+  test("does not retain drafts from a rejected mixed-delivery batch", async () => {
+    const socket = await connectEventSocket();
+    const event: DriverEventInput = {
+      kind: "session.info.updated",
+      sourceEventId: "invalid-batch-session",
+      payload: { title: "Original" },
+      runId: null,
+    };
+    await expect(
+      socket.pushEvents({
+        events: [
+          event,
+          {
+            kind: "diagnostic.reported",
+            delivery: "best_effort",
+            payload: { message: "Diagnostic" },
+            runId: null,
+          },
+        ],
+      }),
+    ).rejects.toThrow("cannot mix lossless and best-effort delivery");
+    await expect(
+      socket.pushEvents({ events: [{ ...event, payload: { title: "Changed" } }] }),
+    ).resolves.toMatchObject({
+      accepted: [{ eventId: "invalid-batch-session" }],
+    });
   });
 
   test.each(["completed", "failed", "cancelled", null] as const)(
@@ -1299,7 +1543,7 @@ describe("DriverInstanceSocket lifecycle", () => {
       value: { status: "completed" },
     });
     await expect(socket.pushEvents({ events: [failed] })).rejects.toThrow(
-      "conflicts with the selected terminal",
+      "conflicts with a retained event",
     );
     const matchingControl = socket.completeRun();
     const eventTerminalOutcome = eventTerminal.then(
@@ -1336,7 +1580,7 @@ describe("DriverInstanceSocket lifecycle", () => {
       startedAt: new Date(0).toISOString(),
     });
     await expect(socket.pushEvents({ events: [failed] })).rejects.toThrow(
-      "conflicts with the selected terminal",
+      "conflicts with a retained event",
     );
     expect((PendingWebSocket.instances[1] as RpcWebSocket).paths).toEqual(["/driver/hello"]);
   });

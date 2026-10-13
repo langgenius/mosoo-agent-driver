@@ -2,8 +2,8 @@ import { withSourceEventIds } from "../core/driver-runtime-io";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
 
-const MAX_PENDING_DRIVER_EVENTS = 1_024;
-const MAX_PENDING_DRIVER_EVENT_BYTES = 32 * 1_024 * 1_024;
+export const MAX_PENDING_DRIVER_EVENTS = 1_024;
+export const MAX_PENDING_DRIVER_EVENT_BYTES = 32 * 1_024 * 1_024;
 export const MAX_RUN_TERMINAL_BATCH_EVENTS = MAX_PENDING_DRIVER_EVENTS;
 export const MAX_RUN_TERMINAL_BATCH_BYTES = 1_024 * 1_024;
 

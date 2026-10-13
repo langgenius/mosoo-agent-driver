@@ -19,10 +19,12 @@ function thinkingUpdate(translator: PiEventTranslator, update: JsonObject) {
 }
 
 function finishThinking(translator: PiEventTranslator, thinking: string, stopReason = "stop") {
-  return translator.translate({
+  const events = translator.translate({
     type: "message_end",
     message: { role: "assistant", content: [{ type: "thinking", thinking }], stopReason },
   });
+  translator.accept(events);
+  return events;
 }
 
 function thoughtText(events: DriverEventInput[]): string {
@@ -499,20 +501,36 @@ describe("Pi Run usage", () => {
 });
 
 describe("Pi tool event contract", () => {
-  test("closes interrupted messages, thoughts and running tools once", () => {
+  test("keeps unadmitted message endings open across the next native message", () => {
     const translator = new PiEventTranslator();
     const first = translator.translate({ type: "message_start", message: { role: "assistant" } });
     translator.translate({
       type: "message_end",
-      message: {
-        role: "assistant",
-        content: [
-          { type: "toolCall", id: "running", name: "bash" },
-          { type: "toolCall", id: "done", name: "read" },
-        ],
-        stopReason: "toolUse",
-      },
+      message: { role: "assistant", content: [], stopReason: "stop" },
     });
+    const next = translator.translate({ type: "message_start", message: { role: "assistant" } });
+    expect(translator.closeOpenItems().map((event) => event.payload)).toEqual([
+      first[0]?.payload,
+      next[0]?.payload,
+    ]);
+  });
+
+  test("closes interrupted messages, thoughts and running tools once", () => {
+    const translator = new PiEventTranslator();
+    const first = translator.translate({ type: "message_start", message: { role: "assistant" } });
+    translator.accept(
+      translator.translate({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "running", name: "bash" },
+            { type: "toolCall", id: "done", name: "read" },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    );
     for (const toolCallId of ["running", "done"]) {
       translator.translate({
         type: "tool_execution_start",
@@ -521,7 +539,9 @@ describe("Pi tool event contract", () => {
         args: { command: "sleep 60" },
       });
     }
-    translator.translate({ type: "tool_execution_end", toolCallId: "done", toolName: "read" });
+    translator.accept(
+      translator.translate({ type: "tool_execution_end", toolCallId: "done", toolName: "read" }),
+    );
     const current = translator.translate({ type: "message_start", message: { role: "assistant" } });
     const thoughts = [];
     for (const contentIndex of [0, 1]) {
@@ -575,14 +595,18 @@ describe("Pi tool event contract", () => {
   ])("accepts empty $status output through the Driver uplink", ({ type, isError, status }) => {
     const translator = new PiEventTranslator();
     translator.translate({ type: "message_start", message: { role: "assistant" } });
-    translator.translate({
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: [{ type: "toolCall", id: "empty", name: "bash", arguments: { command: "true" } }],
-        stopReason: "toolUse",
-      },
-    });
+    translator.accept(
+      translator.translate({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "empty", name: "bash", arguments: { command: "true" } },
+          ],
+          stopReason: "toolUse",
+        },
+      }),
+    );
     translator.translate({
       type: "tool_execution_start",
       toolCallId: "empty",
@@ -612,6 +636,7 @@ describe("Pi tool event contract", () => {
     expect(canonical[0]?.event.payload).not.toHaveProperty("rawOutput");
     if (type === "tool_execution_end")
       expect(canonical[0]?.event.payload).toHaveProperty("rawInput", '{"command":"true"}');
+    translator.accept(events);
     if (type === "tool_execution_end") expect(translator.closeOpenItems()).toEqual([]);
   });
 

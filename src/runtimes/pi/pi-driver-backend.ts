@@ -403,7 +403,7 @@ export class PiDriverBackend implements AgentDriverBackend {
     const events = turn.translator
       .translate(record)
       .map((event) => Object.assign(event, { runId: turn.runId }));
-    const submitted = this.#push(context, events);
+    const submitted = this.#push(context, events, () => turn.translator.accept(events));
     const task = events.some((event) => event.kind === "thought.updated")
       ? submitted.catch((error: unknown) => {
           turn.thoughtDeliveryFailure ??= { cause: error };
@@ -580,7 +580,11 @@ export class PiDriverBackend implements AgentDriverBackend {
     ]);
   }
 
-  #push(context: AgentDriverContext, events: DriverEventInput[]): Promise<void> {
-    return this.#publisher.push(context, "driver.pi.events", events);
+  #push(
+    context: AgentDriverContext,
+    events: DriverEventInput[],
+    onAdmitted?: () => void,
+  ): Promise<void> {
+    return this.#publisher.push(context, "driver.pi.events", events, onAdmitted);
   }
 }

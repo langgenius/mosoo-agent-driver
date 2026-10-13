@@ -43,6 +43,14 @@ import type {
   RuntimeCommand,
 } from "../../runtime-command";
 import { normalizeDurableRunError } from "../../runtime-command";
+import {
+  isRunTerminalDriverEvent,
+  MAX_PENDING_DRIVER_EVENTS,
+  MAX_PENDING_DRIVER_EVENT_BYTES,
+  MAX_RUN_TERMINAL_BATCH_BYTES,
+  MAX_RUN_TERMINAL_BATCH_EVENTS,
+  scopeDriverEvent,
+} from "../../runtimes/driver-event-admission";
 import { raceWithAbort } from "../../utils/async";
 import { dialDriverControlSocket } from "./driver-control-dial";
 import type { DriverWireSocket } from "./driver-control-dial";
@@ -55,6 +63,7 @@ interface DriverInstanceSocketHandlers {
 }
 
 interface PreparedEventPush {
+  readonly cacheOwner: symbol;
   readonly client: DriverRuntimeClient;
   readonly delivery: DriverEventEnvelope["event"]["delivery"] | undefined;
   readonly events: DriverEventEnvelope[];
@@ -70,6 +79,12 @@ interface PreparedEventPush {
 interface RunEventTerminalTask {
   readonly task: Promise<DriverEventBatchOutput["accepted"][number]>;
   readonly ticket: DriverRunTicket;
+}
+
+interface RetainedEventEnvelope {
+  readonly bytes: number;
+  readonly envelope: DriverEventEnvelope;
+  readonly owner: symbol;
 }
 
 const DRIVER_RPC_TIMEOUT_MS = 10_000;
@@ -95,6 +110,8 @@ function isTerminalConflict(error: unknown, runId: RunId): error is ORPCError<st
 }
 
 export class DriverInstanceSocket {
+  readonly #retainedEventEnvelopes = new Map<string, RetainedEventEnvelope>();
+  #retainedEventBytes = 0;
   #activeRunTicket: DriverRunTicket | null = null;
   #client: DriverRuntimeClient | null = null;
   #connectionGeneration = 0;
@@ -176,6 +193,8 @@ export class DriverInstanceSocket {
   }
 
   close(code = 1000, reason = "runtime.socket.closed"): void {
+    this.#retainedEventEnvelopes.clear();
+    this.#retainedEventBytes = 0;
     this.abortConnect(reason);
     this.#rpcAbortController.abort(new Error(reason));
     this.#client = null;
@@ -207,6 +226,11 @@ export class DriverInstanceSocket {
 
   releaseRun(ticket: DriverRunTicket, reason: "command_acked" | "driver_failing"): void {
     this.#terminalState.releaseRun(ticket, reason);
+    for (const [sourceEventId, retained] of this.#retainedEventEnvelopes) {
+      if (retained.envelope.event.runId === ticket.runId) {
+        this.#forgetEventEnvelope(sourceEventId);
+      }
+    }
     if (this.#activeRunTicket === ticket) {
       this.#activeRunTicket = null;
       this.#runEventTerminalTask = null;
@@ -415,6 +439,17 @@ export class DriverInstanceSocket {
     try {
       const result = await task;
       await terminalTask?.task;
+      // A later sub-batch failure makes the caller retry even an acknowledged prefix.
+      // One caller owns each lossless source ID; success ends its retry window.
+      for (const receipt of result.accepted) {
+        const retained = this.#retainedEventEnvelopes.get(receipt.eventId);
+        if (
+          retained?.owner === prepared.cacheOwner &&
+          !isRunTerminalDriverEvent(retained.envelope.event)
+        ) {
+          this.#forgetEventEnvelope(receipt.eventId);
+        }
+      }
       return result;
     } finally {
       if (this.#runEventTerminalTask === terminalTask) {
@@ -447,6 +482,12 @@ export class DriverInstanceSocket {
       throw new Error("Driver hello must complete before events are pushed.");
     }
 
+    const client = this.#requireClient();
+    const cacheOwner = Symbol("driver-event-push");
+    const retainedEvents = new Map<string, RetainedEventEnvelope>();
+    let retainedBytes = this.#retainedEventBytes;
+    let retainedCount = this.#retainedEventEnvelopes.size;
+
     const runTicket = this.#activeRunTicket;
     const activeRunId = runTicket?.runId ?? null;
     const selectedTerminal =
@@ -462,7 +503,33 @@ export class DriverInstanceSocket {
           ? { ...event, sourceEventId: selectedTerminal.sourceEventId }
           : event,
       )
-      .flatMap((event) => toDriverEventEnvelopes(this.payload, event, activeRunId));
+      .flatMap((event) => {
+        const previous =
+          event.sourceEventId === undefined
+            ? undefined
+            : (retainedEvents.get(event.sourceEventId) ??
+              this.#retainedEventEnvelopes.get(event.sourceEventId));
+        return toDriverEventEnvelopes(this.payload, event, activeRunId, previous?.envelope).map(
+          (envelope) => {
+            if (envelope.event.delivery !== "lossless") return envelope;
+            const bytes =
+              previous?.bytes ??
+              Buffer.byteLength(
+                JSON.stringify({
+                  ...scopeDriverEvent(event, activeRunId),
+                  sourceEventId: envelope.eventId,
+                }),
+                "utf8",
+              );
+            if (previous === undefined) {
+              retainedCount += 1;
+              retainedBytes += bytes;
+            }
+            retainedEvents.set(envelope.eventId, { bytes, envelope, owner: cacheOwner });
+            return envelope;
+          },
+        );
+      });
     const delivery = events[0]?.event.delivery;
     let terminal: DriverRunTerminalIdentity | null = null;
     let terminalIndex = -1;
@@ -519,6 +586,13 @@ export class DriverInstanceSocket {
       throw new Error("Driver run terminal must use lossless delivery.");
     }
 
+    if (
+      retainedCount > MAX_PENDING_DRIVER_EVENTS + MAX_RUN_TERMINAL_BATCH_EVENTS ||
+      retainedBytes > MAX_PENDING_DRIVER_EVENT_BYTES + MAX_RUN_TERMINAL_BATCH_BYTES
+    ) {
+      throw new Error("Driver unacknowledged events exceed the retained event capacity.");
+    }
+
     let terminalSelection: PreparedEventPush["terminalSelection"] = null;
     if (terminal !== null) {
       if (runTicket === null) {
@@ -536,8 +610,14 @@ export class DriverInstanceSocket {
       throw new Error("Driver event cannot target a terminated run.");
     }
 
+    for (const [sourceEventId, retained] of retainedEvents) {
+      this.#retainedEventEnvelopes.set(sourceEventId, retained);
+    }
+    this.#retainedEventBytes = retainedBytes;
+
     return {
-      client: this.#requireClient(),
+      cacheOwner,
+      client,
       delivery,
       events,
       generation: this.#connectionGeneration,
@@ -760,6 +840,14 @@ export class DriverInstanceSocket {
   #assertConnection(client: DriverRuntimeClient, generation: number, operation: string): void {
     if (generation !== this.#connectionGeneration || client !== this.#client) {
       throw new Error(`Driver socket connection changed during ${operation}.`);
+    }
+  }
+
+  #forgetEventEnvelope(sourceEventId: string): void {
+    const retained = this.#retainedEventEnvelopes.get(sourceEventId);
+    if (retained !== undefined) {
+      this.#retainedEventBytes -= retained.bytes;
+      this.#retainedEventEnvelopes.delete(sourceEventId);
     }
   }
 

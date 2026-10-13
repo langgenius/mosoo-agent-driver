@@ -264,6 +264,141 @@ test("batches a long thinking stream behind slow ACKs and restores dropped previ
   expect(run.stopped()).toBe(0);
 });
 
+test("closes a tool with its arguments when the completion cannot enter the event queue", async () => {
+  const run = await harness();
+  const outcome = run.turn().catch((error: unknown) => error);
+  await run.prompt.promise;
+  const args = { path: "report.txt" };
+  await run.emit({ type: "message_start", message: { role: "assistant" } });
+  await run.emit({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tool", name: "mcp__report", arguments: args }],
+      stopReason: "toolUse",
+    },
+  });
+  await run.emit({
+    type: "tool_execution_start",
+    toolCallId: "tool",
+    toolName: "mcp__report",
+    args,
+  });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  run.hooks.push = async (events) => {
+    if (events.some((event) => event.kind === "tool.call.updated")) {
+      entered.resolve();
+      await release.promise;
+    }
+  };
+  const progress = Promise.allSettled(
+    Array.from({ length: 32 }, () =>
+      run.emit({
+        type: "tool_execution_update",
+        toolCallId: "tool",
+        toolName: "mcp__report",
+        partialResult: { content: [{ type: "text", text: "x".repeat(1_024 * 1_024 - 512) }] },
+      }),
+    ),
+  );
+  try {
+    await entered.promise;
+    const completion = run.emit({
+      type: "tool_execution_end",
+      toolCallId: "tool",
+      toolName: "mcp__report",
+      isError: false,
+      result: { content: [{ type: "text", text: "x".repeat(20 * 1_024) }] },
+    });
+    await expect(completion).rejects.toThrow("Driver event queue exceeds 33554432 UTF-8 bytes.");
+  } finally {
+    release.resolve();
+  }
+  await progress;
+  expect(await outcome).toMatchObject({
+    message: "Driver event queue exceeds 33554432 UTF-8 bytes.",
+  });
+  const endings = run.events.filter(
+    (event) =>
+      event.kind === "tool.call.updated" && (event.payload as JsonObject)["status"] !== "running",
+  );
+  expect(endings.map((event) => event.payload)).toEqual([
+    expect.objectContaining({
+      toolCallId: "tool",
+      status: "failed",
+      rawInput: JSON.stringify(args),
+    }),
+  ]);
+  expect(run.events.at(-1)?.kind).toBe("run.failed");
+});
+
+test.each(["file rejection", "lost receipt"])(
+  "preserves admitted tool completion after %s without a competing failed tool",
+  async (failure) => {
+    const run = await harness();
+    const outcome = run.turn().catch((error: unknown) => error);
+    await run.prompt.promise;
+    const args = { path: "report.txt", content: "done" };
+    await run.emit({ type: "message_start", message: { role: "assistant" } });
+    await run.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tool", name: "write", arguments: args }],
+        stopReason: "toolUse",
+      },
+    });
+    await run.emit({ type: "tool_execution_start", toolCallId: "tool", toolName: "write", args });
+    let rejected = false;
+    const completionAttempts: (string | undefined)[] = [];
+    run.hooks.push = async (events) => {
+      const completed = events.find(
+        (event) =>
+          event.kind === "tool.call.updated" &&
+          (event.payload as JsonObject)["status"] === "completed",
+      );
+      if (completed) completionAttempts.push(completed.sourceEventId);
+      if (rejected) return;
+      if (failure === "lost receipt" && completed) {
+        rejected = true;
+        throw new Error("completion receipt lost");
+      }
+      const changed = events.find((event) => event.kind === "file.change.updated");
+      if (failure === "file rejection" && changed) {
+        rejected = true;
+        throw new DriverEventRejectedError(
+          changed.sourceEventId!,
+          new Error("file event rejected"),
+        );
+      }
+    };
+    await expect(
+      run.emit({
+        type: "tool_execution_end",
+        toolCallId: "tool",
+        toolName: "write",
+        isError: false,
+        result: { content: [{ type: "text", text: "saved" }] },
+      }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(await outcome).toBeInstanceOf(Error);
+    const endings = run.events.filter(
+      (event) =>
+        event.kind === "tool.call.updated" && (event.payload as JsonObject)["status"] !== "running",
+    );
+    expect(endings.map((event) => event.payload)).toEqual([
+      expect.objectContaining({
+        toolCallId: "tool",
+        status: "completed",
+        rawInput: JSON.stringify(args),
+      }),
+    ]);
+    expect(new Set(completionAttempts).size).toBe(1);
+    expect(run.events.at(-1)?.kind).toBe("run.failed");
+  },
+);
+
 test("does not dispatch native work before the run start receipt, including cancellation", async () => {
   const run = await harness();
   const entered = Promise.withResolvers<void>();

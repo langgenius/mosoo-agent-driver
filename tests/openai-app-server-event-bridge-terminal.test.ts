@@ -65,6 +65,7 @@ function expectRunFinalReferences(
 
 function createPublisherHarness(
   options: {
+    failEventOnce?: DriverEventInput["kind"];
     partialSourcePrefix?: string;
     requestPermission?: AgentDriverPermissionPort["request"];
     threadId?: string;
@@ -74,11 +75,16 @@ function createPublisherHarness(
   const delivered: DriverEventInput[] = [];
   const partialAttempts: DriverEventInput[][] = [];
   const store = createCmaMemoryStore({ sessions: [{ id: DRIVER_TEST_IDS.sessionId }] });
+  let failedEvent = false;
   let nextSeq = 1;
   const context: AgentDriverContext = createAgentDriverContext({
     eventSink: {
       currentRunId: () => DRIVER_TEST_IDS.runId,
       pushEvents: async ({ events }) => {
+        if (!failedEvent && events.some((event) => event.kind === options.failEventOnce)) {
+          failedEvent = true;
+          throw new Error("transient thought delivery failure");
+        }
         const partialSourcePrefix = options.partialSourcePrefix;
         const isPartialAttempt =
           partialSourcePrefix !== undefined &&
@@ -137,6 +143,80 @@ function createPublisherHarness(
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test("preserves the first reasoning delta when its start delivery fails", async () => {
+    const { bridge, context, delivered } = createPublisherHarness({
+      failEventOnce: "thought.started",
+    });
+    const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+    void trackedTurn.catch(() => {});
+    const scope = { threadId: "thread-1", turnId: "turn-1" };
+    await bridge.handleNotification(context, "item/started", {
+      ...scope,
+      item: { content: [], id: "reasoning-1", summary: [], type: "reasoning" },
+    });
+    await bridge.handleNotification(context, "item/reasoning/summaryPartAdded", {
+      ...scope,
+      itemId: "reasoning-1",
+      summaryIndex: 0,
+    });
+    await expect(
+      bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+        ...scope,
+        delta: "Draft",
+        itemId: "reasoning-1",
+        summaryIndex: 0,
+      }),
+    ).rejects.toThrow("transient thought delivery failure");
+    await expect(bridge.failActiveTurns(context, new Error("provider failed"))).resolves.toBe(true);
+    await expect(trackedTurn).rejects.toThrow("provider failed");
+
+    const thoughts = delivered.filter((event) => event.kind.startsWith("thought."));
+    expect(thoughts).toMatchObject([
+      { kind: "thought.started" },
+      { kind: "thought.updated", payload: { content: "Draft", offset: 0 } },
+      { kind: "thought.cancelled" },
+    ]);
+    expect(new Set(thoughts.map((event) => readEventPayloadString(event, "thoughtId"))).size).toBe(
+      1,
+    );
+    expect(delivered.at(-1)?.kind).toBe("run.failed");
+  });
+
+  test.each(["Revised", ""])(
+    "retries the authoritative reasoning %j when snapshot delivery fails",
+    async (text) => {
+      const { bridge, context, delivered } = createPublisherHarness({
+        failEventOnce: "thought.updated",
+      });
+      const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+      void trackedTurn.catch(() => {});
+      const scope = { threadId: "thread-1", turnId: "turn-1" };
+      await bridge.handleNotification(context, "item/reasoning/summaryTextDelta", {
+        ...scope,
+        delta: "Draft",
+        itemId: "reasoning-1",
+        summaryIndex: 0,
+      });
+      await expect(
+        bridge.handleNotification(context, "item/completed", {
+          ...scope,
+          item: { content: [], id: "reasoning-1", summary: [text], type: "reasoning" },
+        }),
+      ).rejects.toThrow("transient thought delivery failure");
+      expect(delivered.filter((event) => event.kind === "thought.completed")).toHaveLength(0);
+      await expect(bridge.failActiveTurns(context, new Error("provider failed"))).resolves.toBe(
+        true,
+      );
+      await expect(trackedTurn).rejects.toThrow("provider failed");
+
+      expect(delivered.filter((event) => event.kind === "thought.updated")).toMatchObject([
+        { delivery: "lossless", payload: { content: text, offset: 0 } },
+      ]);
+      expect(delivered.filter((event) => event.kind === "thought.cancelled")).toHaveLength(1);
+      expect(delivered.at(-1)?.kind).toBe("run.failed");
+    },
+  );
+
   test.each(["completed", "cancelled", "failed"] as const)(
     "snapshots open reasoning once before retrying a %s terminal",
     async (outcome) => {

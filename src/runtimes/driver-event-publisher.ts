@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+
+import type { AgentDriverContext } from "../core/agent-driver-backend";
 import {
   assertDriverEventReceiptPrefix,
   DRIVER_EVENT_DELIVERY_TIMEOUT_MS,
@@ -5,7 +8,6 @@ import {
   pushLosslessEvents,
   withSourceEventIds,
 } from "../core/driver-runtime-io";
-import { createHash } from "node:crypto";
 import { summarizeDriverEventBatch } from "../observability/driver-debug";
 import type { DriverEventInput } from "../protocol/events";
 import type { RunId } from "../protocol/id";
@@ -13,7 +15,6 @@ import { parseNativeCheckpoint, type NativeCheckpoint } from "../protocol/native
 import type { DriverEventReceipt } from "../protocol/orpc";
 import type { DriverRuntime } from "../protocol/runtime";
 import { raceWithAbort } from "../utils/async";
-import type { AgentDriverContext } from "../core/agent-driver-backend";
 import {
   admitDriverEventPush,
   driverEventBatchBytes,
@@ -206,19 +207,24 @@ export class DriverEventPublisher {
     context: AgentDriverContext,
     reason: string,
     events: readonly DriverEventInput[],
+    onAdmitted?: () => void,
   ): Promise<void> {
     if (events.some(isRunTerminalDriverEvent)) {
       throw new Error("Driver run terminals must use pushTerminal().");
     }
 
+    let submitted: Promise<void>;
     try {
-      return this.#submit(context, reason, events).catch((error: unknown) => {
-        throw deliveryCause(error);
-      });
+      submitted = this.#submit(context, reason, events);
     } catch (error) {
       this.#requestPendingDrain(context, reason);
       throw deliveryCause(error);
     }
+    // Admission transfers lossless event ownership before any Host receipt.
+    onAdmitted?.();
+    return submitted.catch((error: unknown) => {
+      throw deliveryCause(error);
+    });
   }
 
   async pushSession(

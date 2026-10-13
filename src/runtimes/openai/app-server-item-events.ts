@@ -1,8 +1,14 @@
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import type { DriverEventInput } from "../../protocol/events";
 import { chunkJsonText } from "../provider-json";
-import { createThoughtContentEvents } from "../thought-content";
 import { createRuntimeSourceEventId, toRuntimePublicId } from "../runtime-public-id";
+import { createThoughtContentEvents } from "../thought-content";
+import {
+  OpenAiAgentTaskState,
+  openAiAgentTasksClosedEvent,
+  toOpenAiAgentTaskId,
+  type OpenAiSubAgentActivity,
+} from "./app-server-agent-task-events";
 import { toOpenAiPlanStatus } from "./app-server-event-mapping";
 import {
   assertOpenAiDurableEventFits,
@@ -18,12 +24,6 @@ import type {
 } from "./app-server-event-state";
 import { isRecord, readArray, readNonEmptyString, readRecord, readString } from "./app-server-json";
 import type { JsonObject } from "./app-server-json";
-import {
-  OpenAiAgentTaskState,
-  openAiAgentTasksClosedEvent,
-  toOpenAiAgentTaskId,
-  type OpenAiSubAgentActivity,
-} from "./app-server-agent-task-events";
 import {
   toOpenAiCollaborationOutput,
   toOpenAiFileChangeEvents,
@@ -639,9 +639,9 @@ export class OpenAiAppServerItemEventBridge {
       })),
     );
 
+    commitText();
     await this.#push(context, "driver.openai.reasoning.summary", events);
     this.#messages.ensureReasoning(messageId, [], true);
-    commitText();
   }
 
   async onReasoningPart(context: AgentDriverContext, params: JsonObject): Promise<void> {
@@ -1077,11 +1077,11 @@ export class OpenAiAppServerItemEventBridge {
         sourceEventId: `openai.reasoning.completed:${messageId}:terminal`,
       },
     );
+    commitText();
 
     return {
       commit: () => {
         this.#messages.ensureReasoning(messageId, [], true);
-        commitText();
         this.#messages.markReasoningEnded(messageId);
       },
       events,

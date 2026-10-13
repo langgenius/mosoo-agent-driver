@@ -51,6 +51,35 @@ function acceptEvents(
 }
 
 describe("DriverEventPublisher", () => {
+  test("reports admission synchronously even when the later receipt fails", async () => {
+    const release = Promise.withResolvers<void>();
+    const context = createContext({
+      pushEvents: async () => {
+        await release.promise;
+        throw new Error("receipt lost");
+      },
+    });
+    const publisher = new DriverEventPublisher("pi", () => "session-ref");
+    let admitted = 0;
+    const delivery = publisher.push(
+      context,
+      "fill",
+      Array.from({ length: 1_024 }, () => createEvent("message.started")),
+      () => {
+        admitted++;
+      },
+    );
+    expect(admitted).toBe(1);
+    const overflow = publisher.push(context, "overflow", [createEvent("message.completed")], () => {
+      admitted++;
+    });
+    await expect(overflow).rejects.toThrow("exceeds 1024 events");
+    expect(admitted).toBe(1);
+    release.resolve();
+    await expect(delivery).rejects.toThrow("receipt lost");
+    expect(admitted).toBe(1);
+  });
+
   test("joins an unresolved lossless draft by explicit identity", async () => {
     const attempts: DriverEventInput[][] = [];
     const context = createContext({
