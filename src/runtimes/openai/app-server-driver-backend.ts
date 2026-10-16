@@ -1,3 +1,4 @@
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { isDriverFullAccess } from "../../core/driver-permission-policy";
 import { pushLosslessEvents } from "../../core/driver-runtime-io";
 import {
@@ -10,12 +11,13 @@ import {
   toDurationMs,
 } from "../../core/driver-runtime-timing";
 import { summarizePath, summarizeRuntimeCommandInput } from "../../observability/driver-debug";
+import type { RuntimeRunCompletedPayload } from "../../protocol/events";
 import { driverIdTimeMs, type RunId } from "../../protocol/id";
+import type { NativeCheckpoint } from "../../protocol/native-checkpoint";
 import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import { createRuntimeSourceEventId } from "../runtime-public-id";
 import {
@@ -23,11 +25,10 @@ import {
   computeRuntimeBootstrapDigest,
   writeSkillBootstrapArtifacts,
 } from "../skill-bootstrap";
-import { OpenAiAppServerClient } from "./app-server-client";
 import { openAiAgentTasksClosedEvent } from "./app-server-agent-task-events";
+import { OpenAiAppServerClient } from "./app-server-client";
 import { MOSOO_OPENAI_RUNTIME_SANDBOX_MODE } from "./app-server-env";
 import { OpenAiAppServerEventBridge } from "./app-server-event-bridge";
-import { createOpenAiNativeCheckpoint, restoreOpenAiNativeCheckpoint } from "./native-checkpoint";
 import { toOpenAiProtocolError } from "./app-server-event-mapping";
 import type {
   ApprovalPolicy,
@@ -36,6 +37,7 @@ import type {
   ThreadStartResponse,
   TurnStatus,
 } from "./app-server-protocol";
+import { createOpenAiNativeCheckpoint, restoreOpenAiNativeCheckpoint } from "./native-checkpoint";
 
 /**
  * App-server approval policy derived from the driver permission policy.
@@ -122,6 +124,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   #pendingTurnStartServerRequests: Promise<void> | null = null;
   #pendingTurnStartUpdates: Promise<void> | null = null;
   #pendingCancellationSettlement: Promise<void> | null = null;
+  #nativeCheckpoint: NativeCheckpoint | null;
   #restartThreadId: string | null = null;
   #stopping = false;
   #threadId: string | null = null;
@@ -154,13 +157,24 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
     push: async (context, reason, events) => this.#eventPublisher.push(context, reason, events),
     pushSession: async (context, reason, events) =>
       this.#eventPublisher.pushSession(context, reason, events),
-    pushTerminal: async (context, reason, closures, terminal, cancellationSignal) =>
-      this.#eventPublisher.pushTerminal(context, reason, closures, terminal, cancellationSignal),
+    pushTerminal: async (context, reason, closures, terminal, cancellationSignal) => {
+      await this.#eventPublisher.pushTerminal(
+        context,
+        reason,
+        closures,
+        terminal,
+        cancellationSignal,
+      );
+      if (terminal.kind === "run.completed") {
+        this.#nativeCheckpoint = (terminal.payload as RuntimeRunCompletedPayload).checkpoint;
+      }
+    },
     requireThreadId: () => this.#requireThreadId(),
   });
 
   constructor(payload: DriverStartInput) {
     this.#payload = payload;
+    this.#nativeCheckpoint = payload.execution.session.nativeCheckpoint;
   }
 
   async start(context: AgentDriverContext, signal: AbortSignal): Promise<void> {
@@ -183,6 +197,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
       restoreOpenAiNativeCheckpoint(this.#payload, signal),
     );
     const nativeResumeThreadId = readResumeThreadId(this.#payload);
+    this.#nativeCheckpoint = this.#payload.execution.session.nativeCheckpoint;
     // Resume emits historical usage before its response; bind the verified native identity first.
     this.#threadId = nativeResumeThreadId;
     const client = this.#createClient(context);
@@ -388,13 +403,43 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
 
     const client = this.#createClient(context);
     const startupCancellation = new AbortController();
-    const resumeThreadId = this.#restartThreadId ?? this.#threadId;
+    const resumeThreadId =
+      this.#nativeCheckpoint !== null ? (this.#restartThreadId ?? this.#threadId) : null;
+    const checkpoint = this.#nativeCheckpoint;
+    if (resumeThreadId !== null) {
+      if (checkpoint === null) {
+        throw new Error("OpenAI native checkpoint is unavailable for thread resume.");
+      }
+      if (
+        checkpoint.nativeRef.runtimeId !== this.runtime ||
+        checkpoint.nativeRef.kind !== "openai_thread_id" ||
+        checkpoint.nativeRef.value !== resumeThreadId
+      ) {
+        throw new Error("OpenAI native checkpoint does not match the resumed thread.");
+      }
+    }
     this.#threadId = resumeThreadId;
     this.#client = client;
     this.#clientStartupCancellation = startupCancellation;
     this.#clientStopRequested = false;
 
     try {
+      if (checkpoint !== null && resumeThreadId !== null) {
+        await restoreOpenAiNativeCheckpoint(
+          {
+            ...this.#payload,
+            execution: {
+              ...this.#payload.execution,
+              session: {
+                ...this.#payload.execution.session,
+                nativeCheckpoint: checkpoint,
+                nativeResumeRef: checkpoint.nativeRef,
+              },
+            },
+          },
+          startupCancellation.signal,
+        );
+      }
       await client.start(startupCancellation.signal);
       const threadResult = await this.#startThread(
         client,
@@ -1015,7 +1060,7 @@ export class OpenAiAppServerDriverBackend implements AgentDriverBackend {
   ): Promise<void> {
     const isCurrentClient = this.#client === client;
     if (isCurrentClient) {
-      this.#restartThreadId = threadId;
+      this.#restartThreadId = this.#nativeCheckpoint !== null ? threadId : null;
       this.#clientStopRequested = true;
     }
     this.#clientStartupCancellation?.abort(new DriverTurnCancelledError(reason));

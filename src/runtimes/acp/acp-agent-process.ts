@@ -4,10 +4,10 @@ import { once } from "node:events";
 import { mkdir } from "node:fs/promises";
 import type { Readable, Writable } from "node:stream";
 
+import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import { summarizePath } from "../../observability/driver-debug";
 import type { DriverStartInput } from "../../protocol/start";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import type { AgentDriverContext } from "../../core/agent-driver-backend";
 import {
   bindSpawnedProcess,
   createProcessTreeEnvironment,
@@ -50,6 +50,7 @@ export async function startAcpAgentProcess(
   supervisionOptions: AcpAgentProcessSupervisionOptions = {},
 ): Promise<{
   readonly process: AcpAgentProcess;
+  readonly releaseStartupAbort: () => void;
   readonly ready: Promise<void>;
 }> {
   const command = supervisionOptions.command ?? readFallbackCommand();
@@ -89,14 +90,22 @@ export async function startAcpAgentProcess(
     watchdog: null,
   };
   agentProcessSupervision.set(agentProcess, supervision);
+  let startupAbortReleased = false;
   const onAbort = () => signalAcpAgentProcess(agentProcess, "SIGKILL");
+  const releaseStartupAbort = () => {
+    if (startupAbortReleased) {
+      return;
+    }
+    startupAbortReleased = true;
+    signal.removeEventListener("abort", onAbort);
+  };
   signal.addEventListener("abort", onAbort, { once: true });
   const exited = Promise.withResolvers<void>();
   const onExit = () => {
     agentProcess.off("exit", onExit);
     agentProcess.off("close", onExit);
     signalLinuxProcessMarker(supervision.marker, "SIGKILL");
-    signal.removeEventListener("abort", onAbort);
+    releaseStartupAbort();
     exited.resolve();
   };
   agentProcess.once("exit", onExit);
@@ -136,7 +145,7 @@ export async function startAcpAgentProcess(
   );
   void ready.catch(() => {});
 
-  return { process: agentProcess, ready };
+  return { process: agentProcess, ready, releaseStartupAbort };
 }
 
 async function waitForAcpAgentProcessReady(

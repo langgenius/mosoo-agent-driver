@@ -1,3 +1,6 @@
+import { dirname, join } from "node:path";
+import { Readable, Writable } from "node:stream";
+
 import {
   client as createAcpClient,
   methods as acpMethods,
@@ -10,9 +13,9 @@ import type {
   ClientContext,
   InitializeResponse,
 } from "@agentclientprotocol/sdk";
-import { Readable, Writable } from "node:stream";
-import { dirname, join } from "node:path";
 
+import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
+import { AGENT_DRIVER_VERSION } from "../../core/version";
 import { summarizePath, summarizePathCollection } from "../../observability/driver-debug";
 import type { DriverEventInput } from "../../protocol/events";
 import type { RunId } from "../../protocol/id";
@@ -20,8 +23,6 @@ import type { DriverRuntime } from "../../protocol/runtime";
 import type { DriverStartInput } from "../../protocol/start";
 import type { RuntimeCommandInput } from "../../runtime-command";
 import { raceWithAbort, settlePromiseWithTimeout } from "../../utils/async";
-import { AGENT_DRIVER_VERSION } from "../../core/version";
-import type { AgentDriverBackend, AgentDriverContext } from "../../core/agent-driver-backend";
 import { DriverEventPublisher } from "../driver-event-publisher";
 import {
   buildRuntimeBootstrapText,
@@ -33,7 +34,6 @@ import {
 import { startAcpAgentProcess, stopAcpAgentProcess } from "./acp-agent-process";
 import type { AcpAgentProcess } from "./acp-agent-process";
 import { AcpClientRequestHandler } from "./acp-client-request-handler";
-import { limitAcpInput } from "./acp-input-limit";
 import {
   ACP_PROTOCOL_VERSION,
   appendOpenCodeInstruction,
@@ -49,11 +49,11 @@ import {
   supportsSessionLoad,
   supportsSessionResume,
 } from "./acp-configuration";
+import { limitAcpInput } from "./acp-input-limit";
 import { toAuthEvent, toInitializeEvents, toSessionReadyEvents } from "./acp-session-events";
 import { setupAcpSession } from "./acp-session-setup";
 import { withAcpStartupStage } from "./acp-startup";
 import { AcpTurnController } from "./acp-turn-controller";
-
 import {
   exportOpenCodeCheckpoint,
   openCodeDataPath,
@@ -130,6 +130,8 @@ export class AcpDriverBackend implements AgentDriverBackend {
       nativeSessionId: () => this.#nativeSessionId,
       onUpdateFailure: (error) => this.#connection?.close(error),
       push: async (context, reason, events) => this.#push(context, reason, events),
+      pushSession: async (context, reason, events) =>
+        this.#eventPublisher.pushSession(context, reason, events),
       turnEvents: this.#turnController.events,
     });
   }
@@ -462,6 +464,7 @@ export class AcpDriverBackend implements AgentDriverBackend {
       }
       connection.signal.throwIfAborted();
       connectionReady = true;
+      startedProcess.releaseStartupAbort();
 
       return setup;
     } catch (error) {
@@ -613,10 +616,25 @@ export class AcpDriverBackend implements AgentDriverBackend {
       await this.#joinStop();
       return;
     }
-    if (resumeSignal.aborted) {
+    if (!providerPromptAdmitted) {
       return;
     }
-    if (!providerPromptAdmitted) {
+
+    if (resumeSignal.aborted) {
+      const transport = this.#connection;
+      const agentProcess = this.#agentProcess;
+      if (transport !== null) {
+        this.#connection = null;
+        transport.close(new Error("ACP cancelled turn stopping provider process."));
+      }
+      if (agentProcess !== null) {
+        await this.#stopOwnedAgent(
+          context,
+          agentProcess,
+          "turn.cancelled.stop",
+          Date.now() + ACP_RECYCLE_BUDGET_MS,
+        );
+      }
       return;
     }
 

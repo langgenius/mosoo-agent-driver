@@ -16,8 +16,10 @@ import {
 import type { DriverArtifactTestEvent } from "./driver-artifact-test-controller";
 import { driverBootPayload } from "./driver-boot-payload-fixture";
 import { messageText } from "./driver-event-test-helpers";
+import { createPiLiveTurn } from "./pi-driver-live-turn";
+import { piLiveChatCompletionsUrl } from "./pi-driver-live-upstream";
 
-// Explicitly opt in: these tests make billable requests through OpenRouter.
+// Explicitly opt in: these tests make billable requests through the configured upstream.
 // The local forwarder certifies the Driver/Pi wire, not hosted Worker/D1 behavior.
 const enabled = process.env["AGENT_DRIVER_PI_LIVE"] === "1";
 const liveTest = enabled ? test : test.skip;
@@ -49,6 +51,7 @@ async function fixture(policy: "full_access" | "supervised" = "full_access") {
   const mcpProof = `server-proof-${randomUUID()}`;
   const mcpMarker = `marker-${randomUUID()}`;
   const requests: { model: unknown; status: number; messages: unknown }[] = [];
+  const upstreamUrl = piLiveChatCompletionsUrl();
   let mcpCalls = 0;
   let unauthorized = 0;
   const proxy = Bun.serve({
@@ -72,7 +75,7 @@ async function fixture(policy: "full_access" | "supervised" = "full_access") {
       const observed = { model: parsed.model, status: 0, messages: parsed.messages };
       requests.push(observed);
       console.log(`Pi live: upstream request ${requests.length}`);
-      const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      const upstream = await fetch(upstreamUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
         body,
@@ -240,13 +243,14 @@ async function fixture(policy: "full_access" | "supervised" = "full_access") {
 }
 
 function begin(controller: DriverArtifactTestController, text: string) {
-  const turn = {
+  const turn = createPiLiveTurn({
     commandId: createDriverId(),
     requestId: createDriverId(),
     runId: createDriverId(),
     eventIndex: controller.events.length,
-  };
-  controller.enqueue({ ...turn, kind: "input.start", input: { text } });
+    text,
+  });
+  controller.enqueue(turn.command);
   return turn;
 }
 

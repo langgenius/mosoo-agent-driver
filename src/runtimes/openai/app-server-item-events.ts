@@ -56,6 +56,10 @@ function toOpenAiMessageSnapshotEvents(input: {
   readonly sourcePrefix: string;
   readonly text: string;
 }): DriverEventInput[] {
+  // Native tool turns can close an assistant item without text. Its lifecycle
+  // still closes, but there is no text snapshot to publish.
+  if (input.text.length === 0) return [];
+
   const createAddedEvent = (content: string): DriverEventInput => ({
     delivery: "lossless",
     kind: "message.added",

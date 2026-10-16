@@ -6,6 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { createDisabledLogger } from "../src/observability";
 import { createDriverStartInputFromBootPayload } from "../src/protocol/start";
 import {
@@ -15,7 +16,6 @@ import {
 } from "../src/runtimes/acp/acp-agent-process";
 import { buildChildEnv } from "../src/runtimes/acp/acp-configuration";
 import { spawnLinuxProcessTreeWatchdog } from "../src/runtimes/child-process";
-import { createAgentDriverContext } from "../src/core/agent-driver-backend";
 import { driverBootPayload, driverStartInput } from "./driver-boot-payload-fixture";
 
 function createHarness() {
@@ -178,6 +178,40 @@ describe("ACP agent process lifecycle", () => {
     } finally {
       if (child !== undefined && child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
+      }
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("stops owning the startup abort after the process is handed off", async () => {
+    const harness = createHarness();
+    const root = await mkdtemp(join(tmpdir(), "driver-acp-startup-handoff-"));
+    const payload = createPayload(root);
+    const controller = new AbortController();
+    let child: AcpAgentProcess | undefined;
+
+    try {
+      const started = await startAcpAgentProcess(
+        harness.context,
+        payload,
+        buildChildEnv(payload),
+        controller.signal,
+        {
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          command: process.execPath,
+        },
+      );
+      child = started.process;
+      await started.ready;
+      started.releaseStartupAbort();
+      controller.abort(new Error("startup deadline elapsed"));
+      await Bun.sleep(50);
+
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+    } finally {
+      if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+        await stopAcpAgentProcess(harness.context, child, "test.cleanup").catch(() => {});
       }
       await rm(root, { force: true, recursive: true });
     }

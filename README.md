@@ -117,6 +117,7 @@ Consumers ignore previews after the first final chunk and preserve each thought'
 Final content is acknowledged through the shared event publisher before the Run terminal, keeping large thoughts outside the terminal batch limit.
 
 Each successful Run exports an immutable, verified native bundle under `.state/native-checkpoints/<runId>` and includes its descriptor in `run.completed`.
+OpenAI cancellation before the first successful native checkpoint starts a fresh thread for the next input; cancellation after a successful checkpoint resumes the established thread.
 In mosoo, the host backs up that bundle before atomically committing the checkpoint descriptor and canonical completion receipt.
 The next Run waits for terminal acknowledgement, backend settlement, required cleanup, and input-command acknowledgement.
 A cleanup failure blocks handoff while preserving the committed outcome.

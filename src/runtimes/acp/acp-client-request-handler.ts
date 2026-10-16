@@ -19,8 +19,8 @@ import type {
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 
-import type { DriverEventInput } from "../../protocol/events";
 import type { AgentDriverContext } from "../../core/agent-driver-backend";
+import type { DriverEventInput } from "../../protocol/events";
 import {
   AcpTurnStateLimitError,
   type AcpAssistantTranscriptState,
@@ -41,6 +41,7 @@ interface AcpClientRequestHandlerOptions {
   nativeSessionId(): string | null;
   onUpdateFailure(error: Error): void;
   push(context: AgentDriverContext, reason: string, events: DriverEventInput[]): Promise<void>;
+  pushSession: AcpClientRequestHandlerOptions["push"];
   readonly turnEvents: AcpAssistantTranscriptState;
 }
 
@@ -63,6 +64,7 @@ export class AcpClientRequestHandler {
   readonly #pathScope: AcpPathScope;
   readonly #pendingPermissions = new Set<Promise<unknown>>();
   readonly #push: AcpClientRequestHandlerOptions["push"];
+  readonly #pushSession: AcpClientRequestHandlerOptions["push"];
   #permissionIngressClosed = false;
   #stopping = false;
   #transcriptTail: Promise<void> = Promise.resolve();
@@ -77,6 +79,7 @@ export class AcpClientRequestHandler {
     this.#nativeSessionId = options.nativeSessionId;
     this.#onUpdateFailure = options.onUpdateFailure;
     this.#push = options.push;
+    this.#pushSession = options.pushSession;
     this.#turnEvents = options.turnEvents;
     this.#pathScope = new AcpPathScope({
       allowedRoots: options.allowedRoots,
@@ -456,7 +459,8 @@ export class AcpClientRequestHandler {
         return;
       }
 
-      await this.#push(context, "driver.acp.session.update", events);
+      const push = isTurnScopedSessionUpdate(params) ? this.#push : this.#pushSession;
+      await push(context, "driver.acp.session.update", events);
     });
   }
 
