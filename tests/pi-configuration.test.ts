@@ -24,6 +24,7 @@ import {
 } from "../src/runtimes/child-process-env";
 import { createNativeCheckpoint, pinNativeCheckpointRoot } from "../src/runtimes/native-checkpoint";
 import {
+  PI_SETTINGS,
   preparePiLaunch,
   readPiSessionFile,
   resolvePiSessionPath,
@@ -153,6 +154,10 @@ test("launch preserves native model, instruction, permission and active MCP wiri
   expect(await readFile(join(config.home, "mosoo-permissions.mjs"), "utf8")).toContain(
     'ctx.ui.confirm("mosoo.tool_permission"',
   );
+  expect(JSON.parse(await readFile(join(config.home, "settings.json"), "utf8"))).toEqual(
+    PI_SETTINGS,
+  );
+  expect(PI_SETTINGS.retry.enabled).toBe(true);
   expect(
     await readFile(join(payload.execution.session.homePath, "runtime-instructions.md"), "utf8"),
   ).toContain("Keep this instruction.");
