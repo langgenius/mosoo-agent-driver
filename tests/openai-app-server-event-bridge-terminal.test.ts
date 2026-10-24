@@ -143,6 +143,87 @@ function createPublisherHarness(
 }
 
 describe("OpenAi app-server event bridge", () => {
+  test.each([
+    "item completion",
+    "turn snapshot",
+    "filtered item completion",
+    "omitted turn items",
+    "replayed item completion",
+    "streamed item completion",
+  ])(
+    "accepts an empty final assistant message from %s without publishing empty text or reusing progress",
+    async (source) => {
+      const { bridge, context, delivered } = createPublisherHarness();
+      const trackedTurn = bridge.trackTurn("turn-1", DRIVER_TEST_IDS.runId);
+      void trackedTurn.catch(() => {});
+      // Given a valid progress message followed by an authoritative empty final.
+      const progress = {
+        id: "message-progress",
+        phase: "commentary",
+        text: "PROGRESS",
+        type: "agentMessage",
+      };
+      const final = {
+        id: "message-final",
+        phase: "final",
+        text: source === "filtered item completion" ? "\uE200cite\uE202turn7search12\uE201" : "",
+        type: "agentMessage",
+      };
+      await bridge.handleNotification(context, "item/completed", {
+        item: progress,
+        threadId: "thread-1",
+        turnId: "turn-1",
+      });
+      if (source === "streamed item completion") {
+        await bridge.handleNotification(context, "item/agentMessage/delta", {
+          delta: "TRANSIENT",
+          itemId: final.id,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        });
+      }
+
+      // When the provider delivers it through either native completion path.
+      if (source !== "turn snapshot") {
+        await bridge.handleNotification(context, "item/completed", {
+          item: final,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        });
+      }
+      if (source === "replayed item completion") {
+        await bridge.handleNotification(context, "item/completed", {
+          item: final,
+          threadId: "thread-1",
+          turnId: "turn-1",
+        });
+      }
+      await bridge.handleNotification(context, "turn/completed", {
+        threadId: "thread-1",
+        turn: {
+          id: "turn-1",
+          items: source === "omitted turn items" ? [] : [progress, final],
+          itemsView: source === "omitted turn items" ? "notLoaded" : "full",
+          status: "completed",
+        },
+      });
+
+      // Then strict event validation succeeds, lifecycles close, and the
+      // completed run does not misidentify the earlier progress as its final.
+      await expect(trackedTurn).resolves.toBeUndefined();
+      expect(
+        delivered
+          .filter((event) => event.kind === "message.added")
+          .map((event) => readEventPayloadString(event, "content")),
+      ).toEqual(["PROGRESS"]);
+      expect(delivered.filter((event) => event.kind === "message.started")).toHaveLength(2);
+      expect(delivered.filter((event) => event.kind === "message.completed")).toHaveLength(2);
+      const terminals = delivered.filter((event) => event.kind === "run.completed");
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]!.payload).not.toHaveProperty("finalMessageId");
+    },
+  );
+
   test("preserves the first reasoning delta when its start delivery fails", async () => {
     const { bridge, context, delivered } = createPublisherHarness({
       failEventOnce: "thought.started",

@@ -8,18 +8,19 @@ import {
   DriverPermissionBroker,
   PermissionEventDeliveryError,
 } from "../src/core/driver-permission-broker";
-import type { DriverPermissionRequest } from "../src/host-ports";
 import {
   DriverEventRejectedError,
   type DriverRuntimeEventPort,
 } from "../src/core/driver-runtime-io";
-import type { DriverEventInput } from "../src/protocol/events";
+import type { DriverPermissionRequest } from "../src/host-ports";
 import { createDisabledLogger } from "../src/observability";
-import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
+import type { DriverEventInput } from "../src/protocol/events";
+import type { RunId } from "../src/protocol/id";
 import { AcpAssistantTranscriptState } from "../src/runtimes/acp/acp-assistant-transcript-state";
+import { AcpClientRequestHandler } from "../src/runtimes/acp/acp-client-request-handler";
 import { DriverEventPublisher } from "../src/runtimes/driver-event-publisher";
 import { beginAcpTranscript } from "./acp-test-helpers";
-import { driverStartInput } from "./driver-boot-payload-fixture";
+import { driverStartInput, DRIVER_TEST_IDS } from "./driver-boot-payload-fixture";
 
 const BASE_HANDLER_OPTIONS = {
   allowedRoots: [],
@@ -28,6 +29,7 @@ const BASE_HANDLER_OPTIONS = {
   isCancelling: () => false,
   nativeSessionId: () => "native-session-1",
   onUpdateFailure: () => {},
+  pushSession: async () => {},
 } satisfies Omit<ConstructorParameters<typeof AcpClientRequestHandler>[0], "push" | "turnEvents">;
 
 describe("ACP client request handler", () => {
@@ -296,6 +298,9 @@ describe("ACP client request handler", () => {
       push: async (_context, reason) => {
         pushedReasons.push(reason);
       },
+      pushSession: async (_context, reason) => {
+        pushedReasons.push(reason);
+      },
       turnEvents: new AcpAssistantTranscriptState(),
     });
     const notification = {
@@ -317,6 +322,89 @@ describe("ACP client request handler", () => {
     await appliedUpdate;
 
     expect(pushedReasons).toEqual(["driver.acp.session.update"]);
+  });
+
+  test("delivers metadata through the session lane after a cancelled terminal", async () => {
+    const terminalEntered = Promise.withResolvers<void>();
+    const releaseTerminal = Promise.withResolvers<void>();
+    const metadataPushEntered = Promise.withResolvers<void>();
+    const runId: RunId = DRIVER_TEST_IDS.runId;
+    let activeRunId: RunId | null = runId;
+    let metadataLane: "run" | "session" | null = null;
+    let sequence = 0;
+    const delivered: DriverEventInput[] = [];
+    const context = createAgentDriverContext({
+      eventSink: {
+        currentRunId: () => activeRunId,
+        pushEvents: async ({ events }) => {
+          delivered.push(...events);
+          if (events.some((event) => event.kind === "run.cancelled")) {
+            terminalEntered.resolve();
+            await releaseTerminal.promise;
+          }
+          return {
+            accepted: events.map((event) => ({
+              eventId: event.sourceEventId!,
+              seq: ++sequence,
+              type: event.kind,
+            })),
+          };
+        },
+      },
+      logger: createDisabledLogger(),
+      payload: driverStartInput,
+      permission: { request: async () => "reject_once" },
+    });
+    const publisher = new DriverEventPublisher("acp-fallback", () => "native-session-1");
+    const handler = new AcpClientRequestHandler({
+      ...BASE_HANDLER_OPTIONS,
+      push: async (pushContext, reason, events) => {
+        metadataLane = "run";
+        metadataPushEntered.resolve();
+        await publisher.push(pushContext, reason, events);
+      },
+      pushSession: async (pushContext, reason, events) => {
+        metadataLane = "session";
+        metadataPushEntered.resolve();
+        await publisher.pushSession(pushContext, reason, events);
+      },
+      turnEvents: beginAcpTranscript(),
+    });
+    const terminal = publisher.pushTerminal(context, "cancelled", [], {
+      kind: "run.cancelled",
+      payload: { runId, status: "cancelled" },
+      runId,
+    });
+
+    await terminalEntered.promise;
+    const metadata = handler.enqueueUpdate(context, {
+      sessionId: "native-session-1",
+      update: {
+        availableCommands: [{ description: "Resume", name: "resume" }],
+        sessionUpdate: "available_commands_update",
+      },
+    });
+
+    let metadataSettled = false;
+    void metadata.then(
+      () => {
+        metadataSettled = true;
+      },
+      () => {
+        metadataSettled = true;
+      },
+    );
+    await metadataPushEntered.promise;
+    expect(metadataLane).toBe("session");
+    expect(metadataSettled).toBe(false);
+    expect(delivered.map((event) => event.kind)).toEqual(["run.cancelled"]);
+    releaseTerminal.resolve();
+    await Promise.all([terminal, metadata]);
+
+    expect(delivered.map((event) => [event.kind, event.runId ?? null])).toEqual([
+      ["run.cancelled", runId],
+      ["session.commands.updated", null],
+    ]);
   });
 
   test("passes the runtime environment to terminal child processes", async () => {
@@ -360,6 +448,9 @@ describe("ACP client request handler", () => {
         if (pushedReasons.length === 1) {
           await gate.promise;
         }
+      },
+      pushSession: async (_context, reason) => {
+        pushedReasons.push(reason);
       },
       turnEvents,
     });
