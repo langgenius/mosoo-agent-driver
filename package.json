@@ -112,7 +112,7 @@
     "@types/node": "^26.3.0",
     "opencode-ai": "1.18.25",
     "typescript": "^7.0.2",
-    "vite-plus": "0.3.0"
+    "vite-plus": "1.1.0"
   },
   "engines": {
     "bun": ">=1.4.0"

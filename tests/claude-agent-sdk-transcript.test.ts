@@ -172,13 +172,13 @@ test.each(["deadline", "cancellation"])(
       return { bytesRead: 0, buffer: Buffer.alloc(0) };
     });
     const originalClose = handle.close;
-    const closeSpy = spyOn(prototype, "close").mockImplementation(
-      async function (this: FileHandle) {
-        const fd = this.fd;
-        await originalClose.call(this);
-        if (fd === readingFd) closed.resolve();
-      },
-    );
+    const closeSpy = spyOn(prototype, "close").mockImplementation(async function (
+      this: FileHandle,
+    ) {
+      const fd = this.fd;
+      await originalClose.call(this);
+      if (fd === readingFd) closed.resolve();
+    });
     const cancellation = new AbortController();
     const reason = new Error("test.cancel.stalled");
     try {
