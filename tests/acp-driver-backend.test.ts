@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -1306,6 +1306,16 @@ describe("ACP driver backend lifecycle", () => {
       },
     });
 
+    const promptAccepted = Promise.withResolvers<void>();
+    const closePermissionIngress = AcpClientRequestHandler.prototype.closePermissionIngress;
+    const ingressSpy = spyOn(
+      AcpClientRequestHandler.prototype,
+      "closePermissionIngress",
+    ).mockImplementation(function (this: AcpClientRequestHandler) {
+      closePermissionIngress.call(this);
+      promptAccepted.resolve();
+    });
+
     try {
       const input = harness.backend.handleInput(
         harness.context,
@@ -1314,6 +1324,13 @@ describe("ACP driver backend lifecycle", () => {
       );
       void input.catch(() => {});
       await reportEntered.promise;
+      // The provider response must reach the turn controller before the file report fails.
+      expect(
+        await settlePromiseWithTimeout(promptAccepted.promise, {
+          label: "ACP ignored file report prompt acceptance",
+          timeoutMs: 2_000,
+        }),
+      ).toEqual({ status: "completed", value: undefined });
       expect(
         await settlePromiseWithTimeout(input, {
           label: "ACP committed file terminal fence",
@@ -1368,6 +1385,7 @@ describe("ACP driver backend lifecycle", () => {
     } finally {
       releaseReport.resolve();
       await harness.destroy();
+      ingressSpy.mockRestore();
     }
   });
 
@@ -1769,6 +1787,10 @@ describe("ACP driver backend lifecycle", () => {
         await waitForAcpTestCondition(
           async () => (await harness.methods()).includes("session/cancel"),
           "ACP session/cancel request",
+        );
+        await waitForAcpTestCondition(
+          () => existsSync(harness.latePidPath),
+          "ACP cancellation child PID",
         );
         gate.release();
         await expect(cancellation).resolves.toBeUndefined();

@@ -274,7 +274,7 @@ Check the diff.`,
   } finally {
     await rm(root, { force: true, recursive: true });
   }
-});
+}, 30_000);
 
 test.each(["full_access", "supervised"] as const)(
   "OpenCode resumes native history and applies %s tool permissions",

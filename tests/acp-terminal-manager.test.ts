@@ -1314,6 +1314,8 @@ while (!existsSync(${JSON.stringify(workerPidPath)})) Atomics.wait(sleeper, 0, 0
           if (createdDraft === undefined) {
             createdDraft = events[0];
             createdPushes += 1;
+            // Admit the fixture process before receipt loss starts its cleanup.
+            await waitForPidFile(pidPath);
             throw new Error("creation receipt lost after commit");
           }
           if (events[0]?.sourceEventId === createdDraft.sourceEventId) {
