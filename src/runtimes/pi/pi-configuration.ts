@@ -41,6 +41,20 @@ const PI_PROVIDER_BY_VENDOR = new Map([
   ["zhipu", "zai"],
 ]);
 
+// Pi makes no provider-level retries, so its agent retry is the only recovery
+// from a model call that fails with a rate limit, server error or dropped
+// connection; quota and billing errors are not retried. A failed attempt ran
+// no tools and Pi removes it from model context, so a retry never repeats a
+// tool call, and the translator clears its failure once a retry completes.
+export const PI_SETTINGS = {
+  extensions: [],
+  skills: [],
+  promptTemplates: [],
+  packages: [],
+  quietStartup: true,
+  retry: { enabled: true, maxRetries: 3 },
+} as const;
+
 // The extension asks through RPC before any tool execution. The Driver owns
 // the decision, including cancellation of an outstanding permission request.
 function createPiExtensionSource(
@@ -207,14 +221,7 @@ export async function preparePiLaunch(
   await writeFileAtomically(
     homeDirectory,
     "settings.json",
-    JSON.stringify({
-      extensions: [],
-      skills: [],
-      promptTemplates: [],
-      packages: [],
-      quietStartup: true,
-      retry: { enabled: false },
-    }),
+    JSON.stringify(PI_SETTINGS),
     0o600,
     signal,
   );

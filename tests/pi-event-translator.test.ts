@@ -761,3 +761,78 @@ describe("Pi tool event contract", () => {
     ).toThrow("Pi tool event has no assistant message.");
   });
 });
+
+describe("Pi automatic retry", () => {
+  test("completes with the retried reply after a transient provider failure", () => {
+    const translator = new PiEventTranslator();
+    const failed = {
+      role: "assistant",
+      content: [],
+      stopReason: "error",
+      errorMessage: '503: {"message":"transient upstream 503"}',
+    };
+    const failedEvents = [
+      ...translator.translate({ type: "message_start", message: failed }),
+      ...translator.translate({ type: "message_end", message: failed }),
+    ];
+    translator.accept(failedEvents);
+    expect(failedEvents.map((event) => event.kind)).toEqual([
+      "message.started",
+      "message.completed",
+    ]);
+    expect(translator.failure).toBe(failed.errorMessage);
+
+    // Pi 1.1.0 emits these between the failed attempt and its retry.
+    for (const record of [
+      { type: "turn_end", message: failed },
+      { type: "agent_end", messages: [failed] },
+      {
+        type: "auto_retry_start",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 2000,
+        errorMessage: failed.errorMessage,
+      },
+      {
+        type: "entry_appended",
+        entry: {
+          type: "context_edit",
+          id: "edit",
+          parentId: "failed",
+          timestamp: "2026-10-20T20:41:24.447Z",
+          targetId: "failed",
+          replacement: null,
+        },
+      },
+      { type: "agent_start" },
+      { type: "turn_start" },
+    ]) {
+      expect(translator.translate(record)).toEqual([]);
+    }
+
+    const reply = {
+      role: "assistant",
+      content: [{ type: "text", text: "Recovered." }],
+      stopReason: "stop",
+    };
+    const replyEvents = [
+      ...translator.translate({ type: "message_start", message: reply }),
+      ...translator.translate({ type: "message_end", message: reply }),
+    ];
+    translator.accept(replyEvents);
+    expect(translator.translate({ type: "auto_retry_end", success: true, attempt: 1 })).toEqual([]);
+    expect(replyEvents.map((event) => event.kind)).toEqual([
+      "message.started",
+      "message.added",
+      "message.completed",
+    ]);
+    expect(translator.failure).toBeNull();
+    const startedPayload = replyEvents[0]?.payload;
+    if (!isJsonObject(startedPayload)) throw new Error("Missing retried message start.");
+    expect(translator.finalMessage).toEqual({
+      id: startedPayload["messageId"],
+      text: "Recovered.",
+    });
+    expect(translator.closeOpenItems()).toEqual([]);
+  });
+});
