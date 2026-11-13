@@ -91,6 +91,12 @@ describe("AgentDriverKernelCore", () => {
         },
       },
     });
+    const runReleased = Promise.withResolvers<void>();
+    const releaseRun = kernel.releaseRun.bind(kernel);
+    kernel.releaseRun = (ticket, reason) => {
+      releaseRun(ticket, reason);
+      runReleased.resolve();
+    };
 
     await kernel.start(bootPayload);
     await expect(
@@ -106,6 +112,7 @@ describe("AgentDriverKernelCore", () => {
     expect(delivered).toContainEqual(
       expect.objectContaining({ kind: "run.completed", runId: DRIVER_TEST_IDS.runId }),
     );
+    await runReleased.promise;
     expect(kernel.currentRunId()).toBeNull();
     await expect(kernel.stop("custom sink complete")).resolves.toBeUndefined();
   });
